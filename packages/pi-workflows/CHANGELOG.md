@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1
+### Patch Changes
+
+- 24a8af4: Remove references to the maintainer's personal dotfile setup from shipped docs
+  and source comments. Each constraint is restated as a property of the package
+  itself: which manager owns a settings file, whether a project permits git
+  worktrees, and installing a package from a single source. No runtime behavior
+  changes.
+
 ## 1.0.0
 ### Major Changes
 

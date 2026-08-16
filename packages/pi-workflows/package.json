@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-workflows",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Declarative DAG workflows backed by pi-subagents managed spawning.",
   "type": "module",
   "license": "MIT",
