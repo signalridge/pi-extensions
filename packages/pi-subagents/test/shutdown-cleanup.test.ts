@@ -19,9 +19,12 @@ vi.mock("../src/agent-runner.js", () => ({
   resumeAgent: vi.fn(),
   getAgentConversation: vi.fn(() => ""),
   getDefaultMaxTurns: vi.fn(() => undefined),
+  getDefaultModel: vi.fn(() => undefined),
   getGraceTurns: vi.fn(() => 1),
   normalizeMaxTurns: vi.fn((n: number | undefined) => n),
+  resolveConfiguredDefaultModel: vi.fn(() => undefined),
   setDefaultMaxTurns: vi.fn(),
+  setDefaultModel: vi.fn(),
   setGraceTurns: vi.fn(),
   steerAgent: vi.fn(),
   SUBAGENT_TOOL_NAMES: {

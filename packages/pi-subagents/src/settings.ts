@@ -82,6 +82,25 @@ export interface SubagentsSettings {
    * these. See `agent-tiers.ts` for resolution and precedence.
    */
   agentTiers?: AgentTiersSettings;
+  /**
+   * The model a subagent runs when nothing else chose one — no tier applied and
+   * no programmatic override. It takes the place of the parent session's model
+   * as the last step of resolution, so a workspace can say "subagents run on the
+   * cheap model" without first defining a tier catalogue.
+   *
+   * A `provider/model` reference, or the literal `"inherit"` to follow the
+   * parent. `"inherit"` is spellable rather than merely omittable because a
+   * project needs a way to undo a global default; omitting the key inherits
+   * whatever global set.
+   *
+   * Deliberately weaker than a tier: a tier naming an unavailable model fails
+   * the spawn, because someone asked for that policy by name, while an
+   * unresolvable default model falls back to the parent. Failing every spawn on
+   * a machine that happens to lack one provider is the wrong trade for a value
+   * nobody named at the call site — the `/agents → Settings` row shows the
+   * fallback instead.
+   */
+  defaultModel?: string;
   maxConcurrent?: number;
   /**
    * 0 = unlimited — the extension's single source of truth for that convention:
@@ -195,6 +214,8 @@ export interface SettingsAppliers {
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
+  /** `undefined` and `"inherit"` both mean "follow the parent session". */
+  setDefaultModel: (ref: string | undefined) => void;
   setSchedulingEnabled: (b: boolean) => void;
   setScopeModels: (enabled: boolean) => void;
   setStrictAgentFiles: (b: boolean) => void;
@@ -215,15 +236,23 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
-const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set([
+/**
+ * Thinking values a tier profile accepts, `inherit` first and then ascending.
+ *
+ * Ordered because the `/agents → Model tiers` editor offers them in this order;
+ * note `off` is absent — a profile that wants no thinking says so through the
+ * model it names, and `clampThinkingLevel` handles a model that supports none.
+ */
+export const TIER_THINKING_LEVELS: readonly TierThinking[] = [
+  "inherit",
   "minimal",
   "low",
   "medium",
   "high",
   "xhigh",
   "max",
-  "inherit",
-]);
+];
+const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set(TIER_THINKING_LEVELS);
 const WORKFLOW_TIER_NAMES: readonly WorkflowTier[] = ["small", "medium", "large"];
 const MAX_MODEL_REFERENCE_LENGTH = 512;
 /** Mirrors MAX_AGENT_TIER_KEY_LENGTH in agent-tiers.ts; duplicated to keep settings dependency-free. */
@@ -244,7 +273,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function validWorkflowModelReference(value: unknown): value is string {
+/**
+ * `inherit`, or a bounded whitespace-free `provider/model` reference.
+ *
+ * Exported so the `/agents` menus can reject a typed reference at the prompt.
+ * Without that they would hand an invalid value to `saveSettings`, which drops
+ * unrecognized fields silently — a success toast for a setting that never
+ * persisted.
+ */
+export function isModelReference(value: unknown): value is string {
   if (typeof value !== "string") return false;
   const model = value.trim();
   if (model === "inherit") return true;
@@ -267,7 +304,7 @@ function sanitizeWorkflowProfile(raw: unknown): WorkflowTierProfile | undefined 
   const keys = Object.keys(raw);
   if (keys.some((key) => key !== "model" && key !== "thinking")) return undefined;
   if (!Object.hasOwn(raw, "model") || !Object.hasOwn(raw, "thinking")) return undefined;
-  if (!validWorkflowModelReference(raw.model) || !validThinkingLevel(raw.thinking)) return undefined;
+  if (!isModelReference(raw.model) || !validThinkingLevel(raw.thinking)) return undefined;
   return { model: raw.model.trim(), thinking: raw.thinking };
 }
 
@@ -318,7 +355,7 @@ function sanitizeAgentTierProfile(raw: unknown): AgentTierProfile | undefined {
   const keys = Object.keys(raw);
   if (keys.some((key) => key !== "model" && key !== "thinking" && key !== "description")) return undefined;
   if (!Object.hasOwn(raw, "model") || !Object.hasOwn(raw, "thinking")) return undefined;
-  if (!validWorkflowModelReference(raw.model) || !validThinkingLevel(raw.thinking)) return undefined;
+  if (!isModelReference(raw.model) || !validThinkingLevel(raw.thinking)) return undefined;
   if (
     Object.hasOwn(raw, "description") &&
     (typeof raw.description !== "string" ||
@@ -396,6 +433,9 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.maxSubagentDepth as number) <= SUBAGENT_DEPTH_CEILING
   ) {
     out.maxSubagentDepth = r.maxSubagentDepth as number;
+  }
+  if (isModelReference(r.defaultModel)) {
+    out.defaultModel = r.defaultModel.trim();
   }
   if (typeof r.defaultJoinMode === "string" && VALID_JOIN_MODES.has(r.defaultJoinMode)) {
     out.defaultJoinMode = r.defaultJoinMode as JoinMode;
@@ -773,6 +813,9 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  // Applied whenever the key is present, `"inherit"` included: that spelling is
+  // how a project cancels a global default model, so it has to reach the setter.
+  if (typeof s.defaultModel === "string") appliers.setDefaultModel(s.defaultModel);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);
   if (typeof s.schedulingEnabled === "boolean") appliers.setSchedulingEnabled(s.schedulingEnabled);
   if (typeof s.scopeModels === "boolean") appliers.setScopeModels(s.scopeModels);

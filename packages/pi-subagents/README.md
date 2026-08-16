@@ -28,6 +28,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
 - **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Protocol v3 adds policy-free managed spawning plus owner-scoped stop/quiescence; workflow callers require the advertised `ownedStop` capability and never fall back to unowned stop. Standardized reply envelopes provide versioning. Emits `subagents:ready` on session start
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
+- **Model tiers** — name a (model, thinking) pair once and let the orchestrator pick it by name; the `Agent` tool exposes `tier` and never `model`/`thinking`, so which model runs stays a config decision. Manage the catalogue in `/agents → Model tiers`, pick the default in `/agents → Settings → Default tier`, or set a plain `defaultModel` when one line beats a catalogue
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
 - **Resilient agent files** — malformed custom `.md` files are skipped with a path-qualified warning so one bad file cannot prevent startup; enable `/agents → Settings → Strict agent files` when startup should fail closed instead
 
@@ -358,6 +359,7 @@ The `/agents` command opens an interactive menu:
 ```
 Agent runs (2) · 1 running · 0 queued · 1 completed · 0 wrapped up · 0 stopped · 0 aborted · 0 failed
 Agent types (6) · unified list of defaults and custom agents
+Model tiers (3) · the (model, thinking) catalogue
 Create new agent
 Settings
 ```
@@ -371,7 +373,8 @@ Settings
 - **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
 - **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list with a `disabled` label and can be re-enabled
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do; a sub-agent writes a unique same-directory staging file, and the parent parses and compare-commits it to the target). Any name is allowed, including default agent names (overrides them)
-- **Settings** — configure max concurrency, default max turns, grace turns, and join mode at runtime
+- **Model tiers** — create, edit and delete the [tier](#model-tiers) profiles. Each row shows what the tier resolves to on this machine (`small — claude-haiku-4-5 · thinking max`), and a tier dropped as malformed is listed as `blocked` so it can be fixed rather than staying invisible. The model picker offers this machine's available models (narrowed to your scope when **Scope models** is on) plus `inherit` and a typed escape hatch; the thinking picker offers only the levels the chosen model actually supports, since the rest would be silently clamped at spawn. Deleting the tier that `defaultTier` names clears the default in the same step
+- **Settings** — configure max concurrency, default max turns, grace turns, default model, default tier, and join mode at runtime
 
 ## Graceful Max Turns
 
@@ -464,13 +467,62 @@ the next pi session, since the description is built once at registration.
 1. `tier` passed to the `Agent` call
 2. `tier:` in the agent's frontmatter
 3. `agentTiers.defaultTier`
-4. the parent session's model and thinking
+4. `defaultModel` — a model with no tier attached, for workspaces that want one
+   setting rather than a catalogue
+5. the parent session's model and thinking
 
-There is no fifth step: an agent cannot pin its own model. `model:`/`thinking:`
-in frontmatter are read only to warn that they are stale, and the built-in
-agents pin nothing either. With no tier anywhere — none passed, none in the
-agent, no `defaultTier` — a subagent runs on the parent session's model, which
-is what a workspace that has configured no tiers gets.
+An agent cannot pin its own model at any step. `model:`/`thinking:` in
+frontmatter are read only to warn that they are stale, and the built-in agents
+pin nothing either. With nothing configured at all, a subagent runs on the
+parent session's model.
+
+### `defaultModel`
+
+Steps 1–3 are a catalogue; step 4 is one line. Set it when the whole point is
+"subagents run on the cheap model" and there is no second policy to name:
+
+```json
+{ "defaultModel": "anthropic/claude-haiku-4-5" }
+```
+
+It only decides the model — thinking still comes from the parent, because a
+level nobody chose for a specific model is exactly what a tier exists to
+express. Any tier that applies overrides it outright.
+
+Set it from `/agents → Settings → Default model` (Enter opens the picker), or by
+hand. It accepts the same references a tier's `model` does, plus the literal
+`"inherit"`, which is how a project cancels a global `defaultModel` — omitting
+the key inherits whatever the global file set.
+
+Unlike a tier, an unresolvable `defaultModel` does **not** fail the spawn: it
+falls back to the parent model, and the Settings row shows
+`(unavailable, fallback: inherit)`. A tier is refused because someone named that
+policy at the call site; `defaultModel` is the value nobody named, so one
+unauthed provider must not take every spawn on the machine down with it.
+
+### Editing tiers
+
+`/agents → Model tiers` manages the catalogue — new tier, change a tier's model,
+thinking or description, delete one. `defaultTier` lives with the other defaults
+in `/agents → Settings → Default tier`. Both write the project file; the global
+file is never written from the menu.
+
+Two things the menu knows that a hand-edited file does not: the thinking picker
+offers only levels the chosen model supports (the rest get clamped at spawn
+anyway), and a tier dropped as malformed still appears in the list, marked
+`blocked`, so redefining it is one selection rather than an archaeology
+expedition through `subagents.json`.
+
+The `Agent` tool description is built once at registration, so a tier edit
+reaches the model on the next pi session. Resolution itself is live — a spawn
+right after the edit already uses the new profile.
+
+One thing the file format cannot express: a project *deleting* a tier that only
+the global file defines. The menu writes the merged catalogue back to the
+project file, so deleting one of several works, but deleting the last one — or
+clearing a `defaultTier` that only global sets — leaves no `agentTiers` key
+behind, and the global value is inherited again on the next start. Remove it
+from `~/.pi/agent/subagents.json` instead. The same is true of `workflow.tiers`.
 
 ### Refusals
 
@@ -540,7 +592,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 ## Persistent Settings
 
-Runtime tuning values set via `/agents` → Settings (max concurrency, default max turns, grace turns, nested depth, fallback agent, default join mode, scheduling on/off, scope models on/off, strict agent files on/off, disable defaults on/off, output transcript on/off, tool description full/compact/custom, fleet view on/off) persist across pi restarts. Two files, merged on load:
+Runtime tuning values set via `/agents` → Settings (max concurrency, default max turns, grace turns, nested depth, fallback agent, default model, default tier, default join mode, scheduling on/off, scope models on/off, strict agent files on/off, disable defaults on/off, output transcript on/off, tool description full/compact/custom, fleet view on/off) persist across pi restarts. Two files, merged on load:
 
 - **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
 - **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
@@ -563,6 +615,8 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 ```
 
 Profiles are complete `model` + `thinking` tuples. Each field may use `inherit`; a project profile replaces the whole matching global tier entry. Malformed or incomplete entries are retained as durable blocked-tier tombstones and fail closed rather than falling back to a built-in profile or merging field-by-field. An explicit `defaultTier` applies when a workflow task omits its tier. Without a task tier or configured default, the parent model and thinking level are inherited. Agent frontmatter remains authoritative for its explicit `model` and `thinking`; thinking is clamped to the selected model's native supported levels.
+
+**Default model** (`defaultModel`, unset): the model a subagent runs when no tier picked one — see [`defaultModel`](#defaultmodel) for where it sits in precedence, why an unresolvable value falls back instead of failing, and how `"inherit"` lets a project cancel a global default. **Default tier** (`agentTiers.defaultTier`, unset) is the tier applied when neither the caller nor the agent names one; the profiles it selects from live under [`agentTiers`](#model-tiers).
 
 **Strict agent files** (`strictAgentFiles`, default `false`): normal startup skips unreadable or malformed agent definitions with a warning that includes the file path. Enable it to fail closed during the first `session_start`, using that session's `ctx.cwd`, with the path in the error instead of silently running a surviving lower-priority override. A failed validation leaves no root manager or RPC responder behind. Reloads after startup remain lenient, so an accidental edit cannot terminate an active session; the setting applies on the next pi session.
 

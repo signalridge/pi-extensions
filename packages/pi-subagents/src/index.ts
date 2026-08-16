@@ -26,7 +26,7 @@ import {
   type ManagedSpawnResult,
   type ManagedSpawnTombstone,
 } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { getAgentConversation, getDefaultMaxTurns, getDefaultModel, getGraceTurns, normalizeMaxTurns, resolveConfiguredDefaultModel, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setDefaultModel, setGraceTurns, steerAgent } from "./agent-runner.js";
 import {
   buildAgentTierListText,
   buildAgentTierParameterDescription,
@@ -34,7 +34,14 @@ import {
   findUnknownAgentTierReferences,
   getAgentTiersSettings,
   getDefaultAgentTierText,
+  isValidAgentTierKey,
+  listAgentTierKeys,
+  MAX_AGENT_TIER_KEY_LENGTH,
+  offerableTierThinking,
+  removeAgentTierProfile,
   setAgentTiersSettings,
+  setDefaultAgentTier,
+  upsertAgentTierProfile,
 } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
@@ -56,7 +63,7 @@ import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, getOutputTranscriptDefault, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
-import { applySettings, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
+import { type AgentTierProfile, applySettings, isModelReference, loadSettings, type SubagentsSettings, saveAndEmitChanged, type TierThinking, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentOwner, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType } from "./types.js";
 import {
@@ -1015,7 +1022,7 @@ function activateRootRuntime(
     // workflow tier is active. Tiered runs validate their effective policy inside
     // runAgent after the tier model has been resolved.
     if (effectiveTier === undefined) {
-      let model = ctxRef.model;
+      let model = resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctxRef.modelRegistry);
         if (typeof resolved === "object") model = resolved;
@@ -1226,6 +1233,7 @@ function activateRootRuntime(
     setDefaultMaxTurns,
     setGraceTurns,
     setDefaultJoinMode,
+    setDefaultModel,
     setSchedulingEnabled,
     setScopeModels: setScopeModelsEnabled,
     setStrictAgentFiles: (enabled) => { strictAgentFiles = enabled; },
@@ -1609,12 +1617,15 @@ Terse command-style prompts produce shallow, generic work.
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
 
       // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
+      // With neither, runAgent falls to the configured `defaultModel` before the
+      // parent, so mirror that here — the scope check below and the model label
+      // must describe the model that will actually run.
+      let model = resolveConfiguredDefaultModel(ctx.modelRegistry) ?? ctx.model;
       if (resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
+          // config-specified: silent fallback to the default model, then parent
         } else {
           model = resolved;
         }
@@ -2095,22 +2106,32 @@ Terse command-style prompts produce shallow, generic work.
   // Directory resolution and frontmatter edits live in agent-file-toggle.ts so
   // they can be tested independently of this command handler.
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
-    const cfg = getAgentConfig(type);
-    if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
-    const label = getModelLabelFromConfig(cfg.model);
+  /**
+   * Render one configured model reference for a menu row.
+   *
+   * Shared by the agent list, the `Default model` setting and the tier editor,
+   * because all three show a value someone typed into a settings file and all
+   * three have to answer the same question about it: does this machine actually
+   * have it? A reference that doesn't resolve falls back at runtime, so the
+   * label says so rather than showing config that isn't in force.
+   */
+  function describeModelReference(ref: string | undefined, registry?: ModelRegistry): string {
+    if (!ref || ref === "inherit") return "inherit"; // no model configured → really inherits parent
+    const label = getModelLabelFromConfig(ref);
     if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
+    const resolved = resolveModel(ref, registry);
     if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
     // Surface what it actually resolved to when that differs from the config —
     // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
     // differences are normalized away so an effectively-identical match stays quiet.
     const resolvedFull = `${resolved.provider}/${resolved.id}`;
     const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
-    if (norm(cfg.model) === norm(resolvedFull)) return label;
+    if (norm(ref) === norm(resolvedFull)) return label;
     return `${label} (resolved: ${resolvedFull.replace(/-\d{8}$/, "")})`;
+  }
+
+  function getModelLabel(type: string, registry?: ModelRegistry): string {
+    return describeModelReference(getAgentConfig(type)?.model, registry);
   }
 
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
@@ -2134,6 +2155,11 @@ Terse command-style prompts produce shallow, generic work.
       const jobCount = scheduler.list().length;
       options.push(`Scheduled jobs (${jobCount})`);
     }
+
+    // Model tiers entry — always present, since an empty catalogue is exactly
+    // the state where the user needs the way in to create the first tier.
+    const tierCount = listAgentTierKeys(getAgentTiersSettings()).length;
+    options.push(`Model tiers (${tierCount})`);
 
     // Actions
     options.push("Create new agent");
@@ -2160,6 +2186,9 @@ Terse command-style prompts produce shallow, generic work.
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Scheduled jobs (")) {
       await showSchedulesMenu(ctx, scheduler);
+      await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Model tiers (")) {
+      await showModelTiersMenu(ctx);
       await showAgentsMenu(ctx);
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
@@ -2783,6 +2812,9 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
       graceTurns: getGraceTurns(),
       defaultJoinMode: getDefaultJoinMode(),
+      // `"inherit"` is written out verbatim so a project can cancel a global
+      // default; never configured stays undefined, which JSON.stringify drops.
+      defaultModel: getDefaultModel(),
       schedulingEnabled: isSchedulingEnabled(),
       scopeModels: isScopeModelsEnabled(),
       strictAgentFiles,
@@ -2824,6 +2856,69 @@ Do not wrap the response in a markdown code fence. Return only the file contents
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns", "maxSubagentDepth"]);
+  /**
+   * Settings whose value is chosen in a dialog rather than cycled in place.
+   * Enter closes the list and reopens it once the dialog resolves, the same way
+   * the numeric fields hand off to a text prompt.
+   */
+  const PICKER_IDS = new Set(["defaultModel"]);
+  /** Row value standing in for "no default tier configured". Not a tier key — keys reject whitespace, not words. */
+  const NO_DEFAULT_TIER = "none";
+  /** Menu entry that starts a new tier instead of editing an existing one. */
+  const NEW_TIER_ENTRY = "+ New tier...";
+
+  /**
+   * Ask for a model reference: this machine's models, plus `inherit` and a
+   * typed escape hatch.
+   *
+   * The escape hatch is not decoration — the settings file accepts references
+   * this machine cannot resolve, which is exactly what a shared project config
+   * naming a provider only some teammates have authed looks like. A picker able
+   * to express only what is available here would be weaker than the file it
+   * writes.
+   *
+   * With `scopeModels` on and a scope configured, the list narrows to that
+   * scope: offering a model the same setting would warn about on every spawn is
+   * a menu arguing with itself.
+   */
+  async function pickModelReference(
+    ctx: ExtensionCommandContext,
+    title: string,
+    current: string | undefined,
+  ): Promise<string | undefined> {
+    const CUSTOM = "custom...";
+    const candidates = isScopeModelsEnabled() && ctx.scopedModels.length > 0
+      ? ctx.scopedModels.map(scoped => scoped.model)
+      : ctx.modelRegistry.getAvailable();
+    const refs = [...new Set(candidates.map(m => `${m.provider}/${m.id}`))].sort((a, b) => a.localeCompare(b));
+
+    const choice = await ctx.ui.select(title, ["inherit", ...refs, CUSTOM]);
+    if (!choice) return undefined;
+    if (choice !== CUSTOM) return choice;
+
+    const typed = await ctx.ui.input("Model (provider/modelId, or inherit)", current ?? "");
+    const trimmed = typed?.trim();
+    if (!trimmed) return undefined;
+    if (!isModelReference(trimmed)) {
+      // Refuse here rather than at save: saveSettings drops unrecognized fields
+      // silently, which would show a success toast for a setting that vanished.
+      ctx.ui.notify(`"${trimmed}" is not a model reference. Use provider/modelId, or inherit.`, "warning");
+      return undefined;
+    }
+    return trimmed;
+  }
+
+  async function pickDefaultModel(ctx: ExtensionCommandContext) {
+    const chosen = await pickModelReference(ctx, "Default model", getDefaultModel());
+    if (chosen === undefined) return;
+    setDefaultModel(chosen);
+    notifyApplied(
+      ctx,
+      chosen === "inherit"
+        ? "Default model set to inherit — subagents follow the parent session."
+        : `Default model set to ${chosen}. Applies to spawns where no tier picks a model.`,
+    );
+  }
 
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
@@ -2838,6 +2933,8 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       // persist a fallback that would hard-error on every dispatch.
       const fallbackValue = getFallbackSubagent() ?? "general-purpose";
       const fallbackValues = [...new Set([...getAvailableTypes(), NO_FALLBACK])];
+      const defaultModelLabel = describeModelReference(getDefaultModel(), ctx.modelRegistry);
+      const tierKeys = listAgentTierKeys(getAgentTiersSettings());
 
       return [
         {
@@ -2867,6 +2964,26 @@ Do not wrap the response in a markdown code fence. Return only the file contents
           description: "Hard cap on nested delegation — main is 0, its subagents 1 (0/1 = nesting off, Enter to type)",
           currentValue: String(msd),
           values: [String(msd)],
+        },
+        {
+          id: "defaultModel",
+          label: "Default model",
+          description:
+            "Model a subagent runs when no tier applies (Enter to choose). \"inherit\" follows the parent session. A tier always wins over this.",
+          currentValue: defaultModelLabel,
+          // Single-value list: the real choice is a picker, opened on Enter,
+          // because cycling a registry of models one keypress at a time is not
+          // a usable way to pick one.
+          values: [defaultModelLabel],
+        },
+        {
+          id: "defaultTier",
+          label: "Default tier",
+          description: tierKeys.length > 0
+            ? "Tier applied when neither the caller nor the agent names one. Edit the tiers themselves in /agents → Model tiers."
+            : "No tiers defined yet — create one in /agents → Model tiers.",
+          currentValue: getAgentTiersSettings().defaultTier ?? NO_DEFAULT_TIER,
+          values: [NO_DEFAULT_TIER, ...tierKeys],
         },
         {
           id: "joinMode",
@@ -2967,6 +3084,15 @@ Do not wrap the response in a markdown code fence. Return only the file contents
               : `Nested depth set to ${n}. Applies to agents started from now on.`,
           );
         }
+      } else if (id === "defaultTier") {
+        const tier = value === NO_DEFAULT_TIER ? undefined : value;
+        setAgentTiersSettings(setDefaultAgentTier(getAgentTiersSettings(), tier));
+        notifyApplied(
+          ctx,
+          tier === undefined
+            ? "Default tier cleared. Spawns that name no tier use the default model."
+            : `Default tier set to ${tier}. The tool description updates on the next pi session.`,
+        );
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
         notifyApplied(ctx, `Default join mode set to ${value}`);
@@ -3050,15 +3176,22 @@ Do not wrap the response in a markdown code fence. Return only the file contents
             currentIndex = Math.min(items.length - 1, currentIndex + 1);
           }
 
-          // Enter on numeric field → close and prompt for typed input
-          if (matchesKey(data, Key.enter) && NUMERIC_IDS.has(items[currentIndex].id)) {
-            done(items[currentIndex].id);
+          // Enter on a numeric or picker field → close and open its dialog
+          const focusedId = items[currentIndex].id;
+          if (matchesKey(data, Key.enter) && (NUMERIC_IDS.has(focusedId) || PICKER_IDS.has(focusedId))) {
+            done(focusedId);
             return;
           }
           list.handleInput?.(data);
         },
       };
     });
+
+    if (result === "defaultModel") {
+      await pickDefaultModel(ctx);
+      await showSettings(ctx);
+      return;
+    }
 
     // If a numeric field ID was returned, prompt for typed input
     if (result && NUMERIC_IDS.has(result)) {
@@ -3093,6 +3226,162 @@ Do not wrap the response in a markdown code fence. Return only the file contents
         input = await ctx.ui.input(label, trimmed);
       }
     }
+  }
+
+  // ---- /agents → Model tiers ----
+  //
+  // The catalogue only; `defaultTier` stays in Settings next to the other
+  // defaults. Every mutation here goes through the pure helpers in
+  // agent-tiers.ts, so the rules that outlive a menu — retiring a tombstone,
+  // never leaving `defaultTier` pointing at a deleted tier — are tested without
+  // a terminal.
+
+  /** One catalogue row: what the tier resolves to on this machine. */
+  function describeTierRow(key: string, ctx: ExtensionCommandContext): string {
+    const settings = getAgentTiersSettings();
+    const profile = settings.profiles?.[key];
+    if (!profile) return `${key} — blocked (malformed profile in subagents.json)`;
+    const suffix = settings.defaultTier === key ? " (default)" : "";
+    const model = describeModelReference(profile.model, ctx.modelRegistry);
+    return `${key} — ${model} · thinking ${profile.thinking}${suffix}`;
+  }
+
+  /**
+   * Ask for a tier's thinking level, offering only what its model supports.
+   *
+   * A model with no thinking support at all leaves `inherit` as the single
+   * honest answer, so it is stored without a one-item menu to click through.
+   */
+  async function pickTierThinking(
+    ctx: ExtensionCommandContext,
+    modelRef: string,
+    current?: TierThinking,
+  ): Promise<TierThinking | undefined> {
+    const levels = offerableTierThinking(modelRef, ctx.modelRegistry);
+    if (levels.length === 1) {
+      ctx.ui.notify(
+        `${describeModelReference(modelRef, ctx.modelRegistry)} supports no thinking levels — storing "inherit".`,
+        "info",
+      );
+      return "inherit";
+    }
+    const choice = await ctx.ui.select(
+      current ? `Thinking level (now ${current})` : "Thinking level",
+      levels,
+    );
+    return choice as TierThinking | undefined;
+  }
+
+  /** Write one profile and report it, naming the delay the tool description has. */
+  function saveTierProfile(ctx: ExtensionCommandContext, key: string, profile: AgentTierProfile, verb: string) {
+    setAgentTiersSettings(upsertAgentTierProfile(getAgentTiersSettings(), key, profile));
+    notifyApplied(ctx, `Tier "${key}" ${verb}. The Agent tool description updates on the next pi session.`);
+  }
+
+  /**
+   * Define a tier from scratch.
+   *
+   * `presetKey` skips the name prompt: redefining a blocked tier already knows
+   * which name it is fixing, and asking again invites a typo that would leave
+   * the tombstone in place next to a near-miss twin.
+   */
+  async function createTier(ctx: ExtensionCommandContext, presetKey?: string) {
+    const rawKey = presetKey ?? (await ctx.ui.input("Tier name (one word, no spaces)"));
+    if (!rawKey) return;
+    const key = rawKey.trim();
+    if (!isValidAgentTierKey(key)) {
+      ctx.ui.notify(
+        `"${key}" is not a tier name. Use one word, no whitespace, at most ${MAX_AGENT_TIER_KEY_LENGTH} characters.`,
+        "warning",
+      );
+      return;
+    }
+    if (getAgentTiersSettings().profiles?.[key]) {
+      ctx.ui.notify(`Tier "${key}" already exists. Pick it from the list to edit it.`, "warning");
+      return;
+    }
+
+    const model = await pickModelReference(ctx, `Model for "${key}"`, undefined);
+    if (model === undefined) return;
+    const thinking = await pickTierThinking(ctx, model);
+    if (thinking === undefined) return;
+    // Description is what the host agent reads when choosing between tiers, so
+    // it is prose about the job, not about the model. Blank falls back to the key.
+    const description = await ctx.ui.input(`What is "${key}" for? (shown to the model, optional)`);
+
+    const trimmed = description?.trim();
+    saveTierProfile(ctx, key, { model, thinking, ...(trimmed ? { description: trimmed } : {}) }, "created");
+  }
+
+  async function editTier(ctx: ExtensionCommandContext, key: string) {
+    const profile = getAgentTiersSettings().profiles?.[key];
+    if (!profile) {
+      // A blocked key has no profile to edit; redefining it is the documented
+      // fix, and upsert retires the tombstone in the same write.
+      const redefine = await ctx.ui.confirm(
+        "Blocked tier",
+        `"${key}" was dropped as malformed. Define it again to unblock it?`,
+      );
+      if (redefine) await createTier(ctx, key);
+      return;
+    }
+
+    const MODEL = "Model";
+    const THINKING = "Thinking";
+    const DESCRIPTION = "Description";
+    const DELETE = "Delete tier";
+    const choice = await ctx.ui.select(`Tier "${key}"`, [MODEL, THINKING, DESCRIPTION, DELETE]);
+    if (!choice) return;
+
+    if (choice === MODEL) {
+      const model = await pickModelReference(ctx, `Model for "${key}"`, profile.model);
+      if (model === undefined) return;
+      saveTierProfile(ctx, key, { ...profile, model }, `now runs ${model}`);
+    } else if (choice === THINKING) {
+      const thinking = await pickTierThinking(ctx, profile.model, profile.thinking);
+      if (thinking === undefined) return;
+      saveTierProfile(ctx, key, { ...profile, thinking }, `now thinks ${thinking}`);
+    } else if (choice === DESCRIPTION) {
+      const description = await ctx.ui.input(`What is "${key}" for?`, profile.description ?? "");
+      if (description === undefined) return;
+      const trimmed = description.trim();
+      const { description: _dropped, ...rest } = profile;
+      saveTierProfile(ctx, key, { ...rest, ...(trimmed ? { description: trimmed } : {}) }, "description updated");
+    } else if (choice === DELETE) {
+      const wasDefault = getAgentTiersSettings().defaultTier === key;
+      const confirmed = await ctx.ui.confirm(
+        "Delete tier",
+        wasDefault
+          ? `Delete "${key}"? It is the default tier, so the default is cleared too.`
+          : `Delete "${key}"? Agents whose frontmatter names it will fail to spawn until you fix them.`,
+      );
+      if (!confirmed) return;
+      setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), key));
+      notifyApplied(
+        ctx,
+        wasDefault
+          ? `Tier "${key}" deleted and the default tier cleared.`
+          : `Tier "${key}" deleted.`,
+      );
+    }
+  }
+
+  async function showModelTiersMenu(ctx: ExtensionCommandContext) {
+    const settings = getAgentTiersSettings();
+    // Blocked keys are listed alongside defined ones: they are the entries most
+    // in need of attention, and hiding them would leave a tier that refuses
+    // every spawn invisible in the menu that exists to manage tiers.
+    const keys = [...new Set([...listAgentTierKeys(settings), ...(settings.blockedProfiles ?? [])])]
+      .sort((a, b) => a.localeCompare(b));
+
+    const rows = keys.map(key => describeTierRow(key, ctx));
+    const choice = await ctx.ui.select("Model tiers", [...rows, NEW_TIER_ENTRY]);
+    if (!choice) return;
+
+    if (choice === NEW_TIER_ENTRY) await createTier(ctx);
+    else await editTier(ctx, keys[rows.indexOf(choice)]);
+
+    await showModelTiersMenu(ctx);
   }
 
   // Persist the current snapshot, emit `subagents:settings_changed`, and surface

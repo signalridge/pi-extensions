@@ -30,6 +30,7 @@ import {
   type InternalAgentConfigOverride,
 } from "./internal-run.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -332,12 +333,55 @@ export function getGraceTurns(): number { return graceTurns; }
 export function setGraceTurns(n: number): void { graceTurns = Math.max(1, n); }
 
 /**
+ * Model every subagent falls back to when nothing else picked one.
+ *
+ * Held here rather than in settings.ts because this is the one module that
+ * consumes it, and every spawn path already reaches model resolution through
+ * `runAgent`.
+ *
+ * Stored verbatim, `"inherit"` included, rather than normalized to `undefined`:
+ * the two are the same at spawn time but not on disk. A project that must
+ * cancel a global `defaultModel` has to write `"inherit"` into its own settings
+ * file, and a state that had already collapsed it to `undefined` would persist
+ * as an absent key and let the global value win again on the next start.
+ */
+let defaultModel: string | undefined;
+
+/** The configured fallback model reference — a `provider/model`, `"inherit"`, or unset. */
+export function getDefaultModel(): string | undefined { return defaultModel; }
+/** Set the fallback model reference. `undefined` and blank clear it; `"inherit"` is kept. */
+export function setDefaultModel(ref: string | undefined): void {
+  const trimmed = ref?.trim();
+  defaultModel = trimmed ? trimmed : undefined;
+}
+
+/**
+ * The configured default model, resolved against this machine's registry.
+ *
+ * Resolved with the same fuzzy `resolveModel` the tiers use, so a hand-written
+ * `subagents.json` may name a model the way a person would. Unlike a tier it
+ * never throws: it is the value nobody chose at the call site, so an
+ * unavailable one yields to the parent rather than taking every spawn on this
+ * machine down with it.
+ *
+ * Exported because the callers that compute a spawn's model for the scope check
+ * and the UI label have to see the same answer this module will act on.
+ */
+export function resolveConfiguredDefaultModel(
+  registry: ModelRegistry<Model<any>>,
+): Model<any> | undefined {
+  if (!defaultModel || defaultModel === "inherit") return undefined;
+  const resolved = resolveModel(defaultModel, registry);
+  return typeof resolved === "string" ? undefined : resolved;
+}
+
+/**
  * Try to find the right model for an agent type.
- * Priority: explicit option > config.model > parent model.
+ * Priority: explicit option > config.model > configured default model > parent model.
  */
 function resolveDefaultModel(
   parentModel: Model<any> | undefined,
-  registry: { find(provider: string, modelId: string): Model<any> | undefined; getAvailable?(): Model<any>[] },
+  registry: ModelRegistry<Model<any>>,
   configModel?: string,
 ): Model<any> | undefined {
   if (configModel) {
@@ -349,7 +393,7 @@ function resolveDefaultModel(
       // Build a set of available model keys for fast lookup
       const available = registry.getAvailable?.();
       const availableKeys = available
-        ? new Set(available.map((m: any) => `${m.provider}/${m.id}`))
+        ? new Set(available.map((m) => `${m.provider}/${m.id}`))
         : undefined;
       const isAvailable = (p: string, id: string) =>
         !availableKeys || availableKeys.has(`${p}/${id}`);
@@ -359,7 +403,7 @@ function resolveDefaultModel(
     }
   }
 
-  return parentModel;
+  return resolveConfiguredDefaultModel(registry) ?? parentModel;
 }
 
 /** Info about a tool event in the subagent. */

@@ -25,7 +25,7 @@
 
 import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
-import type { AgentTierProfile, AgentTiersSettings, TierThinking } from "./settings.js";
+import { type AgentTierProfile, type AgentTiersSettings, TIER_THINKING_LEVELS, type TierThinking } from "./settings.js";
 import type { AgentConfig, ThinkingLevel } from "./types.js";
 
 /** `provider/id`, or undefined when no model was selected. */
@@ -111,13 +111,115 @@ export class AgentTierError extends Error {
   }
 }
 
-function knownTierKeys(settings: AgentTiersSettings): string[] {
+/** Every defined tier key, sorted — the catalogue as the UI and the host see it. */
+export function listAgentTierKeys(settings: AgentTiersSettings): string[] {
   return Object.keys(settings.profiles ?? {}).sort((a, b) => a.localeCompare(b));
 }
 
 function tierKeyList(settings: AgentTiersSettings): string {
-  const keys = knownTierKeys(settings);
+  const keys = listAgentTierKeys(settings);
   return keys.length > 0 ? keys.join(", ") : "(none configured)";
+}
+
+/**
+ * Tier edits, as pure settings-to-settings functions.
+ *
+ * The `/agents → Model tiers` menu is the only caller, but the rules it has to
+ * obey are policy, not presentation — retiring a tombstone, not leaving
+ * `defaultTier` pointing at a tier that no longer exists — so they live here
+ * with the resolver that enforces the other half of the same invariants.
+ *
+ * Each returns a fresh object and omits empty containers, so a catalogue edited
+ * back down to nothing serializes as nothing rather than as empty braces.
+ */
+function withoutBlocked(blocked: string[] | undefined, key: string): string[] | undefined {
+  const rest = (blocked ?? []).filter((k) => k !== key);
+  return rest.length > 0 ? rest : undefined;
+}
+
+function compactTierSettings(settings: AgentTiersSettings): AgentTiersSettings {
+  const out: AgentTiersSettings = {};
+  if (settings.defaultTier !== undefined) out.defaultTier = settings.defaultTier;
+  if (settings.profiles && Object.keys(settings.profiles).length > 0) out.profiles = settings.profiles;
+  if (settings.blockedProfiles && settings.blockedProfiles.length > 0) {
+    out.blockedProfiles = settings.blockedProfiles;
+  }
+  if (settings.blockedDefaultTier) out.blockedDefaultTier = true;
+  return out;
+}
+
+/**
+ * Define or replace one tier.
+ *
+ * Writing a valid profile retires that key's tombstone: the tombstone exists to
+ * stop a malformed entry from silently resolving to some other model, and an
+ * explicit definition is the fix it was waiting for.
+ */
+export function upsertAgentTierProfile(
+  settings: AgentTiersSettings,
+  key: string,
+  profile: AgentTierProfile,
+): AgentTiersSettings {
+  return compactTierSettings({
+    ...settings,
+    profiles: { ...settings.profiles, [key]: profile },
+    blockedProfiles: withoutBlocked(settings.blockedProfiles, key),
+  });
+}
+
+/**
+ * Delete one tier.
+ *
+ * A `defaultTier` pointing at it is cleared in the same step. Leaving it would
+ * turn every later spawn that names no tier into a hard refusal, which is a
+ * strange thing to get from deleting a tier you had stopped using.
+ */
+export function removeAgentTierProfile(settings: AgentTiersSettings, key: string): AgentTiersSettings {
+  const { [key]: _removed, ...profiles } = settings.profiles ?? {};
+  return compactTierSettings({
+    ...settings,
+    profiles,
+    blockedProfiles: withoutBlocked(settings.blockedProfiles, key),
+    ...(settings.defaultTier === key ? { defaultTier: undefined } : {}),
+  });
+}
+
+/**
+ * The thinking values a tier may usefully store for one model reference.
+ *
+ * Asked of the model rather than read off a fixed list, because `resolveAgentTier`
+ * clamps an unsupported level at spawn time: a menu offering a level destined to
+ * be silently lowered would be a menu that lies. `inherit` is always offerable —
+ * it defers to the parent session, which this model has no say over.
+ *
+ * A reference of `inherit`, or one this machine cannot resolve, yields the full
+ * static list: the model is not knowable here, and refusing to let the user
+ * configure a tier for a provider they have not authed yet would make the menu
+ * weaker than hand-editing the file.
+ */
+export function offerableTierThinking(
+  modelRef: string,
+  registry: ModelRegistry<Model<Api>>,
+): TierThinking[] {
+  if (modelRef === "inherit") return [...TIER_THINKING_LEVELS];
+  const resolved = resolveModel(modelRef, registry);
+  if (typeof resolved === "string") return [...TIER_THINKING_LEVELS];
+  const supported = new Set<string>(getSupportedThinkingLevels(resolved));
+  return TIER_THINKING_LEVELS.filter(level => level === "inherit" || supported.has(level));
+}
+
+/**
+ * Set or clear the default tier.
+ *
+ * Always clears `blockedDefaultTier`: that tombstone describes the malformed
+ * value this call is replacing, and keeping it would make the resolver refuse
+ * the choice the user just made explicitly.
+ */
+export function setDefaultAgentTier(
+  settings: AgentTiersSettings,
+  key: string | undefined,
+): AgentTiersSettings {
+  return compactTierSettings({ ...settings, defaultTier: key, blockedDefaultTier: false });
 }
 
 /**
@@ -285,7 +387,7 @@ export function findUnknownAgentTierReferences(
  * models and thinking levels appear — nothing here reads credentials.
  */
 export function buildAgentTierListText(settings: AgentTiersSettings = agentTiersSettings): string {
-  const keys = knownTierKeys(settings);
+  const keys = listAgentTierKeys(settings);
   if (keys.length === 0) return "";
 
   const entries = keys.map((key) => {
@@ -304,7 +406,7 @@ export function buildAgentTierListText(settings: AgentTiersSettings = agentTiers
 
 /** One line per tier, for the compact tool description. */
 export function buildCompactAgentTierListText(settings: AgentTiersSettings = agentTiersSettings): string {
-  const keys = knownTierKeys(settings);
+  const keys = listAgentTierKeys(settings);
   if (keys.length === 0) return "";
 
   const entries = keys.map((key) => {
@@ -323,7 +425,7 @@ export function getDefaultAgentTierText(settings: AgentTiersSettings = agentTier
 
 /** Description for the `tier` parameter, naming the keys this workspace defines. */
 export function buildAgentTierParameterDescription(settings: AgentTiersSettings = agentTiersSettings): string {
-  const keys = knownTierKeys(settings);
+  const keys = listAgentTierKeys(settings);
   const available = keys.length > 0 ? keys.join(", ") : "none configured";
   const fallback =
     settings.defaultTier !== undefined

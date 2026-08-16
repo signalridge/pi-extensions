@@ -19,11 +19,15 @@ import {
   buildCompactAgentTierListText,
   isValidAgentTierKey,
   MAX_AGENT_TIER_KEY_LENGTH,
+  offerableTierThinking,
+  removeAgentTierProfile,
   resolveAgentTier,
+  setDefaultAgentTier,
+  upsertAgentTierProfile,
 } from "../src/agent-tiers.js";
 import type { ModelRegistry } from "../src/model-resolver.js";
 import type { AgentTiersSettings } from "../src/settings.js";
-import { loadSettings } from "../src/settings.js";
+import { loadSettings, saveSettings, TIER_THINKING_LEVELS } from "../src/settings.js";
 import type { AgentConfig } from "../src/types.js";
 
 const parent = {
@@ -440,5 +444,116 @@ describe("agentTiers settings merge", () => {
       thinking: "max",
     });
     expect(loaded.agentTiers?.defaultTier).toBe("everyday");
+  });
+
+  it("round-trips a catalogue built by the tier editor", () => {
+    // The editor's output has to survive `sanitize`; a shape it rejects would
+    // vanish on save behind a success toast.
+    const edited = setDefaultAgentTier(
+      upsertAgentTierProfile({}, "everyday", {
+        model: "test/parent",
+        thinking: "medium",
+        description: "ordinary work",
+      }),
+      "everyday",
+    );
+    saveSettings({ agentTiers: edited }, projectDir);
+    expect(loadSettings(projectDir).agentTiers).toEqual(edited);
+  });
+});
+
+/**
+ * Catalogue edits, as made by `/agents → Model tiers`.
+ *
+ * The menu is a thin caller: these functions carry the rules that outlive it,
+ * so they are exercised here rather than through a terminal.
+ */
+describe("tier catalogue edits", () => {
+  const everyday = { model: "test/parent", thinking: "medium" } as const;
+  const deep = { model: "test/fast", thinking: "low" } as const;
+
+  it("defines a new tier alongside the existing ones", () => {
+    expect(upsertAgentTierProfile({ profiles: { everyday } }, "deep", deep)).toEqual({
+      profiles: { everyday, deep },
+    });
+  });
+
+  it("replaces an existing profile whole", () => {
+    // Whole-profile replacement matches how project settings override global:
+    // never field by field, which would pair a model with a thinking level
+    // nobody chose for it.
+    expect(
+      upsertAgentTierProfile({ profiles: { everyday } }, "everyday", {
+        model: "test/fast",
+        thinking: "max",
+        description: "now the fast one",
+      }),
+    ).toEqual({
+      profiles: { everyday: { model: "test/fast", thinking: "max", description: "now the fast one" } },
+    });
+  });
+
+  it("retires a key's tombstone when that key is defined again", () => {
+    expect(
+      upsertAgentTierProfile({ profiles: { everyday }, blockedProfiles: ["deep", "other"] }, "deep", deep),
+    ).toEqual({ profiles: { everyday, deep }, blockedProfiles: ["other"] });
+  });
+
+  it("deletes a profile and its tombstone", () => {
+    expect(
+      removeAgentTierProfile({ profiles: { everyday, deep }, blockedProfiles: ["deep"] }, "deep"),
+    ).toEqual({ profiles: { everyday } });
+  });
+
+  it("clears defaultTier when the tier it named is deleted", () => {
+    // Leaving it would turn every later spawn that names no tier into a hard
+    // refusal — a strange thing to get from deleting a tier you stopped using.
+    expect(removeAgentTierProfile({ defaultTier: "deep", profiles: { everyday, deep } }, "deep")).toEqual({
+      profiles: { everyday },
+    });
+  });
+
+  it("leaves a defaultTier pointing at a surviving tier alone", () => {
+    expect(removeAgentTierProfile({ defaultTier: "everyday", profiles: { everyday, deep } }, "deep")).toEqual({
+      defaultTier: "everyday",
+      profiles: { everyday },
+    });
+  });
+
+  it("serializes an emptied catalogue as nothing, not as empty containers", () => {
+    expect(removeAgentTierProfile({ profiles: { everyday } }, "everyday")).toEqual({});
+  });
+
+  it("sets the default tier and clears the malformed-default tombstone", () => {
+    // The tombstone describes the value this call replaces; keeping it would
+    // make the resolver refuse the choice the user just made explicitly.
+    expect(
+      setDefaultAgentTier({ profiles: { everyday }, blockedDefaultTier: true }, "everyday"),
+    ).toEqual({ defaultTier: "everyday", profiles: { everyday } });
+  });
+
+  it("clears the default tier", () => {
+    expect(setDefaultAgentTier({ defaultTier: "everyday", profiles: { everyday } }, undefined)).toEqual({
+      profiles: { everyday },
+    });
+  });
+
+});
+
+describe("offerableTierThinking", () => {
+  it("offers every level for inherit, where the model is not knowable yet", () => {
+    expect(offerableTierThinking("inherit", registry)).toEqual([...TIER_THINKING_LEVELS]);
+  });
+
+  it("offers every level for a model this machine cannot resolve", () => {
+    // Refusing here would make the menu weaker than hand-editing the file: a
+    // shared config may name a provider only some teammates have authed.
+    expect(offerableTierThinking("elsewhere/unknown-model", registry)).toEqual([...TIER_THINKING_LEVELS]);
+  });
+
+  it("offers only the levels the named model supports, plus inherit", () => {
+    // `fast` maps high/xhigh/max to null. Offering them would promise a level
+    // that resolveAgentTier silently clamps down at spawn time.
+    expect(offerableTierThinking("test/fast", registry)).toEqual(["inherit", "minimal", "low", "medium"]);
   });
 });

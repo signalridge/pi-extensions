@@ -76,6 +76,21 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 8, defaultJoinMode: "group" });
   });
 
+  it("lets a project cancel a global defaultModel by spelling inherit", () => {
+    // The point of accepting "inherit" as a value: omitting the key inherits
+    // global, so without it a project could raise the default model but never
+    // step back to following the parent session.
+    writeGlobal({ defaultModel: "anthropic/claude-haiku-4-5" });
+    writeProject({ defaultModel: "inherit" });
+    expect(loadSettings(projectDir)).toEqual({ defaultModel: "inherit" });
+
+    writeProject({ maxConcurrent: 2 });
+    expect(loadSettings(projectDir)).toEqual({
+      defaultModel: "anthropic/claude-haiku-4-5",
+      maxConcurrent: 2,
+    });
+  });
+
   it("merges global + project with project winning on conflicts", () => {
     writeGlobal({ maxConcurrent: 16, graceTurns: 10, defaultJoinMode: "async" });
     writeProject({ maxConcurrent: 4, defaultMaxTurns: 50 });
@@ -329,6 +344,27 @@ describe("settings persistence", () => {
       }
     });
 
+    it("accepts a provider/model defaultModel and trims it", () => {
+      writeProject({ defaultModel: "anthropic/claude-haiku-4-5" });
+      expect(loadSettings(projectDir)).toEqual({ defaultModel: "anthropic/claude-haiku-4-5" });
+      writeProject({ defaultModel: "  anthropic/claude-haiku-4-5  " });
+      expect(loadSettings(projectDir)).toEqual({ defaultModel: "anthropic/claude-haiku-4-5" });
+    });
+
+    it("accepts defaultModel: inherit, the spelling that cancels a global default", () => {
+      writeProject({ defaultModel: "inherit" });
+      expect(loadSettings(projectDir)).toEqual({ defaultModel: "inherit" });
+    });
+
+    it("drops a defaultModel that is not a model reference", () => {
+      // No slash, trailing slash, leading slash, whitespace inside, wrong type:
+      // each would otherwise reach resolveModel as a reference nobody can fix.
+      for (const bad of ["haiku", "anthropic/", "/claude", "an thropic/x", 42, null, {}]) {
+        writeProject({ defaultModel: bad });
+        expect(loadSettings(projectDir)).toEqual({});
+      }
+    });
+
     it("accepts scopeModels boolean (true and false)", () => {
       writeProject({ scopeModels: true });
       expect(loadSettings(projectDir)).toEqual({ scopeModels: true });
@@ -475,6 +511,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setDefaultModel: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
         setStrictAgentFiles: vi.fn(),
@@ -497,6 +534,17 @@ describe("settings persistence", () => {
       expect(appliers.setScopeModels).not.toHaveBeenCalled();
       expect(appliers.setDisableDefaultAgents).not.toHaveBeenCalled();
       expect(appliers.setToolDescriptionMode).not.toHaveBeenCalled();
+    });
+
+    it("applies defaultModel, including the inherit spelling", () => {
+      // "inherit" has to reach the setter, not be filtered as a no-op: it is
+      // how a project cancels a global default, and a setter that never sees it
+      // would leave the global value in force.
+      applySettings({ defaultModel: "anthropic/claude-haiku-4-5" }, appliers);
+      expect(appliers.setDefaultModel).toHaveBeenCalledWith("anthropic/claude-haiku-4-5");
+
+      applySettings({ defaultModel: "inherit" }, appliers);
+      expect(appliers.setDefaultModel).toHaveBeenCalledWith("inherit");
     });
 
     it("applies fallbackSubagent through to the registry", () => {
@@ -629,6 +677,7 @@ describe("settings persistence", () => {
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
+        setDefaultModel: vi.fn(),
         setSchedulingEnabled: vi.fn(),
         setScopeModels: vi.fn(),
         setStrictAgentFiles: vi.fn(),
