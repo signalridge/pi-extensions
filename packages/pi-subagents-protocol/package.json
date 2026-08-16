@@ -1,0 +1,53 @@
+{
+  "name": "@signalridge/pi-subagents-protocol",
+  "version": "1.2.0",
+  "description": "Pure managed-subagent wire contracts for Signalridge Pi extensions.",
+  "author": "signalridge contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-subagents-protocol"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-subagents-protocol",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "signalridgePackage": {
+    "kind": "library"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ test/ --error-on-warnings",
+    "lint:fix": "biome check src/ test/ --error-on-warnings --fix",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write src/ test/ --error-on-warnings"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@types/node": "^24.10.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  },
+  "type": "module",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ]
+}

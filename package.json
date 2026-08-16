@@ -1,0 +1,58 @@
+{
+  "name": "@signalridge/pi-extensions-dev",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Private tooling and release workspace for independently published signalridge Pi extensions.",
+  "type": "module",
+  "packageManager": "bun@1.3.14",
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "check": "bun run check:json && bun run check:package-config && bun run check:boundaries && bun run check:tests && bun run check:versions && bun run check:changesets && bun run lint && bun run typecheck && bun run test && bun run test:release && bun run test:config && bun run smoke:pi && bun run pack:check && bun run secret-scan",
+    "check:json": "node scripts/check-json.mjs",
+    "check:package-config": "node scripts/check-package-config.mjs",
+    "check:boundaries": "node scripts/check-extension-boundaries.mjs",
+    "check:tests": "node scripts/check-test-inventory.mjs",
+    "check:versions": "node scripts/check-versions.mjs",
+    "check:changesets": "node scripts/check-changesets.mjs",
+    "format": "biome check --write scripts && node scripts/run-package-scripts.mjs format",
+    "lint": "biome check --error-on-warnings scripts && node scripts/run-package-scripts.mjs lint --error-on-warnings --require-processed-files",
+    "typecheck": "node scripts/run-package-scripts.mjs typecheck",
+    "test": "node scripts/run-package-scripts.mjs test",
+    "test:release": "node --test scripts/publish-packages.test.mjs scripts/publish-changesets.test.mjs scripts/publish-with-token.test.mjs scripts/configure-npm-trusted-publishers.test.mjs scripts/publish-workflow.test.mjs",
+    "test:config": "node --test scripts/check-package-config.test.mjs",
+    "smoke:pi": "node scripts/smoke-pi-loaders.mjs",
+    "pack:check": "node scripts/pack-packages.mjs --dry-run --include-experimental",
+    "changeset": "changeset",
+    "changeset:status": "changeset status --verbose",
+    "version-packages": "changeset version && bun install --lockfile-only",
+    "publish-packages": "node scripts/publish-changesets.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "release:check": "bun run check",
+    "release:pack": "node scripts/pack-packages.mjs",
+    "release:publish": "bun run release:publish:recovery",
+    "release:publish:bootstrap": "node scripts/publish-packages.mjs --bootstrap",
+    "release:publish:recovery": "node scripts/publish-packages.mjs",
+    "release:publish:token": "node scripts/publish-with-token.mjs"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@changesets/cli": "2.31.1",
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "@sinclair/typebox": "^0.34.49",
+    "@types/node": "^24.10.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "proper-lockfile": "^4.1.2",
+    "semver": "^7.7.2",
+    "typebox": "1.3.11",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  }
+}

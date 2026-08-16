@@ -1,0 +1,56 @@
+{
+  "name": "@signalridge/pi-session-recap",
+  "version": "1.2.0",
+  "description": "While-you-were-away recap above the editor when you return to a Pi session. Keeps you in flow when multi-agenting.",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-session-recap"
+  },
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-session-recap",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  },
+  "type": "module",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "*.ts",
+    "assets"
+  ]
+}

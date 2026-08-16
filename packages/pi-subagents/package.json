@@ -1,0 +1,78 @@
+{
+  "name": "@signalridge/pi-subagents",
+  "version": "1.4.0",
+  "description": "Signalridge's managed subagent runtime with workflow-owned orchestration RPC.",
+  "author": "tintinweb and signalridge contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-subagents"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-subagents",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "subagent",
+    "agent",
+    "autonomous"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-tui": ">=0.80.0"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "croner": "^10.0.1",
+    "@signalridge/pi-subagents-protocol": "^1.0.0",
+    "nanoid": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "vitest run e2e --reporter=verbose",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ test/ --error-on-warnings",
+    "lint:fix": "biome check src/ test/ --error-on-warnings --fix",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write src/ test/ --error-on-warnings"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.14",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "type": "module",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src",
+    "examples"
+  ],
+  "signalridgePackage": {
+    "requiredPackagedFiles": [
+      "examples/agent-tool-description.md"
+    ]
+  }
+}

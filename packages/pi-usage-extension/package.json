@@ -1,0 +1,54 @@
+{
+  "name": "@signalridge/pi-usage-extension",
+  "version": "1.2.0",
+  "description": "Usage statistics dashboard for Pi sessions.",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-usage-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-usage-extension",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1"
+  },
+  "type": "module",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "*.ts",
+    "*.png"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "bun test test",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

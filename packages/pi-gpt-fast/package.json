@@ -1,0 +1,44 @@
+{
+  "name": "@signalridge/pi-gpt-fast",
+  "version": "1.2.0",
+  "description": "Opt-in OpenAI and Codex priority service tier for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-gpt-fast"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-gpt-fast",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "bun test test/smoke.test.ts",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

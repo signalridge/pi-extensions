@@ -1,0 +1,64 @@
+{
+  "name": "@signalridge/pi-analytics",
+  "version": "1.2.0",
+  "description": "Local-first, content-free usage analytics for Pi models, skills, tools, and reliability.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "analytics",
+    "metrics",
+    "jsonl",
+    "local-first"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "piExtension": {
+    "lifecycle": "experimental"
+  },
+  "scripts": {
+    "check": "biome check --vcs-use-ignore-file=false src test package.json tsconfig.json README.md && npm run typecheck && npm run test",
+    "format": "biome check --write --vcs-use-ignore-file=false src test package.json tsconfig.json README.md",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test --config vitest.config.ts",
+    "lint": "biome check ."
+  },
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "^0.51.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.7",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2",
+    "vitest": "4.0.18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-analytics"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-analytics",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

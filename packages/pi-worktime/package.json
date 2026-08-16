@@ -1,0 +1,69 @@
+{
+  "name": "@signalridge/pi-worktime",
+  "version": "1.2.0",
+  "description": "Per-prompt active worktime tracking for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "worktime",
+    "active-time",
+    "productivity"
+  ],
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "^24.10.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-worktime"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-worktime",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./events": {
+      "types": "./src/events.ts",
+      "default": "./src/events.ts"
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "vitest run test --config vitest.config.ts",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

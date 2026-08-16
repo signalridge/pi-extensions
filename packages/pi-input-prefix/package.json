@@ -1,0 +1,45 @@
+{
+  "name": "@signalridge/pi-input-prefix",
+  "version": "1.2.0",
+  "description": "Theme-aware rounded input editor and prompt token for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-input-prefix"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-input-prefix",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test test/render.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

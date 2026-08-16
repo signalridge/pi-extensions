@@ -1,0 +1,10 @@
+node_modules/
+bun.lockb
+*.log
+.DS_Store
+coverage/
+dist/
+.release/
+*.tgz
+.ralph/
+.pi/worktrees/

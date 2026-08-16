@@ -1,0 +1,124 @@
+# pi-files-widget
+
+In-terminal file browser and diff viewer widget for Pi. Navigate files, view diffs, select code, and send comments to the agent without leaving the terminal and without interrupting your agent.
+
+Directory symlinks are shown with a `↗` marker and can be expanded like normal folders.
+
+## Install
+
+**Quick install (Pi package manager):**
+
+```bash
+pi install npm:@signalridge/pi-files-widget
+```
+
+Required deps (needed for /readfiles):
+
+```bash
+# macOS (Homebrew)
+brew install bat git-delta glow
+
+# Ubuntu/Debian
+sudo apt-get install -y bat git-delta glow
+```
+
+```bash
+pi install npm:@signalridge/pi-files-widget
+```
+
+Then add to `~/.pi/agent/settings.json`:
+
+```json
+{
+  "packages": [
+    {
+      "source": "npm:@signalridge/pi-files-widget",
+      "extensions": ["index.ts"]
+    }
+  ]
+}
+```
+
+**Local clone:**
+
+Add to your Pi extensions list:
+
+```json
+{
+  "extensions": [
+    "./packages/pi-files-widget"
+  ]
+}
+```
+
+If you prefer symlinking into `~/.pi/agent/extensions`:
+
+```bash
+ln -sfn "$(pwd)/packages/pi-files-widget" ~/.pi/agent/extensions/pi-files-widget
+```
+
+Then reference it in your settings:
+
+```json
+{
+  "extensions": [
+    "~/.pi/agent/extensions/pi-files-widget"
+  ]
+}
+```
+
+## Dependencies (required)
+
+- `bat`: syntax highlighting
+- `delta`: formatted diffs
+- `glow`: markdown rendering
+
+The `/readfiles` browser requires these tools and will refuse to open until they are installed.
+
+## Commands
+
+- `/readfiles` - open the file browser in the current directory
+- `/readfiles <path>` - open the file browser rooted at `<path>` (absolute, relative, or `~`-prefixed)
+
+Diff viewing is built into the file viewer: open a changed tracked file and press `d` to toggle the git diff view.
+
+## Browser Keybindings
+
+- `j/k` or `↑/↓`: move
+- `Enter`: open file / expand folder
+- `h/l` or `←/→`: collapse/expand folder
+- `PgUp/PgDn`: page up/down
+- `c`: toggle changed-only view
+- `]` / `[`: next/prev changed file
+- `/`: search (type to filter, `Esc` to exit)
+- `u`: go up one directory (re-root to parent)
+- `.`: jump back to the starting directory
+- `+` / `-`: increase/decrease browser height
+- `q`: close
+
+## Viewer Keybindings
+
+- `j/k` or `↑/↓`: scroll
+- `PgUp/PgDn`: page up/down
+- `g/G`: top/bottom
+- `d`: toggle diff (tracked files only)
+- `m`: toggle rendered/raw view for Markdown files
+- `/`: search (type to search)
+- `n` / `N`: next/prev match
+- `v`: select mode (line selection)
+- `c`: comment on selected lines (inline prompt)
+- `Enter`: new line in the comment editor
+- `Ctrl+Enter` or `Ctrl+D`: send the comment (`Alt+Enter` also works when supported)
+- `]` / `[`: next/prev changed file
+- `+` / `-`: increase/decrease viewer height
+- `q`: back to browser
+
+## Notes
+
+- Untracked files show as `[UNTRACKED]` and open in normal view.
+- Searching in rendered Markdown switches to raw mode first, and selecting from rendered Markdown first switches you back to raw so line-based matches and comments stay aligned with the source file.
+- When you browse outside the current project directory, inline comments on those files use absolute paths so the agent can still locate them. Files inside the project continue to use project-relative paths.
+- Folder LOCs are shown only when the folder is collapsed (expanded folders would duplicate counts).
+- Line counts load asynchronously; the header shows activity while counts are computed.
+- Large non-git folders load progressively and may show `[partial]` while loading in safe mode.
+- Git status refreshes every 3 seconds while `/readfiles` is open.

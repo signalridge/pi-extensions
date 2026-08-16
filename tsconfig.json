@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"]
+  },
+  "include": [
+    "packages/**/*.ts",
+    "scripts/**/*.mjs"
+  ],
+  "exclude": [
+    "packages/**/test/**",
+    "packages/**/tests/**",
+    "packages/pi-subagents/**",
+    "packages/pi-lsp/test/docker/**"
+  ]
+}

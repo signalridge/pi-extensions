@@ -1,0 +1,56 @@
+{
+  "name": "@signalridge/pi-workflows",
+  "version": "1.2.0",
+  "description": "Declarative DAG workflows backed by pi-subagents managed spawning.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "workflow",
+    "dag"
+  ],
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@signalridge/pi-subagents": ">=1.0.0"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "@signalridge/pi-subagents-protocol": "^1.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-workflows"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-workflows",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "test": "vitest run test --config vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

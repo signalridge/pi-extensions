@@ -1,0 +1,47 @@
+{
+  "name": "@signalridge/pi-input-history",
+  "version": "1.2.0",
+  "description": "Cross-session prompt history with a full fzf/atuin-style Ctrl+R picker for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "author": "ouzhenkun and signalridge contributors",
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-input-history"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-input-history",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "vitest run test --config vitest.config.ts",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

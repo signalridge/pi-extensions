@@ -1,0 +1,108 @@
+name: Version or publish packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: changesets-${{ github.ref }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  # Changesets must version the release transition before any npm publish. When
+  # changesets are present this job opens/updates the Version Packages PR; only
+  # the later main revision with those changesets consumed reaches publish.
+  version:
+    name: Create version pull request or publish to npm
+    environment: npm-publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Set up Node.js and npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install --global npm@11.5.1
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Select a current-main update or authenticated release transition
+        id: release-selection
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ]; then
+            echo "current-main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current-main=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping stale Version Packages update; a newer main revision owns it."
+          fi
+          release_transition="$(node scripts/publish-changesets.mjs --classify-release-transition)"
+          echo "release-transition=$release_transition" >> "$GITHUB_OUTPUT"
+
+
+      - name: Validate release revision
+        if: steps.release-selection.outputs.current-main == 'true' || steps.release-selection.outputs.release-transition == 'true'
+        run: bun run check
+
+
+      - name: Revalidate eligibility immediately before Changesets writes
+        id: release-revalidation
+        if: steps.release-selection.outputs.current-main == 'true' || steps.release-selection.outputs.release-transition == 'true'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          release_transition="$(node scripts/publish-changesets.mjs --classify-release-transition)"
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || [ "$release_transition" = "true" ]; then
+            echo "eligible=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "eligible=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Main advanced during validation; skipping the stale Version Packages update."
+          fi
+
+      - name: Create version pull request or publish to npm
+        id: changesets
+        if: steps.release-revalidation.outputs.eligible == 'true'
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          # PAT_TOKEN must be configured with permission to create/update the Version Packages PR and GitHub releases.
+          # Do not silently fall back to GITHUB_TOKEN; its events do not trigger workflows.
+          github-token: ${{ secrets.PAT_TOKEN }}
+          version: bun run version-packages
+          publish: bun run publish-packages
+          commit: "chore(release): version packages"
+          title: "chore(release): version packages"
+          createGithubReleases: true
+          commitMode: github-api
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

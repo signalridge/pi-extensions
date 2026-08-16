@@ -1,0 +1,58 @@
+{
+  "name": "@signalridge/pi-ralph-wiggum",
+  "version": "1.2.0",
+  "description": "Long-running agent loops for iterative development in Pi.",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-ralph-wiggum"
+  },
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-ralph-wiggum",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./SKILL.md"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1"
+  },
+  "scripts": {
+    "test": "node tests/session-boundary.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  },
+  "type": "module",
+  "private": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.50"
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "*.ts",
+    "SKILL.md"
+  ]
+}

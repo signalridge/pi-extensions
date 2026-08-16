@@ -1,0 +1,61 @@
+{
+  "name": "@signalridge/pi-plan-mode",
+  "version": "1.2.0",
+  "description": "Pi extension that adds a Codex-like read-only /plan collaboration mode.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "plan-mode",
+    "planning"
+  ],
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "piExtension": {
+    "lifecycle": "stable"
+  },
+  "scripts": {
+    "check": "biome check . && npm run typecheck && npm run test",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test --config vitest.config.ts",
+    "lint": "biome check ."
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.7",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "typescript": "7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-plan-mode"
+  },
+  "dependencies": {
+    "@narumitw/pi-tui-kit": "^0.49.1"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-plan-mode",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

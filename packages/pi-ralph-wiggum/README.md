@@ -1,0 +1,116 @@
+# Ralph Wiggum Extension
+
+Long-running agent loops for iterative development. Best for long-running-tasks that are verifiable. Builds on Geoffrey Huntley's ralph-loop for Claude Code and adapts it for Pi.
+This one is cool because:
+- You can ask Pi and it will set up and run the loop all by itself in-session. If you prefer, it can also invoke another Pi via tmux
+- You can have multiple parallel loops at once in the same repo (unlike OG ralph-wiggum)
+- You can ask Pi to self-reflect at regular intervals so it doesn't mindlessly grind through wrong instructions (optional)
+
+<img width="432" height="357" alt="Screenshot 2026-01-07 at 17 16 24" src="https://github.com/user-attachments/assets/68cdab11-76c6-4aed-9ea1-558cbb267ea6" />
+
+**Note: This is a flat version without subagents, similar to the [Anthropic plugins implementation](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-loop).**
+
+## Installation
+
+```bash
+pi install npm:@signalridge/pi-ralph-wiggum
+```
+
+```bash
+pi install npm:@signalridge/pi-ralph-wiggum
+```
+
+Then filter to just this extension in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "packages": [
+    {
+      "source": "npm:@signalridge/pi-ralph-wiggum",
+      "extensions": ["./index.ts"],
+      "skills": ["./SKILL.md"]
+    }
+  ]
+}
+```
+
+## Recommended usage: just ask Pi
+You ask Pi to set up a ralph-wiggum loop.
+- Pi sets up `.ralph/<name>.md` with goals and a checklist (like a list of features to build, errors to check, or files to refactor)
+- You let Pi know:
+  1. What the task is and completion / tests to run
+  2. How many items to process per iteration
+  3. How often to commit
+  4. (optionally) After how many items it should take a step back and self-reflect
+- Pi runs `ralph_start`, beginning iteration 1.
+  - It gets a prompt telling it to work on the task, update the task file, and call ralph_done when it finishes that iteration
+  - When the iteration is done, it calls `ralph_done`, resending the same prompt*
+- Pi runs until either:
+  - All tasks are done and final verification is externally rerunnable (Pi sends `<promise>COMPLETE</promise>`)
+  - Max iterations (default 50)
+  - You hit `esc` (pausing the loop)
+If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, just tell Pi to continue to keep going.
+
+## Iterations, sessions and context windows
+
+An iteration is a new agent turn in the same Pi session, not a fresh context window. `ralph_done` queues the next prompt and the task file carries durable progress, while Pi's normal compaction can summarise older conversation when the context grows. This extension deliberately uses that flat, in-session design; it does not launch a new Pi process or session for each iteration.
+
+Each active loop is owned by the Pi session that started or explicitly resumed it. Reloading or compacting that same session restores its loop automatically. A different session in the same working directory can see that active loops exist, but it does not receive Ralph prompt injection unless the user explicitly runs `/ralph resume <name>`, which transfers ownership.
+
+## Completion gate
+
+For build/test/refactor tasks, Ralph prompts the agent not to complete based only on checked checklist items. Before sending `<promise>COMPLETE</promise>`, the agent should:
+
+- Preserve any build artifacts, generated files, virtualenvs, or copied libraries required by final verification.
+- Record the exact final command, working directory, relevant environment variables, and output summary in the task file.
+- Ensure a separate monitor can rerun that command from the same worktree in a fresh shell.
+- Mark work blocked or deferred if the final command cannot be made externally rerunnable.
+
+## Stale prompt guard
+
+If an already-queued Ralph prompt arrives after a loop has completed, the agent should reload `.ralph/<name>.state.json` before doing work. If the loop state is `completed`, it should ignore the stale prompt, avoid file edits and task commands, and not call `ralph_done`.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/ralph start <name\|path>` | Start a new loop |
+| `/ralph resume <name>` | Resume a paused loop |
+| `/ralph stop` | Pause current loop |
+| `/ralph-stop` | Stop active loop (idle only) |
+| `/ralph status` | Show all loops |
+| `/ralph list --archived` | Show archived loops |
+| `/ralph archive <name>` | Move loop to archive |
+| `/ralph clean [--all]` | Clean completed loops |
+| `/ralph cancel <name>` | Delete a loop |
+| `/ralph nuke [--yes]` | Delete all .ralph data |
+
+### Options for start
+
+| Option | Description |
+|--------|-------------|
+| `--max-iterations N` | Stop after N iterations (default 50) |
+| `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
+| `--reflect-every N` | Reflect every N iterations |
+
+## Agent Tool
+
+The agent can self-start loops using `ralph_start`:
+
+```
+ralph_start({
+  name: "refactor-auth",
+  taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
+  maxIterations: 50,
+  itemsPerIteration: 3,
+  reflectEvery: 10
+})
+```
+
+## Credits
+
+Based on Geoffrey Huntley's Ralph Wiggum approach for long-running agent tasks.
+
+## Changelog
+
+See `CHANGELOG.md`.

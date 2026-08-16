@@ -1,0 +1,103 @@
+# 🔎 pi-github-pr — GitHub Pull Request Statusline for Pi Agents
+
+[![npm](https://img.shields.io/npm/v/@signalridge/pi-github-pr)](https://www.npmjs.com/package/@signalridge/pi-github-pr) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+
+`@signalridge/pi-github-pr` is a passive [Pi coding agent](https://pi.dev) extension that shows the current branch GitHub pull request status in Pi's statusline.
+
+It only reads PR metadata for the current branch. It counts comments and reviews, but does not fetch or display comment bodies, review text, or review-thread content.
+
+It is intentionally ambient: no slash command, no custom tool, no widget, and no comment injection.
+
+## ✨ Features
+
+- Automatically shows compact PR status in Pi's statusline.
+- Refreshes the current branch PR every minute and after agent turns.
+- Shows PR number, GitHub checks state, review state, and comment/review count.
+- Does not read or expose PR discussion text; use `gh pr view --comments` or GitHub directly when you need the conversation.
+- Uses GitHub CLI auth and repository resolution; the extension stores no GitHub token.
+- No slash commands, LLM tools, widgets, webhook server, or separate runtime service.
+
+Example statusline text:
+
+```text
+PR #123: checks passing, approved, 7 comments
+PR #123: checks failing (2), changes requested, 3 comments
+PR #123: checks pending (5), commented, 12 comments
+PR #123: no checks, draft, no comments
+```
+
+The check wording follows GitHub's Checks terminology. The trailing comment count is the
+combined comments + reviews count. When rendered by `pi-statusline`, the `github-pr` icon comes
+from pi-statusline icon settings.
+
+## 📦 Install
+
+```bash
+pi install npm:@signalridge/pi-github-pr
+```
+
+Try without installing permanently:
+
+```bash
+pi -e npm:@signalridge/pi-github-pr
+```
+
+Try this package locally from the repository root:
+
+```bash
+pi -e ./packages/pi-github-pr
+```
+
+## ⚙️ Prerequisites
+
+Install and authenticate GitHub CLI yourself:
+
+```bash
+brew install gh
+gh auth login
+# For GitHub Enterprise Server (include the port if your URL uses one):
+gh auth login --hostname github.example.com:8443
+```
+
+The extension shells out to `gh`; GitHub Enterprise hosts and credential storage are delegated to `gh`. It uses the PR URL host (including any port) for follow-up API calls, so no manual `GH_HOST` is required.
+
+## 💬 Behavior
+
+The extension runs passively:
+
+- On session start, it checks the current branch PR and sets a compact statusline entry.
+- On Git branch change, it clears the old PR immediately and refreshes the new current branch.
+- While the session remains open, it refreshes that same current branch PR every 60 seconds and after each agent turn.
+- On branch change, session replacement, or session shutdown, it cancels the previous refresh timer and any in-flight periodic request.
+- On session shutdown, it clears the statusline entry.
+- If the directory has no GitHub PR, the statusline entry stays empty.
+- If `gh` is missing or unauthenticated, the statusline shows a short hint such as `PR gh missing` or `PR gh auth`.
+
+## Known limits
+
+- Requires `gh`; there is no direct GitHub API, `GITHUB_TOKEN` fallback, or manual `GH_HOST` requirement.
+- Only the current branch PR is shown; there is no command or tool for arbitrary PR lookup.
+- Comment count uses `gh pr view` comments and reviews, not precise unresolved review-thread counts.
+- It does not read PR comment bodies, review bodies, inline diff comments, or unresolved review-thread text.
+- While a session is open, refresh runs every 60 seconds in addition to session start, branch changes, and agent turns; each refresh invokes `gh pr view` and one GraphQL count query.
+
+## 📁 Package layout
+
+```text
+packages/pi-github-pr/
+├── src/index.ts
+├── src/github-pr.ts
+├── test/github-pr.test.ts
+├── package.json
+├── README.md
+├── LICENSE
+└── tsconfig.json
+```
+
+## 🏷️ Keywords
+
+`pi-package`, `pi-extension`, `github`, `pull-request`, `statusline`, `gh`
+
+## 📄 License
+
+MIT

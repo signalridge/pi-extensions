@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: check:changesets compares the working tree against the
+      # merge base with origin/main, which a shallow clone cannot resolve.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: jq empty package.json
+      - run: find . -name '*.json' -not -path './node_modules/*' -print0 | xargs -0 -n1 jq empty
+      - run: bun run check:package-config
+      - run: bun run check:boundaries
+      - run: bun run check:versions
+      - run: bun run check:changesets
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run test:release
+      - run: bun run test:config
+      - run: bun run smoke:pi
+      - run: bun run pack:check
+      - run: bun run secret-scan

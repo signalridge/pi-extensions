@@ -1,0 +1,1033 @@
+/**
+ * /usage - Usage statistics dashboard
+ *
+ * Shows an inline view with usage stats grouped by provider.
+ * - Tab cycles: Today → This Week → Last Week → All Time
+ * - Arrow keys navigate providers
+ * - Enter expands/collapses to show models
+ *
+ * Data collection and caching live in ./data.ts.
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import {
+  CancellableLoader,
+  Container,
+  matchesKey,
+  Spacer,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
+import type { BaseStats, CollectProgress, ProviderStats, TabName, TotalStats, UsageData } from "./data.js";
+import { collectUsageData, getAgentDir, TAB_ORDER } from "./data.js";
+import {
+  buildGraphCsv,
+  buildInsightsJson,
+  buildTableCsv,
+  exportFileName,
+  parseExportDirSetting,
+  resolveExportDir,
+} from "./export.js";
+import type { GraphGroupBy, GraphMetric, GraphModel } from "./graph.js";
+import {
+  buildGraphModel,
+  GROUP_LABELS,
+  GROUP_ORDER,
+  METRIC_LABELS,
+  METRIC_ORDER,
+  renderChart,
+  TOTAL_SERIES_KEY,
+} from "./graph.js";
+
+type ViewMode = "table" | "insights" | "graph";
+
+const VIEW_CYCLE: ViewMode[] = ["graph", "table", "insights"];
+
+const VIEW_LABELS: Record<ViewMode, string> = {
+  graph: "Graphs",
+  table: "Table",
+  insights: "Insights",
+};
+
+// =============================================================================
+// Column Configuration
+// =============================================================================
+
+interface DataColumn {
+  label: string;
+  width: number;
+  dimmed?: boolean;
+  getValue: (stats: BaseStats & { sessions: Set<string> | number }) => string;
+}
+
+interface TableLayoutCandidate {
+  columns: DataColumn[];
+  minNameWidth: number;
+  compact?: boolean;
+}
+
+interface TableLayout {
+  columns: DataColumn[];
+  nameWidth: number;
+  tableWidth: number;
+  compact: boolean;
+}
+
+const MAX_NAME_COL_WIDTH = 26;
+
+const SESSIONS_COLUMN: DataColumn = {
+  label: "Sessions",
+  width: 9,
+  getValue: (s) => formatNumber(typeof s.sessions === "number" ? s.sessions : s.sessions.size),
+};
+
+const MSGS_COLUMN: DataColumn = {
+  label: "Msgs",
+  width: 9,
+  getValue: (s) => formatNumber(s.messages),
+};
+
+const COST_COLUMN: DataColumn = {
+  label: "Cost",
+  width: 9,
+  getValue: (s) => formatCost(s.cost),
+};
+
+const TOKENS_COLUMN: DataColumn = {
+  label: "Tokens",
+  width: 9,
+  getValue: (s) => formatTokens(s.tokens.total),
+};
+
+const INPUT_COLUMN: DataColumn = {
+  label: "↑In",
+  width: 8,
+  dimmed: true,
+  // Include cacheWrite so this reflects fresh input tokens sent this turn,
+  // even for providers like Anthropic that split cached prompt creation out
+  // from the regular input token count.
+  getValue: (s) => formatTokens(s.tokens.input + s.tokens.cacheWrite),
+};
+
+const OUTPUT_COLUMN: DataColumn = {
+  label: "↓Out",
+  width: 8,
+  dimmed: true,
+  getValue: (s) => formatTokens(s.tokens.output),
+};
+
+const CACHE_COLUMN: DataColumn = {
+  label: "Cache",
+  width: 8,
+  dimmed: true,
+  getValue: (s) => formatTokens(s.tokens.cacheRead + s.tokens.cacheWrite),
+};
+
+const FULL_DATA_COLUMNS: DataColumn[] = [
+  SESSIONS_COLUMN,
+  MSGS_COLUMN,
+  COST_COLUMN,
+  TOKENS_COLUMN,
+  INPUT_COLUMN,
+  OUTPUT_COLUMN,
+  CACHE_COLUMN,
+];
+
+const TABLE_LAYOUTS: TableLayoutCandidate[] = [
+  { columns: FULL_DATA_COLUMNS, minNameWidth: MAX_NAME_COL_WIDTH },
+  { columns: [SESSIONS_COLUMN, MSGS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 14, compact: true },
+  { columns: [SESSIONS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 12, compact: true },
+  { columns: [COST_COLUMN, TOKENS_COLUMN], minNameWidth: 10, compact: true },
+  { columns: [COST_COLUMN], minNameWidth: 8, compact: true },
+];
+
+// =============================================================================
+// Formatting Helpers
+// =============================================================================
+
+function formatCost(cost: number): string {
+  if (cost === 0) return "-";
+  if (cost < 0.01) return `$${cost.toFixed(4)}`;
+  if (cost < 1) return `$${cost.toFixed(2)}`;
+  if (cost < 10) return `$${cost.toFixed(2)}`;
+  if (cost < 100) return `$${cost.toFixed(1)}`;
+  return `$${Math.round(cost)}`;
+}
+
+function formatTokens(count: number): string {
+  if (count === 0) return "-";
+  if (count < 1000) return count.toString();
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1000000) return `${Math.round(count / 1000)}k`;
+  if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+  return `${Math.round(count / 1000000)}M`;
+}
+
+function formatNumber(n: number): string {
+  if (n === 0) return "-";
+  return n.toLocaleString();
+}
+
+// Compact axis/legend formatters for the graph view.
+function formatAxisCost(v: number): string {
+  if (v === 0) return "$0";
+  if (v < 1) return `$${v.toFixed(2)}`;
+  if (v < 100) return `$${v.toFixed(1)}`;
+  if (v < 10_000) return `$${Math.round(v)}`;
+  if (v < 1_000_000) return `$${(v / 1000).toFixed(1)}k`;
+  return `$${(v / 1_000_000).toFixed(2)}M`;
+}
+
+function formatAxisCount(v: number): string {
+  if (v === 0) return "0";
+  if (v < 1000) return String(Math.round(v));
+  if (v < 1_000_000) return `${(v / 1000).toFixed(v < 10_000 ? 1 : 0)}k`;
+  if (v < 1_000_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  return `${(v / 1_000_000_000).toFixed(1)}B`;
+}
+
+// Bright ANSI palette for graph series (Total uses index 0).
+const SERIES_COLORS = ["\x1b[97m", "\x1b[96m", "\x1b[95m", "\x1b[93m", "\x1b[92m", "\x1b[94m", "\x1b[91m", "\x1b[90m"];
+const COLOR_RESET = "\x1b[39m";
+
+function seriesColor(index: number): string {
+  return SERIES_COLORS[index % SERIES_COLORS.length] ?? "";
+}
+
+/** "14:32" if the timestamp is today, otherwise "16 Jul" (with year if not this year). */
+function formatSinceDate(ms: number): string {
+  const d = new Date(ms);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+  const opts: Intl.DateTimeFormatOptions = { day: "numeric", month: "short" };
+  if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
+  return d.toLocaleDateString(undefined, opts);
+}
+
+function padLeft(s: string, len: number): string {
+  const vis = visibleWidth(s);
+  if (vis >= len) return s;
+  return " ".repeat(len - vis) + s;
+}
+
+function padRight(s: string, len: number): string {
+  const vis = visibleWidth(s);
+  if (vis >= len) return s;
+  return s + " ".repeat(len - vis);
+}
+
+function sumColumnWidths(columns: DataColumn[]): number {
+  return columns.reduce((sum, col) => sum + col.width, 0);
+}
+
+function fitCell(s: string, len: number, align: "left" | "right" = "left"): string {
+  if (len <= 0) return "";
+  const truncated = truncateToWidth(s, len);
+  return align === "right" ? padLeft(truncated, len) : padRight(truncated, len);
+}
+
+function clampLines(lines: string[], width: number): string[] {
+  return lines.map((line) => truncateToWidth(line, Math.max(width, 0)));
+}
+
+function pickFittingText(width: number, variants: string[]): string {
+  for (const variant of variants) {
+    if (visibleWidth(variant) <= width) return variant;
+  }
+  return variants[variants.length - 1] || "";
+}
+
+function getTableLayout(width: number): TableLayout {
+  const safeWidth = Math.max(width, 0);
+
+  for (const candidate of TABLE_LAYOUTS) {
+    const columnsWidth = sumColumnWidths(candidate.columns);
+    const nameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - columnsWidth, 0));
+    if (nameWidth >= candidate.minNameWidth) {
+      return {
+        columns: candidate.columns,
+        nameWidth,
+        tableWidth: nameWidth + columnsWidth,
+        compact: candidate.compact ?? false,
+      };
+    }
+  }
+
+  const fallback = TABLE_LAYOUTS[TABLE_LAYOUTS.length - 1];
+  if (!fallback) return { columns: [], nameWidth: safeWidth, tableWidth: safeWidth, compact: true };
+  const fallbackColumnsWidth = sumColumnWidths(fallback.columns);
+  const fallbackNameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - fallbackColumnsWidth, 0));
+  return {
+    columns: fallback.columns,
+    nameWidth: fallbackNameWidth,
+    tableWidth: fallbackNameWidth + fallbackColumnsWidth,
+    compact: fallback.compact ?? false,
+  };
+}
+
+// =============================================================================
+// Component
+// =============================================================================
+
+const TAB_LABELS: Record<TabName, string> = {
+  today: "Today",
+  thisWeek: "This Week",
+  lastWeek: "Last Week",
+  last30Days: "Last 30 Days",
+  allTime: "All Time",
+};
+
+class UsageComponent {
+  private activeTab: TabName = "allTime";
+  private viewMode: ViewMode = "graph";
+  private data: UsageData;
+  private selectedIndex = 0;
+  private expanded = new Set<string>();
+  private providerOrder: string[] = [];
+  private theme: Theme;
+  private requestRender: () => void;
+  private done: () => void;
+
+  // Graph explorer state.
+  private graphMetric: GraphMetric = "cost";
+  private graphGroupBy: GraphGroupBy = "provider";
+  private graphCumulative = true;
+  private exportNote: { text: string; ok: boolean } | null = null;
+  private tableHidden = new Set<string>();
+  private tableFilter = "";
+  private tableFilterEditing = false;
+  private graphHidden = new Set<string>();
+  private graphLegendIndex = 0;
+
+  constructor(theme: Theme, data: UsageData, requestRender: () => void, done: () => void) {
+    this.theme = theme;
+    this.requestRender = requestRender;
+    this.done = done;
+    this.data = data;
+    this.updateProviderOrder();
+  }
+
+  private updateProviderOrder(): void {
+    const stats = this.data[this.activeTab];
+    this.providerOrder = Array.from(stats.providers.entries())
+      .sort((a, b) => b[1].cost - a[1].cost)
+      .map(([name]) => name);
+    this.clampTableSelection();
+  }
+
+  private clampTableSelection(): void {
+    this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.visibleTable().providers.size - 1));
+  }
+
+  /**
+   * The table slice after hides and the text filter. A filter matches a
+   * provider name (whole provider stays) or individual model names, in which
+   * case the provider row is synthesized from just the matching models so
+   * the totals row and exports reflect exactly what is on screen.
+   */
+  private visibleTable(): { providers: Map<string, ProviderStats>; totals: TotalStats } {
+    const stats = this.data[this.activeTab];
+    const q = this.tableFilter.trim().toLowerCase();
+    // Always iterate providerOrder so the map is cost-sorted — selection
+    // indexes and rendered rows must agree on ordering.
+    const providers = new Map<string, ProviderStats>();
+    for (const name of this.providerOrder) {
+      if (this.tableHidden.has(name)) continue;
+      const full = stats.providers.get(name);
+      if (!full) continue;
+      if (!q || name.toLowerCase().includes(q)) {
+        providers.set(name, full);
+        continue;
+      }
+      const models = new Map(Array.from(full.models).filter(([model]) => model.toLowerCase().includes(q)));
+      if (models.size === 0) continue;
+      const synth: ProviderStats = {
+        messages: 0,
+        cost: 0,
+        tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        sessions: new Set<string>(),
+        models,
+      };
+      for (const model of models.values()) {
+        synth.messages += model.messages;
+        synth.cost += model.cost;
+        synth.tokens.total += model.tokens.total;
+        synth.tokens.input += model.tokens.input;
+        synth.tokens.output += model.tokens.output;
+        synth.tokens.cacheRead += model.tokens.cacheRead;
+        synth.tokens.cacheWrite += model.tokens.cacheWrite;
+        for (const s of model.sessions) synth.sessions.add(s);
+      }
+      providers.set(name, synth);
+    }
+    if (!q && this.tableHidden.size === 0) return { providers, totals: stats.totals };
+
+    const totals: TotalStats = {
+      sessions: 0,
+      messages: 0,
+      cost: 0,
+      tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const sessions = new Set<string>();
+    for (const provider of providers.values()) {
+      totals.messages += provider.messages;
+      totals.cost += provider.cost;
+      totals.tokens.total += provider.tokens.total;
+      totals.tokens.input += provider.tokens.input;
+      totals.tokens.output += provider.tokens.output;
+      totals.tokens.cacheRead += provider.tokens.cacheRead;
+      totals.tokens.cacheWrite += provider.tokens.cacheWrite;
+      for (const s of provider.sessions) sessions.add(s);
+    }
+    totals.sessions = sessions.size;
+    return { providers, totals };
+  }
+
+  handleInput(data: string): void {
+    // Filter typing captures printable keys, so it runs before everything.
+    if (this.viewMode === "table" && this.tableFilterEditing) {
+      if (matchesKey(data, "escape")) {
+        this.tableFilter = "";
+        this.tableFilterEditing = false;
+      } else if (matchesKey(data, "enter")) {
+        this.tableFilterEditing = false;
+      } else if (matchesKey(data, "backspace")) {
+        this.tableFilter = this.tableFilter.slice(0, -1);
+      } else if (data.length === 1 && data >= " " && data !== "\x7f") {
+        this.tableFilter += data;
+      }
+      this.clampTableSelection();
+      this.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+      this.done();
+      return;
+    }
+
+    if (matchesKey(data, "v")) {
+      const idx = VIEW_CYCLE.indexOf(this.viewMode);
+      const nextView = VIEW_CYCLE[(idx + 1) % VIEW_CYCLE.length];
+      if (nextView) this.viewMode = nextView;
+      this.exportNote = null;
+      this.requestRender();
+      return;
+    }
+
+    if (matchesKey(data, "e")) {
+      this.exportCurrentView();
+      this.requestRender();
+      return;
+    }
+
+    if (this.viewMode === "graph" && this.handleGraphInput(data)) {
+      return;
+    }
+
+    if (matchesKey(data, "tab") || matchesKey(data, "right")) {
+      const idx = TAB_ORDER.indexOf(this.activeTab);
+      const nextTab = TAB_ORDER[(idx + 1) % TAB_ORDER.length];
+      if (nextTab) this.activeTab = nextTab;
+      this.updateProviderOrder();
+      this.exportNote = null;
+      this.requestRender();
+    } else if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) {
+      const idx = TAB_ORDER.indexOf(this.activeTab);
+      const previousTab = TAB_ORDER[(idx - 1 + TAB_ORDER.length) % TAB_ORDER.length];
+      if (previousTab) this.activeTab = previousTab;
+      this.updateProviderOrder();
+      this.exportNote = null;
+      this.requestRender();
+    } else if (this.viewMode === "graph") {
+      // Graph-specific keys were handled above; swallow table-only keys.
+    } else if (this.viewMode === "table" && data === "/") {
+      this.tableFilterEditing = true;
+      this.requestRender();
+    } else if (this.viewMode === "table" && data === "x") {
+      const visible = Array.from(this.visibleTable().providers.keys());
+      const provider = visible[this.selectedIndex];
+      if (provider) {
+        this.tableHidden.add(provider);
+        this.clampTableSelection();
+        this.requestRender();
+      }
+    } else if (this.viewMode === "table" && data === "a") {
+      this.tableHidden.clear();
+      this.tableFilter = "";
+      this.tableFilterEditing = false;
+      this.clampTableSelection();
+      this.requestRender();
+    } else if (this.viewMode === "table" && matchesKey(data, "up")) {
+      if (this.selectedIndex > 0) {
+        this.selectedIndex--;
+        this.requestRender();
+      }
+    } else if (this.viewMode === "table" && matchesKey(data, "down")) {
+      if (this.selectedIndex < this.visibleTable().providers.size - 1) {
+        this.selectedIndex++;
+        this.requestRender();
+      }
+    } else if (this.viewMode === "table" && (matchesKey(data, "enter") || matchesKey(data, "space"))) {
+      const provider = Array.from(this.visibleTable().providers.keys())[this.selectedIndex];
+      if (provider) {
+        if (this.expanded.has(provider)) {
+          this.expanded.delete(provider);
+        } else {
+          this.expanded.add(provider);
+        }
+        this.requestRender();
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Render Methods
+  // -------------------------------------------------------------------------
+
+  private handleGraphInput(data: string): boolean {
+    if (matchesKey(data, "m")) {
+      const idx = METRIC_ORDER.indexOf(this.graphMetric);
+      const nextMetric = METRIC_ORDER[(idx + 1) % METRIC_ORDER.length];
+      if (nextMetric) this.graphMetric = nextMetric;
+    } else if (matchesKey(data, "g")) {
+      const idx = GROUP_ORDER.indexOf(this.graphGroupBy);
+      const nextGroup = GROUP_ORDER[(idx + 1) % GROUP_ORDER.length];
+      if (nextGroup) this.graphGroupBy = nextGroup;
+      this.graphHidden.clear();
+      this.graphLegendIndex = 0;
+    } else if (matchesKey(data, "c")) {
+      this.graphCumulative = !this.graphCumulative;
+    } else if (matchesKey(data, "a")) {
+      this.graphHidden.clear();
+    } else if (matchesKey(data, "up")) {
+      this.graphLegendIndex = Math.max(0, this.graphLegendIndex - 1);
+    } else if (matchesKey(data, "down")) {
+      const count = this.buildGraphModelForView().series.length;
+      this.graphLegendIndex = Math.min(Math.max(count - 1, 0), this.graphLegendIndex + 1);
+    } else if (matchesKey(data, "enter") || matchesKey(data, "space")) {
+      const model = this.buildGraphModelForView();
+      const target = model.series[this.graphLegendIndex];
+      if (target) {
+        if (this.graphHidden.has(target.key)) this.graphHidden.delete(target.key);
+        else this.graphHidden.add(target.key);
+      }
+    } else {
+      return false;
+    }
+    this.requestRender();
+    return true;
+  }
+
+  private exportCurrentView(): void {
+    const now = new Date();
+    let name: string;
+    let content: string;
+    const stats = this.data[this.activeTab];
+    if (this.viewMode === "graph") {
+      const slice = `${this.graphCumulative ? "cumulative" : "per-bucket"}-${this.graphMetric}-by-${this.graphGroupBy}`;
+      name = exportFileName("graph", this.activeTab, slice, "csv", now);
+      content = buildGraphCsv(this.buildGraphModelForView());
+    } else if (this.viewMode === "insights") {
+      name = exportFileName("insights", this.activeTab, null, "json", now);
+      content = buildInsightsJson(this.activeTab, stats.totals, stats.insights.insights);
+    } else {
+      const visible = this.visibleTable();
+      const sliced = this.tableFilter.trim() !== "" || this.tableHidden.size > 0;
+      name = exportFileName("table", this.activeTab, sliced ? "filtered" : null, "csv", now);
+      content = buildTableCsv(visible.providers, visible.totals);
+    }
+    try {
+      let configured: string | null = null;
+      try {
+        configured = parseExportDirSetting(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
+      } catch {
+        // No settings file or unreadable: fall through to the default dir.
+      }
+      const home = homedir();
+      const dir = resolveExportDir(configured, home, existsSync("/tmp"), tmpdir());
+      mkdirSync(dir, { recursive: true });
+      const path = join(dir, name);
+      writeFileSync(path, content);
+      const shown = path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
+      this.exportNote = { text: `Saved ${shown}`, ok: true };
+    } catch (err) {
+      this.exportNote = { text: `Export failed: ${err instanceof Error ? err.message : String(err)}`, ok: false };
+    }
+  }
+
+  private buildGraphModelForView(): GraphModel {
+    return buildGraphModel(this.data.hourly, {
+      period: this.activeTab,
+      metric: this.graphMetric,
+      groupBy: this.graphGroupBy,
+      cumulative: this.graphCumulative,
+      hidden: this.graphHidden,
+      bounds: this.data.bounds,
+    });
+  }
+
+  render(width: number): string[] {
+    if (this.viewMode === "graph") {
+      return clampLines(
+        [
+          ...this.renderTitle(width),
+          ...this.renderTabs(width, getTableLayout(width)),
+          ...this.renderGraph(width),
+          ...this.renderHelp(width),
+        ],
+        width,
+      );
+    }
+
+    if (this.viewMode === "insights") {
+      return clampLines(
+        [
+          ...this.renderTitle(width),
+          ...this.renderTabs(width, getTableLayout(width)),
+          ...this.renderInsights(width),
+          ...this.renderHelp(width),
+        ],
+        width,
+      );
+    }
+
+    const layout = getTableLayout(width);
+    return clampLines(
+      [
+        ...this.renderTitle(width),
+        ...this.renderTabs(width, layout),
+        ...this.renderHeader(layout),
+        ...this.renderRows(layout),
+        ...this.renderTotals(layout),
+        ...this.renderFormulaNote(width),
+        ...this.renderHelp(width),
+      ],
+      width,
+    );
+  }
+
+  private renderTitle(width: number): string[] {
+    const th = this.theme;
+    const title = th.fg("accent", th.bold("Usage"));
+    // Render the views as a tab strip (like the period tabs) so it is
+    // obvious there are multiple views and [v] switches between them.
+    const fullStrip = VIEW_CYCLE.map((view) =>
+      view === this.viewMode ? th.fg("accent", `[${VIEW_LABELS[view]}]`) : th.fg("dim", ` ${VIEW_LABELS[view]} `),
+    ).join(" ");
+    const activeOnly = th.fg("accent", `[${VIEW_LABELS[this.viewMode]}]`);
+    const line = pickFittingText(width, [
+      `${title}   ${fullStrip}  ${th.fg("dim", "[v]")}`,
+      `${title}   ${activeOnly}  ${th.fg("dim", "[v]")}`,
+      `${title} ${activeOnly}`,
+    ]);
+    return [line, ""];
+  }
+
+  private renderGraph(width: number): string[] {
+    const th = this.theme;
+    const model = this.buildGraphModelForView();
+    const lines: string[] = [];
+
+    const modeLabel = `${this.graphCumulative ? "Cumulative" : "Per bucket"} ${METRIC_LABELS[this.graphMetric]} · ${GROUP_LABELS[this.graphGroupBy]}`;
+    lines.push(th.fg("muted", modeLabel));
+    lines.push("");
+
+    if (model.groupedTotal === 0 && model.series.every((s) => s.total === 0)) {
+      lines.push(th.fg("dim", "  No usage data for this period"));
+      lines.push("");
+      return lines;
+    }
+
+    const formatValue = this.graphMetric === "cost" ? formatAxisCost : formatAxisCount;
+    const spanMs = model.domainEndMs - model.domainStartMs;
+    const formatTime = (ms: number): string => {
+      const d = new Date(ms);
+      if (spanMs <= 26 * 3_600_000) {
+        return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+      }
+      return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    };
+
+    const chartHeight = 12;
+    const chart = renderChart(model, {
+      width: Math.max(Math.min(width, 110), 30),
+      height: chartHeight,
+      formatValue,
+      formatTime,
+      colorize: (seriesIndex, text) => {
+        if (seriesIndex < 0) return th.fg("dim", text);
+        return seriesColor(seriesIndex) + text + COLOR_RESET;
+      },
+    });
+    lines.push(...chart);
+    lines.push("");
+
+    // Legend with selection cursor and hide/show state.
+    for (let i = 0; i < model.series.length; i++) {
+      const s = model.series[i];
+      if (!s) continue;
+      const cursor = i === this.graphLegendIndex ? th.fg("accent", "▸ ") : "  ";
+      const marker = s.hidden ? th.fg("dim", "○") : `${seriesColor(i)}●${COLOR_RESET}`;
+      const value = this.graphMetric === "cost" ? formatAxisCost(s.total) : formatAxisCount(s.total);
+      const pct =
+        s.key !== TOTAL_SERIES_KEY && model.groupedTotal > 0
+          ? ` ${th.fg("dim", `${Math.round((s.total / model.groupedTotal) * 100)}%`)}`
+          : "";
+      const label = s.hidden ? th.fg("dim", s.label) : s.key === TOTAL_SERIES_KEY ? th.bold(s.label) : s.label;
+      lines.push(`${cursor}${marker} ${padRight(label, 24)} ${padLeft(value, 8)}${pct}`);
+    }
+    lines.push("");
+    return lines;
+  }
+
+  private renderInsights(width: number): string[] {
+    const th = this.theme;
+    const stats = this.data[this.activeTab];
+    const { insights } = stats.insights;
+    const hasUsage =
+      stats.totals.messages > 0 ||
+      stats.totals.cost > 0 ||
+      stats.totals.tokens.total > 0 ||
+      stats.totals.tokens.cacheRead > 0;
+    const hasCost = stats.totals.cost > 0;
+    const lines: string[] = [];
+
+    // Cap the content column so advice stays readable on very wide terminals.
+    const contentWidth = Math.max(Math.min(width, 100), 40);
+
+    lines.push(th.bold("What's contributing to your cost?"));
+    const subtitle =
+      "Approximate, based on local sessions on this machine (these are independent and don't sum to 100%).";
+    for (const wrapped of wrapTextWithAnsi(subtitle, contentWidth)) {
+      lines.push(th.fg("dim", wrapped));
+    }
+    lines.push("");
+
+    if (!hasUsage) {
+      lines.push(th.fg("dim", "  No usage recorded for this period."));
+      lines.push("");
+      return lines;
+    }
+    if (!hasCost) {
+      lines.push(th.fg("dim", "  No cost data recorded for this period."));
+      lines.push("");
+      return lines;
+    }
+    if (insights.length === 0) {
+      lines.push(th.fg("dim", "  Nothing notable for this period."));
+      lines.push("");
+      return lines;
+    }
+
+    // Columns: marker(2) + stat(6) + gap(1); advice aligns under the headline.
+    const indent = "         ";
+    const adviceWidth = Math.max(contentWidth - indent.length, 30);
+
+    const sectionHeader = (label: string, color: "warning" | "accent"): string => {
+      const rule = "─".repeat(Math.max(contentWidth - label.length - 1, 4));
+      return `${th.fg(color, th.bold(label))} ${th.fg("border", rule)}`;
+    };
+
+    const renderOne = (insight: (typeof insights)[number]): void => {
+      const isAlarm = insight.kind === "alarm";
+      const marker = isAlarm ? th.fg("warning", "⚠ ") : "  ";
+      const statText = padLeft(insight.stat, 6);
+      const stat = isAlarm ? th.fg("warning", th.bold(statText)) : th.fg("accent", th.bold(statText));
+      // De-emphasise the trailing period-share parenthetical on alarm headlines.
+      const match = insight.headline.match(/^(.*?)\s*(\(\d[\d.,]*% of this period\))$/);
+      const headline = match ? `${match[1] ?? ""} ${th.fg("dim", match[2] ?? "")}` : insight.headline;
+      lines.push(`${marker}${stat} ${headline}`);
+      if (insight.advice) {
+        for (const wrapped of wrapTextWithAnsi(insight.advice, adviceWidth)) {
+          lines.push(`${indent}${th.fg("dim", wrapped)}`);
+        }
+      }
+      lines.push("");
+    };
+
+    const alarms = insights.filter((i) => i.kind === "alarm");
+    const structure = insights.filter((i) => i.kind === "structure");
+    // Facts first, flagged waste second.
+    if (structure.length > 0) {
+      lines.push(sectionHeader("Where it went", "accent"));
+      for (const insight of structure) renderOne(insight);
+    }
+    lines.push(sectionHeader("Worth attention", "warning"));
+    if (alarms.length > 0) {
+      for (const insight of alarms) renderOne(insight);
+    } else {
+      lines.push(`  ${th.fg("success", padLeft("✓", 6))} ${th.fg("dim", "no waste patterns flagged for this period")}`);
+      lines.push("");
+    }
+
+    return lines;
+  }
+
+  private renderTabs(width: number, layout: TableLayout): string[] {
+    const th = this.theme;
+    const fullTabs = TAB_ORDER.map((tab) => {
+      const label = TAB_LABELS[tab];
+      return tab === this.activeTab ? th.fg("accent", `[${label}]`) : th.fg("dim", ` ${label} `);
+    }).join("  ");
+
+    const activeTabOnly = th.fg("accent", `[${TAB_LABELS[this.activeTab]}]`);
+    const tabLine = pickFittingText(width, [fullTabs, `${activeTabOnly}  ${th.fg("dim", "[Tab/←→]")}`, activeTabOnly]);
+
+    // Compact-note only applies to the table view — it's meaningless for insights.
+    const infoLines =
+      this.viewMode === "table" && layout.compact
+        ? wrapTextWithAnsi(th.fg("dim", "Compact view. Widen the terminal for more columns."), Math.max(width, 1))
+        : [];
+
+    if (this.viewMode === "table") {
+      if (this.tableFilterEditing) {
+        infoLines.push(`${th.fg("accent", `/ ${this.tableFilter}▌`)}  ${th.fg("dim", "[Enter] keep · [Esc] clear")}`);
+      } else if (this.tableFilter.trim() !== "" || this.tableHidden.size > 0) {
+        const parts: string[] = [];
+        if (this.tableFilter.trim() !== "") parts.push(`filter: “${this.tableFilter.trim()}”`);
+        if (this.tableHidden.size > 0) parts.push(`${this.tableHidden.size} hidden`);
+        infoLines.push(th.fg("warning", `${parts.join(" · ")}  ·  totals reflect this slice · [a] reset`));
+      }
+    }
+
+    return [tabLine, ...infoLines, ""];
+  }
+
+  private renderHeader(layout: TableLayout): string[] {
+    const th = this.theme;
+
+    let headerLine = fitCell("Provider / Model", layout.nameWidth);
+    for (const col of layout.columns) {
+      const label = fitCell(col.label, col.width, "right");
+      headerLine += col.dimmed ? th.fg("dim", label) : label;
+    }
+
+    return [th.fg("muted", headerLine), th.fg("border", "─".repeat(layout.tableWidth))];
+  }
+
+  private renderDataRow(
+    name: string,
+    stats: BaseStats & { sessions: Set<string> | number },
+    layout: TableLayout,
+    options: { indent?: number; selected?: boolean; dimAll?: boolean; prefix?: string } = {},
+  ): string {
+    const th = this.theme;
+    const { indent = 0, selected = false, dimAll = false, prefix } = options;
+
+    const rawPrefix = prefix ?? " ".repeat(indent);
+    const safePrefix = layout.nameWidth > 0 ? truncateToWidth(rawPrefix, layout.nameWidth, "") : "";
+    const prefixWidth = visibleWidth(safePrefix);
+    const innerNameWidth = Math.max(layout.nameWidth - prefixWidth, 0);
+    const truncName = innerNameWidth > 0 ? truncateToWidth(name, innerNameWidth) : "";
+    const styledName = selected ? th.fg("accent", truncName) : dimAll ? th.fg("dim", truncName) : truncName;
+
+    let row = safePrefix + (innerNameWidth > 0 ? padRight(styledName, innerNameWidth) : "");
+
+    for (const col of layout.columns) {
+      const value = fitCell(col.getValue(stats), col.width, "right");
+      const shouldDim = col.dimmed || dimAll;
+      row += shouldDim ? th.fg("dim", value) : value;
+    }
+
+    return row;
+  }
+
+  private renderRows(layout: TableLayout): string[] {
+    const th = this.theme;
+    const lines: string[] = [];
+
+    if (this.providerOrder.length === 0) {
+      lines.push(th.fg("dim", "  No usage data for this period"));
+      return lines;
+    }
+
+    const visible = Array.from(this.visibleTable().providers.entries());
+    if (visible.length === 0) {
+      lines.push(th.fg("dim", "  Nothing matches the current filter — [a] resets"));
+      return lines;
+    }
+
+    for (let i = 0; i < visible.length; i++) {
+      const provider = visible[i];
+      if (!provider) continue;
+      const [providerName, providerStats] = provider;
+      const isSelected = i === this.selectedIndex;
+      const isExpanded = this.expanded.has(providerName);
+      const arrow = isExpanded ? "▾" : "▸";
+      const prefix = isSelected ? th.fg("accent", `${arrow} `) : th.fg("dim", `${arrow} `);
+
+      lines.push(
+        this.renderDataRow(providerName, providerStats, layout, {
+          selected: isSelected,
+          prefix,
+        }),
+      );
+
+      if (isExpanded) {
+        const models = Array.from(providerStats.models.entries()).sort((a, b) => b[1].cost - a[1].cost);
+
+        for (const [modelName, modelStats] of models) {
+          lines.push(this.renderDataRow(modelName, modelStats, layout, { indent: 4, dimAll: true }));
+        }
+      }
+    }
+
+    return lines;
+  }
+
+  private renderTotals(layout: TableLayout): string[] {
+    const th = this.theme;
+    const { totals } = this.visibleTable();
+
+    let totalRow = fitCell(th.bold("Total"), layout.nameWidth);
+    for (const col of layout.columns) {
+      const value = fitCell(col.getValue(totals), col.width, "right");
+      totalRow += col.dimmed ? th.fg("dim", value) : value;
+    }
+
+    return [th.fg("border", "─".repeat(layout.tableWidth)), totalRow, ""];
+  }
+
+  private renderFormulaNote(width: number): string[] {
+    const line = pickFittingText(width, [
+      "Tokens = Input + Output + CacheWrite  ·  ↑In = Input + CacheWrite  (as of 0.2.0)",
+      "Tokens = In + Out + CacheWrite  ·  ↑In = In + CacheWrite  (v0.2.0+)",
+      "Tokens & ↑In include CacheWrite (v0.2.0+)",
+      "Incl. CacheWrite (v0.2.0+)",
+    ]);
+    return [this.theme.fg("dim", line), ""];
+  }
+
+  private renderHelp(width: number): string[] {
+    const noteLines = this.exportNote
+      ? [
+          this.theme.fg(
+            this.exportNote.ok ? "success" : "error",
+            `${this.exportNote.ok ? "✓" : "✗"} ${this.exportNote.text}`,
+          ),
+          "",
+        ]
+      : [];
+    const variants =
+      this.viewMode === "graph"
+        ? [
+            "[Tab/←→] period  [m] metric  [g] group  [c] cumulative  [↑↓/Enter] filter  [a] all  [e] export  [v] view  [q] close",
+            "[Tab] period  [m] metric  [g] group  [c] cumul  [↑↓/Enter] filter  [e] export  [v] view  [q] close",
+            "[m] metric  [g] group  [c] cumul  [↑↓] filter  [q] close",
+            "[m] [g] [c] [↑↓] [q]",
+            "[q] close",
+          ]
+        : this.viewMode === "insights"
+          ? [
+              "[Tab/←→] period  [e] export  [v] view  [q] close",
+              "[Tab] period  [e] export  [v] view  [q] close",
+              "[v] view  [q] close",
+              "[q] close",
+            ]
+          : [
+              "[Tab/←→] period  [↑↓] select  [Enter] expand  [/] filter  [x] hide  [a] all  [e] export  [v] view  [q] close",
+              "[Tab] period  [↑↓] select  [Enter] expand  [/] filter  [x] hide  [e] export  [v] view  [q] close",
+              "[↑↓] select  [Enter] expand  [/] filter  [x] hide  [v] view  [q] close",
+              "[↑↓] select  [/] [x] [v] [q]",
+              "[↑↓] select  [q] close",
+              "[q] close",
+            ];
+    const line = pickFittingText(width, variants);
+    return [...noteLines, this.theme.fg("dim", line)];
+  }
+
+  invalidate(): void {}
+  dispose(): void {}
+}
+
+// =============================================================================
+// Extension Entry Point
+// =============================================================================
+
+export default function (pi: ExtensionAPI) {
+  pi.registerCommand("usage", {
+    description: "Show usage statistics dashboard",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      if (!ctx.hasUI) {
+        return;
+      }
+
+      const data = await ctx.ui.custom<UsageData | null>((tui, theme, _kb, done) => {
+        const loader = new CancellableLoader(
+          tui,
+          (s: string) => theme.fg("accent", s),
+          (s: string) => theme.fg("muted", s),
+          "Loading Usage...",
+        );
+        let finished = false;
+        const finish = (value: UsageData | null) => {
+          if (finished) return;
+          finished = true;
+          loader.dispose();
+          done(value);
+        };
+
+        loader.onAbort = () => finish(null);
+
+        const onProgress = (p: CollectProgress): void => {
+          if (finished || p.filesToParse === 0) return;
+          const files = `${p.filesParsed.toLocaleString()}/${p.filesToParse.toLocaleString()} files`;
+          if (p.mode === "update") {
+            const since = p.sinceMs !== null ? ` since ${formatSinceDate(p.sinceMs)}` : "";
+            loader.setMessage(`Updating your usage history${since}… (${files})`);
+          } else if (p.mode === "rebuild") {
+            loader.setMessage(`Rebuilding your usage history — the cache format changed… (${files})`);
+          } else {
+            loader.setMessage(`Building your usage history for the first time… (${files})`);
+          }
+        };
+
+        collectUsageData({ signal: loader.signal, onProgress })
+          .then(finish)
+          .catch(() => finish(null));
+
+        return loader;
+      });
+
+      if (!data) {
+        return;
+      }
+
+      await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+        const container = new Container();
+
+        // Top border
+        container.addChild(new Spacer(1));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
+        container.addChild(new Spacer(1));
+
+        const usage = new UsageComponent(
+          theme,
+          data,
+          () => tui.requestRender(),
+          () => done(),
+        );
+
+        return {
+          render: (w: number) => {
+            const borderLines = clampLines(container.render(w), w);
+            const usageLines = usage.render(w);
+            const bottomBorder = theme.fg("border", "─".repeat(w));
+            return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
+          },
+          invalidate: () => container.invalidate(),
+          handleInput: (input: string) => usage.handleInput(input),
+          dispose: () => {},
+        };
+      });
+    },
+  });
+}

@@ -1,0 +1,286 @@
+/**
+ * types.ts — Type definitions for the subagent system.
+ */
+
+import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
+import type { AgentTierResolutionSnapshot } from "./agent-tiers.js";
+import type { LifetimeUsage } from "./usage.js";
+import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
+import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
+
+export type { ThinkingLevel, WorkflowTier };
+
+/** Agent type: any string name (built-in defaults or user-defined). */
+export type SubagentType = string;
+
+/** Ownership metadata attached to agents managed by another extension. */
+export interface AgentOwner {
+  extension: "pi-workflows";
+  runId: string;
+  nodeId: string;
+  /** Workflow attempt generation; absent on legacy direct Agent records. */
+  attemptId?: string;
+}
+
+/** Names of the three embedded default agents. */
+export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
+
+/** Memory scope for persistent agent memory. */
+export type MemoryScope = "user" | "project" | "local";
+
+/** Isolation mode for agent execution. */
+export type IsolationMode = "worktree";
+
+/** Unified agent configuration — used for both default and user-defined agents. */
+export interface AgentConfig {
+  name: string;
+  displayName?: string;
+  description: string;
+  builtinToolNames?: string[];
+  /** Raw `ext:` selector entries from the `tools:` CSV, e.g. ["ext:foo", "ext:bar/x"].
+   * Presence of any entry flips extension tools to an explicit allowlist. */
+  extSelectors?: string[];
+  /** Tool denylist — these tools are removed even if `builtinToolNames` or extensions include them. */
+  disallowedTools?: string[];
+  /** true = inherit all, string[] = only listed, false = none */
+  extensions: true | string[] | false;
+  /** Extension-name denylist applied after the `extensions:` include set. Exclude wins.
+   * Plain canonical names only (case-insensitive); no paths, no wildcard. */
+  excludeExtensions?: string[];
+  /** true = inherit all, string[] = only listed, false = none */
+  skills: true | string[] | false;
+  /**
+   * This agent's default model tier, from `tier:` in its frontmatter. A tier
+   * names a (model, thinking) pair in `agentTiers.profiles`; a tier passed at
+   * the call site overrides it. When set, it takes precedence over the legacy
+   * `model`/`thinking` fields below, which stay only for agents written before
+   * tiers existed.
+   */
+  agentTier?: string;
+  /**
+   * Programmatic-only model override. Never populated from an agent file: which
+   * model a subagent runs is the tier catalogue's decision, and `model:` in
+   * frontmatter is read as documentation of an unfinished migration rather than
+   * a pin. Left on the type for callers that construct a config in process.
+   */
+  model?: string;
+  /** Programmatic-only, for the same reason as `model` above. */
+  thinking?: ThinkingLevel;
+  maxTurns?: number;
+  /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
+  persistSession?: boolean;
+  /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
+  outputTranscript?: boolean;
+  /** Optional session directory used when persistSession is true. Omitted = pi's normal session location. */
+  sessionDir?: string;
+  /**
+   * Nested delegation, off by default: undefined = no nested tools;
+   * "all" = any enabled agent; string[] = only those agent types.
+   */
+  allowedSubagents?: "all" | string[];
+  systemPrompt: string;
+  promptMode: "replace" | "append";
+  /** Default for spawn: fork parent conversation. undefined = caller decides. */
+  inheritContext?: boolean;
+  /** Default for spawn: run in background. undefined = caller decides. */
+  runInBackground?: boolean;
+  /** Default for spawn: no extension tools. undefined = caller decides. */
+  isolated?: boolean;
+  /** Persistent memory scope — agents with memory get a persistent directory and MEMORY.md */
+  memory?: MemoryScope;
+  /** Isolation mode — "worktree" runs the agent in a temporary git worktree */
+  isolation?: IsolationMode;
+  /** true = this is an embedded default agent (informational) */
+  isDefault?: boolean;
+  /** false = agent is hidden from the registry */
+  enabled?: boolean;
+  /** Where this agent was loaded from */
+  source?: "default" | "project" | "global";
+  /** Path of the .md it was loaded from. Unset for embedded defaults. */
+  sourcePath?: string;
+}
+
+export type JoinMode = 'async' | 'group' | 'smart';
+
+export interface AgentRecord {
+  id: string;
+  type: SubagentType;
+  description: string;
+  status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
+  result?: string;
+  error?: string;
+  toolUses: number;
+  startedAt: number;
+  completedAt?: number;
+  session?: AgentSession;
+  abortController?: AbortController;
+  promise?: Promise<string>;
+  groupId?: string;
+  joinMode?: JoinMode;
+  /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
+  resultConsumed?: boolean;
+  /** Steering messages queued before the session was ready. */
+  pendingSteers?: string[];
+  /** Worktree info if the agent is running in an isolated worktree. */
+  worktree?: WorktreeInfo;
+  /** Worktree cleanup result after agent completion. */
+  worktreeResult?: WorktreeCleanupResult;
+  /** The tool_use_id from the original Agent tool call. */
+  toolCallId?: string;
+  /** Path to the streaming output transcript file. */
+  outputFile?: string;
+  /** Cleanup function for the output file stream subscription. */
+  outputCleanup?: () => void;
+  /**
+   * Lifetime usage breakdown, accumulated via `message_end` events. Survives
+   * compaction. Total = input + output + cacheWrite (cacheRead deliberately
+   * excluded — see issue #38). Initialized to zeros at spawn.
+   */
+  lifetimeUsage: LifetimeUsage;
+  /** Number of times this agent's session has compacted. Initialized to 0 at spawn. */
+  compactionCount: number;
+  /**
+   * Whether this agent was spawned to run in the background. Tri-state, set at
+   * spawn from `SpawnOptions.isBackground`: `true` = background, `false` =
+   * foreground (has an inline Agent tool-result surface), `undefined` = the
+   * caller never declared it (e.g. a cross-extension RPC spawn, which is detached
+   * and has no inline surface). The widget's background-only filter keys off this
+   * — and excludes only explicit `false`, so `undefined` agents stay visible.
+   * Reliable across ALL spawn paths, unlike the UI-only `invocation` snapshot,
+   * which only the Agent-tool path populates.
+   */
+  isBackground?: boolean;
+  /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
+  invocation?: AgentInvocation;
+  /** Nesting depth: top-level subagent = 1. */
+  depth?: number;
+  /** Parent agent ID for ownership-scoped nested controls. */
+  parentAgentId?: string;
+  /**
+   * Immutable owner lineage captured at allocation, ordered from the root
+   * nested owner to the immediate parent. Intermediate records may be evicted
+   * only after this branch is fully cleaned, so cleanup never needs to rebuild
+   * ownership from mutable parent links.
+   */
+  readonly ancestorAgentIds?: readonly string[];
+  /** Effective inherited nesting cap for this branch. */
+  maxSubagentDepth?: number;
+  /**
+   * Session id of the root (main) session this branch descends from. Nested
+   * spawns inherit it so their transcripts file under the same session
+   * directory as their ancestors' instead of the child session's own id.
+   */
+  rootSessionId?: string;
+  /** Extension that owns this run, when it is managed rather than user-spawned. */
+  owner?: AgentOwner;
+  /** Set when a session-tree replacement detaches this record; late completion is ignored. */
+  detached?: boolean;
+}
+
+export interface AgentInvocation {
+  /** Short display name, e.g. "haiku" — only set when different from parent. */
+  modelName?: string;
+  thinking?: ThinkingLevel;
+  /** Semantic workflow tier selected by the workflow definition. */
+  tier?: WorkflowTier;
+  /** Immutable model/thinking resolution captured by pi-subagents. */
+  tierSnapshot?: WorkflowTierResolutionSnapshot;
+  /**
+   * User-named tier applied to an ordinary spawn. Deliberately a separate field
+   * from `tier` above: that one is the workflow protocol's small/medium/large
+   * union, and widening it to hold arbitrary names would take the protocol's
+   * exhaustiveness with it.
+   */
+  agentTier?: string;
+  /** Immutable model/thinking resolution for `agentTier`. */
+  agentTierSnapshot?: AgentTierResolutionSnapshot;
+  maxTurns?: number;
+  isolated?: boolean;
+  inheritContext?: boolean;
+  runInBackground?: boolean;
+  isolation?: IsolationMode;
+}
+/**
+ * Immutable, observation-only snapshot returned by public record lookups.
+ * Live sessions and manager control handles are intentionally excluded.
+ */
+export type AgentRecordSnapshot = Omit<Readonly<AgentRecord>, "session" | "abortController" | "promise" | "outputCleanup" | "owner" | "ancestorAgentIds" | "lifetimeUsage" | "pendingSteers" | "invocation"> & {
+  readonly owner?: Readonly<AgentOwner>;
+  readonly ancestorAgentIds?: readonly string[];
+  readonly lifetimeUsage: Readonly<LifetimeUsage>;
+  readonly pendingSteers?: readonly string[];
+  readonly invocation?: Readonly<AgentInvocation> & {
+    readonly tierSnapshot?: Readonly<NonNullable<AgentInvocation["tierSnapshot"]>>;
+    readonly agentTierSnapshot?: Readonly<NonNullable<AgentInvocation["agentTierSnapshot"]>>;
+  };
+};
+
+/** Details attached to custom notification messages for visual rendering. */
+export interface NotificationDetails {
+  id: string;
+  description: string;
+  status: string;
+  toolUses: number;
+  turnCount: number;
+  maxTurns?: number;
+  totalTokens: number;
+  durationMs: number;
+  outputFile?: string;
+  error?: string;
+  resultPreview: string;
+  /** Additional agents in a group notification. */
+  others?: NotificationDetails[];
+}
+
+export interface EnvInfo {
+  isGitRepo: boolean;
+  branch: string;
+  platform: string;
+}
+
+/**
+ * A subagent spawn registered to fire on a schedule.
+ *
+ * Stored at `<cwd>/.pi/subagent-schedules/<sessionId>.json`. Session-scoped:
+ * survives `/resume` but resets on `/new`, mirroring pi-chonky-tasks.
+ */
+export interface ScheduledSubagent {
+  id: string;
+  /** Unique within store. Defaults to `description`. */
+  name: string;
+  description: string;
+  /** Raw user input — cron expr | "+10m" | ISO | "5m". */
+  schedule: string;
+  scheduleType: "cron" | "once" | "interval";
+  /** Computed at create time for interval/once. */
+  intervalMs?: number;
+
+  // spawn params (subset of Agent tool params; no inherit_context, no resume)
+  subagent_type: SubagentType;
+  prompt: string;
+  /** Model tier key, resolved at fire time against the then-current catalogue. */
+  tier?: string;
+  model?: string;
+  thinking?: ThinkingLevel;
+  max_turns?: number;
+  isolated?: boolean;
+  isolation?: IsolationMode;
+
+  // state
+  enabled: boolean;
+  /** ISO timestamp. */
+  createdAt: string;
+  lastRun?: string;
+  lastStatus?: "success" | "error" | "running";
+  /** Refreshed on every fire and on store load. */
+  nextRun?: string;
+  runCount: number;
+}
+
+export interface ScheduleStoreData {
+  /** For future migrations. */
+  version: 1;
+  jobs: ScheduledSubagent[];
+}

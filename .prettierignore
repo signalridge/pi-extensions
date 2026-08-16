@@ -1,0 +1,10 @@
+# This repository formats with Biome, not Prettier.
+#
+# Nothing here is Prettier-formatted, and `biome.json` sets a 120-column width
+# while `packages/pi-subagents` disables the formatter outright. An editor or
+# hook that runs Prettier on save would reflow whole files and bury real
+# changes in reformatting noise, so opt every path out.
+#
+# Formatting entry points: `bun run format` (root) or `bun run format` inside
+# a package.
+*
