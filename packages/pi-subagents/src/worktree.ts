@@ -123,6 +123,7 @@ export function cleanupWorktree(
     return { hasChanges: false, cleanupSucceeded: true };
   }
 
+  let hasChanges = false;
   try {
     // Check for uncommitted changes in the worktree
     const status = execFileSync("git", ["status", "--porcelain"], {
@@ -132,6 +133,7 @@ export function cleanupWorktree(
     }).toString().trim();
 
     if (status) {
+      hasChanges = true;
       // Changes exist — stage, commit, and create a branch
       execFileSync("git", ["add", "-A"], { cwd: worktree.path, stdio: "pipe", timeout: 10000 });
       // Truncate description for commit message (no shell sanitization needed — execFileSync uses argv)
@@ -154,6 +156,7 @@ export function cleanupWorktree(
         removeWorktree(cwd, worktree.path);
         return { hasChanges: false, cleanupSucceeded: true };
       }
+      hasChanges = true;
     }
 
     // Create a branch pointing to the worktree's HEAD.
@@ -190,9 +193,15 @@ export function cleanupWorktree(
     // Best effort cleanup on error
     try { removeWorktree(cwd, worktree.path); } catch { /* ignore */ }
     return {
-      hasChanges: false,
+      hasChanges,
+      path: worktree.path,
       cleanupSucceeded: false,
       cleanupDiagnostic: error instanceof Error ? error.message : String(error),
+      recoveryCommands: [
+        `git -C ${JSON.stringify(cwd)} worktree remove --force ${JSON.stringify(worktree.path)}`,
+        `git -C ${JSON.stringify(cwd)} worktree prune`,
+        `rm -rf -- ${JSON.stringify(worktree.path)}`,
+      ],
     };
   }
 }

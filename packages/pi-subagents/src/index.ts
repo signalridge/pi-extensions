@@ -5048,7 +5048,11 @@ Do not wrap the response in a markdown code fence. Return only the file contents
             ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+              : result === "defaultMaxTokens"
+                ? String(getDefaultMaxTokens())
+                : result === "defaultMaxToolCalls"
+                  ? String(getDefaultMaxToolCalls())
+                  : String(getGraceTurns());
 
       const label =
         result === "maxConcurrent"
@@ -5057,7 +5061,11 @@ Do not wrap the response in a markdown code fence. Return only the file contents
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : result === "defaultMaxTokens"
+                ? "Token budget (0 = unlimited)"
+                : result === "defaultMaxToolCalls"
+                  ? "Tool-call budget (0 = unlimited)"
+                  : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.

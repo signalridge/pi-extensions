@@ -1,5 +1,5 @@
 ---
-"@signalridge/pi-workflows": major
+"@signalridge/pi-workflows": minor
 ---
 
 Rewrite `pi-workflows` from a declarative DAG engine to a JavaScript orchestration runtime.
