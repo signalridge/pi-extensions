@@ -21,10 +21,12 @@ import {
 import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
 import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { createAskGate } from "./ask-tools.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from "./gate.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   type InternalAgentConfigOverride,
@@ -36,6 +38,7 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
+import { createSupervisorTool } from "./supervisor.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
 import { resolveWorkflowTier } from "./workflow-tiers.js";
@@ -246,9 +249,11 @@ export function installExtensionToolScope(
     narrowing: Map<string, Set<string>>;
     /** Opt-in nested-delegation tool names to keep active despite the EXCLUDED strip. */
     nestedToolNames: Set<string>;
+    /** Per-call approval gate from `ask_tools:`, when the agent declares any. */
+    askGate?: (toolName: string, input: unknown) => Promise<{ block: true; reason: string } | undefined>;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, askGate } = ctx;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -300,14 +305,51 @@ export function installExtensionToolScope(
 
   const priorBeforeToolCall = session.agent.beforeToolCall;
   session.agent.beforeToolCall = async (context, signal) => {
-    if (!inScope().has(context.toolCall.name)) {
-      return {
-        block: true,
-        reason: `Tool "${context.toolCall.name}" is not available to this subagent.`,
-      };
+    const run = async () => {
+      if (!inScope().has(context.toolCall.name)) {
+        return {
+          block: true,
+          reason: `Tool "${context.toolCall.name}" is not available to this subagent.`,
+        } as const;
+      }
+      // Scope first, then approval: a tool this agent may not use at all is
+      // refused without troubling the user about it.
+      const gated = await askGate?.(context.toolCall.name, (context.toolCall as { input?: unknown }).input);
+      if (gated) return gated;
+      return priorBeforeToolCall?.(context, signal);
+    };
+    // Default per-tool timeout prevents a hung beforeToolCall (slow extension,
+    // stuck LLM arbitrator) from stalling the subagent forever. Approval
+    // dialogs are wrapped too — a tool that cannot be approved in time is
+    // blocked fail-closed rather than left hanging.
+    if (defaultToolTimeoutMs > 0) {
+      try {
+        return await withTimeout(run(), defaultToolTimeoutMs, `beforeToolCall for "${context.toolCall.name}"`);
+      } catch (err) {
+        return { block: true, reason: (err as Error).message };
+      }
     }
-    return priorBeforeToolCall?.(context, signal);
+    return run();
   };
+}
+
+/**
+ * Run an agent's `gate:` command and format its verdict for the result text.
+ *
+ * Failures here are contained: a gate that cannot be fingerprinted simply runs
+ * uncached, and one that cannot run at all reports as failed rather than taking
+ * the agent's whole result down with it.
+ */
+async function runConfiguredGate(command: string, cwd: string, pi: ExtensionAPI): Promise<string> {
+  const exec: GateExec = (file, args, execOptions) =>
+    pi.exec(file, args, execOptions as Parameters<ExtensionAPI["exec"]>[2]);
+  try {
+    const fingerprint = await workspaceFingerprint(cwd, exec);
+    const verdict = await runGate({ command, cwd, exec, ...(fingerprint ? { fingerprint } : {}) });
+    return formatGateVerdict(command, verdict);
+  } catch (error: unknown) {
+    return `\n\n---\nAcceptance gate \`${command}\`: could not run (${error instanceof Error ? error.message : String(error)})`;
+  }
 }
 
 /** Default max turns. undefined = unlimited (no turn limit). */
@@ -325,6 +367,48 @@ export function getDefaultMaxTurns(): number | undefined { return defaultMaxTurn
 export function setDefaultMaxTurns(n: number | undefined): void { defaultMaxTurns = normalizeMaxTurns(n); }
 
 /** Additional turns allowed after the soft limit steer message. */
+/**
+ * Fraction of a resource budget at which the wrap-up steer is sent.
+ *
+ * Not 1.0: an agent told to produce its final answer needs allowance left to
+ * produce it, so the steer has to arrive while there is still budget to spend
+ * on the response.
+ */
+const SOFT_BUDGET_FRACTION = 0.8;
+
+/** Project defaults for the per-agent resource budgets. `0` = unlimited. */
+let defaultMaxTokens = 0;
+let defaultMaxToolCalls = 0;
+
+/** Token budget for one agent run, from settings. `0` disables the cap. */
+export function getDefaultMaxTokens(): number { return defaultMaxTokens; }
+export function setDefaultMaxTokens(n: number): void { defaultMaxTokens = Math.max(0, Math.floor(n)); }
+
+/** Tool-call budget for one agent run, from settings. `0` disables the cap. */
+export function getDefaultMaxToolCalls(): number { return defaultMaxToolCalls; }
+export function setDefaultMaxToolCalls(n: number): void { defaultMaxToolCalls = Math.max(0, Math.floor(n)); }
+
+/** Default per-tool timeout; `0` disables (no timeout). Mirrors tintinweb — no per-tool timeout by default; hung tools are reclaimed via session abort/quiescence, not a hard tool cut. Set via settings defaultToolTimeoutMs when needed. */
+const DEFAULT_TOOL_TIMEOUT_MS = 0;
+const TOOL_TIMEOUT_CEILING_MS = 600_000;
+let defaultToolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS;
+export function getDefaultToolTimeoutMs(): number { return defaultToolTimeoutMs; }
+export function setDefaultToolTimeoutMs(n: number): void {
+  defaultToolTimeoutMs = Math.max(0, Math.min(Math.floor(n), TOOL_TIMEOUT_CEILING_MS));
+}
+/** Race a promise against a timeout that rejects with `label timed out after ms`. */
+export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  if (ms <= 0) return promise;
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    handle = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    handle.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (handle) clearTimeout(handle);
+  });
+}
+
 let graceTurns = 5;
 
 /** Get the grace turns value. */
@@ -478,6 +562,27 @@ export interface RunOptions {
    * JSON/public spawn field; the generation wizard is the only issuer.
    */
   readonly [INTERNAL_AGENT_CONFIG_OVERRIDE]?: InternalAgentConfigOverride;
+  /**
+   * Reopen an existing conversation from this session file instead of starting
+   * a new one. Package-internal: the only issuer is the `@handle` mention
+   * dispatcher, replaying a path this extension itself wrote to the resumable
+   * index. A caller-supplied value would let a spawn read any session on disk,
+   * so no public spawn surface forwards it.
+   */
+  resumeSessionFile?: string;
+  /**
+   * Project default for persisting a top-level agent's conversation to disk,
+   * from the `rememberAgents` setting. Frontmatter `persist_session:` still
+   * wins; nested agents never persist. Without this, only agents that opted in
+   * by frontmatter leave a transcript, and `@handle` has nothing to reopen.
+   */
+  rememberAgents?: boolean;
+  /**
+   * Whether this agent may ask its human a question with `contact_supervisor`.
+   * Defaults to on wherever there is a UI to ask through; `false` withholds the
+   * tool entirely rather than injecting one that always refuses.
+   */
+  supervisorQuestions?: boolean;
   /** Runtime bridge for opt-in child-safe nested delegation. */
   nestedRuntime?: {
     manager: NestedAgentManager;
@@ -978,7 +1083,26 @@ export async function runAgent(
         configCwd,
       })
     : [];
-  const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+  // `contact_supervisor` is injected separately from the nested tools and under
+  // a different condition. Nesting is gated on `allowedSubagents`, but the agent
+  // that most needs to ask a question is a LEAF one that cannot delegate — so
+  // gating them together would withhold it from exactly those agents. It needs
+  // only a human to answer, which `hasUI` decides. Isolation still suppresses
+  // it: an `isolated: true` agent is defined as built-in tools only.
+  const supervisorTools =
+    ctx.hasUI && !isolated && options.supervisorQuestions !== false
+      ? createSupervisorTool({
+          agentLabel: agentConfig?.displayName ?? type,
+          ask: {
+            input: (title, placeholder) => ctx.ui.input(title, placeholder),
+            select: (title, choices) => ctx.ui.select(title, choices),
+          },
+        })
+      : [];
+  // One list from here on: both sets are custom tools this package injects, and
+  // the scoping pass below keeps exactly the names it is given.
+  const injectedTools = [...nestedTools, ...supervisorTools];
+  const nestedToolNames = new Set(injectedTools.map(tool => tool.name));
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
   //
@@ -1040,12 +1164,26 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
-  const parentSession = agentConfig?.persistSession ? ctx.sessionManager.getSessionFile?.() : undefined;
-  const sessionManager = agentConfig?.persistSession
-    ? parentSession
-      ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, { parentSession })
-      : SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
-    : SessionManager.inMemory(effectiveCwd);
+  // Frontmatter wins when it says anything; otherwise the project default,
+  // which `rememberAgents` supplies for top-level agents only. A nested agent
+  // is an implementation detail of its parent and is never addressable by
+  // `@handle`, so it has nothing to gain from a transcript on disk.
+  const persistSession = agentConfig?.persistSession ?? (options.nestedRuntime ? false : options.rememberAgents === true);
+  // Optional metadata — it only nests the subagent under its spawner in
+  // `/resume`. Now that `rememberAgents` persists every top-level spawn, a
+  // context without a session manager (a bare programmatic ctx) must still
+  // persist rather than take the whole spawn down.
+  const parentSession = persistSession ? ctx.sessionManager?.getSessionFile?.() : undefined;
+  const sessionManager = options.resumeSessionFile
+    ? // Reopening an existing conversation: the file already carries its own
+      // header (cwd, parent) and history, so none of the create-time options
+      // apply. `sessionDir` still matters for a later /new or /branch off it.
+      SessionManager.open(options.resumeSessionFile, configuredSessionDir ?? defaultSessionDir)
+    : persistSession
+      ? parentSession
+        ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, { parentSession })
+        : SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
+      : SessionManager.inMemory(effectiveCwd);
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
@@ -1063,7 +1201,7 @@ export async function runAgent(
     ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime }),
     model,
     tools: sessionTools,
-    customTools: nestedTools,
+    customTools: injectedTools,
     resourceLoader: loader,
   };
   if (sessionExcludeTools) {
@@ -1108,6 +1246,15 @@ export async function runAgent(
   // (we can't deny the name of a tool that hasn't registered yet). Both are
   // handled below by re-deriving scope from the loader's live extension maps —
   // `registerTool` writes into those same maps, so late arrivals are judged too.
+  // `ask_tools:` gates individual CALLS, which is orthogonal to which tools
+  // exist — so it applies to isolated agents too, where the scope installer
+  // below never runs because the registry is already statically allowlisted.
+  const askGate = createAskGate({
+    askTools: agentConfig?.askTools ?? [],
+    agentLabel: agentConfig?.displayName ?? type,
+    ...(ctx.hasUI ? { confirm: (title: string, message: string) => ctx.ui.confirm(title, message) } : {}),
+  });
+
   if (!noExtensions) {
     installExtensionToolScope(session, {
       loader,
@@ -1116,7 +1263,26 @@ export async function runAgent(
       extNames,
       narrowing,
       nestedToolNames,
+      ...(askGate ? { askGate } : {}),
     });
+  } else if (askGate) {
+    // Same hook, without the scope check the allowlist already performed.
+    const priorBeforeToolCall = session.agent.beforeToolCall;
+    session.agent.beforeToolCall = async (context, signal) => {
+      const run = async () => {
+        const gated = await askGate(context.toolCall.name, (context.toolCall as { input?: unknown }).input);
+        if (gated) return gated;
+        return priorBeforeToolCall?.(context, signal);
+      };
+      if (defaultToolTimeoutMs > 0) {
+        try {
+          return await withTimeout(run(), defaultToolTimeoutMs, `beforeToolCall for "${context.toolCall.name}"`);
+        } catch (err) {
+          return { block: true, reason: (err as Error).message };
+        }
+      }
+      return run();
+    };
   }
 
   if (options.onSessionCreated) {
@@ -1133,7 +1299,76 @@ export async function runAgent(
   let softLimitReached = false;
   let aborted = false;
 
+  // Resource budgets, in the same shape as max_turns: a wrap-up steer at the
+  // soft threshold, an abort at the hard one. They bound what a single agent
+  // can spend on its own, which turn count does not — one turn can burn an
+  // arbitrary number of tokens or tool calls.
+  //
+  // `0` means unlimited here, matching this package's existing convention for
+  // `maxTurns`. That is the opposite of `maxSubagentSpawnsPerBranch`, and
+  // deliberately: these are opt-in resource caps that ship off, while the
+  // branch spawn budget is a safety valve that ships on.
+  const tokenBudget = normalizeMaxTurns(agentConfig?.maxTokens ?? defaultMaxTokens);
+  const toolCallBudget = normalizeMaxTurns(agentConfig?.maxToolCalls ?? defaultMaxToolCalls);
+  let budgetTokens = 0;
+  let budgetToolCalls = 0;
+  let tokenSoftReached = false;
+  let toolSoftReached = false;
+
+  /**
+   * Apply one budget, returning the next soft-limit state.
+   *
+   * The soft threshold is `SOFT_BUDGET_FRACTION` of the budget so the agent has
+   * room left to actually write its answer after being told to wrap up — a
+   * steer sent at 100% would be asking for a final response with no allowance
+   * to produce it.
+   */
+  const applyBudget = (used: number, budget: number | undefined, softReached: boolean, label: string): boolean => {
+    if (budget == null) return softReached;
+    // The hard limit is checked FIRST. One message can consume more than the
+    // whole budget, and testing the soft threshold first would answer that with
+    // a wrap-up steer and no abort — leaving an agent already over budget to
+    // run on until its next event.
+    if (used >= budget) {
+      aborted = true;
+      session.abort();
+      return true;
+    }
+    if (!softReached && used >= budget * SOFT_BUDGET_FRACTION) {
+      session.steer(
+        `You are near your ${label} budget for this task. Wrap up immediately — provide your final answer now.`,
+      );
+      return true;
+    }
+    return softReached;
+  };
+
   let currentMessageText = "";
+  // Per-tool timeout: a hung bash/MCP call must not stall the subagent forever.
+  // Each tool_execution_start arms a timer; the matching end clears it. On
+  // timeout the session is aborted — which propagates via the tool's
+  // AbortSignal into the hanging execute() and surfaces as an error result.
+  // `contact_supervisor` is excluded: it intentionally waits for a human.
+  const pendingToolTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  const clearToolTimeout = (toolCallId: string): void => {
+    const handle = pendingToolTimeouts.get(toolCallId);
+    if (handle) {
+      clearTimeout(handle);
+      pendingToolTimeouts.delete(toolCallId);
+    }
+  };
+  const armToolTimeout = (toolCallId: string, toolName: string): void => {
+    if (defaultToolTimeoutMs <= 0) return;
+    if (toolName === "contact_supervisor") return;
+    const handle = setTimeout(() => {
+      pendingToolTimeouts.delete(toolCallId);
+      try {
+        session.abort();
+      } catch {}
+    }, defaultToolTimeoutMs);
+    handle.unref?.();
+    pendingToolTimeouts.set(toolCallId, handle);
+  };
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
@@ -1157,9 +1392,13 @@ export async function runAgent(
     }
     if (event.type === "tool_execution_start") {
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
+      armToolTimeout((event as { toolCallId: string }).toolCallId, event.toolName);
     }
     if (event.type === "tool_execution_end") {
+      clearToolTimeout((event as { toolCallId: string }).toolCallId);
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
+      budgetToolCalls++;
+      toolSoftReached = applyBudget(budgetToolCalls, toolCallBudget, toolSoftReached, "tool call");
     }
     if (event.type === "message_end" && event.message.role === "assistant") {
       const u = (event.message as any).usage;
@@ -1168,6 +1407,12 @@ export async function runAgent(
         output: u.output ?? 0,
         cacheWrite: u.cacheWrite ?? 0,
       });
+      if (u) {
+        // Same total as `getLifetimeTotal`: input + output + cacheWrite, with
+        // cacheRead deliberately excluded.
+        budgetTokens += (u.input ?? 0) + (u.output ?? 0) + (u.cacheWrite ?? 0);
+        tokenSoftReached = applyBudget(budgetTokens, tokenBudget, tokenSoftReached, "token");
+      }
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
@@ -1195,9 +1440,18 @@ export async function runAgent(
   } finally {
     unsubTurns();
     collector.unsubscribe();
+    for (const handle of pendingToolTimeouts.values()) clearTimeout(handle);
+    pendingToolTimeouts.clear();
   }
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  const baseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  // The acceptance gate runs AFTER the agent is done and its verdict is
+  // appended to the result, so the parent reads the check and the claim it is
+  // checking side by side. It deliberately does not steer the agent to fix
+  // what failed: the gate is evidence for the caller, not another turn.
+  const responseText = agentConfig?.gate
+    ? `${baseText}${await runConfiguredGate(agentConfig.gate, effectiveCwd, options.pi)}`
+    : baseText;
   completed = true;
   return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
   } finally {
@@ -1253,6 +1507,32 @@ export async function resumeAgent(
         }
       })
     : () => {};
+  // Per-tool timeout for resume as well — same stuck-command fix as runAgent.
+  const resumePendingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  const unsubResumeTimeout =
+    defaultToolTimeoutMs > 0
+      ? session.subscribe((event: AgentSessionEvent) => {
+          if (event.type === "tool_execution_start") {
+            const id = (event as { toolCallId: string }).toolCallId;
+            if (event.toolName === "contact_supervisor") return;
+            const handle = setTimeout(() => {
+              resumePendingTimeouts.delete(id);
+              try {
+                session.abort();
+              } catch {}
+            }, defaultToolTimeoutMs);
+            handle.unref?.();
+            resumePendingTimeouts.set(id, handle);
+          } else if (event.type === "tool_execution_end") {
+            const id = (event as { toolCallId: string }).toolCallId;
+            const handle = resumePendingTimeouts.get(id);
+            if (handle) {
+              clearTimeout(handle);
+              resumePendingTimeouts.delete(id);
+            }
+          }
+        })
+      : () => {};
 
   try {
     throwIfAborted(options.signal);
@@ -1260,6 +1540,9 @@ export async function resumeAgent(
   } finally {
     collector.unsubscribe();
     unsubEvents();
+    unsubResumeTimeout();
+    for (const handle of resumePendingTimeouts.values()) clearTimeout(handle);
+    resumePendingTimeouts.clear();
     cleanupAbort();
   }
 

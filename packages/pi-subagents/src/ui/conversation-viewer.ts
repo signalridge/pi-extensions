@@ -7,11 +7,12 @@
 
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { renderAgentName } from "../agent-color.js";
 import { extractText } from "../context.js";
 import type { AgentRecordSnapshot } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-display.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-display.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-display.js";
 import { PREVIEW_SCAN_LIMIT, safeTerminalText, sanitizeDisplayText, truncateCodePoints } from "./safe-text.js";
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
@@ -187,7 +188,7 @@ export class ConversationViewer implements Component {
 
     lines.push(rule());
     lines.push(row(th.bold("Agent conversation")));
-    const name = getDisplayName(this.record.type);
+    const name = renderAgentName(this.record.type, th, { bold: true });
     const modeLabel = getPromptModeLabel(this.record.type);
     const modeTag = modeLabel ? th.fg("dim", `mode ${modeLabel}`) : undefined;
     const statusText = getAgentStatusLabel(this.record.status);
@@ -205,7 +206,7 @@ export class ConversationViewer implements Component {
 
     const headerParts = [
       th.fg(statusColor, `${getAgentStatusMark(this.record.status)} ${statusText}`),
-      th.bold(name),
+      name,
       modeTag,
       th.fg("muted", sanitizeDisplayText(this.record.description)),
       fgPreservingNestedStyles(th, "dim", headerStats.join(" · ")),

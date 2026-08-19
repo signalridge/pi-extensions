@@ -22,7 +22,8 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 - Stores goal state in the current Pi session, following Codex's thread-owned goal model instead of using a global per-directory goal. Experimental queues keep independent budget, usage, elapsed-time, iteration, status, and stale-id accounting for every item.
 - Registers a `goal_complete({ goal_id, summary })` tool for explicit completion, requiring the current goal id and rejecting missing/stale ids plus plainly contradictory summaries such as “not complete” or “tests still fail”.
 - Registers `goal_blocked({ goal_id, reason, evidence, repeated_turns })` for true impasses only; it requires the current goal id, concrete evidence, and the same blocker recurring for at least three consecutive goal turns.
-- Keeps both goal tools active by default for a stable tool schema; optional `"after-first-goal"` visibility hides them until the first accepted `/goal` activation or an unfinished goal is restored, then keeps them desired for the rest of that extension runtime without overriding a restrictive restore policy.
+- Registers `goal_wait({ goal_id, reason, resume_after_ms? })` for a goal that is waiting on something outside the session rather than unfinished or blocked. The goal pauses with the reason recorded and either waits for the next real message or wakes on the deadline; requests under 10s are clamped, since a shorter "wait" is a polling loop. Resuming a deadline uses the same path as `/goal resume`.
+- Hides all three goal tools by default until the first goal exists (`"after-first-goal"`), keeping their definitions and prompt guidelines out of a session that never runs `/goal`; optional `"always"` visibility keeps them resident for a stable tool schema. Hidden means hidden until the first accepted `/goal` activation or an unfinished goal is restored, then keeps them desired for the rest of that extension runtime without overriding a restrictive restore policy.
 - Records continuation and queue-transition intent, then triggers exactly one next turn only after Pi reports the agent fully settled, idle, and free of pending messages; if terminal tools disappear during a tool loop or before the next queued goal starts, pauses before another model turn.
 - Lets retry, compaction, steering, follow-up, and other queued work settle before automatic goal continuation.
 - Separates user interruption (`paused`), true impasse or terminal non-usage error (`blocked`), provider/account quota exhaustion (`usage_limited`), and user token budget exhaustion (`budget_limited`).
@@ -58,7 +59,7 @@ built-in defaults without creating the file:
 
 ```json
 {
-  "toolVisibility": "always",
+  "toolVisibility": "after-first-goal",
   "experimental": {
     "goals": false
   },
@@ -86,8 +87,8 @@ Custom number inputs reject zero, negative numbers, decimals, text, and unsafe i
 
 `toolVisibility` accepts:
 
-- `"always"` (default) — pi-goal does not proactively hide `goal_complete` or `goal_blocked`, keeping the tool schema stable from session startup.
-- `"after-first-goal"` — hides both tools at fresh runtime startup, reveals them for the first accepted Goal activation, and treats an unfinished-goal restore as unlocked for the remainder of that extension runtime. On restore, pi-goal uses the active tools already established by earlier lifecycle handlers; it does not re-add missing terminal tools over a restrictive policy. Failed kickoff, replacement, resume, or reactivating-edit delivery restores the exact pre-activation tool set, including terminal tools exposed by another extension. If revealing the tools would widen an already-running turn, wait for Pi to become idle and retry `/goal`.
+- `"always"` — pi-goal does not proactively hide `goal_complete` or `goal_blocked`, keeping the tool schema stable from session startup.
+- `"after-first-goal"` (default) — hides both tools at fresh runtime startup, reveals them for the first accepted Goal activation, and treats an unfinished-goal restore as unlocked for the remainder of that extension runtime. On restore, pi-goal uses the active tools already established by earlier lifecycle handlers; it does not re-add missing terminal tools over a restrictive policy. Failed kickoff, replacement, resume, or reactivating-edit delivery restores the exact pre-activation tool set, including terminal tools exposed by another extension. If revealing the tools would widen an already-running turn, wait for Pi to become idle and retry `/goal`.
 
 `experimental.goals` accepts a boolean and defaults to `false`. Set it to `true` to enable the ordered-goal subcommands and automatic queue advancement described below. Enabled sessions show one warning because command behavior and persisted queue state remain experimental.
 

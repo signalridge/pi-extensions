@@ -1,10 +1,21 @@
 # @signalridge/pi-workflows
 
-Declarative DAG orchestration for Pi. The `workflow` tool validates phases, task dependencies, cycles, bounded synthesis input, and optional `small`/`medium`/`large` semantic tiers, then submits ready tasks through the additive `subagents:rpc:spawn-managed` event-bus protocol. `pi-subagents` remains the only owner of model, thinking, queue, concurrency, tools, skills, cwd, isolation, retry, and session policy.
+JavaScript orchestration for Pi. A workflow is a raw JavaScript module executed
+in a determinism-guarded `node:vm` realm; the runtime supplies `agent()`,
+`parallel()`, `pipeline()`, `workflow()`, quality helpers (`verify`,
+`judgePanel`, `loopUntilDry`, `completenessCheck`, `retry`, `gate`), human
+`checkpoint()`, `phase()`, `log()`, `args`, `cwd`, restricted `process`, and
+`budget`. Every live `agent()` call is dispatched through the additive
+`subagents:rpc:spawn-managed` event-bus protocol — `pi-subagents` remains the
+only owner of model, thinking, queue, concurrency, tools, skills, cwd,
+isolation, retry, and session policy.
 
 ## Install
 
-`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.0.0` with protocol v3 managed-spawn support. They are separate Pi packages: the peer dependency documents the requirement but intentionally does not auto-load or duplicate the subagent extension.
+`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.0.0`
+with protocol v3 managed-spawn support. They are separate Pi packages: the peer
+dependency documents the requirement but intentionally does not auto-load or
+duplicate the subagent extension.
 
 ```bash
 pi install npm:@signalridge/pi-subagents
@@ -13,29 +24,158 @@ pi install npm:@signalridge/pi-workflows
 
 ## Use from this checkout
 
-From the repository root, load both local package directories once:
+From the repository root, load both local package directories once. Disable
+extension discovery so the npm-installed copies do not also load — an npm copy
+of one alongside a local checkout of the other loads both, and the duplicate
+registers its tools twice:
 
 ```bash
-pi -e ./packages/pi-subagents
-pi -e ./packages/pi-workflows
+pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 ```
 
-Pi activates each package from its own `pi.extensions` manifest. Install `pi-workflows` and `pi-subagents` from the same source — an npm copy of one alongside a local checkout of the other loads both, and the duplicate registers its tools twice.
+`-ne` skips the installed extension catalogue while keeping explicit `-e`
+paths; without it, first remove the installed copies (`pi remove
+@signalridge/pi-subagents @signalridge/pi-workflows`) or accept duplicate tool
+registration.
 
-At `session_start`, this extension sends `subagents:rpc:ping` and verifies protocol version 3 plus the `managedSpawn`, `lifecycleOwner`, owner-scoped `ownedStop`, `ownedQuiescence`, and `workflowTiers` capabilities. The package floor and capability check prevent older v3 peers from receiving tiered requests they cannot validate. If the fork is missing, old, or duplicated incorrectly, workflow execution returns a diagnostic naming the required packages instead of dispatching agents. The legacy unowned stop RPC remains available to older external callers, but workflow cleanup never falls back to it.
+Pi activates each package from its own `pi.extensions` manifest.
 
-## Tools and command
+## Writing a workflow
 
-- `workflow`: run a foreground or background workflow. `depends_on` is a scheduling barrier only. A task may additionally declare `inputs`, a duplicate-free subset of its own `depends_on`, to have those dependencies' journaled results appended to its dispatch prompt: each result is capped at 6,000 characters, the appended section at 24,000, and the whole prompt at the protocol's 100,000-character ceiling. When the task prompt leaves less than 512 characters of headroom, nothing is appended and the prompt dispatches unchanged. Omitting `inputs` dispatches exactly the authored prompt.
-- `workflow_control`: `list`, `get`, `pause`, `resume`, or `stop` a run. `get` returns bounded task and synthesis details including status, agent ID, compactions, and result/error previews.
-- `/workflows`: TUI run list/detail navigator. Live agent conversation navigation remains in pi-subagents FleetView.
+A workflow script starts with the only legal export — a literal-only meta
+contract — and then runs inside an async function:
 
-Composed input sections are a pure function of the journaled prefix — declared `inputs` order, journaled result fields only — so a replay reproduces the same prompt and the managed spawn fingerprint stays stable across a branch rewind.
+```js
+export const meta = {
+  name: "example",
+  description: "Fan out three checks and synthesize",
+  phases: [{ title: "scan" }, { title: "synthesize" }],
+};
 
-State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries, which do not enter model context. Results and synthesis instructions are capped before journaling or dispatch. Interrupted runs reset unreconciled dispatches to a recoverable state and reuse their managed spawn keys; completed task facts are not dispatched again. A task failure stops remaining owned agents, journals their terminal callbacks, blocks dependents, and settles the workflow as failed.
-Restore rotation is journaled atomically per run (`run_recovery`) so a failed append leaves no partial generation; older multi-entry recovery prefixes remain replayable and are migrated with independent `attempt_recovery` entries.
-Each atomic recovery also carries a deterministic bounded `recoveryId` derived from its branch/run and attempt rotations. Replay treats an exact normalized duplicate as a no-op, quarantines same-ID conflicts, and accepts older schema-v2 atomic entries without an ID only through deterministic legacy normalization.
-Managed lifecycle calls are owner-scoped to the exact `{ runId, nodeId, attemptId }` generation. Branch replacement stops/quiesces owned agents and tracks in-flight dispatch RPCs; if a peer cannot settle, the run is quarantined conservatively and late lifecycle or spawn replies are ignored. Foreground `AbortSignal`s cancel only the caller's wait. The session signal may cancel an outstanding RPC wait during shutdown, but neither signal is used to cancel a managed child; explicit stop/quiescence owns child cancellation.
+phase("scan");
+const findings = await parallel([
+  () => agent("Check for cross-package imports", { label: "imports", tier: "small" }),
+  () => agent("Check for secrets", { label: "secrets", tier: "small" }),
+  () => agent("Check for dead code", { label: "dead-code", tier: "small" }),
+]);
 
+phase("synthesize");
+const report = await agent("Summarize the findings: " + JSON.stringify(findings), {
+  label: "report",
+});
+return report;
+```
 
-Interrupted-attempt recovery is intentionally bounded to three generations per task, including synthesis. Normal interruptions retry with a fresh managed attempt; if the same node is interrupted repeatedly beyond that bound, the workflow fails safely instead of creating an unbounded outer retry loop.
+The meta statement must be the first statement and use only literals — spread,
+computed keys, methods, template interpolation, and the reserved keys
+`__proto__`/`constructor`/`prototype` are rejected. `Date.now()`,
+`Math.random()`, and no-argument `new Date()` are unavailable (a regex precheck
+plus in-realm stubs); pass timestamps and randomness through `args`. The vm is
+a determinism guardrail, not a security boundary — scripts are generated by the
+user's own LLM and run on the user's own machine.
+
+### Runtime globals
+
+- `agent(prompt, { label, phase, schema, model, tier, agentType, timeoutMs, retries })`
+  — dispatch one subagent through the managed spawn protocol. Returns text, a
+  schema-validated value, or recoverable `null` after retries. `schema` is a
+  plain JSON Schema; the reply is parsed and validated client-side with bounded
+  repair across attempts, and exhaustion throws `SCHEMA_NONCOMPLIANCE`.
+  Explicit per-call `model` is refused (the spawn-managed protocol routes by
+  `tier`; see "Model routing").
+- `parallel(thunks)` — run thunks concurrently, preserve input order. Recoverable
+  thunk failures become `null`; non-recoverable failures (token budget, agent
+  limit) halt the run. Fan-out that breaches `maxAgents` cancels only its own
+  batch.
+- `pipeline(items, ...stages)` — items run concurrently, stages per item run
+  sequentially with `(previousValue, originalItem, index)`.
+- `workflow(savedName, childArgs?)` — run a saved workflow inline; one nested
+  level, sharing the limiter, counters, token accounting, and store.
+- `verify(item, { reviewers, threshold, lens })`, `judgePanel(attempts,
+  { judges, rubric })`, `loopUntilDry({ round, key, consecutiveEmpty,
+  maxRounds })`, `completenessCheck(taskArgs, results)`, `retry(thunk,
+  { attempts, until })`, `gate(thunk, validator, { attempts })` — quality
+  helpers built purely on `agent()`/`parallel()` so call sequencing stays
+  stable and resume keeps working.
+- `checkpoint(prompt, { default, headless, kind, choices, timeoutMs })` —
+  journaled human confirmation. Foreground runs thread the real UI; background
+  runs are headless and take the declared `default`.
+- `phase(title, { budget })`, `log(message)`, `args`, `cwd`, `process.cwd()`,
+  `budget` (`{ total, spent(), remaining() }`).
+
+### Resume
+
+A script edit replays the longest unchanged prefix from the journal and runs
+live from the first changed or inserted `agent()`/`checkpoint()` call. Pass
+`resumeFromRunId` with the edited script; unchanged calls report zero tokens,
+and edited calls rotate their managed spawn key generation so pi-subagents
+never raises a fingerprint conflict.
+
+## Tools and commands
+
+- `workflow`: run a script (`script`) or a saved/built-in workflow (`name`),
+  with `args`, `background` (default true), `maxAgents`, `concurrency`,
+  `agentRetries`, `tokenBudget`, `agentTimeoutMs`, and `resumeFromRunId`.
+- `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run.
+- `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
+  `resume`, `rm`, and `save <name> [runId]` subcommands.
+- `/workflows-models`: points at pi-subagents' `/agents → Model tiers` — there
+  is deliberately no second tier configuration file.
+- `/effort` and `/ultracode`: effort presets that map to the `small`/`medium`/
+  `large` workflow tiers.
+- `/deep-research`, `/adversarial-review`, `/code-review`,
+  `/multi-perspective`, `/codebase-audit`: the five built-in workflows. A
+  saved workflow with the same name takes precedence.
+- `/workflows-trigger`: `set <keyword>`, `off`, or `on`. See keyword arming below.
+- `/<saved-name>`: every saved workflow registers its own slash command at
+  `session_start` (Pi cannot unregister commands, so registration happens there
+  rather than at factory time, and existing commands are never overwritten).
+
+### Keyword arming
+
+Typing the bounded word `workflow` or `workflows` in an ordinary message counts
+as an explicit opt-in to multi-agent orchestration: the message is annotated to
+tell the model the `workflow` tool is authorized for this turn.
+
+Arming **authorizes; it does not compel**. The annotation says the model may run
+a workflow and may still decline, so "how do workflows work?" stays an ordinary
+question with an ordinary answer. Nothing is swallowed and no UI opens.
+
+Only a standalone word arms. A workflow is also a thing people write code about,
+so none of `myworkflow`, `workflow_name`, `WorkflowEngine`, `--workflow-id`,
+`src/workflow-editor.ts`, `workflow.ts`, or the `/workflows` command matches. A
+sentence-ending dot is not a filename dot: "please run a workflow." arms, and
+`workflow.json` does not. Set a different word with `/workflows-trigger set
+<word>` (matched exactly — only the default word also matches its plural) or
+turn it off entirely with `/workflows-trigger off`.
+
+Saved workflows live at `~/.pi/workflows/projects/<basename>-<sha256(cwd)[0:12]>/{saved,settings.json}`,
+written atomically with a backup.
+
+## Model routing
+
+The spawn-managed protocol carries `tier` (small/medium/large) but no per-call
+`model`; pi-subagents resolves the tier against its `workflow.tiers` settings
+(frontmatter > tier > `defaultModel` > parent). `agent({ tier })` maps directly
+to that field. A per-call `model` is refused rather than silently ignored —
+that needs a protocol extension. Worktree isolation is likewise agent-owned:
+declare `isolation: worktree` in an agent's frontmatter; per-call isolation is
+not part of the protocol (documented divergence).
+
+## Intentional divergences from upstream
+
+- **No host-side web tools.** Upstream injects `web_search`/`web_fetch` from
+  the host process; agents here reach the web through their own configured
+  tools (pi-web-access / MCP).
+- **No agent registry.** Upstream parses `.pi/agents/*.md` itself; here
+  `agentType` resolves in pi-subagents, which owns the agent system.
+- **No `model-tiers.json`.** Tier routing uses pi-subagents' `workflow.tiers`.
+- **Schema validation is client-side.** The spawn-managed request has no
+  structured-output tool; the runtime asks for JSON, parses, validates, and
+  repairs across attempts.
+
+State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom
+entries (schema v3). Interrupted runs replay from the journal; schema-v2
+(declarative DAG) journals are quarantined rather than replayed. Foreground
+`AbortSignal`s cancel only the caller's wait; managed children are stopped only
+through explicit stop/pause/quiescence.

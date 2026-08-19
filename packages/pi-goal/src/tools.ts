@@ -11,6 +11,7 @@ import {
   formatStatus,
   GOAL_BLOCKED_TOOL,
   GOAL_COMPLETE_TOOL,
+  GOAL_WAIT_TOOL,
   type GoalRuntime,
   goalIdRejectionReason,
   isContradictoryCompletionSummary,
@@ -19,11 +20,21 @@ import {
   transitionGoal,
   truncateNotification,
 } from "./runtime.js";
+import { createGoalWait, MAX_GOAL_WAIT_REASON_LENGTH, MIN_GOAL_WAIT_DELAY_MS, resolveGoalWaitDelay } from "./wait.js";
 
 interface GoalCompleteDetails {
   goal: string;
   goal_id: string;
   summary: string;
+}
+
+interface GoalWaitDetails {
+  goal: string;
+  goal_id: string;
+  reason: string;
+  requested_resume_after_ms?: number;
+  effective_resume_after_ms?: number;
+  resume_at?: number;
 }
 
 interface GoalBlockedDetails {
@@ -285,8 +296,107 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
     },
   });
 
+  const goalWaitTool = defineTool({
+    name: GOAL_WAIT_TOOL,
+    label: "Goal Wait",
+    description: `Keep the active /goal alive but quiet while something outside this session is expected — CI finishing, a review landing, a reply arriving. The goal pauses, stays resumable, and records why. Call it alone, after arranging whatever will wake it, or pass resume_after_ms as a safety deadline. Requests below ${MIN_GOAL_WAIT_DELAY_MS}ms are clamped to ${MIN_GOAL_WAIT_DELAY_MS}ms. Do not use it for ordinary unfinished work: if there is anything left you can do yourself, do it instead.`,
+    promptSnippet: "Pause the active /goal while waiting on something outside this session",
+    promptGuidelines: [
+      "Use goal_wait only when progress genuinely depends on a later external event — not when work remains that you could do now.",
+      `Prefer deadlines measured in minutes; anything under ${MIN_GOAL_WAIT_DELAY_MS}ms is a polling loop and is clamped.`,
+      "Omit resume_after_ms when a message will wake the goal anyway; pass it only as a bounded safety net.",
+      "Call goal_wait alone: a sibling tool call in the same turn can prevent the turn from ending.",
+    ],
+    parameters: Type.Object({
+      goal_id: Type.String({
+        minLength: 1,
+        maxLength: MAX_GOAL_ID_LENGTH,
+        description: "The exact goal_id shown in the current active /goal prompt.",
+      }),
+      reason: Type.String({
+        minLength: 1,
+        maxLength: MAX_GOAL_WAIT_REASON_LENGTH,
+        description: "What is being waited for, and what will make it done.",
+      }),
+      resume_after_ms: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          description: `Safety wake-up in milliseconds. Clamped up to ${MIN_GOAL_WAIT_DELAY_MS}ms. Omit to wait for external input only.`,
+        }),
+      ),
+    }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const goal = runtime.activeGoal;
+      const requestedGoalId = params.goal_id.trim();
+      const reason = safeTerminalText(params.reason).trim();
+      const requestedResumeAfterMs = params.resume_after_ms;
+
+      const details = (): GoalWaitDetails => {
+        const { requestedMs, effectiveMs } = resolveGoalWaitDelay(requestedResumeAfterMs);
+        return {
+          goal: (goal?.text ?? "").slice(0, MAX_GOAL_TEXT_LENGTH),
+          goal_id: requestedGoalId.slice(0, MAX_GOAL_ID_LENGTH),
+          reason: reason.slice(0, MAX_GOAL_WAIT_REASON_LENGTH),
+          ...(requestedMs === undefined ? {} : { requested_resume_after_ms: requestedMs }),
+          ...(effectiveMs === undefined ? {} : { effective_resume_after_ms: effectiveMs }),
+        };
+      };
+
+      const reject = (why: string, terminate = false) => {
+        const rejection = `goal_wait rejected: ${why}`;
+        notifyTerminal(ctx.ui, rejection, "warning");
+        return {
+          content: toolContent(rejection),
+          details: details(),
+          ...(terminate ? { terminate: true as const } : {}),
+        };
+      };
+
+      if (!goal) return reject("no active goal");
+      if (!runtime.canRecordGoalUsage()) return reject("current run does not own the active goal");
+      if (hasPendingSkipForGoal(runtime, goal.id)) {
+        runtime.recordGoalUsage(goal, ctx);
+        runtime.persistGoal(goal);
+        runtime.updateStatus(ctx, goal);
+        runtime.clearBudgetWrapUp();
+        return reject("goal is queued to be skipped", true);
+      }
+      const staleGoalRejection = goalIdRejectionReason(goal, requestedGoalId);
+      if (staleGoalRejection) return reject(staleGoalRejection);
+      if (goal.status !== "active") return reject(`goal is ${goal.status}, not active`);
+      if (!reason) return reject("reason is empty");
+
+      const wait = createGoalWait(reason, requestedResumeAfterMs);
+      const stoppedGoal = runtime.stopActiveGoal(ctx, {
+        kind: "wait",
+        expectedGoalId: goal.id,
+        reason,
+      });
+      if (!stoppedGoal) return reject("active goal changed before the wait took effect");
+
+      // Armed after the stop, so a wake can never race a goal that is still
+      // being transitioned out of `active`.
+      if (wait.resumeAt !== undefined) runtime.scheduleGoalWaitWake(ctx, stoppedGoal.id, wait.resumeAt);
+
+      const { requestedMs, effectiveMs } = resolveGoalWaitDelay(requestedResumeAfterMs);
+      const clamped = requestedMs !== undefined && effectiveMs !== undefined && effectiveMs !== requestedMs;
+      const deadline =
+        effectiveMs === undefined
+          ? "It will stay paused until you send it something or resume it."
+          : `It will wake in ${Math.round(effectiveMs / 1000)}s${clamped ? ` (raised from ${requestedMs}ms)` : ""}.`;
+      notifyTerminal(ctx.ui, `Goal waiting: ${truncateNotification(reason)}`, "info");
+
+      return {
+        content: toolContent(`Goal waiting: ${reason}. ${deadline}`),
+        details: { ...details(), ...(wait.resumeAt === undefined ? {} : { resume_at: wait.resumeAt }) },
+        terminate: true,
+      };
+    },
+  });
+
   pi.registerTool(goalCompleteTool);
   pi.registerTool(goalBlockedTool);
+  pi.registerTool(goalWaitTool);
 }
 
 function toolContent(text: string) {

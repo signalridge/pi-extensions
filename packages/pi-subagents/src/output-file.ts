@@ -69,6 +69,22 @@ export function writeInitialEntry(path: string, agentId: string, prompt: string,
 }
 
 /**
+ * Ensure a transcript file exists without disturbing what is already in it.
+ *
+ * A resume reuses the agent's existing transcript (same deterministic path), so
+ * it must never call `writeInitialEntry` — that truncates, discarding turns the
+ * completion notification still points the user at, and any history the session
+ * has since compacted away is gone for good (#145). Appending nothing creates
+ * the file when this is the agent's first transcript and is a no-op when it is
+ * not.
+ */
+export function ensureOutputFile(path: string): void {
+  try {
+    appendFileSync(path, "", "utf-8");
+  } catch { /* ignore — streaming writes are best-effort too */ }
+}
+
+/**
  * Subscribe to session events and flush new messages to the output file on each turn_end.
  * Returns a cleanup function that does a final flush and unsubscribes.
  */
@@ -77,8 +93,14 @@ export function streamToOutputFile(
   path: string,
   agentId: string,
   cwd: string,
+  startIndex?: number,
 ): () => void {
-  let writtenCount = 1; // initial user prompt already written
+  // Index of the first message this stream is responsible for. A spawn writes
+  // messages[0] as the initial prompt entry, so it starts at 1. A resume hands
+  // in the session's length as of just before the run: the session already
+  // holds every prior turn, and re-emitting those would duplicate history that
+  // is already in the file.
+  let writtenCount = startIndex ?? 1;
 
   const flush = () => {
     const messages = session.messages;

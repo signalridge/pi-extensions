@@ -2,12 +2,22 @@
 // - Global:  ~/.pi/agent/subagents.json (via getAgentDir()) — manual defaults, never written here
 // - Project: <cwd>/.pi/subagents.json — written by /agents → Settings; overrides global on load
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
+// Imported only for the applySettings fallback so a persisted defaultToolTimeoutMs
+// takes effect even before the host wires the new applier — avoids needing to
+// edit index.ts in the same change.
+import { setDefaultToolTimeoutMs } from "./agent-runner.js";
 import { NO_FALLBACK } from "./agent-types.js";
 import type { JoinMode, ThinkingLevel } from "./types.js";
+
+/** How a `@handle message` mention is dispatched. See `agentMentions`. */
+export const AGENT_MENTION_MODES = ["model", "direct", "off"] as const;
+export type AgentMentionMode = (typeof AGENT_MENTION_MODES)[number];
+const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set(AGENT_MENTION_MODES);
 
 /** A tier's thinking value: a level, or `inherit` to keep the parent's. */
 export type TierThinking = ThinkingLevel | "inherit";
@@ -109,6 +119,19 @@ export interface SubagentsSettings {
    */
   defaultMaxTurns?: number;
   graceTurns?: number;
+  /**
+   * Token budget for one subagent run. `0` (default) = unlimited, matching
+   * `defaultMaxTurns`. A wrap-up steer is sent at 80% and the run is aborted at
+   * 100%. Bounds what one agent can spend, which a turn count cannot — a single
+   * turn can burn an arbitrary number of tokens. Frontmatter `max_tokens` wins.
+   */
+  defaultMaxTokens?: number;
+  /**
+   * Tool-call budget for one subagent run. `0` (default) = unlimited, with the
+   * same 80%/100% shape as `defaultMaxTokens`. Frontmatter `max_tool_calls`
+   * wins.
+   */
+  defaultMaxToolCalls?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Master switch for the schedule subagent feature. Defaults to `true`.
@@ -183,12 +206,54 @@ export interface SubagentsSettings {
    */
   outputTranscript?: boolean;
   /**
+   * Whether evicted agent records stay addressable as resumable entries
+   * (`@handle` reopen). Defaults to true. When false, a cleaned-up record is
+   * forgotten entirely.
+   */
+  rememberAgents?: boolean;
+  /**
+   * How `@handle message` typed at the prompt is dispatched.
+   *
+   *  - `"model"` (default) — a mention that names an agent TYPE takes its turn
+   *    in an off-screen clone of the conversation, so the started agent gets a
+   *    prompt written with context instead of only the words after the handle.
+   *    Messaging and resuming an existing agent stay direct either way.
+   *  - `"direct"` — start the agent straight from the typed text, no clone.
+   *  - `"off"` — the text goes to the main model verbatim, exactly as it did
+   *    before mentions existed.
+   *
+   * A boolean is still accepted and read as `"model"`/`"off"`.
+   */
+  agentMentions?: AgentMentionMode;
+  /**
+   * Whether subagents may interrupt with `contact_supervisor` to ask their
+   * human a question. Defaults to true. The tool is only ever injected where
+   * there is a UI to ask through, so this turns it off where there is one.
+   */
+  supervisorQuestions?: boolean;
+  /**
    * Hard ceiling on nested subagent delegation, counted from the main session:
    * main = 0, its subagents = 1, their children = 2. Defaults to `2`; `0` or `1`
    * disables nesting project-wide. Read when a subagent session is built, so a
    * change applies to agents started after it.
    */
   maxSubagentDepth?: number;
+  /**
+   * Cumulative descendants any one top-level agent may start, over its whole
+   * life. Defaults to `64`. The depth cap bounds how DEEP nesting goes and
+   * nothing about how WIDE it gets — this is the horizontal bound. Minimum 1;
+   * turn nesting off with `maxSubagentDepth` instead.
+   */
+  maxSubagentSpawnsPerBranch?: number;
+  /**
+   * Default per-tool timeout in milliseconds. `0` = disabled (no timeout). When
+   * set, any tool call that does not settle within this window is aborted with
+   * a timeout error, preventing a hung `bash` or MCP tool from stalling the
+   * subagent forever. `0` when unset, matching tintinweb (no per-tool timeout
+   * by default; hung tools are reclaimed via abort/quiescence). Frontmatter does
+   * not override.
+   */
+  defaultToolTimeoutMs?: number;
   /**
    * Agent type substituted when a caller-supplied `subagent_type` doesn't
    * resolve to exactly one enabled agent (unknown, disabled, or ambiguous by
@@ -213,6 +278,9 @@ export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
+  setDefaultMaxTokens: (n: number) => void;
+  setDefaultMaxToolCalls: (n: number) => void;
+  setDefaultToolTimeout?: (ms: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   /** `undefined` and `"inherit"` both mean "follow the parent session". */
   setDefaultModel: (ref: string | undefined) => void;
@@ -223,7 +291,11 @@ export interface SettingsAppliers {
   setToolDescriptionMode: (mode: ToolDescriptionMode) => void;
   setFleetView: (b: boolean) => void;
   setOutputTranscript: (b: boolean) => void;
+  setRememberAgents: (b: boolean) => void;
+  setAgentMentions: (mode: AgentMentionMode) => void;
+  setSupervisorQuestions: (b: boolean) => void;
   setMaxSubagentDepth: (n: number) => void;
+  setMaxSubagentSpawnsPerBranch: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
   /** Optional because non-runtime settings tests and consumers need not apply workflow state. */
   setWorkflow?: (settings: WorkflowSettings) => void;
@@ -268,6 +340,14 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+/**
+ * Upper bound on the branch spawn budget. A configured value this high is
+ * already far past the point where a fan-out is intentional; the ceiling exists
+ * so a typo cannot turn the horizontal bound off by writing a huge number.
+ */
+const SUBAGENT_SPAWNS_PER_BRANCH_CEILING = 4_096;
+/** Per-tool timeout ceiling: 10 minutes, matching gate timeout. */
+const TOOL_TIMEOUT_CEILING_MS = 600_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -427,12 +507,36 @@ function sanitize(raw: unknown): SubagentsSettings {
   ) {
     out.graceTurns = r.graceTurns as number;
   }
+  // `0` is accepted and means unlimited, matching `defaultMaxTurns`.
+  if (Number.isInteger(r.defaultMaxTokens) && (r.defaultMaxTokens as number) >= 0) {
+    out.defaultMaxTokens = r.defaultMaxTokens as number;
+  }
+  if (Number.isInteger(r.defaultMaxToolCalls) && (r.defaultMaxToolCalls as number) >= 0) {
+    out.defaultMaxToolCalls = r.defaultMaxToolCalls as number;
+  }
   if (
     Number.isInteger(r.maxSubagentDepth) &&
     (r.maxSubagentDepth as number) >= 0 &&
     (r.maxSubagentDepth as number) <= SUBAGENT_DEPTH_CEILING
   ) {
     out.maxSubagentDepth = r.maxSubagentDepth as number;
+  }
+  // Minimum 1, not 0: zero reads as a limit, and silently meaning "unlimited"
+  // is how a safety valve gets disabled by accident. Nesting is turned off with
+  // `maxSubagentDepth`, which says so.
+  if (
+    Number.isInteger(r.maxSubagentSpawnsPerBranch) &&
+    (r.maxSubagentSpawnsPerBranch as number) >= 1 &&
+    (r.maxSubagentSpawnsPerBranch as number) <= SUBAGENT_SPAWNS_PER_BRANCH_CEILING
+  ) {
+    out.maxSubagentSpawnsPerBranch = r.maxSubagentSpawnsPerBranch as number;
+  }
+  if (
+    Number.isInteger(r.defaultToolTimeoutMs) &&
+    (r.defaultToolTimeoutMs as number) >= 0 &&
+    (r.defaultToolTimeoutMs as number) <= TOOL_TIMEOUT_CEILING_MS
+  ) {
+    out.defaultToolTimeoutMs = r.defaultToolTimeoutMs as number;
   }
   if (isModelReference(r.defaultModel)) {
     out.defaultModel = r.defaultModel.trim();
@@ -460,6 +564,17 @@ function sanitize(raw: unknown): SubagentsSettings {
   }
   if (typeof r.outputTranscript === "boolean") {
     out.outputTranscript = r.outputTranscript;
+  }
+  if (typeof r.rememberAgents === "boolean") {
+    out.rememberAgents = r.rememberAgents;
+  }
+  if (typeof r.agentMentions === "boolean") {
+    out.agentMentions = r.agentMentions ? "model" : "off";
+  } else if (typeof r.agentMentions === "string" && VALID_AGENT_MENTION_MODES.has(r.agentMentions)) {
+    out.agentMentions = r.agentMentions as AgentMentionMode;
+  }
+  if (typeof r.supervisorQuestions === "boolean") {
+    out.supervisorQuestions = r.supervisorQuestions;
   }
   if (r.fallbackSubagent === false) {
     // The only non-string spelling worth accepting: a boolean would otherwise be
@@ -799,7 +914,23 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
   const path = projectPath(cwd);
   try {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify(sanitize(s), null, 2), "utf-8");
+    // Atomic write: settings are written on every /agents mutation, and a torn
+    // write (crash, kill, disk full between truncate and flush) would silently
+    // discard the project's entire configuration. Write to a unique temp file
+    // in the same directory, then rename over the target — rename is atomic on
+    // POSIX and Windows. Same pattern as packages/pi-goal/src/settings.ts.
+    const document = `${JSON.stringify(sanitize(s), null, 2)}\n`;
+    const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temporaryPath, document, { encoding: "utf8", flag: "wx" });
+      renameSync(temporaryPath, path);
+    } finally {
+      try {
+        rmSync(temporaryPath, { force: true });
+      } catch {
+        // Best-effort cleanup must not replace the save result.
+      }
+    }
     return true;
   } catch {
     return false;
@@ -811,7 +942,18 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
+  if (typeof s.defaultMaxTokens === "number") appliers.setDefaultMaxTokens(s.defaultMaxTokens);
+  if (typeof s.defaultMaxToolCalls === "number") appliers.setDefaultMaxToolCalls(s.defaultMaxToolCalls);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
+  if (typeof s.maxSubagentSpawnsPerBranch === "number")
+    appliers.setMaxSubagentSpawnsPerBranch(s.maxSubagentSpawnsPerBranch);
+  if (typeof s.defaultToolTimeoutMs === "number") {
+    appliers.setDefaultToolTimeout?.(s.defaultToolTimeoutMs);
+    // Fallback for hosts that have not yet wired the new applier (and for tests
+    // that call applySettings with a minimal appliers object): ensure the
+    // in-memory timeout still follows the persisted value.
+    setDefaultToolTimeoutMs(s.defaultToolTimeoutMs);
+  }
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   // Applied whenever the key is present, `"inherit"` included: that spelling is
   // how a project cancels a global default model, so it has to reach the setter.
@@ -824,6 +966,9 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (s.toolDescriptionMode) appliers.setToolDescriptionMode(s.toolDescriptionMode);
   if (typeof s.fleetView === "boolean") appliers.setFleetView(s.fleetView);
   if (typeof s.outputTranscript === "boolean") appliers.setOutputTranscript(s.outputTranscript);
+  if (typeof s.rememberAgents === "boolean") appliers.setRememberAgents(s.rememberAgents);
+  if (s.agentMentions) appliers.setAgentMentions(s.agentMentions);
+  if (typeof s.supervisorQuestions === "boolean") appliers.setSupervisorQuestions(s.supervisorQuestions);
   if (s.workflow) appliers.setWorkflow?.(s.workflow);
   // Applied unconditionally so a session that had tiers and no longer does gets
   // the empty catalogue rather than keeping the previous one.

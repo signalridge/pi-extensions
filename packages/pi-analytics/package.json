@@ -36,10 +36,10 @@
     "lint": "biome check ."
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.51.0"
+    "@narumitw/pi-tui-kit": "^0.54.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "^0.84.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

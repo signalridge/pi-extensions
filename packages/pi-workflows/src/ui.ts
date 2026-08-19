@@ -1,9 +1,9 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
-import type { WorkflowEngine, WorkflowSummary } from "./engine.js";
+import type { WorkflowEngine } from "./engine.js";
+import type { ScriptRun } from "./journal.js";
 import { sanitizeDisplayText } from "./safe-text.js";
-import { isTerminalWorkflow, type WorkflowStatus } from "./state-machine.js";
 
 /** Bounds, in code points, for untrusted strings rendered into the navigator. */
 const MAX_NAME_CHARS = 200;
@@ -12,6 +12,24 @@ const MAX_RESULT_CHARS = 300;
 const MAX_RUN_ERROR_CHARS = 500;
 const MAX_DESCRIPTION_CHARS = 120;
 
+/**
+ * Pure snapshot render layer shared by the navigator, the live widget, and any
+ * inline render site. All child-agent output passes through sanitizeDisplayText
+ * BEFORE truncation so a live escape introducer is never cut mid-sequence.
+ */
+export function snapshotRunLine(run: ScriptRun): string {
+  return formatWorkflowRunLabel(run);
+}
+
+/** Live-widget lines for all non-terminal runs (A10). */
+export function liveWidgetLines(runs: readonly ScriptRun[]): string[] {
+  const active = runs.filter((run) => !isTerminal(run.status));
+  if (active.length === 0) return [];
+  return ["Workflows", ...active.slice(0, 6).map((run) => `  ${snapshotRunLine(run)}`)].slice(0, 8);
+}
+
+export type RunStatus = ScriptRun["status"];
+
 function elapsed(ms: number): string {
   const seconds = Math.floor(ms / 1_000);
   if (seconds < 60) return `${seconds}s`;
@@ -19,47 +37,51 @@ function elapsed(ms: number): string {
   return `${minutes}m ${seconds % 60}s`;
 }
 
-export function formatWorkflowRunLabel(run: WorkflowSummary): string {
-  const phases = run.phaseCount > 0 ? ` · phases ${run.completedPhases}/${run.phaseCount}` : "";
-  const tokens = run.tokenCount === undefined ? "" : ` · ${run.tokenCount} tokens`;
-  const name = sanitizeDisplayText(run.name, MAX_NAME_CHARS);
-  return `${name} · ${run.status}${phases} · ${run.completedTasks}/${run.taskCount} tasks · ${elapsed(run.elapsedMs)}${tokens}`;
+function isTerminal(status: RunStatus): boolean {
+  return status === "completed" || status === "failed" || status === "stopped";
+}
+
+export function formatWorkflowRunLabel(run: ScriptRun): string {
+  const phases = run.meta.phases && run.meta.phases.length > 0 ? ` · phases ${run.meta.phases.length}` : "";
+  const calls = Object.keys(run.callResults).length;
+  const name = sanitizeDisplayText(run.meta.name, MAX_NAME_CHARS);
+  return `${name} · ${run.status}${phases} · ${calls} calls · ${elapsed(Math.max(0, (isTerminal(run.status) ? run.updatedAt : Date.now()) - run.startedAt))}`;
 }
 
 export function formatWorkflowDetail(engine: WorkflowEngine, runId: string): string {
-  const run = engine.getRun(runId);
-  if (!run) return "Workflow run is no longer available.";
-  const tokenValues = [...Object.values(run.taskResults), ...(run.synthesisResult ? [run.synthesisResult] : [])]
+  const state = engine.getState(runId);
+  if (!state) return "Workflow run is no longer available.";
+  const run = state.run;
+  const tokenValues = Object.values(run.callResults)
     .map((result) => result.tokenCount)
     .filter((value): value is number => value !== undefined);
   const tokenCount = tokenValues.length > 0 ? tokenValues.reduce((total, value) => total + value, 0) : undefined;
   const lines = [
-    `${sanitizeDisplayText(run.definition.name, MAX_NAME_CHARS)} [${run.status}]`,
+    `${sanitizeDisplayText(run.meta.name, MAX_NAME_CHARS)} [${run.status}]`,
     `run: ${sanitizeDisplayText(run.runId, MAX_ID_CHARS)}`,
-    `elapsed: ${elapsed(Math.max(0, (isTerminalWorkflow(run.status) ? run.updatedAt : Date.now()) - run.startedAt))}`,
+    `elapsed: ${elapsed(Math.max(0, (isTerminal(run.status) ? run.updatedAt : Date.now()) - run.startedAt))}`,
     "",
     ...(tokenCount === undefined ? [] : [`tokens: ${tokenCount}`]),
   ];
-  for (const phase of run.definition.phases) {
+  for (const phase of run.meta.phases ?? []) {
     lines.push(`Phase: ${sanitizeDisplayText(phase.title, MAX_NAME_CHARS)}`);
-    for (const task of run.definition.tasks.filter((candidate) => candidate.phase === phase.id)) {
-      const status = run.taskStatus[task.id] ?? "pending";
-      const agent = run.agentIds[task.id] ? ` agent=${sanitizeDisplayText(run.agentIds[task.id], MAX_ID_CHARS)}` : "";
-      const compact = run.compactions[task.id] ? ` compactions=${run.compactions[task.id]}` : "";
-      lines.push(`  ${status.padEnd(11)} ${sanitizeDisplayText(task.id, MAX_ID_CHARS)}${agent}${compact}`);
-      const result = run.taskResults[task.id];
-      if (result?.error) lines.push(`    error: ${sanitizeDisplayText(result.error, MAX_RESULT_CHARS)}`);
-      if (result?.text) lines.push(`    result: ${sanitizeDisplayText(result.text, MAX_RESULT_CHARS)}`);
-    }
   }
-  const unphased = run.definition.tasks.filter((task) => task.phase === undefined);
-  if (unphased.length > 0) {
-    lines.push("Tasks:");
-    for (const task of unphased) {
-      const status = run.taskStatus[task.id] ?? "pending";
-      const agent = run.agentIds[task.id] ? ` agent=${sanitizeDisplayText(run.agentIds[task.id], MAX_ID_CHARS)}` : "";
-      lines.push(`  ${status.padEnd(11)} ${sanitizeDisplayText(task.id, MAX_ID_CHARS)}${agent}`);
-    }
+  const calls = Object.entries(run.callStatus)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .map(([nodeId, status]) => {
+      const result = run.callResults[nodeId];
+      const agent = run.agentIds[nodeId] ? ` agent=${sanitizeDisplayText(run.agentIds[nodeId], MAX_ID_CHARS)}` : "";
+      const compact = run.compactions[nodeId] ? ` compactions=${run.compactions[nodeId]}` : "";
+      const parts = [`  ${status.padEnd(11)} call ${sanitizeDisplayText(nodeId, MAX_ID_CHARS)}${agent}${compact}`];
+      if (result?.error) parts.push(`    error: ${sanitizeDisplayText(result.error, MAX_RESULT_CHARS)}`);
+      if (result?.result !== undefined && result.status === "completed") {
+        parts.push(`    result: ${sanitizeDisplayText(String(result.result), MAX_RESULT_CHARS)}`);
+      }
+      return parts.join("\n");
+    });
+  if (calls.length > 0) {
+    lines.push("Calls:");
+    lines.push(...calls);
   }
   lines.push("", "Live agent conversations remain available through pi-subagents FleetView.");
   if (run.error) lines.push(`Error: ${sanitizeDisplayText(run.error, MAX_RUN_ERROR_CHARS)}`);
@@ -81,15 +103,12 @@ const STOP: WorkflowActionItem = { value: "stop", label: "Stop" };
 const BACK: WorkflowActionItem = { value: "back", label: "Back" };
 
 /**
- * Menu actions legal for a run in `status`, mirroring what `WorkflowEngine.control` accepts.
- * Exhaustive by construction: there is no `default` arm, so adding a `WorkflowStatus` member
- * is a compile error here instead of a silently wrong menu.
+ * Menu actions legal for a run in `status`. Exhaustive by construction.
  */
-export function workflowActionsFor(status: WorkflowStatus): readonly WorkflowActionItem[] {
+export function workflowActionsFor(status: RunStatus): readonly WorkflowActionItem[] {
   switch (status) {
     case "pending":
     case "pausing":
-    case "synthesizing":
     case "stopping":
       return [REFRESH, STOP, BACK];
     case "running":
@@ -145,25 +164,29 @@ export async function showWorkflowNavigator(ctx: ExtensionCommandContext, engine
     return;
   }
   while (true) {
-    const runs = engine.list();
+    const states = engine
+      .list()
+      .map((summary) => engine.getRun(String(summary.runId)))
+      .filter((run): run is ScriptRun => run !== undefined)
+      .sort((a, b) => b.startedAt - a.startedAt);
     const selected = await selectList<string>(
       ctx,
       "Workflow runs",
-      runs.map((run) => ({
+      states.map((run) => ({
         value: run.runId,
         label: formatWorkflowRunLabel(run),
         description: run.error === undefined ? undefined : sanitizeDisplayText(run.error, MAX_DESCRIPTION_CHARS),
       })),
       (theme) =>
-        runs.length > 0
+        states.length > 0
           ? theme.fg("dim", "Select a run to inspect.")
           : theme.fg("muted", "No workflow runs in this session."),
     );
     if (!selected) return;
     while (true) {
-      const run = engine.get(selected);
+      const run = engine.getRun(selected);
       if (!run) break;
-      const name = sanitizeDisplayText(run.name, MAX_NAME_CHARS);
+      const name = sanitizeDisplayText(run.meta.name, MAX_NAME_CHARS);
       const action = await selectList<WorkflowAction>(
         ctx,
         `${name} · ${run.status}`,

@@ -31,20 +31,24 @@ import {
   worktreeAdministrativeDirectory,
   worktreeForBranch,
   worktreeInventory,
+  worktreeStatusOutput,
 } from "./git.js";
 import { removeWorktreeSafely } from "./safe-remove.js";
 import { switchToWorktree } from "./session.js";
 import type { WorktreeSettingsRuntime } from "./settings.js";
+import { formatStatusEntry, groupStatusEntries, parsePorcelainV2, type StatusEntry } from "./status.js";
 
 const ACTION_ADD = "Add worktree";
 const ACTION_SWITCH = "Switch worktree";
 const ACTION_REMOVE = "Remove worktree";
+const ACTION_STATUS = "Browse worktree status";
 const ACTION_PRUNE = "Prune stale metadata";
 const ACTION_CONFIGURE_ROOT = "Configure worktree root";
 const ACTIONS = {
   add: ACTION_ADD,
   switch: ACTION_SWITCH,
   remove: ACTION_REMOVE,
+  status: ACTION_STATUS,
   prune: ACTION_PRUNE,
   configure: ACTION_CONFIGURE_ROOT,
 } as const;
@@ -126,6 +130,7 @@ export function registerWorktreeCommand(
             add: async () => runFlow(() => addFlow(pi, ctx, records, root.effectiveRoot)),
             switch: async ({ signal }) => runFlow(() => switchFlow(pi, ctx, records, currentPath, signal)),
             remove: async ({ signal }) => runFlow(() => removeFlow(pi, ctx, records, currentPath, signal)),
+            status: async ({ signal }) => runFlow(() => statusFlow(pi, ctx, records, currentPath, signal)),
             prune: async () => runFlow(() => pruneFlow(pi, ctx, records)),
             configure: async () => runFlow(() => configureRootFlow(ctx, settings)),
           },
@@ -512,6 +517,49 @@ async function removeFlow(
     throw new Error(`Git remove returned success, but ${selected.path} is still registered.`);
   }
   safeNotify(ctx, `Removed worktree ${selected.path}. Its branch was preserved.`, "info");
+}
+
+/**
+ * Show one worktree's status, grouped the way a commit is assembled.
+ *
+ * The point of a browser rather than a count is that "3 changes" is not enough
+ * to decide anything: removing a worktree, switching away from one, or
+ * committing in it are all decisions about WHICH changes exist. Conflicts lead
+ * because nothing else can proceed past them.
+ */
+async function statusFlow(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  records: readonly WorktreeRecord[],
+  currentPath: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const target =
+    records.length === 1
+      ? records[0]
+      : await selectWorktree(ctx, "Browse status of which worktree?", records, currentPath, signal);
+  if (!target) return;
+
+  const entries = parsePorcelainV2(await worktreeStatusOutput(pi, target.path, signal), "\0");
+  if (entries.length === 0) {
+    safeNotify(ctx, `${target.path} is clean.`, "info");
+    return;
+  }
+
+  const groups = groupStatusEntries(entries);
+  const lines: string[] = [];
+  const section = (label: string, group: readonly StatusEntry[]) => {
+    if (group.length === 0) return;
+    lines.push(`${label} (${group.length}):`);
+    for (const entry of group) lines.push(`  ${formatStatusEntry(entry)}`);
+    lines.push("");
+  };
+  section("Conflicted", groups.conflicted);
+  section("Staged", groups.staged);
+  section("Unstaged", groups.unstaged);
+  section("Untracked", groups.untracked);
+
+  safeNotify(ctx, [`${target.path}`, "", ...lines].join("\n").trimEnd(), "info");
 }
 
 async function pruneFlow(

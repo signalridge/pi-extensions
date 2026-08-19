@@ -1,379 +1,229 @@
+/**
+ * journal.test.ts — schema-v3 script-run journal replay.
+ *
+ * Acceptance coverage from the optimization spec (A3):
+ *  - run_created carries script text + hash + meta
+ *  - node identity is the call index
+ *  - schema v2 runs are quarantined rather than replayed
+ *  - recovery events rotate call generations
+ *  - buildResumeJournal reconstructs the runtime's cache map
+ */
+
 import { describe, expect, it } from "vitest";
 import {
-  deriveRecoveryId,
-  JOURNAL_ENTRY_TYPE,
-  type JournalEvent,
+  applyRecoveryEvent,
+  applyTerminalRecoveryEvent,
+  buildResumeJournal,
+  JOURNAL_SCHEMA_VERSION,
+  type RunRecoveryEvent,
   replayJournal,
-  type SessionEntryLike,
+  type TerminalRecoveryEvent,
 } from "../src/journal.js";
-import type { WorkflowDefinition } from "../src/schema.js";
 
-const definition: WorkflowDefinition = {
-  name: "journal",
-  phases: [],
-  tasks: [{ id: "a", subagent_type: "Explore", description: "A", prompt: "A", depends_on: [] }],
-  background: false,
-};
+const SCRIPT = `export const meta = { name: "demo", description: "d" };
+const a = await agent("first");
+return a;`;
 
-describe("workflow journal replay", () => {
-  it("reconstructs transitions, results, and compaction observations", () => {
-    const events: JournalEvent[] = [
-      { kind: "run_created", schemaVersion: 1, runId: "run-1", definition, timestamp: 1 },
-      { kind: "workflow_transition", schemaVersion: 1, runId: "run-1", status: "running", timestamp: 2 },
-      {
-        kind: "task_transition",
-        schemaVersion: 1,
-        runId: "run-1",
-        nodeId: "a",
-        status: "running",
-        agentId: "agent-1",
-        timestamp: 3,
-      },
-      { kind: "task_compacted", schemaVersion: 1, runId: "run-1", nodeId: "a", compactionCount: 2, timestamp: 4 },
-      {
-        kind: "task_result",
-        schemaVersion: 1,
-        runId: "run-1",
-        nodeId: "a",
-        result: { status: "completed", agentId: "agent-1", text: "done", compactionCount: 2, updatedAt: 5 },
-        timestamp: 5,
-      },
-    ];
-    const runs = replayJournal(events.map((data) => ({ type: "custom", customType: JOURNAL_ENTRY_TYPE, data })));
-    const run = runs.get("run-1");
-    expect(run?.status).toBe("running");
-    expect(run?.agentIds.a).toBe("agent-1");
-    expect(run?.taskResults.a?.text).toBe("done");
-    expect(run?.compactions.a).toBe(2);
+const runCreated = (runId: string, overrides: Record<string, unknown> = {}) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "run_created",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    script: SCRIPT,
+    scriptHash: "h".repeat(64),
+    meta: { name: "demo", description: "d" },
+    timestamp: 1,
+    ...overrides,
+  },
+});
+
+const transition = (runId: string, status: string, timestamp: number, overrides: Record<string, unknown> = {}) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "workflow_transition",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    status,
+    timestamp,
+    ...overrides,
+  },
+});
+
+const callResult = (runId: string, nodeId: string, timestamp: number, overrides: Record<string, unknown> = {}) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "call_result",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    nodeId,
+    result: { status: "completed", compactionCount: 0, updatedAt: timestamp },
+    callHash: `hash-${nodeId}`,
+    timestamp,
+    ...overrides,
+  },
+});
+
+describe("workflow journal replay (schema v3)", () => {
+  it("replays a run_created with script text, hash, and meta", () => {
+    const runs = replayJournal([runCreated("r1")]);
+    const run = runs.get("r1");
+    expect(run).toBeDefined();
+    expect(run?.script).toBe(SCRIPT);
+    expect(run?.scriptHash).toBe("h".repeat(64));
+    expect(run?.meta.name).toBe("demo");
+    expect(run?.status).toBe("pending");
   });
 
-  it("skips malformed, future, unknown-node, and forged-owner entries once", () => {
+  it("quarantines a schema-v2 declarative run instead of replaying it", () => {
     const diagnostics: string[] = [];
-    const entries = [
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "run_created", schemaVersion: 99, runId: "future", definition, timestamp: 1 },
+    const v2 = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind: "run_created",
+        schemaVersion: 2,
+        runId: "old",
+        definition: { name: "old", phases: [], tasks: [], background: true },
+        timestamp: 1,
       },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "run_created", schemaVersion: 1, runId: "valid", definition, timestamp: 1 },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "task_transition",
-          schemaVersion: 1,
-          runId: "valid",
-          nodeId: "missing",
-          status: "running",
-          timestamp: 2,
-        },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "task_result",
-          schemaVersion: 1,
-          runId: "valid",
-          nodeId: "a",
-          owner: { extension: "other", runId: "valid", nodeId: "a" },
-          result: { status: "completed", compactionCount: 0, updatedAt: 2 },
-          timestamp: 2,
-        },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "workflow_transition", schemaVersion: 1, runId: "valid", status: "running", timestamp: 2 },
-      },
-    ];
-    const runs = replayJournal(entries, { onInvalid: (diagnostic) => diagnostics.push(diagnostic) });
-    expect(runs.get("valid")).toBeUndefined();
-    expect(runs.get("future")).toBeUndefined();
-    expect(diagnostics).toHaveLength(1);
-    expect(diagnostics[0]).toMatch(/quarantined malformed workflow journal run/);
+    };
+    const runs = replayJournal([v2], { onInvalid: (d) => diagnostics.push(d) });
+    expect(runs.size).toBe(0);
+    expect(diagnostics.length).toBe(1);
   });
 
-  it("accepts an older direct pending-to-running task transition for replay compatibility", () => {
+  it("replays call_result facts keyed by call index and settles the run", () => {
     const runs = replayJournal([
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "run_created", schemaVersion: 1, runId: "legacy", definition, timestamp: 1 },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "task_transition",
-          schemaVersion: 1,
-          runId: "legacy",
-          nodeId: "a",
-          status: "running",
-          timestamp: 2,
-        },
-      },
+      runCreated("r2"),
+      transition("r2", "running", 2),
+      callResult("r2", "0", 3, { result: { status: "completed", result: "ok", compactionCount: 0, updatedAt: 3 } }),
+      transition("r2", "completed", 4),
     ]);
-    expect(runs.get("legacy")?.taskStatus.a).toBe("running");
+    const run = runs.get("r2");
+    expect(run?.status).toBe("completed");
+    expect(run?.callResults["0"]?.result).toBe("ok");
+    expect(run?.callStatus["0"]).toBe("completed");
   });
 
-  it("replays a self-contained recovery event and quarantines duplicate generations", () => {
-    const runId = "atomic-journal";
-    const attemptOne = `${runId}/a/attempt-1`;
-    const attemptTwo = `${runId}/a/attempt-2`;
-    const base: SessionEntryLike[] = [
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "run_created",
-          schemaVersion: 2,
-          runId,
-          definition,
-          attempts: { a: 1, __synthesis__: 1 },
-          attemptIds: { a: attemptOne, __synthesis__: `${runId}/__synthesis__/attempt-1` },
-          timestamp: 1,
-        },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "workflow_transition", schemaVersion: 2, runId, status: "running", timestamp: 2 },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "task_transition",
-          schemaVersion: 2,
-          runId,
-          nodeId: "a",
-          status: "running",
-          attemptId: attemptOne,
-          agentId: "old-agent",
-          owner: { extension: "pi-workflows", runId, nodeId: "a", attemptId: attemptOne },
-          timestamp: 3,
-        },
-      },
-    ];
-    const recovery = {
-      kind: "run_recovery",
-      schemaVersion: 2,
-      runId,
-      status: "interrupted",
-      branchGeneration: 12,
-      rotations: [
+  it("rejects an unknown run reference", () => {
+    const diagnostics: string[] = [];
+    const runs = replayJournal(
+      [
         {
-          nodeId: "a",
-          sourceAttemptId: attemptOne,
-          sourceGeneration: 1,
-          sourceStatus: "running",
-          attemptId: attemptTwo,
-          generation: 2,
-          owner: { extension: "pi-workflows", runId, nodeId: "a", attemptId: attemptTwo },
-          supersededAgentId: "old-agent",
+          type: "custom" as const,
+          customType: "pi-workflows:journal",
+          data: {
+            kind: "call_result",
+            schemaVersion: JOURNAL_SCHEMA_VERSION,
+            runId: "missing",
+            nodeId: "0",
+            result: { status: "completed", compactionCount: 0, updatedAt: 3 },
+            timestamp: 3,
+          },
         },
       ],
-      timestamp: 4,
-    };
-    const recoveryWithId = { ...recovery, recoveryId: deriveRecoveryId(recovery) };
-    const runs = replayJournal([...base, { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId }]);
-    const run = runs.get(runId);
-    expect(run?.status).toBe("interrupted");
-    expect(run?.taskStatus.a).toBe("ready");
-    expect(run?.attempts.a).toBe(2);
-    expect(run?.attemptIds.a).toBe(attemptTwo);
-    expect(run?.agentIds.a).toBeUndefined();
-    expect(run?.taskResults.a).toBeUndefined();
-    expect(run?.compactions.a).toBe(0);
+      { onInvalid: (d) => diagnostics.push(d) },
+    );
+    expect(runs.size).toBe(0);
+    expect(diagnostics.some((d) => d.includes("unknown run"))).toBe(true);
+  });
 
-    // A stale top-level generation must be ignored even if the payload names a
-    // newer attempt. It must not mutate the recovered branch or quarantine the
-    // whole run.
-    const staleGeneration = replayJournal([
-      ...base,
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
+  it("rejects a call index beyond the 1000-call limit", () => {
+    const diagnostics: string[] = [];
+    const runs = replayJournal([runCreated("r3"), callResult("r3", "1000", 3)], {
+      onInvalid: (d) => diagnostics.push(d),
+    });
+    expect(runs.size).toBe(0);
+    expect(diagnostics.some((d) => d.includes("call index"))).toBe(true);
+  });
+
+  it("applies a run_recovery rotation that advances the call generation", () => {
+    const run = replayJournal([runCreated("r4"), callResult("r4", "0", 3)]).get("r4");
+    if (!run) throw new Error("run r4 missing");
+    const rotation = {
+      nodeId: "0",
+      sourceAttemptId: `${run.runId}/call-0/attempt-1`,
+      sourceGeneration: 1,
+      sourceStatus: "running" as const,
+      attemptId: `${run.runId}/call-0/attempt-2`,
+      generation: 2,
+      owner: {
+        extension: "pi-workflows" as const,
+        runId: run.runId,
+        nodeId: "0",
+        attemptId: `${run.runId}/call-0/attempt-2`,
+      },
+    };
+    const event: RunRecoveryEvent = {
+      kind: "run_recovery",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      status: "interrupted",
+      branchGeneration: 0,
+      rotations: [rotation],
+      recoveryId: `r3-${"a".repeat(64)}`,
+      timestamp: 5,
+    };
+    applyRecoveryEvent(run, event);
+    expect(run.status).toBe("interrupted");
+    expect(run.attempts["0"]).toBe(2);
+    expect(run.attemptIds["0"]).toBe(`${run.runId}/call-0/attempt-2`);
+    expect(run.callStatus["0"]).toBe("running");
+  });
+
+  it("applies a terminal recovery that marks the run stopped and non-resumable", () => {
+    const run = replayJournal([runCreated("r5"), transition("r5", "running", 2)]).get("r5");
+    if (!run) throw new Error("run r5 missing");
+    const terminal: TerminalRecoveryEvent = {
+      kind: "terminal_recovery",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      status: "stopped",
+      terminalIntent: "stop",
+      branchGeneration: 0,
+      terminalResults: [],
+      blockedNodeIds: [],
+      error: "workflow stopped",
+      recoveryId: `r3-${"b".repeat(64)}`,
+      timestamp: 5,
+    };
+    applyTerminalRecoveryEvent(run, terminal);
+    expect(run.status).toBe("stopped");
+    expect(run.nonResumable).toBe(true);
+    expect(run.error).toBe("workflow stopped");
+  });
+
+  it("buildResumeJournal reconstructs the runtime cache map keyed by runId:callIndex", () => {
+    const entries = [
+      runCreated("r6"),
+      callResult("r6", "0", 3, { result: { status: "completed", result: "a", compactionCount: 0, updatedAt: 3 } }),
+      callResult("r6", "1", 4, {
+        result: { status: "completed", result: { nested: true }, compactionCount: 0, updatedAt: 4 },
+        storeDelta: { k: "v" },
+      }),
+      // A result without a callHash is not replayable.
       {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
+        type: "custom" as const,
+        customType: "pi-workflows:journal",
         data: {
-          kind: "task_result",
-          schemaVersion: 2,
-          runId,
-          nodeId: "a",
-          attemptId: attemptOne,
-          result: {
-            status: "completed",
-            attemptId: attemptTwo,
-            text: "stale result",
-            compactionCount: 0,
-            updatedAt: 5,
-          },
-          owner: { extension: "pi-workflows", runId, nodeId: "a", attemptId: attemptOne },
+          kind: "call_result",
+          schemaVersion: JOURNAL_SCHEMA_VERSION,
+          runId: "r6",
+          nodeId: "2",
+          result: { status: "completed", result: "x", compactionCount: 0, updatedAt: 5 },
           timestamp: 5,
         },
       },
-    ]);
-    expect(staleGeneration.get(runId)?.taskStatus.a).toBe("ready");
-    expect(staleGeneration.get(runId)?.taskResults.a).toBeUndefined();
-
-    expect(recoveryWithId.recoveryId).toMatch(/^r1-[0-9a-f]{64}$/);
-    const diagnostics: string[] = [];
-    const duplicate = replayJournal(
-      [
-        ...base,
-        { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
-        { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
-      ],
-      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
-    );
-    expect(duplicate.get(runId)?.attempts.a).toBe(2);
-    expect(diagnostics).toHaveLength(0);
-
-    const conflictDiagnostics: string[] = [];
-    const conflict = replayJournal(
-      [
-        ...base,
-        { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
-        {
-          type: "custom",
-          customType: JOURNAL_ENTRY_TYPE,
-          data: {
-            ...recoveryWithId,
-            rotations: [{ ...recoveryWithId.rotations[0], supersededAgentId: "different-agent" }],
-          },
-        },
-      ],
-      { onInvalid: (diagnostic) => conflictDiagnostics.push(diagnostic) },
-    );
-    expect(conflict.get(runId)).toBeUndefined();
-    expect(conflictDiagnostics).toHaveLength(1);
-
-    const legacy = replayJournal([
-      ...base,
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recovery },
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recovery },
-    ]);
-    expect(legacy.get(runId)?.attempts.a).toBe(2);
-
-    const nextAttempt = `${runId}/a/attempt-3`;
-    const nextRecoveryBase = {
-      kind: "run_recovery" as const,
-      schemaVersion: 2 as const,
-      runId,
-      status: "interrupted" as const,
-      branchGeneration: 13,
-      rotations: [
-        {
-          ...recoveryWithId.rotations[0],
-          sourceAttemptId: attemptTwo,
-          sourceGeneration: 2,
-          sourceStatus: "ready" as const,
-          attemptId: nextAttempt,
-          generation: 3,
-          owner: { extension: "pi-workflows" as const, runId, nodeId: "a", attemptId: nextAttempt },
-        },
-      ],
-      timestamp: 6,
-    };
-    const nextRecovery = { ...nextRecoveryBase, recoveryId: deriveRecoveryId(nextRecoveryBase) };
-    const newer = replayJournal([
-      ...base,
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "workflow_transition", schemaVersion: 2, runId, status: "running", timestamp: 5 },
-      },
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: nextRecovery },
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: nextRecovery },
-    ]);
-    expect(newer.get(runId)?.attempts.a).toBe(3);
-    expect(newer.get(runId)?.attemptIds.a).toBe(nextAttempt);
-
-    const invalidId = replayJournal([
-      ...base,
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { ...recoveryWithId, recoveryId: "r1-too-short" },
-      },
-    ]);
-    expect(invalidId.get(runId)).toBeUndefined();
-
-    const foreignRun = replayJournal([
-      ...base,
-      { type: "custom", customType: JOURNAL_ENTRY_TYPE, data: recoveryWithId },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { ...recoveryWithId, runId: "foreign-run" },
-      },
-    ]);
-    expect(foreignRun.get(runId)?.attempts.a).toBe(2);
-    expect(foreignRun.get("foreign-run")).toBeUndefined();
-  });
-
-  it("quarantines owner-missing attempt-aware events instead of falling back to the current generation", () => {
-    const runId = "owner-missing";
-    const attemptId = `${runId}/a/attempt-1`;
-    const synthesisAttemptId = `${runId}/__synthesis__/attempt-1`;
-    const custom = (data: unknown): SessionEntryLike => ({
-      type: "custom",
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    });
-    const runs = replayJournal([
-      custom({
-        kind: "run_created",
-        schemaVersion: 2,
-        runId,
-        definition,
-        attempts: { a: 1, __synthesis__: 1 },
-        attemptIds: { a: attemptId, __synthesis__: synthesisAttemptId },
-        timestamp: 1,
-      }),
-      custom({ kind: "workflow_transition", schemaVersion: 2, runId, status: "running", timestamp: 2 }),
-      custom({
-        kind: "task_transition",
-        schemaVersion: 2,
-        runId,
-        nodeId: "a",
-        status: "running",
-        attemptId,
-        timestamp: 3,
-      }),
-      custom({
-        kind: "task_result",
-        schemaVersion: 2,
-        runId,
-        nodeId: "a",
-        attemptId,
-        result: { status: "completed", attemptId, compactionCount: 0, updatedAt: 4 },
-        timestamp: 4,
-      }),
-      custom({
-        kind: "task_compacted",
-        schemaVersion: 2,
-        runId,
-        nodeId: "a",
-        attemptId,
-        compactionCount: 1,
-        timestamp: 5,
-      }),
-      custom({
-        kind: "synthesis_result",
-        schemaVersion: 2,
-        runId,
-        attemptId: synthesisAttemptId,
-        result: { status: "completed", attemptId: synthesisAttemptId, compactionCount: 0, updatedAt: 6 },
-        timestamp: 6,
-      }),
-    ]);
-    expect(runs.get(runId)).toBeUndefined();
+    ];
+    const journal = buildResumeJournal(entries);
+    expect(journal.size).toBe(2);
+    expect(journal.get("r6:0")).toMatchObject({ index: 0, runId: "r6", result: "a" });
+    expect(journal.get("r6:1")?.result).toEqual({ nested: true });
+    expect(journal.get("r6:1")?.storeDelta).toEqual({ k: "v" });
+    expect(journal.get("r6:2")).toBeUndefined();
   });
 });

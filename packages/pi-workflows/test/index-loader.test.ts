@@ -91,13 +91,16 @@ describe("pi-workflows loader context isolation", () => {
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
     await new Promise((resolve) => setImmediate(resolve));
     expect(fixture.tools).toEqual(["workflow", "workflow_control"]);
-    expect(fixture.commands).toEqual(["workflows"]);
+    expect(fixture.commands).toContain("workflows");
+    expect(fixture.commands).toContain("workflows-models");
+    expect(fixture.commands).toContain("deep-research");
+    expect(fixture.commands).toContain("code-review");
+    expect(fixture.commands).toContain("effort");
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
-  it("retries initial active-run recovery before exposing the workflow surface", async () => {
+  it("quarantines a schema-v2 declarative journal instead of replaying it", async () => {
     const runId = "recovery-loader-run";
-    const attemptId = `${runId}/a/attempt-1`;
     const definition = {
       name: "recovery",
       phases: [],
@@ -115,27 +118,13 @@ describe("pi-workflows loader context isolation", () => {
         customType: "pi-workflows:journal",
         data: { kind: "workflow_transition", schemaVersion: 2, runId, status: "running", timestamp: 2 },
       },
-      {
-        type: "custom",
-        customType: "pi-workflows:journal",
-        data: {
-          kind: "task_transition",
-          schemaVersion: 2,
-          runId,
-          nodeId: "a",
-          status: "running",
-          agentId: "old-agent",
-          attemptId,
-          owner: { extension: "pi-workflows", runId, nodeId: "a", attemptId },
-          timestamp: 3,
-        },
-      },
     ];
-    const fixture = createPi(false, 1, branch);
+    const fixture = createPi(false, 0, branch);
     piWorkflows(fixture.pi as never);
     await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
     expect(fixture.tools).toEqual(["workflow", "workflow_control"]);
-    expect(fixture.entries.some((entry) => (entry as { kind?: string }).kind === "run_recovery")).toBe(true);
+    // No recovery event is appended for the v2 run — it is quarantined, not replayed.
+    expect(fixture.entries.some((entry) => (entry as { kind?: string }).kind === "run_recovery")).toBe(false);
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 });

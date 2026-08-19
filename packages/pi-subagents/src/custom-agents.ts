@@ -26,6 +26,12 @@ import { sanitizeDisplayText } from "./ui/safe-text.js";
 type WarningSink = (message: string, key?: string) => void;
 type SkippedAgent = { name: string; priority: number };
 
+/**
+ * Colon is reserved for plugin-scoped identifiers (extension-owned agent
+ * types). A file may not claim one; see the `name:` guard in `loadFromDir`.
+ */
+const RESERVED_IN_TYPE = ":";
+
 /** Normalize a discovery root so aliases and symlinked worktree paths share state. */
 function normalizeDiscoveryRoot(cwd: string): string {
   const absolute = resolve(cwd);
@@ -69,6 +75,27 @@ function warningIdentity(path: string): string {
 
 function warningReasonKey(reason: string): string {
   return reason.split(":", 1)[0] ?? reason;
+}
+
+/** Best-effort extraction of `name:` from raw frontmatter when strict parsing failed. */
+function peekDeclaredName(path: string): string | undefined {
+  try {
+    const raw = readFileSync(path, "utf-8");
+    const fmMatch = /^---\s*\n([\s\S]*?)\n---/m.exec(raw);
+    if (!fmMatch) return undefined;
+    const block = fmMatch[1];
+    // Match `name:` with optional quotes, trimming inline comments.
+    const nameMatch = /^\s*name\s*:\s*["']?([^"'\n#]+?)["']?\s*(?:#.*)?$/m.exec(block);
+    if (!nameMatch) return undefined;
+    const declared = nameMatch[1].trim();
+    // Guard `||` semantics: empty/whitespace falls back to filename.
+    if (!declared) return undefined;
+    // Colon is plugin-scope reserved; such files never enter skip override logic.
+    if (declared.includes(RESERVED_IN_TYPE)) return undefined;
+    return declared;
+  } catch {
+    return undefined;
+  }
 }
 
 const MAX_WARNING_ROOTS = 64;
@@ -154,14 +181,47 @@ function loadFromDir(
   }
 
   for (const file of files) {
-    const name = basename(file, ".md");
+    const filenameType = basename(file, ".md");
+
     const path = join(dir, file);
+
     const parsed = readAgentFile(path, strict, warn);
     if (!parsed) {
-      skipped.push({ name, priority });
+      // Even a malformed file may have declared `name:`; when it does, the
+      // skip must be filed under that name, not the filename, so a higher-
+      // priority higher file declaring the same name still suppresses the
+      // warning (B1#1). Best-effort regex — the authoritative parse already
+      // failed, so this is only for the override warning key.
+      const peeked = peekDeclaredName(path);
+      const skipName = peeked !== undefined ? peeked : filenameType;
+      skipped.push({ name: skipName, priority });
       continue;
     }
     const { frontmatter: fm, body } = parsed;
+
+    // Claude Code's rule: `name:` IS the agent type, and the filename need not
+    // match. Absent, the filename stands in — Claude Code requires the field,
+    // but most files here predate it and must keep loading.
+    const declared = str(fm.name)?.trim();
+    if (declared?.includes(RESERVED_IN_TYPE)) {
+      // Refusing beats silently substituting: the file would otherwise load
+      // under its filename, so `Agent({subagent_type})` would succeed against
+      // an agent whose declared identity nothing honoured.
+      warn(
+        `Agent file ${path} declares name "${declared}", which contains "${RESERVED_IN_TYPE}" — reserved for `
+        + "plugin-scoped identifiers. Rename it, or move the label to `display_name:`. Skipping.",
+        `reserved-name:${warningIdentity(path)}`,
+      );
+      // No skipped entry: this file would have registered under its *declared*
+      // name, which nothing else can hold (a colon keeps it out of the
+      // registry), so it shadowed nothing. Reporting the filename instead
+      // would claim a substitution of an unrelated agent that never happened.
+      continue;
+    }
+    // `||`, not `??`: a quoted empty or all-whitespace `name:` would otherwise
+    // register the agent under the empty type — unspawnable, and it takes the
+    // filename-derived one down with it.
+    const name = declared || filenameType;
 
     const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
     warnLegacyModelFields(fm, path, warn);
@@ -169,15 +229,20 @@ function loadFromDir(
     agents.set(name, {
       name,
       displayName: label(fm.display_name),
+      color: str(fm.color)?.trim(),
       description: label(fm.description) ?? sanitizeDisplayText(name),
       builtinToolNames,
       extSelectors,
       disallowedTools: csvListOptional(fm.disallowed_tools),
+      askTools: csvListOptional(fm.ask_tools),
+      gate: str(fm.gate)?.trim(),
       extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
       excludeExtensions: csvListOptional(fm.exclude_extensions),
       skills: inheritField(fm.skills ?? fm.inherit_skills),
       agentTier: parseTier(fm.tier, path, warn),
       maxTurns: nonNegativeInt(fm.max_turns),
+      maxTokens: nonNegativeInt(fm.max_tokens),
+      maxToolCalls: nonNegativeInt(fm.max_tool_calls),
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
       outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
       sessionDir: str(fm.session_dir),

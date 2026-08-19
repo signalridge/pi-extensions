@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 
@@ -24,7 +24,7 @@ import { resumeAgent, runAgent } from "../src/agent-runner.js";
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
 
-const mockSession = () => ({ dispose: vi.fn() } as any);
+const mockSession = (sessionFile?: string) => ({ dispose: vi.fn(), sessionFile } as any);
 
 const resolvedRun = () =>
   vi.mocked(runAgent).mockResolvedValue({
@@ -781,6 +781,79 @@ describe("AgentManager — nested runtime propagation", () => {
     expect(await manager.resume(childId, "missing parent")).toBeUndefined();
   });
 
+  it("run_in_background resume settles asynchronously and notifies on completion", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    });
+    let releaseResume!: (value: { text: string }) => void;
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => { releaseResume = resolve; }),
+    );
+    let completed: AgentRecord | undefined;
+    manager = new AgentManager((record) => {
+      completed = record;
+    });
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+    completed = undefined; // the initial spawn already notified; watch the resume only
+
+    // Background resume returns immediately with the record still active.
+    const resumed = await manager.resume(id, "keep going", undefined, { isBackground: true });
+    expect(resumed).toBeDefined();
+    expect(resumed!.status).toBe("running");
+    expect(manager.getRecordMutable(id)!.status).toBe("running");
+
+    // It must not block: the call returned before the run settled.
+    expect(completed).toBeUndefined();
+
+    // Let the background run settle; completion notifies the observer.
+    releaseResume({ text: "background resumed" });
+    await vi.waitFor(() => {
+      expect(completed?.status).toBe("completed");
+    });
+    expect(completed?.result).toBe("background resumed");
+    expect(manager.getRecordMutable(id)!.status).toBe("completed");
+  });
+
+  it("background resume refuses a second concurrent resume of the same agent", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    });
+    let releaseResume!: (value: { text: string }) => void;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => { releaseResume = resolve; }),
+    );
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+
+    const first = await manager.resume(id, "one", undefined, { isBackground: true });
+    expect(first?.status).toBe("running");
+    // Second background resume while the first is in flight is refused.
+    const second = await manager.resume(id, "two", undefined, { isBackground: true });
+    expect(second).toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+    releaseResume({ text: "settled" });
+    await vi.waitFor(() => {
+      expect(manager.getRecordMutable(id)!.status).toBe("completed");
+    });
+  });
+
   it("captures immutable nested ancestor lineage in public snapshots", () => {
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
     manager = new AgentManager();
@@ -1117,6 +1190,120 @@ describe("AgentManager — nested runtime propagation", () => {
       vi.useRealTimers();
       rmSync(baseRepo, { recursive: true, force: true });
     }
+  });
+});
+
+describe("AgentManager — resumable index (rememberAgents)", () => {
+  let manager: AgentManager;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    await manager?.dispose();
+    vi.useRealTimers();
+  });
+
+  it("indexes an evicted top-level agent with a session file", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession("/sessions/agent-1.jsonl"),
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "work", {
+      description: "work",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+    const record = manager.getRecordMutable(id)!;
+    record.completedAt = Date.now() - 11 * 60_000; // older than the 10-minute cutoff
+
+    manager.clearCompleted();
+
+    const entries = manager.listResumable();
+    expect(entries.length).toBe(1);
+    expect(entries[0].id).toBe(id);
+    expect(entries[0].sessionFile).toBe("/sessions/agent-1.jsonl");
+    expect(manager.getResumable(id)).toBeDefined();
+  });
+
+  it("does not index records without a session file", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession(), // no sessionFile
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "work", {
+      description: "work",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+    const record = manager.getRecordMutable(id)!;
+    record.completedAt = Date.now() - 11 * 60_000;
+
+    manager.clearCompleted();
+
+    expect(manager.listResumable().length).toBe(0);
+  });
+
+  it("setting rememberAgents=false clears the index and stops new entries", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession("/sessions/a.jsonl"),
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "work", {
+      description: "work",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+    const record = manager.getRecordMutable(id)!;
+    record.completedAt = Date.now() - 11 * 60_000;
+    manager.clearCompleted();
+    expect(manager.listResumable().length).toBe(1);
+
+    manager.setRememberAgents(false);
+    expect(manager.listResumable().length).toBe(0);
+
+    const id2 = manager.spawn(mockPi, mockCtx, "general-purpose", "more", {
+      description: "more",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id2)!.promise;
+    const record2 = manager.getRecordMutable(id2)!;
+    record2.completedAt = Date.now() - 11 * 60_000;
+    manager.clearCompleted();
+    expect(manager.listResumable().length).toBe(0);
+  });
+
+  it("dropResumable forgets an entry by handle or id", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession("/sessions/b.jsonl"),
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "work", {
+      description: "work",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+    const record = manager.getRecordMutable(id)!;
+    record.completedAt = Date.now() - 11 * 60_000;
+    manager.clearCompleted();
+    expect(manager.listResumable().length).toBe(1);
+
+    expect(manager.dropResumable(id)).toBe(true);
+    expect(manager.listResumable().length).toBe(0);
+    expect(manager.dropResumable(id)).toBe(false);
   });
 });
 

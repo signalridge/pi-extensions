@@ -24,7 +24,14 @@ export interface GoalSettings {
 }
 
 export const DEFAULT_GOAL_SETTINGS: GoalSettings = {
-  toolVisibility: "always",
+  // `after-first-goal`, not `always`: `goal_complete` and `goal_blocked` are
+  // meaningless without an active goal, so in a session that never runs
+  // `/goal` — the overwhelming majority — their definitions and prompt
+  // guidelines are pure context cost paid on every request. They are revealed
+  // the moment the first goal is set, and a session that restores an
+  // unfinished goal reveals them at startup. Set `"always"` to keep them
+  // resident.
+  toolVisibility: "after-first-goal",
   experimental: { goals: false },
   rpc: { enabled: false },
   continuationLimits: { automaticTurns: 25, noProgressTurns: 3 },

@@ -12,7 +12,11 @@ import { createMockContext, createMockPi } from "./support.js";
 const settingsDirectory = mkdtempSync(join(tmpdir(), "pi-goal-queue-settings-"));
 const enabledSettingsPath = join(settingsDirectory, "enabled.json");
 const disabledSettingsPath = join(settingsDirectory, "disabled.json");
-writeFileSync(enabledSettingsPath, '{"experimental":{"goals":true}}\n');
+// `toolVisibility` is pinned rather than left to the default: these tests
+// exercise queue mechanics, which need the goal tools present, and the default
+// is `after-first-goal` (tools hidden until the first goal is set). Leaving it
+// implicit made the whole file depend on a setting it is not testing.
+writeFileSync(enabledSettingsPath, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
 writeFileSync(disabledSettingsPath, "{}\n");
 
 type GoalTool = {
@@ -27,7 +31,7 @@ test("experimental mode keeps singular registration and exposes canonical queue 
   assert.deepEqual([...harness.mock.commands.keys()], ["goal"]);
   assert.deepEqual(
     harness.mock.tools.map(({ name }) => name),
-    ["goal_complete", "goal_blocked"],
+    ["goal_complete", "goal_blocked", "goal_wait"],
   );
   assert.equal(harness.mock.commands.has("goals"), false);
   assert.deepEqual(
@@ -1340,7 +1344,7 @@ test("disabled settings freeze retained queues without losing state", async () =
 });
 
 async function createHarness(overrides: Record<string, unknown> = {}, enabled = true) {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   goal(mock.pi, { settingsPath: enabled ? enabledSettingsPath : disabledSettingsPath });
   const context = createMockContext(overrides);
   await mock.events.get("session_start")?.[0]?.({}, context.ctx);

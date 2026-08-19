@@ -2,6 +2,12 @@
 
 A Pi extension that provides an in-terminal file browser, viewer, and review workflow - enabling you to navigate, view, and comment on files without leaving Pi or interrupting the agent.
 
+> **Status: design document, not a description of the shipped surface.** The
+> extension registers exactly one command today, `/readfiles`. Everything below
+> marked *Proposed*, *Phase 2*, or *Phase 3* — including the `/review` and
+> `/diff` commands and the `tuicr`/`critique` integrations — is unbuilt. See
+> `README.md` for what actually ships.
+
 ## Problem Statement
 
 When working with coding agents in Pi:
@@ -323,8 +329,9 @@ You: /review                          # or Ctrl+R
 Agent: [receives structured feedback, addresses comments]
 ```
 
-**Implementation**:
+**Implementation** (illustrative proposal — not shipped; see banner above):
 ```typescript
+// Illustrative proposal — not shipped
 pi.registerCommand("review", {
   description: "Open tuicr to review changes, send feedback to agent",
   handler: async (args, ctx) => {

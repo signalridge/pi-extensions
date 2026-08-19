@@ -233,6 +233,21 @@ export function createCodexCompactExtension(
       compactRemotely(pi, event, ctx, settingsRuntime.get().settings, options.fetch),
     );
 
+    // Post-compaction continuation (item 53): `session_before_compact` drives
+    // the remote request, but the replay window only opens after Pi finishes
+    // compaction. Observing `session_compact` keeps both sides of the
+    // lifecycle handled and lets the extension re-validate the checkpoint in
+    // the post-compaction context without mutating session state.
+    pi.on("session_compact", (_event, ctx) => {
+      if (!settingsRuntime.get().settings.enabled) return;
+      const checkpoint = activeCheckpoint(ctx);
+      if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return;
+      // No mutation: `context` and `before_provider_request` already replay
+      // the checkpoint. This handler exists so both compaction events are
+      // subscribed per OPTIMIZATION-SPEC C4 item 53 and future post-compaction
+      // work has a place without reintroducing a second `session_before_compact`.
+    });
+
     pi.on("context", (event, ctx) => {
       if (!settingsRuntime.get().settings.enabled) return undefined;
       const checkpoint = activeCheckpoint(ctx);

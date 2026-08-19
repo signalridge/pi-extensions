@@ -20,9 +20,10 @@ import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   type InternalAgentConfigOverride,
 } from "./internal-run.js";
+import { assignHandle, handleBase } from "./mention.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { WorkflowThinking } from "./settings.js";
-import type { AgentInvocation, AgentOwner, AgentRecord, AgentRecordSnapshot, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentInvocation, AgentOwner, AgentRecord, AgentRecordSnapshot, IsolationMode, ResumableAgentEntry, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
 import { cleanupWorktree, cleanupWorktreeAsync, createWorktree, pruneWorktrees, pruneWorktreesAsync, type WorktreeCleanupResult, type WorktreeInfo } from "./worktree.js";
@@ -42,6 +43,15 @@ export interface WorktreeCleanupFailure {
 
 /** Default max concurrent background agents. */
 const DEFAULT_MAX_CONCURRENT = 4;
+/** Bound on the resumable (`@handle`) index. */
+const MAX_RESUMABLE_ENTRIES = 128;
+/**
+ * Cumulative descendants one top-level agent may start, over its whole life.
+ *
+ * High enough that no ordinary delegation notices it, low enough that a runaway
+ * fan-out is caught by a number here rather than by the account's rate limit.
+ */
+export const DEFAULT_MAX_SUBAGENT_SPAWNS_PER_BRANCH = 64;
 /**
  * Nested worktree cleanup waits for cooperative children, but a provider that
  * ignores abort must not hold its parent forever. Timed-out descendants are
@@ -157,15 +167,18 @@ function snapshotAgentRecord(record: AgentRecord): AgentRecordSnapshot {
 
 const WORKTREE_FAILURE_DIAGNOSTIC_LIMIT = 2_000;
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
+function shellQuote(value: string | undefined): string {
+  if (!value) return "''";
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-function worktreeRecoveryCommands(cwd: string, path: string): readonly string[] {
+function worktreeRecoveryCommands(cwd?: string, path?: string): readonly string[] {
+  const c = cwd ? shellQuote(cwd) : "'.'";
+  const p = path ? shellQuote(path) : "''";
   return Object.freeze([
-    `git -C ${shellQuote(cwd)} worktree remove --force ${shellQuote(path)}`,
-    `rm -rf -- ${shellQuote(path)}`,
-    `git -C ${shellQuote(cwd)} worktree prune`,
+    `git -C ${c} worktree remove --force ${p}`,
+    `rm -rf -- ${p}`,
+    `git -C ${c} worktree prune`,
   ]);
 }
 
@@ -576,6 +589,20 @@ export interface SpawnOptions {
   configCwd?: string;
   /** Root session id, inherited by nested launches so transcripts stay grouped. */
   rootSessionId?: string;
+  /**
+   * Reuse an existing mention handle instead of allocating a fresh one. Set when
+   * a resumable entry is reopened, so `@handle` keeps addressing the same
+   * conversation across the eviction. Bypasses the uniqueness search on purpose:
+   * the handle is already spoken for by the entry being reopened.
+   */
+  reclaimHandle?: string;
+  /**
+   * Reopen the conversation in this session file rather than starting a new
+   * one. Like `reclaimHandle`, an internal capability: the value always comes
+   * from a resumable entry this extension wrote, never from a tool argument or
+   * an RPC payload — a forged path would let a spawn read an unrelated session.
+   */
+  resumeSessionFile?: string;
 }
 
 /** Internal managed-spawn policy; model and thinking are finalized by runAgent when a tier is present. */
@@ -599,8 +626,29 @@ export class AgentManager {
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
 
-  /** Queue of background agents waiting to start. */
-  private queue: { id: string; args: SpawnArgs }[] = [];
+  /** Queue of background agents waiting to start (spawn or resume). */
+  private queue: Array<
+    | { kind: "spawn"; id: string; args: SpawnArgs }
+    | { kind: "resume"; id: string; start: () => void }
+  > = [];
+  /**
+   * Resumable index: evicted top-level agents whose conversations can still be
+   * reopened from disk (`@handle` reopen). Bounded; oldest evicted first.
+   * Distinct from ManagedSpawnTombstone (managed-spawn idempotency).
+   */
+  private readonly resumable = new Map<string, ResumableAgentEntry>();
+  /** Whether evicted records are indexed at all (settings: rememberAgents). */
+  private rememberAgents = true;
+  /** Whether spawned agents get `contact_supervisor` (settings). */
+  private supervisorQuestions = true;
+  /**
+   * Descendants spawned so far under each top-level agent, keyed by that
+   * agent's id. Cumulative for the branch's lifetime — see the budget check in
+   * `spawnInternal`. Pruned with the branch's metadata.
+   */
+  private readonly branchSpawnCounts = new Map<string, number>();
+  /** Cumulative descendants any one top-level agent may start (settings). */
+  private maxSubagentSpawnsPerBranch = DEFAULT_MAX_SUBAGENT_SPAWNS_PER_BRANCH;
   /** Number of currently running background agents. */
   private runningBackground = 0;
   /** IDs that currently hold a background pool slot; guards late/double settlements. */
@@ -744,6 +792,7 @@ export class AgentManager {
       const record = this.agents.get(ownerId);
       if (!record) return `parent agent "${ownerId}" is missing`;
       if (this.removingRecords.has(ownerId)) return `parent agent "${ownerId}" is being removed`;
+      if (this.deferredRecordRemovals.has(ownerId)) return `parent agent "${ownerId}" is pending removal`;
       if (record.detached) return `parent agent "${ownerId}" is detached`;
       if (this.nestedSpawnSeals.has(ownerId)) return `parent agent "${ownerId}" is sealed`;
       if (record.status !== "queued" && record.status !== "running") {
@@ -769,6 +818,7 @@ export class AgentManager {
   private canResumeNested(record: AgentRecord): boolean {
     return !record.detached && !this.removingRecords.has(record.id) &&
       !this.settlingRecords.has(record.id) &&
+      !this.deferredRecordRemovals.has(record.id) &&
       (record.parentAgentId === undefined || this.nestedOwnerValidation(record.parentAgentId) === undefined);
   }
 
@@ -1000,6 +1050,30 @@ export class AgentManager {
       ? Object.freeze([...(nestedParent.ancestorAgentIds ?? []), nestedParent.id])
       : undefined;
 
+    // Cumulative spawn budget for the branch. The depth cap bounds how DEEP
+    // nesting goes and nothing about how WIDE it gets: with nesting on by
+    // default (depth 2), a single top-level agent can fan out without limit,
+    // because its only cost per child is one of its own turns — and max turns
+    // is commonly unlimited. This counts every descendant of a top-level agent
+    // for the branch's whole lifetime, so a runaway fan-out stops at a number
+    // instead of at the account's rate limit.
+    //
+    // Counted here rather than in the nested tool so that every path into a
+    // nested spawn is covered, and counted cumulatively rather than
+    // concurrently on purpose: a loop spawning one child at a time, forever, is
+    // exactly the shape a concurrency limit does not catch.
+    const branchRoot = ancestorAgentIds?.[0] ?? nestedParent?.id;
+    if (branchRoot !== undefined) {
+      const spawned = this.branchSpawnCounts.get(branchRoot) ?? 0;
+      if (spawned >= this.maxSubagentSpawnsPerBranch) {
+        throw new Error(
+          `Nested spawn budget exhausted for this branch (${spawned}/${this.maxSubagentSpawnsPerBranch} agents). ` +
+            "Complete the remaining work directly, or raise `maxSubagentSpawnsPerBranch` in subagents.json.",
+        );
+      }
+      this.branchSpawnCounts.set(branchRoot, spawned + 1);
+    }
+
     // Validate before the queue branch — a queued spawn should fail at the
     // call, not minutes later at drain. Throw (not warn): programmatic callers
     // can fix and retry; the RPC layer converts throws into error envelopes.
@@ -1031,6 +1105,14 @@ export class AgentManager {
       rootSessionId: options.rootSessionId,
       ...(owner ? { owner: Object.freeze({ ...owner }) } : {}),
     };
+    // Top-level agents get a mention handle derived from their type. The name
+    // space covers live records and resumable entries, so a handle is never
+    // allocated twice while its conversation is still reachable.
+    if (options.parentAgentId === undefined && options.reclaimHandle === undefined) {
+      record.handle = assignHandle(handleBase(type), this.takenHandles());
+    } else if (options.reclaimHandle !== undefined) {
+      record.handle = options.reclaimHandle;
+    }
     this.agents.set(id, record);
     if (!record.detached) {
       try { this.onCreated?.(record); } catch { /* observer failures cannot orphan a record */ }
@@ -1073,7 +1155,7 @@ export class AgentManager {
 
     if (occupiesPoolSlot(record) && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
-      this.queue.push({ id, args });
+      this.queue.push({ kind: "spawn", id, args });
       return id;
     }
 
@@ -1287,6 +1369,11 @@ export class AgentManager {
       // off-limits, even when the invocation started in a subdirectory.
       worktreeBase: worktreeRepoRoot,
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+      // Top-level conversations persist by default so `@handle` has something
+      // to reopen after the record is evicted; frontmatter still overrides.
+      rememberAgents: this.rememberAgents,
+      supervisorQuestions: this.supervisorQuestions,
+      resumeSessionFile: options.resumeSessionFile,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (record.detached) return;
@@ -1350,6 +1437,9 @@ export class AgentManager {
           return;
         }
         record.session = session;
+        // Capture the persisted session file so an evicted record can be
+        // reopened as a resumable entry (@handle reopen).
+        record.sessionFile = session.sessionManager?.getSessionFile?.() ?? (session as { sessionFile?: string })?.sessionFile;
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -1432,6 +1522,7 @@ export class AgentManager {
         // undefined output or session.
         record.result = responseText;
         record.session = session;
+        record.sessionFile = session.sessionManager?.getSessionFile?.() ?? (session as { sessionFile?: string })?.sessionFile;
         this.syncManagedRecord(record);
 
         // Quiesce descendants before removing the parent's worktree. A nested
@@ -1634,6 +1725,20 @@ export class AgentManager {
         this.releasePoolSlot(record.id);
         continue;
       }
+      if (next.kind === "resume") {
+        try {
+          next.start();
+        } catch (err) {
+          record.status = "error";
+          record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+          this.clearParentSignal(record.id);
+          this.releasePoolSlot(record.id);
+          this.syncManagedRecord(record);
+          this.notifyComplete(record);
+        }
+        continue;
+      }
       try {
         this.startAgent(next.id, record, next.args);
       } catch (err) {
@@ -1742,6 +1847,12 @@ export class AgentManager {
     id: string,
     prompt: string,
     signal?: AbortSignal,
+    options?: {
+      isBackground?: boolean;
+      onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
+      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+      onCompaction?: (info: unknown) => void;
+    },
   ): Promise<AgentRecord | undefined> {
     if (this.disposed) return undefined;
     const record = this.agents.get(id);
@@ -1752,6 +1863,43 @@ export class AgentManager {
     if (!this.canResumeNested(record)) return undefined;
     if (signal?.aborted) return record;
     if (!record.session) return undefined;
+
+    // Background resume (run_in_background on resume): settle asynchronously
+    // and notify on completion exactly like a background spawn, returning
+    // immediately with the record still "running" — or "queued" when at the
+    // concurrency limit. Previously run_in_background was accepted then
+    // silently dropped on resume (the Agent tool's resume branch returned
+    // before its background branch), so a resumed agent always blocked the
+    // caller until it finished. The nested-ownership gate above runs first,
+    // and the queue drain respects deferred record removals the same way the
+    // spawn path does.
+    if (options?.isBackground) {
+      // Never re-enter a run that is still in flight. Detaching means the
+      // caller gets control back while the record stays "running", so nothing
+      // stops the model from resuming the same agent again. Starting a second
+      // run would overwrite record.abortController — orphaning the live run
+      // beyond the reach of /agents stop and abortAll() — double-count the
+      // pool slot, and then reject from session.prompt() with "Agent is
+      // already processing". Refuse instead, leaving the record untouched.
+      if (record.status === "running" || record.status === "queued") return undefined;
+
+      record.isBackground = true;
+      record.resultConsumed = false;
+      record.result = undefined;
+      record.error = undefined;
+      record.completedAt = undefined;
+      record.status = "queued";
+
+      const start = () => this.startResume(id, record, prompt, signal, options);
+      if (occupiesPoolSlot(record) && this.runningBackground >= this.maxConcurrent) {
+        // At the concurrency limit — queue it, drains when a slot frees.
+        this.queue.push({ kind: "resume", id, start });
+      } else {
+        start();
+      }
+      return record;
+    }
+
     this.settlingRecords.add(id);
 
     const previousStatus = record.status;
@@ -1822,6 +1970,103 @@ export class AgentManager {
     this.settlingRecords.delete(id);
     this.retryDeferredRecordRemovals();
     return record;
+  }
+
+  /**
+   * Run a background resume to completion. Mirrors the foreground resume's
+   * settle contract (including nested-ownership, detach, and deferred-removal
+   * handling) but acquires a pool slot and notifies on completion like a
+   * background spawn. Called directly or from the queue drain.
+   */
+  private async startResume(
+    id: string,
+    record: AgentRecord,
+    prompt: string,
+    signal: AbortSignal | undefined,
+    options?: {
+      isBackground?: boolean;
+      onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
+      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+      onCompaction?: (info: unknown) => void;
+    },
+  ): Promise<void> {
+    if (this.disposed || record.detached || this.agents.get(id) !== record) return;
+    // Re-validate the nested-ownership gate at start time too: a queued resume
+    // may outlive its owner branch.
+    if (!this.canResumeNested(record)) {
+      record.status = "error";
+      record.error = "owner branch is no longer resumable";
+      record.completedAt = Date.now();
+      this.syncManagedRecord(record);
+      this.notifyComplete(record);
+      return;
+    }
+    this.settlingRecords.add(id);
+    if (occupiesPoolSlot(record)) {
+      this.heldPoolSlots.add(id);
+      this.runningBackground++;
+    }
+    record.status = "running";
+    record.startedAt = Date.now();
+    record.completedAt = undefined;
+    record.result = undefined;
+    record.error = undefined;
+    this.syncManagedRecord(record);
+
+    const previousStatus = record.status;
+    const previousCompletedAt = record.completedAt;
+    const previousResult = record.result;
+    const previousError = record.error;
+    try {
+      const { text, failure } = await resumeAgent(record.session!, prompt, {
+        onToolActivity: (activity) => {
+          if (!record.detached && activity.type === "end") record.toolUses++;
+          options?.onToolActivity?.(activity);
+        },
+        onAssistantUsage: (usage) => {
+          if (!record.detached) addUsage(record.lifetimeUsage, usage);
+          options?.onAssistantUsage?.(usage);
+        },
+        onCompaction: (info) => {
+          if (record.detached) return;
+          record.compactionCount++;
+          this.syncManagedRecord(record);
+          this.onCompact?.(record, info);
+          options?.onCompaction?.(info);
+        },
+        signal,
+      });
+      if (!record.detached && (record.status as string) !== "stopped") {
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+        record.result = text;
+        record.completedAt = Date.now();
+      }
+    } catch (err) {
+      if (!record.detached && (record.status as string) !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt = Date.now();
+      }
+    }
+
+    if (record.detached) {
+      record.status = previousStatus;
+      record.completedAt = previousCompletedAt;
+      record.result = previousResult;
+      record.error = previousError;
+      this.releasePoolSlot(id);
+      this.settlingRecords.delete(id);
+      this.retryDeferredRecordRemovals();
+      return;
+    }
+
+    this.syncManagedRecord(record);
+    await this.abortOwnedChildren(id);
+    this.releasePoolSlot(id);
+    this.settlingRecords.delete(id);
+    this.retryDeferredRecordRemovals();
+    this.notifyComplete(record);
   }
 
   /**
@@ -2008,6 +2253,17 @@ export class AgentManager {
       );
       if (!stillReferenced) this.nestedSpawnSeals.delete(id);
     }
+    // Branch spawn budgets outlive their descendants on purpose — the count is
+    // cumulative for the branch's life, so it must survive children being
+    // evicted, or a slow loop would reset its own budget. It is dropped only
+    // once the root itself is gone and nothing still descends from it.
+    for (const rootId of this.branchSpawnCounts.keys()) {
+      if (this.agents.has(rootId) || this.removingRecords.has(rootId)) continue;
+      const stillReferenced = [...this.agents.values()].some(
+        (record) => record.ancestorAgentIds?.includes(rootId) === true,
+      );
+      if (!stillReferenced) this.branchSpawnCounts.delete(rootId);
+    }
   }
   private retryPinnedWorktreeCleanup(): void {
     if (this.disposed) return;
@@ -2074,6 +2330,7 @@ export class AgentManager {
         try { record.outputCleanup(); } catch { /* ignore stale transcript cleanup errors */ }
         record.outputCleanup = undefined;
       }
+      this.indexResumable(record);
       if (record.session) this.trackRecordSessionTeardown(id, record.session);
       record.session = undefined;
       this.clearParentSignal(id);
@@ -2088,6 +2345,132 @@ export class AgentManager {
     }
   }
 
+  /**
+   * Preserve enough of a departing record for `@handle` to reopen its
+   * conversation later. Nothing to keep unless it has a session file to reopen
+   * — an in-memory session leaves no transcript, so the mention would have
+   * nothing to continue from. Only top-level agents are indexed.
+   */
+  private indexResumable(record: AgentRecord): void {
+    if (!this.rememberAgents) return;
+    if (record.parentAgentId !== undefined) return;
+    if (!record.sessionFile || !record.session) return;
+    const entry: ResumableAgentEntry = {
+      handle: record.handle ?? record.id,
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      sessionFile: record.sessionFile,
+      completedAt: record.completedAt ?? Date.now(),
+    };
+    this.resumable.set(entry.handle, entry);
+    // Bound the memory a long session can accumulate. Oldest first, since the
+    // agent someone still wants to reach is the one they used most recently.
+    while (this.resumable.size > MAX_RESUMABLE_ENTRIES) {
+      let oldest: ResumableAgentEntry | undefined;
+      for (const candidate of this.resumable.values()) {
+        if (!oldest || candidate.completedAt <= oldest.completedAt) oldest = candidate;
+      }
+      if (!oldest) break;
+      this.resumable.delete(oldest.handle);
+    }
+  }
+
+  /**
+   * Every handle currently spoken for — live records and resumable entries
+   * alike. One shared set, so a fresh spawn can never be handed the handle of
+   * an evicted conversation that `@handle` can still reopen.
+   */
+  private takenHandles(): ReadonlySet<string> {
+    const taken = new Set<string>(this.resumable.keys());
+    for (const record of this.agents.values()) {
+      if (record.handle) taken.add(record.handle);
+    }
+    return taken;
+  }
+
+  /**
+   * What `@handle` currently addresses: the live record holding that handle,
+   * else the resumable entry left behind when it was evicted.
+   *
+   * Live wins. A resumable entry is deliberately kept after its conversation is
+   * reopened (the reopened record may die before establishing a session of its
+   * own, and the original transcript is still the right thing to reopen next
+   * time), so both can hold the same handle at once — and while a record is
+   * live, it is the one the user means.
+   */
+  resolveMention(handle: string): { kind: "live"; record: AgentRecord } | { kind: "resumable"; entry: ResumableAgentEntry } | undefined {
+    const wanted = handle.toLowerCase();
+    for (const record of this.agents.values()) {
+      if (record.detached) continue;
+      if (record.handle?.toLowerCase() === wanted || record.id === handle) return { kind: "live", record };
+    }
+    const entry = this.getResumable(handle);
+    return entry ? { kind: "resumable", entry } : undefined;
+  }
+
+  /** Resolve a resumable entry by handle or id. */
+  getResumable(name: string): ResumableAgentEntry | undefined {
+    const wanted = name.toLowerCase();
+    for (const entry of this.resumable.values()) {
+      if (entry.handle.toLowerCase() === wanted || entry.id === name) return entry;
+    }
+    return undefined;
+  }
+
+  /** Evicted agents whose conversation can still be reopened, newest first. */
+  listResumable(): ResumableAgentEntry[] {
+    return [...this.resumable.values()].sort((a, b) => b.completedAt - a.completedAt);
+  }
+
+  /** Forget an evicted agent, by handle or id. */
+  dropResumable(name: string): boolean {
+    const entry = this.getResumable(name);
+    if (!entry) return false;
+    this.resumable.delete(entry.handle);
+    return true;
+  }
+
+  /** Cumulative descendants any one top-level agent may start. */
+  getMaxSubagentSpawnsPerBranch(): number {
+    return this.maxSubagentSpawnsPerBranch;
+  }
+
+  /**
+   * Set the branch spawn budget. `0` is refused rather than treated as
+   * "unlimited": zero reads as a limit, and silently meaning its opposite is
+   * how a safety valve gets disabled by accident. Nesting is turned off with
+   * `maxSubagentDepth`, which says so.
+   */
+  setMaxSubagentSpawnsPerBranch(n: number): void {
+    if (!Number.isSafeInteger(n) || n < 1) return;
+    this.maxSubagentSpawnsPerBranch = n;
+  }
+
+  /** Descendants started so far under a top-level agent (for UI and tests). */
+  getBranchSpawnCount(rootAgentId: string): number {
+    return this.branchSpawnCounts.get(rootAgentId) ?? 0;
+  }
+
+  /** Whether spawned agents may ask their human a question. */
+  getSupervisorQuestions(): boolean {
+    return this.supervisorQuestions;
+  }
+
+  setSupervisorQuestions(enabled: boolean): void {
+    this.supervisorQuestions = enabled;
+  }
+
+  /** Whether evicted records are indexed for `@handle` reopen. */
+  getRememberAgents(): boolean {
+    return this.rememberAgents;
+  }
+
+  setRememberAgents(enabled: boolean): void {
+    this.rememberAgents = enabled;
+    if (!enabled) this.resumable.clear();
+  }
+
   private cleanup() {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
@@ -2096,9 +2479,7 @@ export class AgentManager {
       this.removeRecord(id, record);
     }
     this.retryDeferredRecordRemovals();
-  }
-
-  /**
+  }  /**
    * Remove all completed/stopped/errored records immediately.
    * Called on session start/switch so tasks from a prior session don't persist.
    * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet

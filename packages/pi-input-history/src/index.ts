@@ -57,7 +57,7 @@ const MAX_LIST_ROWS = 40;
 /** Width of the right-aligned age column ("now", "59m", "23h", "364d"). */
 const AGE_WIDTH = 4;
 
-interface HistoryEntry {
+export interface HistoryEntry {
   text: string;
   /** Epoch ms taken from the session entry that recorded this prompt. */
   timestamp?: number;
@@ -142,7 +142,7 @@ export default function (pi: ExtensionAPI) {
 type Done = (value: string | null) => void;
 
 /** Subsequence fuzzy match: all chars in needle appear in haystack in order. */
-function subsequence(haystack: string, needle: string): boolean {
+export function subsequence(haystack: string, needle: string): boolean {
   let hi = 0;
   for (let ni = 0; ni < needle.length; ni++) {
     const idx = haystack.indexOf(needle[ni], hi);
@@ -152,19 +152,19 @@ function subsequence(haystack: string, needle: string): boolean {
   return true;
 }
 
-function fuzzyMatch(item: string, query: string): boolean {
+export function fuzzyMatch(item: string, query: string): boolean {
   if (!query) return true;
   const lower = item.toLowerCase();
   const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
   return tokens.every((t) => subsequence(lower, t));
 }
 
-function toSingleLinePreview(text: string): string {
+export function toSingleLinePreview(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
 /** Compact age for the list gutter; "" when the session recorded no timestamp. */
-function relativeAge(timestamp: number | undefined, now: number): string {
+export function relativeAge(timestamp: number | undefined, now: number): string {
   if (timestamp === undefined) return "";
   const diff = now - timestamp;
   if (diff < 60_000) return "now";
@@ -518,7 +518,7 @@ export class HistoryPopupComponent implements Component, Focusable {
 
 // ─── History Collection ────────────────────────────────────────────────────────
 
-function parseTimestamp(value: unknown): number | undefined {
+export function parseTimestamp(value: unknown): number | undefined {
   if (typeof value !== "string") return undefined;
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? undefined : ms;
@@ -542,7 +542,7 @@ function collectBranchHistory(ctx: ExtensionContext): HistoryEntry[] {
 }
 
 /** Merge branch history (current session) with cached cross-session history, deduplicated. */
-function mergeHistory(branchHistory: HistoryEntry[], cached: HistoryEntry[]): HistoryEntry[] {
+export function mergeHistory(branchHistory: HistoryEntry[], cached: HistoryEntry[]): HistoryEntry[] {
   const seen = new Set<string>();
   const merged: HistoryEntry[] = [];
   for (const entry of [...branchHistory, ...cached]) {
@@ -596,7 +596,7 @@ function extractUserMessages(sessionPath: string): HistoryEntry[] {
   }
 }
 
-function extractText(content: UserMessage["content"]): string | null {
+export function extractText(content: UserMessage["content"]): string | null {
   if (typeof content === "string") return content || null;
   return (
     content.find(

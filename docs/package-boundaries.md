@@ -78,6 +78,37 @@ not become a shared developer-tool coordinator. A future shared library is only
 justified for a pure parser or wire contract whose semantics are demonstrably
 identical in at least two packages.
 
+## Shared third-party surfaces
+
+`@narumitw/pi-tui-kit` is a shared rendering surface, not an ordinary
+dependency. Nine packages draw with it into the same terminal, inside one host
+process, so the version they agree on is part of how the extensions look and
+behave together rather than an implementation detail of each.
+
+That makes divergent ranges a real defect, and a quiet one. Declared at three
+separate floors (`^0.54.0`, `^0.51.0`, `^0.49.1`), the lockfile resolved three
+copies — 0.54.0, 0.51.0 and 0.49.3 — installed side by side. Nothing fails at
+install; it surfaces later as a theme that renders one way in one extension and
+another way in the next.
+
+The rule is therefore **one declared range per shared dependency**, enforced by
+`bun run check:shared-deps` (included in `bun run check`) over `dependencies`
+and `peerDependencies` in every package. A dependency is shared once at least
+`MIN_PACKAGES = 2` packages declare it, so two packages agreeing on a floor
+is already a contract. The check compares range strings, not their semantics:
+two ranges that merely overlap are still a finding, because the goal is one
+intentional answer per dependency rather than an accidental intersection. Host
+peer ranges (`@earendil-works/*`) are covered by the same rule for the same
+reason — a session loads every extension into one host, so packages naming
+different host ranges are disagreeing about what they are running inside.
+
+`devDependencies` are deliberately out of scope. A build tool is not a shared
+surface, and `pi-subagents` intentionally carries its own toolchain: it is
+excluded from both the root `tsconfig.json` and the root `biome.json` and runs
+its own `typecheck`, `lint`, and `test` scripts. That exclusion is a deliberate
+arrangement, not drift — it is also the repository's largest un-root-linted
+surface, which is the cost that buys it.
+
 ## Package kind rules
 
 Directories under `packages/` are either:

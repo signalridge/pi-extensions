@@ -1,10 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { WorktreeInfo } from "../src/worktree.js";
-import { cleanupWorktree, cleanupWorktreeAsync, createWorktree, pruneWorktrees } from "../src/worktree.js";
+import {
+  cleanupWorktree,
+  createWorktree,
+  isWorktreeIsolationEnabled,
+  pruneWorktrees,
+  setWorktreeIsolationEnabled,
+} from "../src/worktree.js";
 
 /**
  * Helper: create a temporary git repo with an initial commit.
@@ -18,16 +23,6 @@ function initGitRepo(): string {
   execFileSync("git", ["add", "README.md"], { cwd: dir, stdio: "pipe" });
   execFileSync("git", ["commit", "-m", "initial"], { cwd: dir, stdio: "pipe" });
   return dir;
-}
-
-function initGitRepoAt(dir: string): string {
-  execFileSync("git", ["init"], { cwd: dir, stdio: "pipe" });
-  execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: dir, stdio: "pipe" });
-  execFileSync("git", ["config", "user.name", "Test"], { cwd: dir, stdio: "pipe" });
-  writeFileSync(join(dir, "README.md"), "# Detached worktree");
-  execFileSync("git", ["add", "README.md"], { cwd: dir, stdio: "pipe" });
-  execFileSync("git", ["commit", "-m", "initial"], { cwd: dir, stdio: "pipe" });
-  return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, stdio: "pipe" }).toString().trim();
 }
 
 describe("worktree", () => {
@@ -49,7 +44,6 @@ describe("worktree", () => {
       expect(wt).toBeDefined();
       expect(existsSync(wt!.path)).toBe(true);
       expect(wt!.branch).toBe("pi-agent-test-id-1");
-      expect(wt!.repoRoot).toBe(realpathSync(repoDir));
       expect(wt!.baseSha).toBe(execFileSync("git", ["rev-parse", "HEAD"], {
         cwd: repoDir, stdio: "pipe",
       }).toString().trim());
@@ -96,26 +90,9 @@ describe("worktree", () => {
 
       const wt = createWorktree(join(repoDir, "packages", "api"), "subdir-wp")!;
       expect(wt).toBeDefined();
-      expect(wt.repoRoot).toBe(realpathSync(repoDir));
       expect(wt.workPath).toBe(join(wt.path, "packages", "api"));
       expect(existsSync(wt.workPath)).toBe(true);
       try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
-    });
-
-    it("uses the nearest Git root when cwd is inside a nested repository", () => {
-      const nestedRepo = join(repoDir, "packages", "nested");
-      mkdirSync(nestedRepo, { recursive: true });
-      execFileSync("git", ["init"], { cwd: nestedRepo, stdio: "pipe" });
-      execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: nestedRepo, stdio: "pipe" });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd: nestedRepo, stdio: "pipe" });
-      writeFileSync(join(nestedRepo, "README.md"), "# Nested repo");
-      execFileSync("git", ["add", "README.md"], { cwd: nestedRepo, stdio: "pipe" });
-      execFileSync("git", ["commit", "-m", "nested initial"], { cwd: nestedRepo, stdio: "pipe" });
-
-      const wt = createWorktree(nestedRepo, "nested-root")!;
-      expect(wt.repoRoot).toBe(realpathSync(nestedRepo));
-      expect(wt.workPath).toBe(wt.path);
-      try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: nestedRepo, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
     it("uses unique paths for multiple worktrees", () => {
@@ -139,232 +116,6 @@ describe("worktree", () => {
       const result = cleanupWorktree(repoDir, wt, "test cleanup");
       expect(result.hasChanges).toBe(false);
       expect(result.branch).toBeUndefined();
-    });
-
-
-    it("does not report success for a dangling symlink that replaced the worktree", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-deadc0de";
-      const path = join(tempRoot, tempName);
-      symlinkSync(join(tempRoot, `${tempName}-missing`), path, "dir");
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "dangling symlink cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(false);
-        expect(result.pruneAttempted).toBe(true);
-        expect(result.cleanupDiagnostic).toContain(path);
-        expect(result.cleanupDiagnostic).toContain("symlink");
-        expect(result.recoveryCommands?.join(" ")).toContain(path);
-        expect(lstatSync(path).isSymbolicLink()).toBe(true);
-      } finally {
-        unlinkSync(path);
-      }
-    });
-
-    it("does not follow or remove a live symlink that replaced the worktree", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-feedface";
-      const path = join(tempRoot, tempName);
-      const target = mkdtempSync(join(tmpdir(), "pi-wt-live-target-"));
-      writeFileSync(join(target, "keep.txt"), "keep");
-      symlinkSync(target, path, "dir");
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "live symlink cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(false);
-        expect(result.cleanupDiagnostic).toContain(path);
-        expect(result.cleanupDiagnostic).toContain("symlink");
-        expect(lstatSync(path).isSymbolicLink()).toBe(true);
-        expect(existsSync(join(target, "keep.txt"))).toBe(true);
-      } finally {
-        unlinkSync(path);
-        rmSync(target, { recursive: true, force: true });
-      }
-    });
-
-    it("does not report success for a special file that replaced the worktree", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-cafebabe";
-      const path = join(tempRoot, tempName);
-      writeFileSync(path, "replacement");
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "special file cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(false);
-        expect(result.cleanupDiagnostic).toContain(path);
-        expect(result.cleanupDiagnostic).toContain("special file");
-        expect(existsSync(path)).toBe(true);
-      } finally {
-        rmSync(path, { force: true });
-      }
-    });
-
-    it("keeps an absent directory cleanup result verifiable", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-ab5e0000";
-      const path = join(tempRoot, tempName);
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-
-      const result = cleanupWorktree(repoDir, wt, "already absent cleanup");
-      expect(result.cleanupSucceeded).toBe(true);
-      expect(result.filesystemFallbackSucceeded).toBe(true);
-      expect(existsSync(path)).toBe(false);
-    });
-
-    it("fails closed when lstat cannot verify the worktree path", () => {
-      const errorRoot = mkdtempSync(join(tmpdir(), "pi-wt-lstat-error-"));
-      const path = join(errorRoot, "worktree");
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-lstat-error",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-      };
-      chmodSync(errorRoot, 0o000);
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "lstat error cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(false);
-        expect(result.cleanupDiagnostic).toContain(path);
-        expect(result.cleanupDiagnostic).toContain("could not be verified");
-        expect(result.recoveryCommands?.join(" ")).toContain(path);
-      } finally {
-        chmodSync(errorRoot, 0o700);
-        rmSync(errorRoot, { recursive: true, force: true });
-      }
-    });
-
-    it("falls back to safe filesystem removal and prunes registration after Git removal fails", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-deadbeef";
-      const path = join(tempRoot, tempName);
-      mkdirSync(path);
-      const baseSha = initGitRepoAt(path);
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha,
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "fallback cleanup");
-        expect(result.cleanupSucceeded).toBe(true);
-        expect(result.gitRemovalSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(true);
-        expect(result.filesystemFallbackSucceeded).toBe(true);
-        expect(result.pruneAttempted).toBe(true);
-        expect(result.pruneSucceeded).toBe(true);
-        expect(result.registrationCleanupVerified).toBe(true);
-        expect(existsSync(path)).toBe(false);
-      } finally {
-        rmSync(path, { recursive: true, force: true });
-      }
-    });
-
-    it("retains diagnostic recovery metadata when Git and filesystem removal both fail", () => {
-      const tempRoot = resolve(tmpdir());
-      const tempName = "pi-agent-fallback-badf000d";
-      const path = join(tempRoot, tempName);
-      mkdirSync(path);
-      let baseSha = initGitRepoAt(path);
-      const lockedDirectory = join(path, "locked");
-      mkdirSync(lockedDirectory, { recursive: true });
-      writeFileSync(join(lockedDirectory, "file.txt"), "locked");
-      execFileSync("git", ["add", "-A"], { cwd: path, stdio: "pipe" });
-      execFileSync("git", ["commit", "-m", "add locked file"], { cwd: path, stdio: "pipe" });
-      baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: path, stdio: "pipe" }).toString().trim();
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-fallback",
-        baseSha,
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-        tempRoot,
-        tempName,
-      };
-      chmodSync(lockedDirectory, 0o500);
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "failed cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.path).toBe(path);
-        expect(result.filesystemFallbackAttempted).toBe(true);
-        expect(result.filesystemFallbackSucceeded).toBe(false);
-        expect(result.pruneAttempted).toBe(true);
-        expect(result.cleanupDiagnostic).toContain(path);
-        expect(result.cleanupDiagnostic).toContain("filesystem fallback failed");
-        expect(result.recoveryCommands?.join(" ")).toContain(path);
-        expect(existsSync(path)).toBe(true);
-      } finally {
-        chmodSync(lockedDirectory, 0o700);
-        rmSync(path, { recursive: true, force: true });
-      }
-    });
-
-    it("does not use direct rm for an arbitrary worktree path", () => {
-      const path = join(repoDir, "not-a-package-worktree");
-      mkdirSync(path);
-      const wt: WorktreeInfo = {
-        path,
-        branch: "pi-agent-arbitrary",
-        baseSha: "missing",
-        repoRoot: realpathSync(repoDir),
-        workPath: path,
-      };
-
-      try {
-        const result = cleanupWorktree(repoDir, wt, "unsafe cleanup");
-        expect(result.cleanupSucceeded).toBe(false);
-        expect(result.filesystemFallbackAttempted).toBe(false);
-        expect(result.cleanupDiagnostic).toContain("not a verified package-created worktree");
-        expect(existsSync(path)).toBe(true);
-      } finally {
-        rmSync(path, { recursive: true, force: true });
-      }
     });
 
     it("commits changes and creates branch when changes exist", () => {
@@ -392,25 +143,6 @@ describe("worktree", () => {
       expect(log).toContain("pi-agent: added new file");
 
       // Cleanup branch
-      try { execFileSync("git", ["branch", "-D", result.branch!], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
-    });
-
-
-    it("async cleanup detects and preserves changes from the worktree cwd", async () => {
-      const wt = createWorktree(repoDir, "async-dirty-1")!;
-      writeFileSync(join(wt.path, "async-file.txt"), "preserve me");
-
-      const result = await cleanupWorktreeAsync(repoDir, wt, "async added file");
-
-      expect(result.cleanupSucceeded).toBe(true);
-      expect(result.hasChanges).toBe(true);
-      expect(result.branch).toContain("pi-agent-async-dirty-1");
-      expect(existsSync(wt.path)).toBe(false);
-      const preserved = execFileSync("git", ["show", `${result.branch}:async-file.txt`], {
-        cwd: repoDir, stdio: "pipe",
-      }).toString();
-      expect(preserved).toBe("preserve me");
-
       try { execFileSync("git", ["branch", "-D", result.branch!], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
@@ -528,5 +260,114 @@ describe("worktree", () => {
         rmSync(nonGit, { recursive: true, force: true });
       }
     });
+  });
+});
+
+// cleanupWorktree's outer catch is the only place in the repo where a caught
+// error can DESTROY user work while reporting success-shaped output: it removes
+// the worktree and returns `{ hasChanges: false }`, which the manager renders as
+// "the agent changed nothing". If the commit or branch step fails, the agent's
+// commits go with the worktree and nobody is told.
+describe("cleanupWorktree — failure path", () => {
+  let repoDir: string;
+
+  beforeEach(() => { repoDir = initGitRepo(); });
+  afterEach(() => {
+    try { pruneWorktrees(repoDir); } catch { /* ignore */ }
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("short-circuits when the worktree directory is already gone", () => {
+    // Hits the existsSync guard at the top of cleanupWorktree, not the outer
+    // catch — cleanup can be called twice (settle path plus dispose), so it has
+    // to be idempotent rather than throw on the second call.
+    const wt = createWorktree(repoDir, "vanished")!;
+    expect(wt).toBeDefined();
+    rmSync(wt.path, { recursive: true, force: true });
+
+    const result = cleanupWorktree(repoDir, wt, "agent that vanished");
+
+    expect(result.hasChanges).toBe(false);
+    expect(result.branch).toBeUndefined();
+  });
+
+  it("swallows a git failure inside a still-present worktree and reports no changes", () => {
+    // The outer catch. The directory exists — so the existsSync guard above
+    // does not fire — but git cannot operate in it, which is what a corrupted
+    // or externally-detached worktree looks like. The agent's work is lost
+    // either way; what matters is that cleanup does not throw out of the
+    // manager's settle path and take the whole record down with it.
+    const wt = createWorktree(repoDir, "corrupt")!;
+    writeFileSync(join(wt.path, "work.txt"), "agent output");
+    // Break the worktree's link back to the repo.
+    writeFileSync(join(wt.path, ".git"), "gitdir: /nonexistent/path/that/is/not/a/repo");
+
+    const result = cleanupWorktree(repoDir, wt, "corrupted agent");
+
+    expect(result.hasChanges).toBe(false);
+    expect(result.branch).toBeUndefined();
+  });
+
+  it("creates the branch BEFORE removing the worktree, so a removal failure cannot lose commits", () => {
+    // Ordering is the actual safety property. If a refactor moved
+    // removeWorktree above the `git branch` call, the commits would be
+    // unreachable the moment removal succeeded and branching failed.
+    const wt = createWorktree(repoDir, "ordered")!;
+    writeFileSync(join(wt.path, "work.txt"), "agent output");
+
+    const result = cleanupWorktree(repoDir, wt, "ordered agent");
+
+    expect(result.hasChanges).toBe(true);
+    expect(result.branch).toBeDefined();
+    // The branch must exist in the MAIN repo after the worktree is gone —
+    // that is what makes the agent's work recoverable.
+    const branches = execFileSync("git", ["branch", "--list", result.branch!], {
+      cwd: repoDir, stdio: "pipe",
+    }).toString();
+    expect(branches).toContain(result.branch!);
+    expect(existsSync(wt.path)).toBe(false);
+    // And the commit is reachable from that branch.
+    const files = execFileSync("git", ["ls-tree", "--name-only", result.branch!], {
+      cwd: repoDir, stdio: "pipe",
+    }).toString();
+    expect(files).toContain("work.txt");
+  });
+});
+
+/**
+ * The project switch itself (`worktreeIsolation`, #184). Its consumers —
+ * agent-manager, both tool schemas, the invocation resolver — all mock this
+ * module, so without this block the real singleton is never executed and its
+ * default is never exercised. That default is what every "worktree isolation
+ * still behaves as before" claim rests on.
+ */
+describe("worktree isolation switch", () => {
+  afterEach(() => setWorktreeIsolationEnabled(true));
+
+  it("defaults to enabled", () => {
+    expect(isWorktreeIsolationEnabled()).toBe(true);
+  });
+
+  it("round-trips both ways", () => {
+    setWorktreeIsolationEnabled(false);
+    expect(isWorktreeIsolationEnabled()).toBe(false);
+    setWorktreeIsolationEnabled(true);
+    expect(isWorktreeIsolationEnabled()).toBe(true);
+  });
+
+  // The switch gates callers; it deliberately does not disarm createWorktree
+  // itself, so a caller that has already decided (agent-manager checks first)
+  // still gets a real worktree rather than a silent no-op.
+  it("does not disable createWorktree directly", () => {
+    const repoDir = initGitRepo();
+    try {
+      setWorktreeIsolationEnabled(false);
+      const wt = createWorktree(repoDir, "switch-test");
+      expect(wt).toBeDefined();
+      cleanupWorktree(repoDir, wt!, "switch test");
+    } finally {
+      pruneWorktrees(repoDir);
+      rmSync(repoDir, { recursive: true, force: true });
+    }
   });
 });

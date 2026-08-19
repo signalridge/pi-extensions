@@ -252,7 +252,7 @@ function createFlakySessionManager(cwd, failures = 2) {
     if (
       customType === "pi-workflows:journal" &&
       state.remaining > 0 &&
-      (data?.kind === "task_result" || data?.kind === "synthesis_result")
+      (data?.kind === "call_result" || data?.kind === "call_attempt")
     ) {
       state.remaining -= 1;
       throw new Error("transient smoke journal failure");
@@ -264,34 +264,39 @@ function createFlakySessionManager(cwd, failures = 2) {
 
 function seedInterruptedWorkflow(session) {
   const runId = "real-pi-recovery";
-  const nodeId = "recover";
+  const script = `export const meta = { name: "recovery smoke", description: "Recover one call" };
+const recovered = await agent("Return the recovered result.", { label: "recover" });
+return recovered;`;
+  const nodeId = "0";
   const attemptId = `${runId}/${nodeId}/attempt-1`;
-  const definition = {
-    name: "recovery smoke",
-    background: true,
-    tasks: [
-      {
-        id: nodeId,
-        subagent_type: "general-purpose",
-        description: "Recover one task",
-        prompt: "Return the recovered result.",
-        depends_on: [],
-      },
-    ],
-  };
-  const attempts = { [nodeId]: 1, __synthesis__: 1 };
-  const attemptIds = {
-    [nodeId]: attemptId,
-    __synthesis__: `${runId}/__synthesis__/attempt-1`,
-  };
   const owner = { extension: "pi-workflows", runId, nodeId, attemptId };
   let timestamp = Date.now();
   const append = (event) => session.sessionManager.appendCustomEntry("pi-workflows:journal", event);
-  append({ kind: "run_created", schemaVersion: 2, runId, definition, attempts, attemptIds, timestamp: timestamp++ });
-  append({ kind: "workflow_transition", schemaVersion: 2, runId, status: "running", timestamp: timestamp++ });
   append({
-    kind: "task_transition",
-    schemaVersion: 2,
+    kind: "run_created",
+    schemaVersion: 3,
+    runId,
+    script,
+    scriptHash: "smoke-recovery-script-hash",
+    meta: { name: "recovery smoke", description: "Recover one call" },
+    attempts: { [nodeId]: 1 },
+    attemptIds: { [nodeId]: attemptId },
+    timestamp: timestamp++,
+  });
+  append({ kind: "workflow_transition", schemaVersion: 3, runId, status: "running", timestamp: timestamp++ });
+  append({
+    kind: "call_attempt",
+    schemaVersion: 3,
+    runId,
+    nodeId,
+    attemptId,
+    generation: 1,
+    owner,
+    timestamp: timestamp++,
+  });
+  append({
+    kind: "call_transition",
+    schemaVersion: 3,
     runId,
     nodeId,
     status: "running",
@@ -333,29 +338,19 @@ async function runRealPiWorkflowIntegration(session, faux) {
     isolatedResponse,
     response("synthesis output"),
   ]);
+  const dagScript = `export const meta = { name: "real Pi DAG", description: "Integration DAG" };
+const results = await parallel([
+  () => agent("Return A.", { label: "a" }),
+  () => agent("Return B.", { label: "b" }),
+]);
+const c = await agent("Return C.", { label: "c" });
+const isolated = await agent("Return isolated.", { label: "isolated", agentType: "isolated" });
+return "synthesis output";`;
   const completed = await workflow.execute(
     "real-dag",
     {
-      name: "real Pi DAG",
-      tasks: [
-        { id: "a", subagent_type: "general-purpose", description: "Task A", prompt: "Return A." },
-        { id: "b", subagent_type: "general-purpose", description: "Task B", prompt: "Return B." },
-        {
-          id: "c",
-          subagent_type: "general-purpose",
-          description: "Task C",
-          prompt: "Return C.",
-          depends_on: ["a", "b"],
-        },
-        {
-          id: "isolated",
-          subagent_type: "isolated",
-          description: "Isolated task",
-          prompt: "Return isolated.",
-          depends_on: ["c"],
-        },
-      ],
-      synthesis: { subagent_type: "general-purpose", prompt: "Synthesize the task results." },
+      script: dagScript,
+      background: false,
     },
     undefined,
     undefined,
@@ -378,6 +373,15 @@ async function runRealPiWorkflowIntegration(session, faux) {
         entry.type === "custom" && entry.customType === "subagents:managed-spawn" && entry.data?.type === "isolated",
     ),
   );
+  assert.ok(
+    entriesAfterDag.some(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "subagents:managed-spawn" &&
+        typeof entry.data?.owner?.nodeId === "string" &&
+        entry.data?.owner?.nodeId?.startsWith("call-"),
+    ),
+  );
 
   // Force a real managed queue with the temporary maxConcurrent=2 setting and
   // ensure every queued response drains instead of being lost at the terminal
@@ -394,15 +398,14 @@ async function runRealPiWorkflowIntegration(session, faux) {
     return fauxAssistantMessage(text);
   };
   faux.setResponses([queuedResponse("queue 1"), queuedResponse("queue 2"), queuedResponse("queue 3")]);
+  const queueScript = `export const meta = { name: "real Pi queue", description: "Queue" };
+await parallel(Array.from({ length: 3 }, (_, i) => () => agent("Return queue " + (i + 1) + ".", { label: "q" + (i + 1) })));
+return 0;`;
   const queued = await workflow.execute(
     "real-queue",
     {
-      name: "real Pi queue",
-      tasks: [
-        { id: "q1", subagent_type: "general-purpose", description: "Queue 1", prompt: "Return queue 1." },
-        { id: "q2", subagent_type: "general-purpose", description: "Queue 2", prompt: "Return queue 2." },
-        { id: "q3", subagent_type: "general-purpose", description: "Queue 3", prompt: "Return queue 3." },
-      ],
+      script: queueScript,
+      background: false,
     },
     undefined,
     undefined,
@@ -432,12 +435,14 @@ async function runRealPiWorkflowIntegration(session, faux) {
     },
   ]);
   const slowCallTarget = faux.state.callCount + 1;
+  const slowScript = `export const meta = { name: "real Pi stop", description: "Stop" };
+await agent("Return slowly.", { label: "slow" });
+return 0;`;
   const background = await workflow.execute(
     "real-stop",
     {
-      name: "real Pi stop",
+      script: slowScript,
       background: true,
-      tasks: [{ id: "slow", subagent_type: "general-purpose", description: "Slow task", prompt: "Return slowly." }],
     },
     undefined,
     undefined,
@@ -461,10 +466,10 @@ async function runRealPiWorkflowIntegration(session, faux) {
         entry.type === "custom" &&
         entry.customType === "subagents:managed-spawn" &&
         entry.data?.owner?.runId === stopRunId &&
-        entry.data?.owner?.nodeId === "slow" &&
+        entry.data?.owner?.nodeId === "call-0" &&
         entry.data?.state === "running",
     );
-  const activeAgentId = activeManaged?.data?.id ?? activeRun?.tasks?.find((task) => task.id === "slow")?.agentId;
+  const activeAgentId = activeManaged?.data?.id ?? activeRun?.calls?.find((call) => call.index === 0)?.agentId;
   const activeAttemptId = activeManaged?.data?.owner?.attemptId;
   assert.equal(typeof activeAgentId, "string");
   assert.equal(typeof activeAttemptId, "string");
@@ -474,7 +479,7 @@ async function runRealPiWorkflowIntegration(session, faux) {
       channel: "subagents:completed",
       data: {
         id: activeAgentId,
-        owner: { extension: "pi-workflows", runId: stopRunId, nodeId: "slow", attemptId: "stale-attempt" },
+        owner: { extension: "pi-workflows", runId: stopRunId, nodeId: "call-0", attemptId: "stale-attempt" },
         result: "stale completion",
       },
     },
@@ -490,7 +495,6 @@ async function runRealPiWorkflowIntegration(session, faux) {
     undefined,
   );
   assert.notEqual(afterStale.details?.run?.status, "completed");
-  assert.notEqual(afterStale.details?.run?.taskStatus?.slow, "completed");
   const stopped = await control.execute(
     "real-stop-control",
     { action: "stop", run_id: stopRunId },

@@ -125,6 +125,8 @@ import {
   resumeAgent,
   runAgent,
   SUBAGENT_TOOL_NAMES,
+  setDefaultMaxTokens,
+  setDefaultMaxToolCalls,
 } from "../src/agent-runner.js";
 import {
   AGENT_DEFINITION_GENERATION_OVERRIDE,
@@ -2106,5 +2108,293 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("read");
     expect(tools).toContain("foo_other");
     expect(tools).not.toContain("foo_tool"); // denylisted even though ext:foo selects it
+  });
+});
+
+// ─── Per-run resource budgets ───────────────────────────────────────────
+// `maxTurns` bounds how many turns an agent takes and nothing about what a
+// turn costs — one turn can burn an arbitrary number of tokens or tool calls.
+// These budgets are the missing bound, in the same soft/hard shape: a wrap-up
+// steer at 80%, an abort at 100%.
+describe("agent-runner resource budgets", () => {
+  afterEach(() => {
+    setDefaultMaxTokens(0);
+    setDefaultMaxToolCalls(0);
+  });
+
+  const usage = (total: number) => ({ input: total, output: 0, cacheWrite: 0 });
+  const emitUsage = (listeners: Array<(e: any) => void>, total: number) => {
+    for (const l of listeners) l({ type: "message_end", message: { role: "assistant", usage: usage(total) } });
+  };
+  const emitToolCall = (listeners: Array<(e: any) => void>) => {
+    for (const l of listeners) l({ type: "tool_execution_end", toolName: "read" });
+  };
+
+  describe("token budget", () => {
+    it("does nothing while unset — 0 means unlimited, as it does for maxTurns", async () => {
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => emitUsage(listeners, 10_000_000));
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
+    it("stays quiet below the soft threshold", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => emitUsage(listeners, 700));
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
+    // The steer arrives at 80%, not 100%: an agent told to produce its final
+    // answer needs budget left to actually produce it.
+    it("steers a wrap-up at the soft threshold without aborting", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => emitUsage(listeners, 800));
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.steer.mock.calls[0][0]).toMatch(/token budget/i);
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
+    it("steers only once, however many messages follow", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        emitUsage(listeners, 800);
+        emitUsage(listeners, 10);
+        emitUsage(listeners, 10);
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborts once the budget is spent", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        emitUsage(listeners, 800);
+        emitUsage(listeners, 300);
+      });
+
+      const result = await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.abort).toHaveBeenCalled();
+      expect(result.aborted).toBe(true);
+    });
+
+    it("counts across messages, not per message", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      // No single message reaches the threshold; their sum does.
+      session.prompt = vi.fn(async () => {
+        emitUsage(listeners, 300);
+        emitUsage(listeners, 300);
+        emitUsage(listeners, 300);
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts input, output and cacheWrite the way lifetime usage does", async () => {
+      setDefaultMaxTokens(1_000);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        for (const l of listeners) {
+          l({
+            type: "message_end",
+            message: { role: "assistant", usage: { input: 300, output: 300, cacheWrite: 200 } },
+          });
+        }
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).toHaveBeenCalledTimes(1);
+    });
+
+    /** Give the agent whose config this run reads an extra frontmatter field. */
+    function withAgentConfig(extra: Record<string, unknown>): () => void {
+      const base = vi.mocked(getAgentConfig).getMockImplementation();
+      vi.mocked(getAgentConfig).mockImplementation(
+        ((type: string) => ({ ...(base?.(type) as object), ...extra })) as never,
+      );
+      return () => {
+        if (base) vi.mocked(getAgentConfig).mockImplementation(base);
+      };
+    }
+
+    it("is overridden by the agent's own frontmatter", async () => {
+      setDefaultMaxTokens(1_000);
+      const restore = withAgentConfig({ maxTokens: 100 });
+      try {
+        const { session, listeners } = createSession("OK");
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt = vi.fn(async () => emitUsage(listeners, 90));
+
+        await runAgent(ctx, "Explore", "go", { pi });
+
+        // 90 is under the project default's soft threshold (800) but over this
+        // agent's own (80), so only the frontmatter value can explain the steer.
+        expect(session.steer).toHaveBeenCalledTimes(1);
+      } finally {
+        restore();
+      }
+    });
+
+    it("frontmatter `max_tokens: 0` opts an agent out of the project budget", async () => {
+      setDefaultMaxTokens(1_000);
+      const restore = withAgentConfig({ maxTokens: 0 });
+      try {
+        const { session, listeners } = createSession("OK");
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt = vi.fn(async () => emitUsage(listeners, 10_000));
+
+        await runAgent(ctx, "Explore", "go", { pi });
+
+        expect(session.steer).not.toHaveBeenCalled();
+        expect(session.abort).not.toHaveBeenCalled();
+      } finally {
+        restore();
+      }
+    });
+  });
+
+  describe("tool-call budget", () => {
+    it("does nothing while unset", async () => {
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        for (let i = 0; i < 500; i++) emitToolCall(listeners);
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).not.toHaveBeenCalled();
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
+    it("steers a wrap-up at the soft threshold", async () => {
+      setDefaultMaxToolCalls(10);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        for (let i = 0; i < 8; i++) emitToolCall(listeners);
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.steer.mock.calls[0][0]).toMatch(/tool call budget/i);
+      expect(session.abort).not.toHaveBeenCalled();
+    });
+
+    it("aborts once the budget is spent", async () => {
+      setDefaultMaxToolCalls(10);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        for (let i = 0; i < 10; i++) emitToolCall(listeners);
+      });
+
+      const result = await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.abort).toHaveBeenCalled();
+      expect(result.aborted).toBe(true);
+    });
+
+    it("counts completed calls, not started ones", async () => {
+      setDefaultMaxToolCalls(10);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        // Starts alone must not consume budget; a call that never finishes
+        // produced no work to charge for.
+        for (let i = 0; i < 20; i++) {
+          for (const l of listeners) l({ type: "tool_execution_start", toolName: "read" });
+        }
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      expect(session.steer).not.toHaveBeenCalled();
+    });
+
+    it("runs independently of the token budget", async () => {
+      setDefaultMaxToolCalls(10);
+      const { session, listeners } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt = vi.fn(async () => {
+        emitUsage(listeners, 10_000_000);
+        for (let i = 0; i < 8; i++) emitToolCall(listeners);
+      });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      // Only the tool budget is configured, so only it can have fired.
+      expect(session.steer).toHaveBeenCalledTimes(1);
+      expect(session.steer.mock.calls[0][0]).toMatch(/tool call/i);
+    });
+  });
+});
+
+// Regression: one message can consume more than the whole budget in a single
+// event. Checking the soft threshold before the hard one answered that with a
+// wrap-up steer and no abort, leaving an agent already over budget running.
+describe("agent-runner budget overshoot in a single event", () => {
+  afterEach(() => {
+    setDefaultMaxTokens(0);
+    setDefaultMaxToolCalls(0);
+  });
+
+  it("aborts when one message blows straight past the whole token budget", async () => {
+    setDefaultMaxTokens(1_000);
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) {
+        l({ type: "message_end", message: { role: "assistant", usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
+      }
+    });
+
+    const result = await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(session.abort).toHaveBeenCalled();
+    expect(result.aborted).toBe(true);
+  });
+
+  it("does not send a wrap-up steer it has already overrun", async () => {
+    setDefaultMaxTokens(1_000);
+    const { session, listeners } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    session.prompt = vi.fn(async () => {
+      for (const l of listeners) {
+        l({ type: "message_end", message: { role: "assistant", usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
+      }
+    });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(session.steer).not.toHaveBeenCalled();
   });
 });
