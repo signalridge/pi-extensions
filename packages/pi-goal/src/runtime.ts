@@ -17,8 +17,9 @@ export { queueGoalSafetyReset, resetGoalSafetyEpoch } from "./safety.js";
 
 import { DEFAULT_GOAL_SETTINGS, type GoalSettings, type GoalSettingsLoadIssue } from "./settings.js";
 import { GoalToolPolicy, type GoalToolVisibilitySnapshot } from "./tool-policy.js";
+import { GoalWaitTimer } from "./wait.js";
 
-export { GOAL_BLOCKED_TOOL, GOAL_COMPLETE_TOOL, GOAL_TOOL_NAMES } from "./tool-policy.js";
+export { GOAL_BLOCKED_TOOL, GOAL_COMPLETE_TOOL, GOAL_TOOL_NAMES, GOAL_WAIT_TOOL } from "./tool-policy.js";
 
 export interface ContinuationTicket {
   goalId: string;
@@ -62,6 +63,13 @@ export type GoalStopRequest =
       reason: string;
     }
   | { kind: "retry_exhausted"; expectedGoalId: string; reason: string }
+  /**
+   * `goal_wait`: the goal has no work left until something outside the session
+   * happens. Stops exactly like a reported blocker — same usage accounting,
+   * same stale-call block — but lands on `paused`, which is already the state
+   * every resume path knows how to bring back.
+   */
+  | { kind: "wait"; expectedGoalId: string; reason: string }
   | {
       kind: "tools_unavailable";
       expectedGoalId: string;
@@ -184,6 +192,8 @@ export class GoalRuntime {
   settings: GoalSettings = DEFAULT_GOAL_SETTINGS;
   settingsLoadIssue?: GoalSettingsLoadIssue;
   activeGoal?: ActiveGoal;
+  /** The single `goal_wait` safety wake-up. Cancelled with continuation work. */
+  private readonly goalWaitTimer = new GoalWaitTimer();
   /** Terminal details captured for the matching persisted-state snapshot. */
   private terminalDetails?: GoalTerminalDetails;
   private goalStateSink?: (snapshot: GoalStateSnapshot) => void;
@@ -398,6 +408,15 @@ export class GoalRuntime {
           abortCurrentTurn(ctx);
         }
         goal = { ...goal, safetyPauseCause: request.cause };
+        status = "paused";
+        terminalReason = request.reason;
+        break;
+      case "wait":
+        this.recordGoalUsage(goal, ctx);
+        this.cancelContinuationWork();
+        this.clearGoalRecoveryForGoal(goal.id);
+        this.clearBudgetWrapUp();
+        this.blockStaleGoalToolCalls();
         status = "paused";
         terminalReason = request.reason;
         break;
@@ -706,7 +725,33 @@ export class GoalRuntime {
     return true;
   }
 
+  /**
+   * Arm the `goal_wait` safety wake-up.
+   *
+   * The callback is supplied by the command layer, which owns the only correct
+   * resume: tool-policy preparation, recovery clearing, and prompt delivery all
+   * have to happen, and a shortcut here would be a second, worse resume path.
+   * Unset (a headless or partially-built runtime) simply means a wait keeps
+   * waiting for real input, which is the safe direction.
+   */
+  onGoalWaitElapsed?: (ctx: StatusContext, goalId: string) => void;
+
+  scheduleGoalWaitWake(ctx: StatusContext, goalId: string, resumeAt: number): void {
+    this.goalWaitTimer.schedule(resumeAt, () => {
+      // Re-checked at fire time, not at schedule time: the goal may have been
+      // completed, cleared, or replaced during the wait, and waking a goal that
+      // is no longer the active one would resume the wrong work.
+      if (this.activeGoal?.id !== goalId || this.activeGoal.status !== "paused") return;
+      this.onGoalWaitElapsed?.(ctx, goalId);
+    });
+  }
+
+  clearGoalWaitWake(): void {
+    this.goalWaitTimer.clear();
+  }
+
   cancelContinuationWork() {
+    this.clearGoalWaitWake();
     this.clearContinuationDispatchTimer();
     if (this.continuationDelivery) {
       this.rememberCancelledContinuationMarker(this.continuationDelivery.marker);

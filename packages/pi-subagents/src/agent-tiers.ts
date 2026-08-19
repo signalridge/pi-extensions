@@ -36,14 +36,82 @@ function effectiveModelId(model: Model<Api> | undefined): string | undefined {
 /** Longest accepted tier key. Long enough for any real name, short enough to render. */
 export const MAX_AGENT_TIER_KEY_LENGTH = 64;
 
-let agentTiersSettings: AgentTiersSettings = {};
+/**
+ * The tier every fresh install gets: a cheap, low-thinking tier named `fast`.
+ *
+ * Explore — the highest-frequency built-in spawn — points its `tier:` at it, so
+ * read-only search does not silently inherit the parent session's most
+ * expensive model on a machine that never configured `agentTiers`. This is the
+ * tier strategy, not a per-agent vendor pin: the shipped profile is
+ * provider-neutral (`inherit` model, low thinking), and any user who defines
+ * `fast` in `subagents.json` replaces it wholesale.
+ *
+ * It is not shown as an available tier until settings are loaded; the merge in
+ * `setAgentTiersSettings` is where a worktree that explicitly disables/renames
+ * `fast` can win.
+ */
+const SHIPPED_FAST_PROFILE: AgentTierProfile = {
+  model: "inherit",
+  thinking: "low",
+  description: "Fast, low-cost tier for cheap read-only work (shipped default)",
+};
 
+export const SHIPPED_AGENT_TIER_PROFILES: Readonly<Record<string, AgentTierProfile>> = {
+  fast: SHIPPED_FAST_PROFILE,
+};
+
+let agentTiersSettings: AgentTiersSettings = {}; // effective view (shipped tiers merged)
+let agentTiersConfigured: AgentTiersSettings = {}; // exactly what the user configured
+
+/** Effective catalogue: shipped tiers merged under any user configuration. */
 export function getAgentTiersSettings(): AgentTiersSettings {
   return structuredClone(agentTiersSettings);
 }
 
+/** The raw user configuration, without shipped tiers — what snapshotSettings writes back. */
+export function getAgentTiersConfiguredSettings(): AgentTiersSettings {
+  return structuredClone(agentTiersConfigured);
+}
+
+/** Exactly-equal profile? Used to strip untouched shipped tiers from the configured view. */
+function sameProfile(a: AgentTierProfile, b: AgentTierProfile): boolean {
+  return a.model === b.model && a.thinking === b.thinking && (a.description ?? "") === (b.description ?? "");
+}
+
+/**
+ * Install the effective tier catalogue.
+ *
+ * The shipped `fast` tier is merged in unless the caller already defined it or
+ * explicitly blocked it — a user catalogue wins over the shipped default, and a
+ * tombstone means "do not substitute", which applies to shipped defaults too.
+ *
+ * The configured view is derived from the same input by stripping profiles that
+ * exactly equal a shipped default, so the UI can operate on the effective view
+ * and send it back without materializing untouched shipped tiers into
+ * `subagents.json`. Editing a shipped tier (changing its model, thinking, or
+ * description) makes it a user-owned profile and it is then persisted; deleting
+ * one leaves its tombstone, which persists.
+ */
 export function setAgentTiersSettings(settings: AgentTiersSettings): void {
-  agentTiersSettings = structuredClone(settings);
+  const effective = structuredClone(settings);
+  const profiles = { ...(effective.profiles ?? {}) };
+  const blocked = new Set<string>(effective.blockedProfiles ?? []);
+
+  const configuredProfiles: Record<string, AgentTierProfile> = {};
+  for (const [key, profile] of Object.entries(profiles)) {
+    const shipped = SHIPPED_AGENT_TIER_PROFILES[key];
+    if (!blocked.has(key) && shipped !== undefined && sameProfile(profile, shipped)) continue;
+    configuredProfiles[key] = profile;
+  }
+  for (const [key, profile] of Object.entries(SHIPPED_AGENT_TIER_PROFILES)) {
+    if (!blocked.has(key) && profiles[key] === undefined) profiles[key] = profile;
+  }
+
+  agentTiersSettings = { ...effective, profiles };
+  const configured: AgentTiersSettings = { ...effective };
+  if (Object.keys(configuredProfiles).length > 0) configured.profiles = configuredProfiles;
+  else delete configured.profiles;
+  agentTiersConfigured = configured;
 }
 
 /**
@@ -173,13 +241,24 @@ export function upsertAgentTierProfile(
  * A `defaultTier` pointing at it is cleared in the same step. Leaving it would
  * turn every later spawn that names no tier into a hard refusal, which is a
  * strange thing to get from deleting a tier you had stopped using.
+ *
+ * Deleting a shipped tier (the default `fast`) tombstones it instead of just
+ * dropping it: the shipped merge in `setAgentTiersSettings` would otherwise
+ * silently re-add it on the next load, and a user who deletes it means it. The
+ * tombstone says "do not substitute", which is exactly the semantics the load
+ * path already honors for malformed profiles. Explore still names `fast` in its
+ * frontmatter, so the spawn refusal then says so loudly until the agent file or
+ * the tier is fixed.
  */
 export function removeAgentTierProfile(settings: AgentTiersSettings, key: string): AgentTiersSettings {
   const { [key]: _removed, ...profiles } = settings.profiles ?? {};
+  const shipped = Object.hasOwn(SHIPPED_AGENT_TIER_PROFILES, key);
+  let blocked = withoutBlocked(settings.blockedProfiles, key);
+  if (shipped) blocked = [...(blocked ?? []), key];
   return compactTierSettings({
     ...settings,
     profiles,
-    blockedProfiles: withoutBlocked(settings.blockedProfiles, key),
+    blockedProfiles: blocked,
     ...(settings.defaultTier === key ? { defaultTier: undefined } : {}),
   });
 }

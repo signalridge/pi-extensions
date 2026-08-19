@@ -1,7 +1,6 @@
 import { homedir } from "node:os";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { completeStatuslineArguments } from "./command-contract.js";
-import { handleStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
+import { registerStatuslineCommand, type StatuslineCommandOptions } from "./commands.js";
 import {
   buildExtensionStatusIconAliases,
   type ExtensionStatusIconAliasMap,
@@ -231,15 +230,9 @@ export default function statusline(pi: ExtensionAPI) {
       previewPalettePreset = palettePreset;
       refresh();
     },
+    isCurrentSession: (ctx) => ctx.sessionManager === activeSessionManager,
   };
-  pi.registerCommand("statusline", {
-    description: "Open or inspect the statusline settings",
-    getArgumentCompletions: completeStatuslineArguments,
-    handler: async (args, ctx) => {
-      if (ctx.sessionManager !== activeSessionManager) return;
-      await handleStatuslineCommand(args, ctx, commandOptions);
-    },
-  });
+  registerStatuslineCommand(pi, commandOptions);
 
   pi.on("session_start", (_event, ctx) => {
     runtime.turnCount = 0;

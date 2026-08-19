@@ -15,13 +15,14 @@
     "lifecycle": "stable"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0",
     "@signalridge/pi-subagents": ">=1.0.0"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49",
-    "@signalridge/pi-subagents-protocol": "^1.0.0"
+    "@signalridge/pi-subagents-protocol": "^1.0.0",
+    "@sinclair/typebox": "^0.34.50",
+    "acorn": "^8.16.0"
   },
   "pi": {
     "extensions": [

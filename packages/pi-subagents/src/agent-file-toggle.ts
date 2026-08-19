@@ -690,11 +690,17 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   const fmFields: string[] = [];
   fmFields.push(`description: ${JSON.stringify(cfg.description)}`);
   if (cfg.displayName) fmFields.push(`display_name: ${JSON.stringify(cfg.displayName)}`);
+  if (cfg.color) fmFields.push(`color: ${formatYamlScalar(cfg.color)}`);
   fmFields.push(`tools: ${formatYamlScalar(formatToolsField(cfg))}`);
   // Never model:/thinking: — the loader ignores them, so writing them back
   // would recreate a pin that looks effective and is not.
   if (cfg.agentTier) fmFields.push(`tier: ${formatYamlScalar(cfg.agentTier)}`);
   if (cfg.maxTurns) fmFields.push(`max_turns: ${cfg.maxTurns}`);
+  // Written when explicitly set, INCLUDING an explicit 0: for the budgets, 0
+  // means "unlimited" and is a real opt-out of a project default, so dropping
+  // it on eject would silently re-impose that default on the ejected copy.
+  if (cfg.maxTokens !== undefined) fmFields.push(`max_tokens: ${cfg.maxTokens}`);
+  if (cfg.maxToolCalls !== undefined) fmFields.push(`max_tool_calls: ${cfg.maxToolCalls}`);
   if (cfg.persistSession) fmFields.push("persist_session: true");
   if (cfg.sessionDir) fmFields.push(`session_dir: ${JSON.stringify(cfg.sessionDir)}`);
   if (cfg.allowedSubagents !== undefined) {
@@ -707,6 +713,8 @@ export function serializeAgentFile(cfg: AgentConfig): string {
   if (cfg.skills === false) fmFields.push("skills: false");
   else if (Array.isArray(cfg.skills)) fmFields.push(`skills: ${formatYamlScalar(cfg.skills.join(", "))}`);
   if (cfg.disallowedTools?.length) fmFields.push(`disallowed_tools: ${formatYamlScalar(cfg.disallowedTools.join(", "))}`);
+  if (cfg.askTools?.length) fmFields.push(`ask_tools: ${formatYamlScalar(cfg.askTools.join(", "))}`);
+  if (cfg.gate) fmFields.push(`gate: ${formatYamlScalar(cfg.gate)}`);
   if (cfg.inheritContext) fmFields.push("inherit_context: true");
   if (cfg.runInBackground) fmFields.push("run_in_background: true");
   if (cfg.outputTranscript === false) fmFields.push("output_transcript: false");

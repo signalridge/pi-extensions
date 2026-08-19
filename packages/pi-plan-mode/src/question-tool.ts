@@ -166,42 +166,89 @@ export async function answerPlanModeQuestions(
   return planModeQuestionAnswered(questions, answers);
 }
 
+/** Shown when more than one question is being asked, so the run has an end in sight. */
+const BACK_CHOICE = "← Back (change the previous answer)";
+
+/**
+ * Ask a batch of questions as a paged sequence rather than a one-way run.
+ *
+ * The questions arrive together and are answered one screen at a time, which is
+ * the right shape — a single screen holding four multi-option questions does not
+ * fit a terminal. What the one-way loop lacked was everything that makes a
+ * sequence navigable: no sense of how many were left, and no way back, so a
+ * misread option could only be fixed by cancelling the whole batch and making
+ * the model ask again.
+ *
+ * Answers are therefore held BY POSITION, not appended: stepping back and
+ * choosing again overwrites that slot instead of leaving a stale answer behind
+ * a corrected one. Cancellation semantics are unchanged — `undefined` still
+ * means "the user backed out", and `shouldContinue()` is still consulted after
+ * every await, since plan mode can end while a prompt is open.
+ */
 export async function askPlanModeQuestions(
   questions: PlanModeQuestion[],
   ctx: ExtensionContext,
   shouldContinue: () => boolean = () => true,
 ): Promise<PlanModeQuestionAnswer[] | undefined> {
-  const answers: PlanModeQuestionAnswer[] = [];
-  for (const question of questions) {
+  const answers: (PlanModeQuestionAnswer | undefined)[] = new Array(questions.length).fill(undefined);
+  // A single question has nothing to page through, so it keeps the plain title
+  // and gains no Back affordance that would only ever cancel.
+  const paged = questions.length > 1;
+
+  let index = 0;
+  while (index < questions.length) {
+    const question = questions[index];
+    if (!question) return undefined;
     const choices = question.options.map(formatPlanModeQuestionChoice);
     const otherChoice = `${question.options.length + 1}. Other (free-form)`;
-    const choice = await ctx.ui.select(`${question.header}: ${question.question}`, [...choices, otherChoice]);
+    const options = [...choices, otherChoice, ...(paged && index > 0 ? [BACK_CHOICE] : [])];
+    const position = paged ? `[${index + 1}/${questions.length}] ` : "";
+    const choice = await ctx.ui.select(`${position}${question.header}: ${question.question}`, options);
     if (!shouldContinue() || !choice) return undefined;
+
+    if (choice === BACK_CHOICE) {
+      // The answer being revised is dropped now rather than on re-answer, so a
+      // cancel from the previous screen cannot leave a half-corrected batch.
+      index -= 1;
+      answers[index] = undefined;
+      continue;
+    }
+
     if (choice === otherChoice) {
       const customAnswer = (await ctx.ui.editor(question.question, ""))?.trim();
-      if (!shouldContinue() || !customAnswer) return undefined;
-      answers.push({
+      if (!shouldContinue()) return undefined;
+      // An empty free-form answer returns to this question rather than
+      // cancelling the batch: opening the editor and thinking better of it is
+      // a correction, not a decision to abandon everything already answered.
+      if (!customAnswer) continue;
+      answers[index] = {
         id: question.id,
         header: question.header,
         question: question.question,
         answer: customAnswer,
         wasCustom: true,
-      });
+      };
+      index += 1;
       continue;
     }
+
     const optionIndex = choices.indexOf(choice);
     const option = question.options[optionIndex];
     if (!option) return undefined;
-    answers.push({
+    answers[index] = {
       id: question.id,
       header: question.header,
       question: question.question,
       answer: option.label,
       wasCustom: false,
       optionIndex: optionIndex + 1,
-    });
+    };
+    index += 1;
   }
-  return answers;
+
+  // Every slot is filled: the loop only advances past a question after writing
+  // one, and stepping back clears exactly the slot it returns to.
+  return answers.filter((answer): answer is PlanModeQuestionAnswer => answer !== undefined);
 }
 
 function formatPlanModeQuestionChoice(option: PlanModeQuestionOption, index: number) {

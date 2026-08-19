@@ -12,13 +12,15 @@
     "packages/*"
   ],
   "scripts": {
-    "check": "bun run check:json && bun run check:package-config && bun run check:boundaries && bun run check:tests && bun run check:versions && bun run check:changesets && bun run lint && bun run typecheck && bun run test && bun run test:release && bun run test:config && bun run smoke:pi && bun run pack:check && bun run secret-scan",
+    "check": "bun run check:json && bun run check:package-config && bun run check:boundaries && bun run check:shared-deps && bun run check:tests && bun run check:versions && bun run check:changesets && bun run check:capabilities && bun run lint && bun run typecheck && bun run test && bun run test:release && bun run test:config && bun run smoke:pi && bun run pack:check && bun run secret-scan",
     "check:json": "node scripts/check-json.mjs",
     "check:package-config": "node scripts/check-package-config.mjs",
     "check:boundaries": "node scripts/check-extension-boundaries.mjs",
+    "check:shared-deps": "node scripts/check-shared-dep-ranges.mjs",
     "check:tests": "node scripts/check-test-inventory.mjs",
     "check:versions": "node scripts/check-versions.mjs",
     "check:changesets": "node scripts/check-changesets.mjs",
+    "check:capabilities": "node scripts/check-capabilities.mjs",
     "format": "biome check --write scripts && node scripts/run-package-scripts.mjs format",
     "lint": "biome check --error-on-warnings scripts && node scripts/run-package-scripts.mjs lint --error-on-warnings --require-processed-files",
     "typecheck": "node scripts/run-package-scripts.mjs typecheck",

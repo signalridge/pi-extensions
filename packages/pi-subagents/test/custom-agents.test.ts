@@ -938,4 +938,83 @@ Bad isolation.`);
       rmSync(altAgentDir, { recursive: true, force: true });
     }
   });
+
+  // ---- `name:` frontmatter as agent type (Claude Code interop, B1#1) ----
+
+  it("registers an agent under its declared `name:` when it differs from the filename", () => {
+    writeAgent("file-named-differently", `---
+name: code-reviewer
+description: Declared name wins
+---
+
+Test body.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.has("code-reviewer")).toBe(true);
+    expect(result.has("file-named-differently")).toBe(false);
+    expect(result.get("code-reviewer")!.name).toBe("code-reviewer");
+    expect(result.get("code-reviewer")!.description).toBe("Declared name wins");
+  });
+
+  it("falls back to the filename when `name:` is absent", () => {
+    writeAgent("plain-filename", `---
+description: No declared name
+---
+
+Test body.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.has("plain-filename")).toBe(true);
+  });
+
+  it("rejects an empty or whitespace-only `name:` via || (not ??), keeping the filename", () => {
+    writeAgent("fallback-name", `---
+name: "   "
+description: Whitespace name
+---
+
+Test body.`);
+
+    const result = loadCustomAgents(tmpDir);
+    // `||`, not `??`: `""` and `"   "` are falsy so the filename stands in.
+    expect(result.has("fallback-name")).toBe(true);
+    expect(result.has("   ")).toBe(false);
+  });
+
+  it("skips an agent whose `name:` contains a colon (reserved for plugin scopes)", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    writeAgent("plugin-thing", `---
+name: some:plugin
+description: Reserved name
+---
+
+Test body.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.has("some:plugin")).toBe(false);
+    expect(result.has("plugin-thing")).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("reserved for"));
+    warn.mockRestore();
+  });
+
+  it("a declared name participates in priority resolution across discovery roots", () => {
+    // Workspace file declares `name: shared-reviewer`; project file declares the
+    // same name. The project file (higher priority) must win under the declared
+    // name, regardless of filenames.
+    writeWorkspaceAgent("workspace-file", `---
+name: shared-reviewer
+description: From workspace
+---
+
+Workspace.`);
+    writeAgentIn(".pi", "project-file", `---
+name: shared-reviewer
+description: From project
+---
+
+Project.`);
+
+    const result = loadCustomAgents(tmpDir);
+    expect(result.get("shared-reviewer")?.description).toBe("From project");
+  });
 });

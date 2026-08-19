@@ -17,11 +17,14 @@ import {
   buildAgentTierListText,
   buildAgentTierParameterDescription,
   buildCompactAgentTierListText,
+  getAgentTiersConfiguredSettings,
+  getAgentTiersSettings,
   isValidAgentTierKey,
   MAX_AGENT_TIER_KEY_LENGTH,
   offerableTierThinking,
   removeAgentTierProfile,
   resolveAgentTier,
+  setAgentTiersSettings,
   setDefaultAgentTier,
   upsertAgentTierProfile,
 } from "../src/agent-tiers.js";
@@ -187,6 +190,83 @@ describe("agent tier resolution", () => {
     expect(result.snapshot).toBeUndefined();
     expect(result.model).toBeUndefined();
     expect(result.thinkingLevel).toBeUndefined();
+  });
+});
+
+describe("setAgentTiersSettings shipped fast tier", () => {
+  beforeEach(() => {
+    setAgentTiersSettings({});
+  });
+
+  it("ships the `fast` tier on a fresh install", () => {
+    setAgentTiersSettings({});
+    const result = resolveAgentTier({
+      requestedTier: "fast",
+      settings: getAgentTiersSettings(),
+      parentModel: parent,
+      parentThinking: "high",
+      modelRegistry: registry,
+    });
+    expect(result.snapshot?.tier).toBe("fast");
+    expect(result.snapshot?.source).toBe("call");
+  });
+
+  it("a user-defined `fast` profile wins over the shipped one", () => {
+    setAgentTiersSettings({
+      profiles: { fast: { model: "test/parent", thinking: "high", description: "mine" } },
+    });
+    const resolved = resolveAgentTier({
+      requestedTier: "fast",
+      settings: getAgentTiersSettings(),
+      parentModel: parent,
+      parentThinking: "high",
+      modelRegistry: registry,
+    });
+    expect(resolved.model?.id).toBe("parent");
+  });
+
+  it("a blocked `fast` is not resurrected by the shipped merge", () => {
+    setAgentTiersSettings({ blockedProfiles: ["fast"] });
+    expect(getAgentTiersSettings().profiles?.fast).toBeUndefined();
+  });
+
+  it("deleting the shipped `fast` tombstones it so it does not come back", () => {
+    setAgentTiersSettings({});
+    const afterDelete = removeAgentTierProfile(getAgentTiersSettings(), "fast");
+    setAgentTiersSettings(afterDelete);
+    expect(getAgentTiersSettings().profiles?.fast).toBeUndefined();
+    expect(getAgentTiersSettings().blockedProfiles).toContain("fast");
+  });
+
+  it("redefining a deleted shipped tier retires the tombstone", () => {
+    setAgentTiersSettings({});
+    setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), "fast"));
+    setAgentTiersSettings(upsertAgentTierProfile(getAgentTiersSettings(), "fast", { model: "test/parent", thinking: "medium" }));
+    setAgentTiersSettings(getAgentTiersSettings());
+    expect(getAgentTiersSettings().profiles?.fast).toBeDefined();
+    expect(getAgentTiersSettings().blockedProfiles ?? []).not.toContain("fast");
+  });
+
+  it("shows the shipped tier in the rendered catalogue when nothing else is configured", () => {
+    setAgentTiersSettings({});
+    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("fast");
+    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("shipped default");
+  });
+
+  it("the configured view stays empty so persistence never writes shipped tiers", () => {
+    setAgentTiersSettings({});
+    expect(getAgentTiersSettings().profiles?.fast).toBeDefined();
+    expect(getAgentTiersConfiguredSettings().profiles).toBeUndefined();
+    expect(getAgentTiersConfiguredSettings().defaultTier).toBeUndefined();
+  });
+
+  it("user-configured tiers are reflected in the configured view", () => {
+    setAgentTiersSettings({
+      profiles: { custom: { model: "test/fast", thinking: "medium" } },
+      defaultTier: "custom",
+    });
+    expect(getAgentTiersConfiguredSettings().defaultTier).toBe("custom");
+    expect(getAgentTiersConfiguredSettings().profiles?.custom).toBeDefined();
   });
 });
 

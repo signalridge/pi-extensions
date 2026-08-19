@@ -304,7 +304,13 @@ test("after-first-goal resume can restore tools after a restrictive mode exits",
 
   assert.equal(lastGoalStatus(restored.mock), "active");
   assert.equal(restored.mock.sentUserMessages.length, 1);
-  assert.deepEqual(restored.mock.rawPi.getActiveTools(), ["read", "bash", "goal_complete", "goal_blocked"]);
+  assert.deepEqual(restored.mock.rawPi.getActiveTools(), [
+    "read",
+    "bash",
+    "goal_complete",
+    "goal_blocked",
+    "goal_wait",
+  ]);
 });
 
 test("active edit pauses when another policy hides terminal tools", async () => {

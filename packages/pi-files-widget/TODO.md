@@ -83,13 +83,13 @@
 - [x] Check for tuicr availability (`which tuicr`)
 - [x] Document install: `brew install agavra/tap/tuicr`
 
-### /review Command
-- [x] Register `/review` command
-- [x] Spawn tuicr with `stdio: "inherit"` (takes over terminal)
-- [x] After exit, read clipboard (`pbpaste` on macOS, `xclip` on Linux)
-- [x] Detect tuicr export format (contains `## Review Summary` or structured markdown)
-- [x] Send review to agent via `pi.sendUserMessage()`
-- [x] Show confirmation notification
+### /review Command — proposed, not shipped (see DESIGN.md banner)
+- [ ] Register `/review` command
+- [ ] Spawn tuicr with `stdio: "inherit"` (takes over terminal)
+- [ ] After exit, read clipboard (`pbpaste` on macOS, `xclip` on Linux)
+- [ ] Detect tuicr export format (contains `## Review Summary` or structured markdown)
+- [ ] Send review to agent via `pi.sendUserMessage()`
+- [ ] Show confirmation notification
 
 ### UX
 - [ ] `/review` - review all unstaged changes
@@ -102,11 +102,11 @@
 - [ ] Check for critique availability (requires Bun)
 - [ ] Document install: `bun install -g critique`
 
-### /diff Command
-- [x] Register `/diff` command
-- [x] Spawn critique for quick diff viewing
+### /diff Command — proposed, not shipped (see DESIGN.md banner)
+- [ ] Register `/diff` command
+- [ ] Spawn critique for quick diff viewing
 - [ ] `/diff --watch` for live monitoring while agent works
-- [x] `/diff <file>` for specific file
+- [ ] `/diff <file>` for specific file
 
 ### Web Preview
 - [ ] `/diff --web` generates shareable URL

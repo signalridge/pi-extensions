@@ -20,7 +20,7 @@ function runtime() {
   state.toolPolicy.restore({
     activeTools: ["read"],
     goalToolsUnlocked: false,
-    goalToolsHiddenByPolicy: ["goal_complete", "goal_blocked"],
+    goalToolsHiddenByPolicy: ["goal_complete", "goal_blocked", "goal_wait"],
   });
   Object.defineProperty(state, "visibility", {
     get: () => state.toolPolicy.snapshot(),
@@ -86,7 +86,7 @@ test("applyGoalSettings restores effective tool policy when persistence fails", 
 });
 
 test("applyGoalSettings rolls back file and effective state after runtime application fails", () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -120,7 +120,7 @@ test("applyGoalSettings rolls back file and effective state after runtime applic
 });
 
 test("disabling a retained queue pauses and aborts in-flight Goal work", () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -149,7 +149,7 @@ test("disabling a retained queue pauses and aborts in-flight Goal work", () => {
 });
 
 test("freezing a queue preserves an unrelated in-flight run", () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -203,9 +203,13 @@ test("revealing lazy Goal tools rejects a busy unrelated run", () => {
 });
 
 test("hiding always-visible Goal tools rejects a busy unrelated run", () => {
-  const mock = createMockPi({ activeTools: ["read", "goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["read", "goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
-  state.settings = structuredClone(DEFAULT_GOAL_SETTINGS);
+  // Pinned to `always` rather than taken from the default, which is now
+  // `after-first-goal`: this test is about the transition INTO hiding, and
+  // reading the start state from the default made it silently become a no-op
+  // transition the moment that default changed.
+  state.settings = { ...structuredClone(DEFAULT_GOAL_SETTINGS), toolVisibility: "always" as const };
   const before = state.toolPolicy.snapshot();
   const next = {
     ...structuredClone(state.settings),
@@ -229,7 +233,7 @@ test("hiding always-visible Goal tools rejects a busy unrelated run", () => {
 });
 
 test("lowering the no-progress limit pauses and aborts in-flight Goal work", () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -257,7 +261,7 @@ test("lowering the no-progress limit pauses and aborts in-flight Goal work", () 
 });
 
 test("lowering a reached limit preserves an unrelated in-flight run", () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -286,7 +290,7 @@ test("lowering a reached limit preserves an unrelated in-flight run", () => {
 });
 
 test("replacement confirmation does not replace a goal that changed while open", async () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.activeGoal = createGoal("previewed objective", undefined, 0);
   const replacement = createGoal("replacement objective", undefined, 0);
@@ -308,7 +312,7 @@ test("replacement confirmation does not replace a goal that changed while open",
 });
 
 test("replacement confirmation sanitizes terminal controls without changing goal data", async () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.activeGoal = createGoal("current\u001b]8;;bad\u0007 objective", undefined, 0);
   state.queuedGoals = [createGoal("queued\u001b objective", undefined, 0)];
@@ -336,7 +340,7 @@ test("replacement confirmation sanitizes terminal controls without changing goal
 });
 
 test("unfreezing waits for an aborted frozen run to settle before dispatching", async () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -371,7 +375,7 @@ test("unfreezing waits for an aborted frozen run to settle before dispatching", 
 });
 
 test("unfreezing an active retained queue dispatches Goal work immediately", async () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -391,7 +395,7 @@ test("unfreezing an active retained queue dispatches Goal work immediately", asy
 });
 
 test("unfreezing a pending priority dispatches it at the idle boundary", async () => {
-  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked"] });
+  const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
@@ -785,8 +789,9 @@ test("standard Goal tools setting saves and applies immediately", async () => {
       saved = structuredClone(settings);
     },
   });
-  assert.equal(saved?.toolVisibility, "after-first-goal");
-  assert.equal(state.settings.toolVisibility, "after-first-goal");
+  // Toggled away from the default, which is `after-first-goal`.
+  assert.equal(saved?.toolVisibility, "always");
+  assert.equal(state.settings.toolVisibility, "always");
 });
 
 test("invalid settings use a standard read-only detail screen", async () => {

@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { encodeCwd, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
+import { encodeCwd, ensureOutputFile, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
 
 describe("encodeCwd", () => {
   it("encodes a POSIX absolute path by stripping the leading slash and replacing separators", () => {
@@ -263,5 +263,61 @@ describe("streamToOutputFile", () => {
     session.push({ role: "assistant", content: [{ type: "text", text: "ghost" }] });
     session.fire({ type: "turn_end" });
     expect(readEntries()).toHaveLength(2);
+  });
+
+  // ---- Resume / re-anchor (#145, resume): a resume reuses the deterministic
+  // per-agent transcript path. `ensureOutputFile` must create it without
+  // truncating, and `startIndex` must anchor the stream past turns already on
+  // disk so re-running an agent never duplicates or destroys history.
+
+  it("ensureOutputFile creates a missing file without truncating an existing one", () => {
+    const fresh = join(tmp, "never-existed.output");
+    expect(() => ensureOutputFile(fresh)).not.toThrow();
+    expect(readFileSync(fresh, "utf-8")).toBe("");
+
+    // Existing file with prior turns stays byte-identical.
+    ensureOutputFile(outPath);
+    expect(readEntries()).toHaveLength(1);
+  });
+
+  it("startIndex anchors streaming past messages already written to the file", () => {
+    const session = makeFakeSession([
+      { role: "user", content: "first run prompt" },
+      { role: "assistant", content: [{ type: "text", text: "first run answer" }] },
+    ]);
+    // Simulate a resumed agent: the file already holds the first run, and the
+    // stream must not re-emit it — startIndex = session length at resume time.
+    streamToOutputFile(session as never, outPath, "agent-1", "/work", 2);
+
+    session.push({ role: "assistant", content: [{ type: "text", text: "second run answer" }] });
+    session.fire({ type: "turn_end" });
+
+    const entries = readEntries();
+    expect(entries).toHaveLength(2); // initial entry + second-run answer only
+    expect(JSON.stringify(entries.at(-1))).toContain("second run answer");
+    expect(JSON.stringify(entries.join("\n"))).not.toContain("first run answer");
+  });
+
+  it("an anchor beyond current messages holds until the array grows past it", () => {
+    // A resumed run's prompt lands at index = session length at resume time
+    // (the anchor). History below the anchor is already on disk.
+    const history = [
+      { role: "user", content: "previous run prompt" },
+      { role: "assistant", content: [{ type: "text", text: "previous run answer" }] },
+    ];
+    const session = makeFakeSession(history);
+    streamToOutputFile(session as never, outPath, "agent-1", "/work", history.length);
+
+    session.fire({ type: "turn_end" }); // nothing past the anchor yet
+    expect(readEntries()).toHaveLength(1);
+
+    session.push({ role: "user", content: "resumed prompt" }); // index 2 = anchor
+    session.push({ role: "assistant", content: [{ type: "text", text: "after resume" }] });
+    session.fire({ type: "turn_end" });
+
+    const combined = JSON.stringify(readEntries());
+    expect(combined).toContain("resumed prompt");
+    expect(combined).toContain("after resume");
+    expect(combined).not.toContain("previous run answer");
   });
 });

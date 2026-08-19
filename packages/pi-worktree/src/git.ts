@@ -572,6 +572,32 @@ export async function worktreeInventory(
   ];
 }
 
+/**
+ * A worktree's status as raw porcelain-v2 output, for the status browser.
+ *
+ * Separate from `worktreeInventory` on purpose: that reads porcelain v1 for the
+ * safety check, where a flat "is anything dirty" answer in the fewest moving
+ * parts is exactly right. This reads v2 because a person is going to READ the
+ * result, and v2 is the version that distinguishes staged from unstaged,
+ * carries a rename's original path and score, and names submodules. Ignored
+ * files are excluded: the safety check wants them, a reader does not.
+ */
+export async function worktreeStatusOutput(
+  pi: Pick<ExtensionAPI, "exec">,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  // Raw output, parsed by the caller: this module deliberately has no
+  // intra-package imports (a test loads it standalone under Node's strip-only
+  // TypeScript, which cannot resolve a sibling `./x.js` to `x.ts`), so the
+  // parser lives in `status.ts` and is applied where the result is consumed.
+  //
+  // `-z` so a path containing a newline or a quote is read exactly as git wrote
+  // it, rather than through the quoting v1 output would need.
+  const result = await runGit(pi, ["status", "--porcelain=v2", "--untracked-files=all", "-z"], path, signal);
+  return result.stdout;
+}
+
 export async function worktreeAdministrativeDirectory(
   pi: Pick<ExtensionAPI, "exec">,
   cwd: string,

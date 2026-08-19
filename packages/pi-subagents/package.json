@@ -25,12 +25,12 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0"
+    "@earendil-works/pi-ai": "^0.84.0",
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0"
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.49",
+    "@sinclair/typebox": "^0.34.50",
     "croner": "^10.0.1",
     "@signalridge/pi-subagents-protocol": "^1.0.0",
     "nanoid": "^5.0.0"

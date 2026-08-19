@@ -60,13 +60,31 @@ export interface StatuslineCommandOptions {
   preview?(palettePreset: PalettePreset | undefined, ctx: ExtensionCommandContext): void;
   save?: (settingsPath: string, rawDocument: string) => LoadedStatuslineSettings;
   getMenuOwner?(): { signal: AbortSignal; isCurrent(): boolean };
+  /**
+   * Whether `ctx` belongs to the session this runtime is currently drawing.
+   *
+   * Pi keeps a command registered across session switches, so a handler can be
+   * invoked with a context the runtime no longer owns; acting on it would apply
+   * settings to a retired session. Optional so a caller with a single session
+   * (and every test) can omit it, in which case every context is accepted.
+   */
+  isCurrentSession?(ctx: ExtensionCommandContext): boolean;
 }
 
+/**
+ * Register `/statusline`. The ONLY registration path — the runtime used to
+ * register the command inline with its own session guard while this function
+ * existed unused beside it, so the tests exercised a wrapper the product never
+ * ran, and the guard lived on only one of the two.
+ */
 export function registerStatuslineCommand(pi: ExtensionAPI, options: StatuslineCommandOptions) {
   pi.registerCommand("statusline", {
     description: "Open or inspect the statusline settings",
     getArgumentCompletions: completeStatuslineArguments,
-    handler: (args, ctx) => handleStatuslineCommand(args, ctx, options),
+    handler: async (args, ctx) => {
+      if (options.isCurrentSession?.(ctx) === false) return;
+      await handleStatuslineCommand(args, ctx, options);
+    },
   });
 }
 

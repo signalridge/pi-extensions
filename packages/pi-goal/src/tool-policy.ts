@@ -3,7 +3,8 @@ import type { GoalToolVisibility } from "./settings.js";
 
 export const GOAL_COMPLETE_TOOL = "goal_complete";
 export const GOAL_BLOCKED_TOOL = "goal_blocked";
-export const GOAL_TOOL_NAMES = [GOAL_COMPLETE_TOOL, GOAL_BLOCKED_TOOL] as const;
+export const GOAL_WAIT_TOOL = "goal_wait";
+export const GOAL_TOOL_NAMES = [GOAL_COMPLETE_TOOL, GOAL_BLOCKED_TOOL, GOAL_WAIT_TOOL] as const;
 
 export interface GoalToolVisibilitySnapshot {
   activeTools: string[];

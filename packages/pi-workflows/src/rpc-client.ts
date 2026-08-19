@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type {
   ManagedSpawnResponse as ProtocolManagedSpawnResponse,
   ManagedTerminalSnapshot as ProtocolManagedTerminalSnapshot,
+  WorkflowTier,
 } from "@signalridge/pi-subagents-protocol";
 import {
   PROTOCOL_VERSION,
@@ -11,7 +12,14 @@ import {
   workflowTierCapabilityMatch,
 } from "@signalridge/pi-subagents-protocol";
 import type { WorkflowOwner } from "./journal.js";
-import type { WorkflowTask } from "./schema.js";
+
+/** Minimal dispatch task for a script-run agent() call. */
+export interface DispatchTask {
+  subagent_type: string;
+  prompt: string;
+  description: string;
+  tier?: WorkflowTier;
+}
 
 export interface WorkflowEventBus {
   on(event: string, handler: (data: unknown) => void): () => void;
@@ -247,7 +255,7 @@ export interface ManagedSpawnClient {
    * runtime context and is not sent over RPC.
    */
   spawn(
-    task: WorkflowTask,
+    task: DispatchTask,
     runId: string,
     nodeId: string,
     attemptId?: string,
@@ -281,13 +289,26 @@ export function createManagedSpawnClient(
   ): Promise<T> => callRpc(events, channel, payload, timeoutMs, signal);
 
   return {
+    /**
+     * Dispatch one managed agent call.
+     *
+     * `nodeId` is the runtime's `call-${callIndex}` and `attemptId` is
+     * `attempt-${generation}`. The spawnKey is opaque to pi-subagents, so the
+     * generation is the client-side rotation knob: when a resume replays a
+     * changed call (local callHash differs from the journaled one), the engine
+     * bumps the generation and this key changes — pi-subagents then treats the
+     * new key as a fresh spawn instead of throwing its fingerprint-conflict
+     * error for the same key with a different fingerprint. Same key + same
+     * fingerprint still reuses the persisted tombstone (per-call cache).
+     */
     async spawn(task, runId, nodeId, attemptId) {
-      const effectiveAttemptId = attemptId ?? `${runId}/${nodeId}/attempt-1`;
+      const effectiveAttemptId = attemptId ?? `attempt-1`;
+      const spawnKey = `${runId}/${nodeId}/${effectiveAttemptId}`;
       const data = await call<unknown>(
         "subagents:rpc:spawn-managed",
         {
           requestId: requestId(),
-          spawnKey: `${runId}/${nodeId}/${effectiveAttemptId}`,
+          spawnKey,
           type: task.subagent_type,
           prompt: task.prompt,
           description: task.description,

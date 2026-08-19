@@ -37,6 +37,25 @@ export type IsolationMode = "worktree";
 export interface AgentConfig {
   name: string;
   displayName?: string;
+  /**
+   * Badge colour for this agent, as a Claude Code palette name or `#RRGGBB`.
+   * Anything else renders without a badge rather than failing the load — a
+   * colour typo must not cost the user their agent.
+   */
+  color?: string;
+  /**
+   * Tools whose every call needs the user to agree first (`ask_tools:`). The
+   * third answer between `tools:` and `disallowed_tools:`, for tools that are
+   * usually fine and occasionally not. Approval comes from the human, never
+   * from a model — see `ask-tools.ts`.
+   */
+  askTools?: string[];
+  /**
+   * Shell command run by the HOST after this agent finishes, whose pass/fail is
+   * appended to its result (`gate:`). The one acceptance signal the agent
+   * cannot author — see `gate.ts`.
+   */
+  gate?: string;
   description: string;
   builtinToolNames?: string[];
   /** Raw `ext:` selector entries from the `tools:` CSV, e.g. ["ext:foo", "ext:bar/x"].
@@ -69,6 +88,14 @@ export interface AgentConfig {
   /** Programmatic-only, for the same reason as `model` above. */
   thinking?: ThinkingLevel;
   maxTurns?: number;
+  /**
+   * Token budget for one run of this agent (`max_tokens`). `0`/omitted =
+   * unlimited, matching `maxTurns`. Bounds what a single turn can spend, which
+   * a turn count cannot: one turn can burn an arbitrary number of tokens.
+   */
+  maxTokens?: number;
+  /** Tool-call budget for one run of this agent (`max_tool_calls`). `0`/omitted = unlimited. */
+  maxToolCalls?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;
   /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
@@ -134,6 +161,17 @@ export interface AgentRecord {
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**
+   * Session file path when the agent's conversation is persisted to disk
+   * (session_file in the agent definition or pi's session persistence). Set at
+   * spawn so an evicted record can be reopened as a resumable entry.
+   */
+  sessionFile?: string;
+  /**
+   * Resumable mention handle, when the agent was addressable by `@handle`.
+   * Only top-level agents carry one.
+   */
+  handle?: string;
+  /**
    * Lifetime usage breakdown, accumulated via `message_end` events. Survives
    * compaction. Total = input + output + cacheWrite (cacheRead deliberately
    * excluded — see issue #38). Initialized to zeros at spawn.
@@ -177,6 +215,25 @@ export interface AgentRecord {
   owner?: AgentOwner;
   /** Set when a session-tree replacement detaches this record; late completion is ignored. */
   detached?: boolean;
+}
+
+/**
+ * What survives a record's eviction so `@handle` keeps working. The live record
+ * is discarded after the cleanup timer, but the pi session it wrote is still on
+ * disk, and this is the little that is needed to find and describe it again.
+ *
+ * Named `ResumableAgentEntry` (not "tombstone") because this codebase already
+ * uses `ManagedSpawnTombstone` for the managed-spawn idempotency record — two
+ * different concepts must not share a name.
+ */
+export interface ResumableAgentEntry {
+  handle: string;
+  id: string;
+  type: SubagentType;
+  description: string;
+  /** Always set — a record with no session file is never indexed. */
+  sessionFile: string;
+  completedAt: number;
 }
 
 export interface AgentInvocation {

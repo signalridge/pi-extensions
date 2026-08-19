@@ -9,8 +9,8 @@
     "lifecycle": "stable"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "^0.84.0",
+    "@earendil-works/pi-tui": "^0.84.0"
   },
   "pi": {
     "extensions": [

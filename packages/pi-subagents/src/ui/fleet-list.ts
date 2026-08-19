@@ -12,10 +12,11 @@
  */
 
 import { Editor, isKeyRelease, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, getDisplayName, type Theme } from "./agent-display.js";
+import { type AgentActivity, type Theme } from "./agent-display.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 import { sanitizeDisplayText } from "./safe-text.js";
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
@@ -379,11 +380,11 @@ export class FleetList {
 
   private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {
     const selected = rosterIndex === sel;
-    const name = getDisplayName(record.type);
     const status = getAgentStatusLabel(record.status);
-    const nameText = selected
-      ? theme.bold(theme.fg("accent", name))
-      : theme.fg("muted", name);
+    const nameText = renderAgentName(record.type, theme, {
+      fallbackColor: selected ? "accent" : "muted",
+      bold: selected,
+    });
     const description = sanitizeDisplayText(record.description);
     const descriptionText = selected ? theme.fg("accent", description) : description;
     const semanticStatusColor = getAgentStatusColor(record.status);

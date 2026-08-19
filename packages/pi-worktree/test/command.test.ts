@@ -181,6 +181,7 @@ test("/worktree menu exposes only actionable flows", async () => {
     "Add worktree",
     "Switch worktree",
     "Remove worktree",
+    "Browse worktree status",
     "Prune stale metadata",
     "Configure worktree root",
   ]);

@@ -34,7 +34,7 @@ export function registerGoal(pi: Parameters<typeof goal>[0], toolVisibility: "al
 }
 
 export function registerGoalWithSettingsPath(pi: Parameters<typeof goal>[0], goalSettingsPath: string) {
-  pi.setActiveTools([...new Set([...pi.getActiveTools(), "goal_complete", "goal_blocked"])]);
+  pi.setActiveTools([...new Set([...pi.getActiveTools(), "goal_complete", "goal_blocked", "goal_wait"])]);
   goal(pi, { settingsPath: goalSettingsPath });
 }
 export type GoalTool = {

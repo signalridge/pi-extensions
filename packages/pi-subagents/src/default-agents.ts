@@ -34,11 +34,12 @@ export const DEFAULT_AGENTS: Map<string, AgentConfig> = new Map([
       builtinToolNames: READ_ONLY_TOOLS,
       extensions: true,
       skills: true,
-      // No model pin. Which model a subagent runs is the tier catalogue's
-      // decision; a built-in that pinned one would be the same end-run around it
-      // that agent frontmatter is no longer allowed to make, and it would name a
-      // vendor on a machine that may not have it. With no tier configured this
-      // inherits the parent's model, which is the documented fallback.
+      // Runs on the shipped `fast` agent tier (model inherit, low thinking) so
+      // read-only search does not inherit the parent session's most expensive
+      // model on machines that never configured agentTiers. The tier is the
+      // policy: point `fast` at a cheap model in subagents.json and Explore
+      // follows without touching agent files.
+      agentTier: "fast",
       systemPrompt: `# CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS
 You are a file search specialist. You excel at thoroughly navigating and exploring codebases.
 Your role is EXCLUSIVELY to search and analyze existing code. You do NOT have access to file editing tools.

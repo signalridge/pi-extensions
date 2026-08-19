@@ -11,6 +11,11 @@ const DEFAULT_GOAL_SETTINGS_DOCUMENT = `${JSON.stringify(DEFAULT_GOAL_SETTINGS, 
 test("normalizeGoalSettings applies defaults and accepts bounded continuation limits", () => {
   assert.equal(DEFAULT_GOAL_SETTINGS.continuationLimits.automaticTurns, 25);
   assert.deepEqual(DEFAULT_GOAL_SETTINGS.rpc, { enabled: false });
+  // Asserted here rather than inferred from a round-trip: the goal tools are
+  // meaningless without an active goal, so a session that never runs `/goal`
+  // must not carry their definitions or prompt guidelines. Changing this
+  // default changes the context cost of every session that installs pi-goal.
+  assert.equal(DEFAULT_GOAL_SETTINGS.toolVisibility, "after-first-goal");
   assert.deepEqual(normalizeGoalSettings({}), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ futureOption: true }), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ toolVisibility: "always" }), {

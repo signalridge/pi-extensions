@@ -59,7 +59,7 @@ setup.
 ## Quality
 
 - Use Pi's public APIs and `pi.events` for cross-extension communication.
-- Avoid dynamic imports and `any`; validate event-bus payloads at package boundaries.
+- Avoid dynamic imports (except to defer loading a TUI-only dependency out of headless paths — see `docs/open-decisions.md`) and `any`; validate event-bus payloads at package boundaries.
 - Guard TUI-only features with `ctx.mode === "tui"` and dialogs with `ctx.hasUI`.
 - Run `bun run check` before committing.
 - Add tests for state transitions, persistence, event ownership, and recovery behavior.
