@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-herdr-state",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Report Pi lifecycle state to herdr.",
   "type": "module",
   "license": "MIT",

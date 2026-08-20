@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-statusline",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Signalridge's polished, theme-native statusline for Pi.",
   "type": "module",
   "license": "MIT",

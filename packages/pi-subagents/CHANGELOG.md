@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1
+### Patch Changes
+
+- f714ea0: Publish the package versions already prepared by the previous release transition after its first publish attempt was blocked before npm publication.
+- Updated dependencies [f714ea0]
+  - @signalridge/pi-subagents-protocol@1.3.1
+
 ## 1.6.0
 ### Minor Changes
 

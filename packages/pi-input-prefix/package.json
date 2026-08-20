@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-input-prefix",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Theme-aware rounded input editor and prompt token for Pi.",
   "type": "module",
   "license": "MIT",

@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-gpt-fast",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Opt-in OpenAI and Codex priority service tier for Pi.",
   "type": "module",
   "license": "MIT",

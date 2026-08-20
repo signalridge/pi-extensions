@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-files-widget",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "In-terminal file browser and viewer for Pi.",
   "license": "MIT",
   "author": "Thomas Mustier",
