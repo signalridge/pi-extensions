@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+### Patch Changes
+
+- 7d2c6c9: Keep generated workflow capability references synchronized when Changesets versions the package.
+
 ## 1.3.0
 ### Minor Changes
 
