@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-recall",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Experimental Pi extension for saving and recalling messages across sessions.",
   "type": "module",
   "license": "MIT",
