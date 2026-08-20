@@ -36,7 +36,11 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const packagesRoot = resolve(root, "packages");
 const DEFAULT_BRANCH = "main";
 /** Published files the release writes for itself; see the header. */
-const RELEASE_GENERATED = new Set(["CHANGELOG.md"]);
+const RELEASE_GENERATED = new Set([
+  "CHANGELOG.md",
+  "skills/workflow-authoring/references/capabilities.md",
+  "skills/workflow-authoring/references/capability-details.md",
+]);
 
 function git(args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
@@ -132,9 +136,12 @@ for (const directory of readdirSync(packagesRoot).sort()) {
   if (released.has(manifest.name)) continue;
 
   const prefixes = publishedPrefixes(directory, manifest);
-  const touched = changedFiles.filter((file) =>
-    prefixes.some((prefix) => (prefix.endsWith("/") ? file.startsWith(prefix) : file === prefix)),
-  );
+  const packagePrefix = `packages/${directory}/`;
+  const touched = changedFiles.filter((file) => {
+    const relative = file.startsWith(packagePrefix) ? file.slice(packagePrefix.length) : undefined;
+    if (relative !== undefined && RELEASE_GENERATED.has(relative)) return false;
+    return prefixes.some((prefix) => (prefix.endsWith("/") ? file.startsWith(prefix) : file === prefix));
+  });
   if (touched.length > 0) missing.push({ name: manifest.name, touched });
 }
 
