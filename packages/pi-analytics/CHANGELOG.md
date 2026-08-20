@@ -1,5 +1,10 @@
 # @signalridge/pi-analytics
 
+## 1.2.3
+### Patch Changes
+
+- f714ea0: Publish the package versions already prepared by the previous release transition after its first publish attempt was blocked before npm publication.
+
 ## 1.2.2
 ### Patch Changes
 
