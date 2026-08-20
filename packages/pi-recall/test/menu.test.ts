@@ -271,20 +271,15 @@ test("TUI direct delete confirms the selected message, shows progress, and resto
     await release;
     return originalDelete(id);
   };
-  let confirmation: { title: string; message: string } | undefined;
   const tui = createTuiHarness({
     width: 72,
     rows: 18,
     keybindings: recallPickerKeybindings() as never,
   });
-  const base = createMockContext({
-    hasUI: true,
-    mode: "tui",
-    confirm: async (title: string, message: string) => {
-      confirmation = { title, message };
-      return true;
-    },
-  }).ctx as unknown as { ui: Record<string, unknown>; [key: string]: unknown };
+  const base = createMockContext({ hasUI: true, mode: "tui" }).ctx as unknown as {
+    ui: Record<string, unknown>;
+    [key: string]: unknown;
+  };
   const controller = createRecallMenu(data);
   const choosing = controller.menu.actions.chooseSaved({
     ctx: { ...base, ui: { ...base.ui, custom: tui.custom } } as never,
@@ -298,15 +293,15 @@ test("TUI direct delete confirms the selected message, shows progress, and resto
   tui.type("saved");
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
-  await started;
-  try {
-    assert.match(confirmation?.title ?? "", /Delete saved message/);
-    assert.match(confirmation?.message ?? "", /saved text saved-other/);
-    assert.match(tui.render().join("\n"), /Deleting saved message/);
-  } finally {
-    releaseDelete();
-  }
+  const confirmationView = stripVTControlCharacters(tui.render().join("\n"));
+  assert.match(confirmationView, /Delete saved message/);
+  assert.match(confirmationView, /saved text saved-other/);
+  tui.press("tui.select.confirm");
   await waitForOpenCount(tui, 3, choosing);
+  await started;
+  assert.match(stripVTControlCharacters(tui.render().join("\n")), /Deleting saved message/);
+  releaseDelete();
+  await waitForOpenCount(tui, 4, choosing);
   const restored = stripVTControlCharacters(tui.render().join("\n"));
   assert.match(restored, /Scope: All \(1\).*1 match/);
   assert.match(restored, /Search: .*saved/);
@@ -331,11 +326,10 @@ test("cancelling direct delete is side-effect free and restores query and select
     rows: 18,
     keybindings: recallPickerKeybindings() as never,
   });
-  const base = createMockContext({
-    hasUI: true,
-    mode: "tui",
-    confirm: async () => false,
-  }).ctx as unknown as { ui: Record<string, unknown>; [key: string]: unknown };
+  const base = createMockContext({ hasUI: true, mode: "tui" }).ctx as unknown as {
+    ui: Record<string, unknown>;
+    [key: string]: unknown;
+  };
   const controller = createRecallMenu(data);
   const choosing = controller.menu.actions.chooseSaved({
     ctx: { ...base, ui: { ...base.ui, custom: tui.custom } } as never,
@@ -347,6 +341,10 @@ test("cancelling direct delete is side-effect free and restores query and select
   tui.type("saved-a");
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
+  const confirmationView = stripVTControlCharacters(tui.render().join("\n"));
+  assert.match(confirmationView, /Delete saved message/);
+  tui.press("tui.select.cancel");
+  await waitForOpenCount(tui, 3, choosing);
   const restored = stripVTControlCharacters(tui.render().join("\n"));
   assert.match(restored, /Search: .*saved-a/);
   assert.match(restored, /> assistant .*saved text saved-a/);
@@ -383,8 +381,10 @@ test("direct delete failure preserves the record and reports an actionable error
   await tui.waitForOpen();
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
-  releaseDelete();
+  tui.press("tui.select.confirm");
   await waitForOpenCount(tui, 3, choosing);
+  releaseDelete();
+  await waitForOpenCount(tui, 4, choosing);
   assert.equal(data.records.length, 1);
   assert.match(tui.render().join("\n"), /saved text saved-a/);
   assert.match(mock.notifications.at(-1)?.message ?? "", /Couldn.t delete.*lock unavailable/i);
@@ -424,6 +424,8 @@ test("session cancellation aborts in-flight direct delete without stale success 
   await tui.waitForOpen();
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
+  tui.press("tui.select.confirm");
+  await waitForOpenCount(tui, 3, choosing);
   await started;
   owner.abort(new DOMException("Session replaced", "AbortError"));
   assert.deepEqual(await choosing, { kind: "close" });
@@ -456,7 +458,9 @@ test("direct delete reconciles a record already removed by another process", asy
   });
   await tui.waitForOpen();
   tui.send("\u0004");
-  await waitForOpenCount(tui, 3, choosing);
+  await waitForOpenCount(tui, 2, choosing);
+  tui.press("tui.select.confirm");
+  await waitForOpenCount(tui, 4, choosing);
   assert.match(tui.render().join("\n"), /No saved messages in this scope/);
   assert.match(mock.notifications.at(-1)?.message ?? "", /already removed/i);
   tui.press("tui.select.cancel");

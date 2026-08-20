@@ -77,6 +77,8 @@ const WORKFLOW_STATUS_VALUES = new Set<WorkflowStatus>([
 const CALL_STATUS_VALUES = new Set<CallStatus>(["running", "completed", "failed", "stopped"]);
 const JOURNAL_KINDS = new Set([
   "run_created",
+  "run_revision",
+  "run_removed",
   "workflow_transition",
   "run_recovery",
   "terminal_recovery",
@@ -108,6 +110,17 @@ export interface ScriptRun {
   script: string;
   scriptHash: string;
   meta: WorkflowMeta;
+  /** Number of the latest edited-script revision. */
+  revision?: number;
+  /** Toolset marker persisted across resume (e.g. "web-research" for deep-research). */
+  toolset?: string;
+  /** Frozen run params — persisted so resume after restore keeps original budget/scale. */
+  frozenMaxAgents?: number;
+  frozenConcurrency?: number;
+  frozenAgentRetries?: number;
+  frozenTokenBudget?: number | null;
+  frozenAgentTimeoutMs?: number | null;
+  frozenExcludeTools?: string[];
   status: WorkflowStatus;
   /** Call index → status. Absent entries were never dispatched (replayed or skipped). */
   callStatus: Record<string, CallStatus>;
@@ -193,8 +206,25 @@ export type JournalEvent =
       script: string;
       scriptHash: string;
       meta: WorkflowMeta;
+      toolset?: string;
+      frozenMaxAgents?: number;
+      frozenConcurrency?: number;
+      frozenAgentRetries?: number;
+      frozenTokenBudget?: number | null;
+      frozenAgentTimeoutMs?: number | null;
+      frozenExcludeTools?: string[];
       attempts?: Record<string, number>;
       attemptIds?: Record<string, string>;
+    })
+  | (JournalBase & {
+      kind: "run_revision";
+      revision: number;
+      script: string;
+      scriptHash: string;
+      meta: WorkflowMeta;
+    })
+  | (JournalBase & {
+      kind: "run_removed";
     })
   | (JournalBase & {
       kind: "workflow_transition";
@@ -573,6 +603,46 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
     const script = boundedString(raw.script, "script", JOURNAL_SCRIPT_LIMIT);
     const scriptHash = boundedString(raw.scriptHash, "scriptHash", 128);
     const meta = parseMeta(raw.meta);
+    const toolset =
+      raw.toolset === undefined
+        ? undefined
+        : typeof raw.toolset === "string" && raw.toolset.length > 0 && raw.toolset.length <= 64
+          ? raw.toolset
+          : undefined;
+    const frozenMaxAgents =
+      typeof raw.frozenMaxAgents === "number" && Number.isInteger(raw.frozenMaxAgents) && raw.frozenMaxAgents >= 1
+        ? raw.frozenMaxAgents
+        : undefined;
+    const frozenConcurrency =
+      typeof raw.frozenConcurrency === "number" && Number.isInteger(raw.frozenConcurrency) && raw.frozenConcurrency >= 1
+        ? raw.frozenConcurrency
+        : undefined;
+    const frozenAgentRetries =
+      typeof raw.frozenAgentRetries === "number" &&
+      Number.isInteger(raw.frozenAgentRetries) &&
+      raw.frozenAgentRetries >= 0
+        ? raw.frozenAgentRetries
+        : undefined;
+    const frozenTokenBudget =
+      raw.frozenTokenBudget === null
+        ? null
+        : typeof raw.frozenTokenBudget === "number" &&
+            Number.isFinite(raw.frozenTokenBudget) &&
+            raw.frozenTokenBudget >= 1
+          ? raw.frozenTokenBudget
+          : undefined;
+    const frozenAgentTimeoutMs =
+      raw.frozenAgentTimeoutMs === null
+        ? null
+        : typeof raw.frozenAgentTimeoutMs === "number" &&
+            Number.isFinite(raw.frozenAgentTimeoutMs) &&
+            raw.frozenAgentTimeoutMs >= 1
+          ? raw.frozenAgentTimeoutMs
+          : undefined;
+    const frozenExcludeTools =
+      Array.isArray(raw.frozenExcludeTools) && raw.frozenExcludeTools.every((v) => typeof v === "string")
+        ? (raw.frozenExcludeTools as string[])
+        : undefined;
     return {
       kind: "run_created",
       schemaVersion: raw.schemaVersion as JournalSchemaVersion,
@@ -580,6 +650,13 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
       script,
       scriptHash,
       meta,
+      ...(toolset ? { toolset } : {}),
+      ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
+      ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
+      ...(frozenAgentRetries !== undefined ? { frozenAgentRetries } : {}),
+      ...(frozenTokenBudget !== undefined ? { frozenTokenBudget } : {}),
+      ...(frozenAgentTimeoutMs !== undefined ? { frozenAgentTimeoutMs } : {}),
+      ...(frozenExcludeTools ? { frozenExcludeTools } : {}),
       timestamp,
       ...(raw.attempts === undefined ? {} : { attempts: parseAttemptMap(raw.attempts, "attempts") }),
       ...(raw.attemptIds === undefined ? {} : { attemptIds: parseAttemptIdMap(raw.attemptIds, "attemptIds") }),
@@ -588,6 +665,25 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
 
   const run = runs.get(runId);
   if (!run) throw new Error("journal event references an unknown run");
+  if (raw.kind === "run_revision") {
+    const revision = raw.revision;
+    if (typeof revision !== "number" || !Number.isInteger(revision) || revision <= (run.revision ?? 0))
+      throw new Error("workflow revision is invalid or stale");
+    const script = boundedString(raw.script, "revision.script", JOURNAL_SCRIPT_LIMIT);
+    const scriptHash = boundedString(raw.scriptHash, "revision.scriptHash", 128);
+    return {
+      kind: "run_revision",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId,
+      revision,
+      script,
+      scriptHash,
+      meta: parseMeta(raw.meta),
+      timestamp,
+    };
+  }
+  if (raw.kind === "run_removed")
+    return { kind: "run_removed", schemaVersion: JOURNAL_SCHEMA_VERSION, runId, timestamp };
   if (raw.kind === "run_recovery") return parseRunRecovery(raw, run, timestamp);
   if (raw.kind === "terminal_recovery") return parseTerminalRecovery(raw, run, timestamp);
   if (raw.kind === "attempt_recovery") return parseAttemptRecovery(raw, run, timestamp);
@@ -717,6 +813,7 @@ export function replayJournal(
 ): Map<string, ScriptRun> {
   const runs = new Map<string, ScriptRun>();
   const quarantined = new Set<string>();
+  const removed = new Set<string>();
   /** Recovery identities are scoped to one replayed run and bounded explicitly. */
   const seenRecoveries = new Map<string, Map<string, string>>();
   let reported = false;
@@ -730,7 +827,19 @@ export function replayJournal(
     const raw = entry.data;
     const rawRunId = isRecord(raw) && typeof raw.runId === "string" ? raw.runId : undefined;
     if (rawRunId && quarantined.has(rawRunId)) continue;
+    if (rawRunId && removed.has(rawRunId)) continue;
     try {
+      if (isRecord(raw) && raw.kind === "run_created" && rawRunId && runs.has(rawRunId)) {
+        const existing = runs.get(rawRunId);
+        if (
+          existing &&
+          existing.script === raw.script &&
+          existing.scriptHash === raw.scriptHash &&
+          JSON.stringify(existing.meta) === JSON.stringify(raw.meta)
+        )
+          continue;
+        throw new Error("conflicting duplicate workflow run_created event");
+      }
       if (
         isRecord(raw) &&
         (raw.kind === "run_recovery" || raw.kind === "terminal_recovery") &&
@@ -786,6 +895,9 @@ export function replayJournal(
         continue;
       }
       applyJournalEvent(runs, event);
+      if (event.kind === "run_removed") {
+        removed.add(event.runId);
+      }
     } catch (error: unknown) {
       if (error instanceof StaleJournalGenerationError) continue;
       if (rawRunId) {
@@ -871,6 +983,14 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       script: event.script,
       scriptHash: event.scriptHash,
       meta: event.meta,
+      revision: 0,
+      ...(event.toolset ? { toolset: event.toolset } : {}),
+      ...(event.frozenMaxAgents !== undefined ? { frozenMaxAgents: event.frozenMaxAgents } : {}),
+      ...(event.frozenConcurrency !== undefined ? { frozenConcurrency: event.frozenConcurrency } : {}),
+      ...(event.frozenAgentRetries !== undefined ? { frozenAgentRetries: event.frozenAgentRetries } : {}),
+      ...(event.frozenTokenBudget !== undefined ? { frozenTokenBudget: event.frozenTokenBudget } : {}),
+      ...(event.frozenAgentTimeoutMs !== undefined ? { frozenAgentTimeoutMs: event.frozenAgentTimeoutMs } : {}),
+      ...(event.frozenExcludeTools ? { frozenExcludeTools: event.frozenExcludeTools } : {}),
       status: "pending",
       callStatus,
       agentIds: {},
@@ -887,8 +1007,18 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
 
   const run = runs.get(event.runId);
   if (!run) return;
+  if (event.kind === "run_removed") {
+    runs.delete(event.runId);
+    return;
+  }
   run.updatedAt = event.timestamp;
   switch (event.kind) {
+    case "run_revision":
+      run.revision = event.revision;
+      run.script = event.script;
+      run.scriptHash = event.scriptHash;
+      run.meta = event.meta;
+      break;
     case "workflow_transition":
       run.status = event.status;
       if (event.error !== undefined) run.error = event.error;
@@ -967,7 +1097,12 @@ function canTransitionWorkflow(previous: WorkflowStatus, next: WorkflowStatus): 
       return next === "running" || next === "stopping";
     case "running":
       return (
-        next === "pausing" || next === "stopping" || next === "interrupted" || next === "completed" || next === "failed"
+        next === "pausing" ||
+        next === "paused" ||
+        next === "stopping" ||
+        next === "interrupted" ||
+        next === "completed" ||
+        next === "failed"
       );
     case "pausing":
       return next === "paused" || next === "stopping";
@@ -1016,12 +1151,10 @@ export function buildResumeJournal(
       continue;
     }
     const result = isRecord(raw.result) ? raw.result : undefined;
-    if (!result || (result.status !== "completed" && result.status !== "failed" && result.status !== "stopped")) {
-      continue;
-    }
-    if (!Object.hasOwn(result, "result") && result.status !== "failed" && result.status !== "stopped") {
-      continue;
-    }
+    // Failed/stopped lifecycle facts are diagnostic history, not successful
+    // replay values. Replaying them as `undefined` would silently skip a call
+    // and bypass the runtime's retry/error policy.
+    if (result?.status !== "completed" || !Object.hasOwn(result, "result")) continue;
     journal.set(`${runId}:${nodeId}`, {
       index: Number(nodeId),
       runId,

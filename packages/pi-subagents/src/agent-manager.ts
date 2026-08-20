@@ -26,7 +26,16 @@ import type { WorkflowThinking } from "./settings.js";
 import type { AgentInvocation, AgentOwner, AgentRecord, AgentRecordSnapshot, IsolationMode, ResumableAgentEntry, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
-import { cleanupWorktree, cleanupWorktreeAsync, createWorktree, pruneWorktrees, pruneWorktreesAsync, type WorktreeCleanupResult, type WorktreeInfo } from "./worktree.js";
+import {
+  cleanupWorktree,
+  cleanupWorktreeAsync,
+  createWorktree,
+  isWorktreeIsolationEnabled,
+  pruneWorktrees,
+  pruneWorktreesAsync,
+  type WorktreeCleanupResult,
+  type WorktreeInfo,
+} from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentCreated = (record: AgentRecord) => void;
@@ -237,6 +246,9 @@ const MANAGED_TEXT_LIMIT = 8_000;
 const MANAGED_ERROR_LIMIT = 2_000;
 const MANAGED_PATH_LIMIT = 2_000;
 const MANAGED_MAX_TIMESTAMP = 8_640_000_000_000_000;
+const MANAGED_PERSIST_RETRY_INITIAL_DELAY_MS = 25;
+const MANAGED_PERSIST_RETRY_MAX_DELAY_MS = 2_000;
+const MANAGED_PERSIST_RETRY_MAX_ATTEMPTS = 8;
 
 export type ManagedSpawnState = "queued" | "running" | "completed" | "failed" | "stopped" | "interrupted";
 
@@ -266,6 +278,10 @@ export interface ManagedSpawnTombstone {
   owner: AgentOwner;
   /** Semantic tier requested by the workflow; resolution remains internal. */
   tier?: WorkflowTier;
+  /** Named managed thread, when this spawn re-enters a sequential session. */
+  thread?: string;
+  /** Effective policy fingerprint that makes thread reuse safe across calls/reloads. */
+  threadPolicyFingerprint?: string;
   /** Internal audit snapshot of the resolved model/thinking policy. */
   tierSnapshot?: WorkflowTierResolutionSnapshot;
   state: ManagedSpawnState;
@@ -340,7 +356,30 @@ function normalizeManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
   return parseManagedSpawnRequest(raw);
 }
 
-function managedFingerprint(request: ManagedSpawnRequest): string {
+function managedFingerprint(request: ManagedSpawnRequest, policyFingerprint?: string): string {
+  return createHash("sha256")
+    .update(JSON.stringify([
+      request.type,
+      request.prompt,
+      request.description,
+      ...(request.tier === undefined ? [] : [request.tier]),
+      request.model,
+      request.thinking,
+      request.toolset,
+      request.excludeTools,
+      request.isolation,
+      request.thread,
+      request.owner.extension,
+      request.owner.runId,
+      request.owner.nodeId,
+      request.owner.attemptId,
+      policyFingerprint,
+    ]))
+    .digest("hex");
+}
+
+/** Exact schema-v1 identity; do not add newer policy fields to this algorithm. */
+function managedLegacyFingerprintV1(request: ManagedSpawnRequest): string {
   return createHash("sha256")
     .update(JSON.stringify([
       request.type,
@@ -351,6 +390,34 @@ function managedFingerprint(request: ManagedSpawnRequest): string {
       request.owner.runId,
       request.owner.nodeId,
       request.owner.attemptId,
+    ]))
+    .digest("hex");
+}
+
+/**
+ * Policy identity for a managed spawn. Prompts and owner attempt identities
+ * intentionally do not participate: a thread is allowed to receive new work,
+ * but its session cannot safely change model/tool/isolation policy.
+ */
+function managedThreadPolicyFingerprint(request: ManagedSpawnRequest, policy: ManagedSpawnPolicy): string {
+  const model = policy.model as { provider?: unknown; id?: unknown } | undefined;
+  const excludeTools = [...new Set([...(request.excludeTools ?? []), ...(policy.excludeTools ?? [])])].sort();
+  return createHash("sha256")
+    .update(JSON.stringify([
+      request.type,
+      request.tier,
+      request.model,
+      request.thinking === "off" ? undefined : request.thinking,
+      request.toolset ?? policy.toolset,
+      excludeTools,
+      request.isolation ?? policy.isolation,
+      policy.maxTurns,
+      policy.isolated,
+      policy.inheritContext,
+      policy.thinkingLevel,
+      policy.policyFingerprint,
+      model?.provider,
+      model?.id,
     ]))
     .digest("hex");
 }
@@ -461,6 +528,11 @@ function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined 
     if (!isManagedState(state)) return undefined;
     const terminalValue = raw.terminal;
     const persistedCompactionCount = raw.compactionCount;
+    const thread = raw.thread === undefined ? undefined : boundedManagedString(raw.thread, "thread", 128);
+    const threadPolicyFingerprint = raw.threadPolicyFingerprint === undefined
+      ? undefined
+      : boundedManagedString(raw.threadPolicyFingerprint, "threadPolicyFingerprint", 128);
+    if ((thread === undefined) !== (threadPolicyFingerprint === undefined)) return undefined;
     const tier = raw.tier;
     if (tier !== undefined && !isWorkflowTier(tier)) return undefined;
     const tierSnapshotValue = raw.tierSnapshot;
@@ -516,6 +588,7 @@ function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined 
       description: boundedManagedString(raw.description, "description", 512),
       owner: normalizeManagedOwner(raw.owner),
       ...(tier === undefined ? {} : { tier }),
+      ...(thread === undefined ? {} : { thread, threadPolicyFingerprint }),
       ...(tierSnapshot ? { tierSnapshot } : {}),
       state,
       createdAt,
@@ -539,6 +612,12 @@ export interface SpawnOptions {
   tier?: WorkflowTier;
   /** User-named model tier; resolved by pi-subagents at session start. */
   agentTier?: string;
+  /** Optional toolset hint; concrete tool availability remains agent-configured. */
+  toolset?: string;
+  /** Additional tool names denied for this invocation. */
+  excludeTools?: string[];
+  /** Named sequential-thread hint for workflow orchestration. */
+  thread?: string;
   isBackground?: boolean;
   /**
    * Skip the maxConcurrent queue check for this spawn — start immediately even
@@ -608,8 +687,29 @@ export interface SpawnOptions {
 /** Internal managed-spawn policy; model and thinking are finalized by runAgent when a tier is present. */
 export type ManagedSpawnPolicy = Pick<
   SpawnOptions,
-  "model" | "maxTurns" | "isolated" | "inheritContext" | "thinkingLevel" | "isolation" | "invocation" | "rootSessionId"
->;
+  "model" | "maxTurns" | "isolated" | "inheritContext" | "thinkingLevel" | "isolation" | "invocation" | "rootSessionId" | "toolset" | "excludeTools"
+> & {
+  /** In-process identity of the resolved agent definition/tool allowlist for thread reuse. */
+  policyFingerprint?: string;
+};
+
+interface ResumeTerminalSnapshot {
+  status: AgentRecord["status"];
+  startedAt: number;
+  completedAt?: number;
+  result?: string;
+  error?: string;
+}
+
+interface ResumeControl {
+  controller: AbortController;
+  cleanup: () => void;
+  snapshot: ResumeTerminalSnapshot;
+  deferred?: {
+    resolve: (value: string) => void;
+    reject: (error: unknown) => void;
+  };
+}
 
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
@@ -620,7 +720,18 @@ export class AgentManager {
   private onCompact?: OnAgentCompact;
   private managedSpawns = new Map<string, ManagedSpawnTombstone>();
   private managedKeysById = new Map<string, string>();
+  /** Active workflow-thread name to the managed AgentSession it re-enters. */
+  private managedThreads = new Map<string, string>();
+  /** Policy identity captured with each thread; policy changes cannot bypass a denylist. */
+  private managedThreadPolicies = new Map<string, string>();
+  /** Reservation closes the synchronous onSpawned -> same-thread re-entry window. */
+  private managedThreadReservations = new Set<string>();
   private managedPersistence?: ManagedSpawnPersistence;
+  private readonly managedPersistenceRetries = new Map<string, {
+    tombstone: ManagedSpawnTombstone;
+    attempt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
   private maxConcurrent: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
@@ -661,6 +772,8 @@ export class AgentManager {
   private readonly removingRecords = new Set<string>();
   /** Records whose provider/session cleanup is still running after terminal status. */
   private readonly settlingRecords = new Set<string>();
+  /** Active resume controller/listener and the terminal state it superseded. */
+  private readonly resumeControls = new Map<string, ResumeControl>();
 
   /** Records whose runAgent provider/tool promise itself has not settled. */
   private readonly providerPendingRecords = new Set<string>();
@@ -822,6 +935,53 @@ export class AgentManager {
       (record.parentAgentId === undefined || this.nestedOwnerValidation(record.parentAgentId) === undefined);
   }
 
+  private clearManagedPersistenceRetry(key: string): void {
+    const pending = this.managedPersistenceRetries.get(key);
+    if (!pending) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    this.managedPersistenceRetries.delete(key);
+  }
+
+  private clearManagedPersistenceRetries(): void {
+    for (const key of this.managedPersistenceRetries.keys()) this.clearManagedPersistenceRetry(key);
+  }
+
+  private scheduleManagedPersistenceRetry(tombstone: ManagedSpawnTombstone): void {
+    if (this.disposed) return;
+    const persistence = this.managedPersistence;
+    if (!persistence) return;
+    const key = tombstone.spawnKey;
+    this.clearManagedPersistenceRetry(key);
+    const pending = { tombstone, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    this.managedPersistenceRetries.set(key, pending);
+    const attempt = (): void => {
+      if (this.managedPersistenceRetries.get(key) !== pending) return;
+      pending.timer = undefined;
+      if (this.disposed || this.managedSpawns.get(key) !== tombstone) {
+        this.managedPersistenceRetries.delete(key);
+        return;
+      }
+      try {
+        persistence.append(cloneManagedTombstone(tombstone));
+        this.managedPersistenceRetries.delete(key);
+      } catch (error: unknown) {
+        pending.attempt += 1;
+        if (pending.attempt >= MANAGED_PERSIST_RETRY_MAX_ATTEMPTS) {
+          this.managedPersistenceRetries.delete(key);
+          console.warn(`[pi-subagents] managed tombstone persistence retry exhausted for ${key}: ${error instanceof Error ? error.message : String(error)}`);
+          return;
+        }
+        const delay = Math.min(
+          MANAGED_PERSIST_RETRY_MAX_DELAY_MS,
+          MANAGED_PERSIST_RETRY_INITIAL_DELAY_MS * 2 ** Math.min(pending.attempt - 1, 6),
+        );
+        pending.timer = setTimeout(attempt, delay);
+        pending.timer.unref?.();
+      }
+    };
+    queueMicrotask(attempt);
+  }
+
   private persistManaged(tombstone: ManagedSpawnTombstone, required = false): void {
     if (!this.managedPersistence) {
       if (required) throw new Error("managed spawn persistence is unavailable");
@@ -829,12 +989,14 @@ export class AgentManager {
     }
     try {
       this.managedPersistence.append(cloneManagedTombstone(tombstone));
+      this.clearManagedPersistenceRetry(tombstone.spawnKey);
     } catch (error: unknown) {
       if (required) {
         throw error instanceof Error ? error : new Error(String(error));
       }
-      // Terminal updates are best effort; never change ordinary Agent
-      // execution semantics because a later journal append failed.
+      // Terminal persistence is retried independently of the agent promise. A
+      // permanently unavailable journal degrades to a warning, never a failed run.
+      this.scheduleManagedPersistenceRetry(tombstone);
     }
   }
 
@@ -850,6 +1012,7 @@ export class AgentManager {
   private replaceManagedTombstone(key: string, next: ManagedSpawnTombstone, required = false): void {
     const previous = this.managedSpawns.get(key);
     if (previous && JSON.stringify(previous) === JSON.stringify(next)) return;
+    this.clearManagedPersistenceRetry(key);
     this.managedSpawns.set(key, next);
     this.managedKeysById.set(next.id, key);
     this.persistManaged(next, required);
@@ -939,9 +1102,13 @@ export class AgentManager {
     entries: readonly ManagedSpawnEntryLike[],
     options: { dropActive?: boolean } = {},
   ): ManagedSpawnTombstone[] {
+    this.clearManagedPersistenceRetries();
     if (this.disposed) return [];
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedThreads.clear();
+    this.managedThreadPolicies.clear();
+    this.managedThreadReservations.clear();
     for (const entry of entries) {
       if (entry.type !== "custom" || entry.customType !== MANAGED_SPAWN_ENTRY_TYPE) continue;
       const tombstone = parseManagedTombstone(entry.data);
@@ -949,6 +1116,11 @@ export class AgentManager {
       if (options.dropActive && !isManagedTerminalState(tombstone.state)) continue;
       this.managedSpawns.set(tombstone.spawnKey, tombstone);
       this.managedKeysById.set(tombstone.id, tombstone.spawnKey);
+      if (tombstone.thread && tombstone.threadPolicyFingerprint) {
+        const threadKey = `${tombstone.owner.runId}\u0000${tombstone.thread}`;
+        this.managedThreads.set(threadKey, tombstone.id);
+        this.managedThreadPolicies.set(threadKey, tombstone.threadPolicyFingerprint);
+      }
     }
     const recovered: ManagedSpawnTombstone[] = [];
     for (const [key, tombstone] of this.managedSpawns) {
@@ -966,6 +1138,22 @@ export class AgentManager {
   getManagedSpawn(spawnKey: string): ManagedSpawnTombstone | undefined {
     const tombstone = this.managedSpawns.get(spawnKey.trim());
     return tombstone ? cloneManagedTombstone(tombstone) : undefined;
+  }
+
+  /** Reconcile a spawn whose RPC reply was lost after allocation. */
+  reconcileManaged(spawnKey: string, owner: AgentOwner): ManagedSpawnResult | undefined {
+    const key = spawnKey.trim();
+    const tombstone = this.managedSpawns.get(key);
+    if (!tombstone) return undefined;
+    if (
+      tombstone.owner.extension !== owner.extension ||
+      tombstone.owner.runId !== owner.runId ||
+      tombstone.owner.nodeId !== owner.nodeId ||
+      tombstone.owner.attemptId !== owner.attemptId
+    ) return undefined;
+    const record = this.agents.get(tombstone.id);
+    if (record && (record.status === "queued" || record.status === "running")) this.abortOwned(record.id, owner);
+    return this.managedResult(key);
   }
 
   /**
@@ -1200,14 +1388,88 @@ export class AgentManager {
   ): ManagedSpawnResult {
     if (this.disposed) throw new Error("AgentManager is disposed");
     const normalized = normalizeManagedSpawnRequest(request);
+    if (normalized.thread && (normalized.isolation === "worktree" || policy.isolation === "worktree")) {
+      throw new Error("Managed workflow threads cannot use worktree isolation; use separate calls instead.");
+    }
     const scope = normalized.spawnKey;
-    const fingerprint = managedFingerprint(normalized);
+    const policyFingerprint = managedThreadPolicyFingerprint(normalized, policy);
+    const fingerprint = managedFingerprint(normalized, policyFingerprint);
+    const legacyFingerprint = managedLegacyFingerprintV1(normalized);
+    const threadPolicyFingerprint = normalized.thread ? policyFingerprint : undefined;
     const previous = this.managedSpawns.get(scope);
     if (previous) {
-      if (previous.fingerprint !== fingerprint) {
+      if (previous.fingerprint !== fingerprint && previous.fingerprint !== legacyFingerprint) {
         throw new Error(`Managed spawn key conflict: "${normalized.spawnKey}"`);
       }
+      if (normalized.thread && previous.threadPolicyFingerprint !== threadPolicyFingerprint) {
+        throw new Error(`Managed workflow thread policy conflict: "${normalized.thread}"; use a new thread name for changed model/tool policy.`);
+      }
       return this.managedResult(scope);
+    }
+
+    const threadKey = normalized.thread ? `${normalized.owner.runId}\u0000${normalized.thread}` : undefined;
+    if (threadKey && this.managedThreadReservations.has(threadKey)) {
+      throw new Error(`Managed workflow thread "${normalized.thread}" is already running; calls must be sequential.`);
+    }
+    const threadedId = threadKey ? this.managedThreads.get(threadKey) : undefined;
+    if (threadedId) {
+      if (threadPolicyFingerprint !== undefined && this.managedThreadPolicies.get(threadKey!) !== threadPolicyFingerprint) {
+        throw new Error(`Managed workflow thread policy conflict: "${normalized.thread}"; use a new thread name for changed model/tool policy.`);
+      }
+      const record = this.agents.get(threadedId);
+      if (record?.session && record.status !== "running" && record.status !== "queued" && !record.detached) {
+        const previousOwner = record.owner;
+        const previousInvocation = record.invocation;
+        const previousManagedKey = this.managedKeysById.get(threadedId);
+        record.owner = Object.freeze({ ...normalized.owner });
+        record.invocation = policy.invocation;
+        const now = Date.now();
+        const tombstone: ManagedSpawnTombstone = {
+          schemaVersion: MANAGED_SPAWN_SCHEMA_VERSION,
+          spawnKey: scope,
+          fingerprint,
+          id: threadedId,
+          requestId: normalized.requestId,
+          type: normalized.type,
+          description: normalized.description,
+          owner: { ...normalized.owner },
+          ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
+          ...(normalized.thread === undefined ? {} : { thread: normalized.thread, threadPolicyFingerprint }),
+          state: "queued",
+          createdAt: now,
+          updatedAt: now,
+          compactionCount: record.compactionCount,
+        };
+        this.clearManagedPersistenceRetry(scope);
+        this.managedSpawns.set(scope, tombstone);
+        this.managedKeysById.set(threadedId, scope);
+        try {
+          this.persistManaged(tombstone, true);
+        } catch (error: unknown) {
+          this.managedSpawns.delete(scope);
+          if (previousManagedKey === undefined) this.managedKeysById.delete(threadedId);
+          else this.managedKeysById.set(threadedId, previousManagedKey);
+          record.owner = previousOwner;
+          record.invocation = previousInvocation;
+          throw error;
+        }
+        void this.resume(threadedId, normalized.prompt, undefined, {
+          isBackground: true,
+          onToolActivity: callbacks?.onToolActivity,
+          onAssistantUsage: callbacks?.onAssistantUsage,
+          onCompaction: callbacks?.onCompaction ? (info) => callbacks.onCompaction?.(info as CompactionInfo) : undefined,
+        }).catch(() => {});
+        this.syncManagedRecord(record, true);
+        const resumedState = String(record.status);
+        return { id: threadedId, state: resumedState === "queued" ? "queued" : "running", created: true };
+      }
+      if (record && !record.detached && (record.status === "running" || record.status === "queued")) {
+        throw new Error(`Managed workflow thread "${normalized.thread}" is already running; calls must be sequential.`);
+      }
+      if (!record || record.detached || !record.session) {
+        this.managedThreads.delete(threadKey!);
+        this.managedThreadPolicies.delete(threadKey!);
+      }
     }
 
     // Register and persist the immutable idempotency identity before starting
@@ -1223,7 +1485,8 @@ export class AgentManager {
       type: normalized.type,
       description: normalized.description,
       owner: { ...normalized.owner },
-        ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
+      ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
+      ...(normalized.thread === undefined ? {} : { thread: normalized.thread, threadPolicyFingerprint }),
       state: "queued",
       createdAt: now,
       updatedAt: now,
@@ -1231,6 +1494,11 @@ export class AgentManager {
     };
     this.managedSpawns.set(scope, tombstone);
     this.managedKeysById.set(id, scope);
+    if (threadKey) {
+      this.managedThreads.set(threadKey, id);
+      this.managedThreadPolicies.set(threadKey, threadPolicyFingerprint!);
+      this.managedThreadReservations.add(threadKey);
+    }
     try {
       // The allocation identity must reach the session journal before the
       // AgentSession or queue can produce side effects. A failed append rolls
@@ -1239,6 +1507,11 @@ export class AgentManager {
     } catch (error: unknown) {
       this.managedSpawns.delete(scope);
       this.managedKeysById.delete(id);
+      if (threadKey) {
+        this.managedThreads.delete(threadKey);
+        this.managedThreadPolicies.delete(threadKey);
+        this.managedThreadReservations.delete(threadKey);
+      }
       throw error;
     }
 
@@ -1246,11 +1519,17 @@ export class AgentManager {
       this.spawnInternal(pi, ctx, normalized.type, normalized.prompt, {
         ...policy,
         ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
+        ...(normalized.thread === undefined ? {} : { thread: normalized.thread }),
         description: normalized.description,
         isBackground: true,
         ...callbacks,
       }, normalized.owner, id);
     } catch (error: unknown) {
+      if (threadKey) {
+        this.managedThreads.delete(threadKey);
+        this.managedThreadPolicies.delete(threadKey);
+        this.managedThreadReservations.delete(threadKey);
+      }
       const existing = this.managedSpawns.get(scope);
       if (existing?.state === "failed" && existing.terminal) return this.managedResult(scope, true);
       const completedAt = Date.now();
@@ -1270,13 +1549,18 @@ export class AgentManager {
 
     const record = this.agents.get(id);
     if (record) this.syncManagedRecord(record);
+    if (threadKey) this.managedThreadReservations.delete(threadKey);
     return this.managedResult(scope, true);
   }
 
   /** Forget managed idempotency keys when a logical session is replaced. */
   resetManagedSpawns(): void {
+    this.clearManagedPersistenceRetries();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedThreads.clear();
+    this.managedThreadPolicies.clear();
+    this.managedThreadReservations.clear();
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
@@ -1294,23 +1578,23 @@ export class AgentManager {
     // Worktree isolation: try to create a temporary git worktree. Strict —
     // fail loud if not possible (no silent fallback to main tree). Done
     // BEFORE state mutation so a throw doesn't leave the record half-running.
+    // "off" explicitly opts out; global switch gates "worktree" deterministically.
     let worktreeCwd: string | undefined;
     let worktreeRepoRoot: string | undefined;
-    if (options.isolation === "worktree") {
+    if (options.isolation === "off") {
+      // Explicit opt-out — no worktree, no check.
+    } else if (options.isolation === "worktree") {
+      if (!isWorktreeIsolationEnabled()) {
+        throw new Error('Cannot run with isolation: "worktree" — worktree isolation is disabled in project settings. Enable it or omit `isolation`.');
+      }
       const wt = createWorktree(baseCwd, id);
       if (!wt) {
         throw new Error(
           'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-          'Initialize git and commit at least once, or omit `isolation`.',
+            'Initialize git and commit at least once, or omit `isolation`.',
         );
       }
       record.worktree = wt;
-      // workPath preserves subdirectory scoping for caller-supplied cwds: a
-      // cwd deep in a monorepo maps to the same subdir inside the copy, not
-      // the copied repo's root. Plain worktree spawns keep the historical
-      // behavior (agent at the copy's root) — moving them to workPath would
-      // also move .pi config discovery when the parent session sits in a repo
-      // subdirectory, silently dropping extensions/skills.
       worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
       worktreeRepoRoot = wt.repoRoot;
       this.worktreeRepos.add(wt.repoRoot);
@@ -1374,6 +1658,9 @@ export class AgentManager {
       rememberAgents: this.rememberAgents,
       supervisorQuestions: this.supervisorQuestions,
       resumeSessionFile: options.resumeSessionFile,
+      toolset: options.toolset,
+      excludeTools: options.excludeTools,
+      thread: options.thread,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         if (record.detached) return;
@@ -1840,6 +2127,60 @@ export class AgentManager {
     return { id, record };
   }
 
+  private resumeSnapshot(record: AgentRecord): ResumeTerminalSnapshot {
+    return {
+      status: record.status,
+      startedAt: record.startedAt,
+      ...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
+      ...(record.result === undefined ? {} : { result: record.result }),
+      ...(record.error === undefined ? {} : { error: record.error }),
+    };
+  }
+
+  private restoreResumeSnapshot(record: AgentRecord, snapshot: ResumeTerminalSnapshot): void {
+    record.status = snapshot.status;
+    record.startedAt = snapshot.startedAt;
+    record.completedAt = snapshot.completedAt;
+    record.result = snapshot.result;
+    record.error = snapshot.error;
+  }
+
+  private beginResumeControl(
+    id: string,
+    record: AgentRecord,
+    signal: AbortSignal | undefined,
+    snapshot: ResumeTerminalSnapshot,
+    deferred?: ResumeControl["deferred"],
+  ): ResumeControl {
+    const controller = new AbortController();
+    let control!: ResumeControl;
+    const onAbort = (): void => {
+      controller.abort(signal?.reason);
+      if (record.status === "queued" || record.status === "running") this.abort(id);
+    };
+    const cleanup = (): void => {
+      signal?.removeEventListener("abort", onAbort);
+      if (this.resumeControls.get(id) === control) this.resumeControls.delete(id);
+      if (record.abortController === controller) record.abortController = undefined;
+    };
+    control = { controller, cleanup, snapshot, ...(deferred ? { deferred } : {}) };
+    this.resumeControls.set(id, control);
+    record.abortController = controller;
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    }
+    return control;
+  }
+
+  private cancelResumeControl(id: string): void {
+    const control = this.resumeControls.get(id);
+    if (!control) return;
+    control.controller.abort();
+    control.cleanup();
+    control.deferred?.resolve("");
+  }
+
   /**
    * Resume an existing agent session with a new prompt.
    */
@@ -1857,42 +2198,42 @@ export class AgentManager {
     if (this.disposed) return undefined;
     const record = this.agents.get(id);
     if (!record) return undefined;
-    // Nested resumes are another way to restart work below an owner. Require
-    // the same live, unsuspended ancestor chain as a fresh nested spawn before
-    // touching the target record or invoking the provider.
     if (!this.canResumeNested(record)) return undefined;
     if (signal?.aborted) return record;
+    if (this.resumeControls.has(id) || record.status === "running" || record.status === "queued") return undefined;
     if (!record.session) return undefined;
 
-    // Background resume (run_in_background on resume): settle asynchronously
-    // and notify on completion exactly like a background spawn, returning
-    // immediately with the record still "running" — or "queued" when at the
-    // concurrency limit. Previously run_in_background was accepted then
-    // silently dropped on resume (the Agent tool's resume branch returned
-    // before its background branch), so a resumed agent always blocked the
-    // caller until it finished. The nested-ownership gate above runs first,
-    // and the queue drain respects deferred record removals the same way the
-    // spawn path does.
+    const snapshot = this.resumeSnapshot(record);
     if (options?.isBackground) {
-      // Never re-enter a run that is still in flight. Detaching means the
-      // caller gets control back while the record stays "running", so nothing
-      // stops the model from resuming the same agent again. Starting a second
-      // run would overwrite record.abortController — orphaning the live run
-      // beyond the reach of /agents stop and abortAll() — double-count the
-      // pool slot, and then reject from session.prompt() with "Agent is
-      // already processing". Refuse instead, leaving the record untouched.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
+      // A background resume is one lifecycle, including time spent queued. Keep
+      // a promise on the record for quiesce/waitForAll instead of the completed
+      // promise from the original spawn.
+      let resolveResume!: (value: string) => void;
+      let rejectResume!: (error: unknown) => void;
+      const lifecyclePromise = new Promise<string>((resolve, reject) => {
+        resolveResume = resolve;
+        rejectResume = reject;
+      });
+      const control = this.beginResumeControl(id, record, signal, snapshot, {
+        resolve: resolveResume,
+        reject: rejectResume,
+      });
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
       record.error = undefined;
       record.completedAt = undefined;
       record.status = "queued";
+      record.promise = lifecyclePromise;
 
-      const start = () => this.startResume(id, record, prompt, signal, options);
+      const start = (): void => {
+        const execution = this.startResume(id, record, prompt, control, options);
+        record.promise = execution;
+        void execution
+          .then(resolveResume, rejectResume)
+          .catch(() => {});
+      };
       if (occupiesPoolSlot(record) && this.runningBackground >= this.maxConcurrent) {
-        // At the concurrency limit — queue it, drains when a slot frees.
         this.queue.push({ kind: "resume", id, start });
       } else {
         start();
@@ -1901,17 +2242,12 @@ export class AgentManager {
     }
 
     this.settlingRecords.add(id);
-
-    const previousStatus = record.status;
-    const previousCompletedAt = record.completedAt;
-    const previousResult = record.result;
-    const previousError = record.error;
+    const control = this.beginResumeControl(id, record, signal, snapshot);
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
-
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
@@ -1926,48 +2262,35 @@ export class AgentManager {
           this.syncManagedRecord(record);
           this.onCompact?.(record, info);
         },
-        signal,
+        signal: control.controller.signal,
       });
-      if (!record.detached && (record.status as string) !== "stopped") {
-        // Same contract as the spawn path (#144): a failed final turn is an
-        // error, not a completion — but the resumed text stays available.
+      if (!record.detached && !control.controller.signal.aborted && (record.status as AgentRecord["status"]) !== "stopped") {
         record.status = failure ? "error" : "completed";
         if (failure) record.error = failure;
         record.result = text;
         record.completedAt = Date.now();
       }
     } catch (err) {
-      if (!record.detached && (record.status as string) !== "stopped") {
-        record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
+      if (!record.detached && (record.status as AgentRecord["status"]) !== "stopped") {
+        record.status = control.controller.signal.aborted ? "stopped" : "error";
+        if (record.status === "error") record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
       }
-    }
-
-    if (record.detached) {
-      // A branch replacement/quiescence timeout owns this late continuation.
-      // Restore the pre-resume terminal snapshot rather than publishing the
-      // result from the detached session into the old record.
-      record.status = previousStatus;
-      record.completedAt = previousCompletedAt;
-      record.result = previousResult;
-      record.error = previousError;
+    } finally {
+      if (record.detached) this.restoreResumeSnapshot(record, snapshot);
+      control.cleanup();
       this.settlingRecords.delete(id);
       this.retryDeferredRecordRemovals();
-      return undefined;
     }
 
-    // Same contract as the spawn settle paths: children spawned during the
-    // resumed turn must not outlive it — nothing else can see or reach them.
+    if (record.detached) return undefined;
     this.syncManagedRecord(record);
     await this.abortOwnedChildren(id);
     if (record.detached) {
-      this.settlingRecords.delete(id);
+      this.restoreResumeSnapshot(record, snapshot);
       this.retryDeferredRecordRemovals();
       return undefined;
     }
-
-    this.settlingRecords.delete(id);
     this.retryDeferredRecordRemovals();
     return record;
   }
@@ -1982,91 +2305,94 @@ export class AgentManager {
     id: string,
     record: AgentRecord,
     prompt: string,
-    signal: AbortSignal | undefined,
+    control: ResumeControl,
     options?: {
       isBackground?: boolean;
       onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
       onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
       onCompaction?: (info: unknown) => void;
     },
-  ): Promise<void> {
-    if (this.disposed || record.detached || this.agents.get(id) !== record) return;
-    // Re-validate the nested-ownership gate at start time too: a queued resume
-    // may outlive its owner branch.
-    if (!this.canResumeNested(record)) {
-      record.status = "error";
-      record.error = "owner branch is no longer resumable";
-      record.completedAt = Date.now();
-      this.syncManagedRecord(record);
-      this.notifyComplete(record);
-      return;
-    }
-    this.settlingRecords.add(id);
-    if (occupiesPoolSlot(record)) {
-      this.heldPoolSlots.add(id);
-      this.runningBackground++;
-    }
-    record.status = "running";
-    record.startedAt = Date.now();
-    record.completedAt = undefined;
-    record.result = undefined;
-    record.error = undefined;
-    this.syncManagedRecord(record);
-
-    const previousStatus = record.status;
-    const previousCompletedAt = record.completedAt;
-    const previousResult = record.result;
-    const previousError = record.error;
+  ): Promise<string> {
+    const snapshot = control.snapshot;
+    let slotHeld = false;
     try {
-      const { text, failure } = await resumeAgent(record.session!, prompt, {
-        onToolActivity: (activity) => {
-          if (!record.detached && activity.type === "end") record.toolUses++;
-          options?.onToolActivity?.(activity);
-        },
-        onAssistantUsage: (usage) => {
-          if (!record.detached) addUsage(record.lifetimeUsage, usage);
-          options?.onAssistantUsage?.(usage);
-        },
-        onCompaction: (info) => {
-          if (record.detached) return;
-          record.compactionCount++;
-          this.syncManagedRecord(record);
-          this.onCompact?.(record, info);
-          options?.onCompaction?.(info);
-        },
-        signal,
-      });
-      if (!record.detached && (record.status as string) !== "stopped") {
-        record.status = failure ? "error" : "completed";
-        if (failure) record.error = failure;
-        record.result = text;
-        record.completedAt = Date.now();
+      if (this.disposed || record.detached || this.agents.get(id) !== record) {
+        if (record.detached) this.restoreResumeSnapshot(record, snapshot);
+        return "";
       }
-    } catch (err) {
-      if (!record.detached && (record.status as string) !== "stopped") {
+      if (!this.canResumeNested(record)) {
         record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
+        record.error = "owner branch is no longer resumable";
         record.completedAt = Date.now();
+        this.syncManagedRecord(record);
+        this.notifyComplete(record);
+        return "";
       }
-    }
+      this.settlingRecords.add(id);
+      if (occupiesPoolSlot(record)) {
+        this.heldPoolSlots.add(id);
+        this.runningBackground++;
+        slotHeld = true;
+      }
+      record.status = "running";
+      record.startedAt = Date.now();
+      record.completedAt = undefined;
+      record.result = undefined;
+      record.error = undefined;
+      this.syncManagedRecord(record);
 
-    if (record.detached) {
-      record.status = previousStatus;
-      record.completedAt = previousCompletedAt;
-      record.result = previousResult;
-      record.error = previousError;
-      this.releasePoolSlot(id);
+      try {
+        const { text, failure } = await resumeAgent(record.session!, prompt, {
+          onToolActivity: (activity) => {
+            if (!record.detached && activity.type === "end") record.toolUses++;
+            options?.onToolActivity?.(activity);
+          },
+          onAssistantUsage: (usage) => {
+            if (!record.detached) addUsage(record.lifetimeUsage, usage);
+            options?.onAssistantUsage?.(usage);
+          },
+          onCompaction: (info) => {
+            if (record.detached) return;
+            record.compactionCount++;
+            this.syncManagedRecord(record);
+            this.onCompact?.(record, info);
+            options?.onCompaction?.(info);
+          },
+          signal: control.controller.signal,
+        });
+        if (!record.detached && !control.controller.signal.aborted && (record.status as AgentRecord["status"]) !== "stopped") {
+          record.status = failure ? "error" : "completed";
+          if (failure) record.error = failure;
+          record.result = text;
+          record.completedAt = Date.now();
+        }
+      } catch (err) {
+        if (!record.detached && (record.status as AgentRecord["status"]) !== "stopped") {
+          record.status = control.controller.signal.aborted ? "stopped" : "error";
+          if (record.status === "error") record.error = err instanceof Error ? err.message : String(err);
+          record.completedAt = Date.now();
+        }
+      }
+
+      if (record.detached) {
+        this.restoreResumeSnapshot(record, snapshot);
+        return "";
+      }
+      this.syncManagedRecord(record);
+      await this.abortOwnedChildren(id);
+      if (record.detached) {
+        this.restoreResumeSnapshot(record, snapshot);
+        return "";
+      }
+      this.notifyComplete(record);
+      return record.result ?? "";
+    } finally {
+      control.cleanup();
       this.settlingRecords.delete(id);
+      if (slotHeld) this.releasePoolSlot(id);
       this.retryDeferredRecordRemovals();
-      return;
+      this.drainQueue();
     }
-
-    this.syncManagedRecord(record);
-    await this.abortOwnedChildren(id);
-    this.releasePoolSlot(id);
-    this.settlingRecords.delete(id);
-    this.retryDeferredRecordRemovals();
-    this.notifyComplete(record);
   }
 
   /**
@@ -2124,6 +2450,7 @@ export class AgentManager {
   private abortRecord(id: string, drain = true): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
+    const resumeControl = this.resumeControls.get(id);
 
     // Remove from queue if queued.
     if (record.status === "queued") {
@@ -2131,6 +2458,9 @@ export class AgentManager {
       record.status = "stopped";
       record.completedAt = Date.now();
       this.clearParentSignal(record.id);
+      resumeControl?.controller.abort();
+      resumeControl?.cleanup();
+      resumeControl?.deferred?.resolve("");
       this.syncManagedRecord(record);
       // Queued agents have no run promise yet. Still use the normal terminal
       // callback so lifecycle consumers (including workflow waits) cannot hang.
@@ -2334,6 +2664,12 @@ export class AgentManager {
       if (record.session) this.trackRecordSessionTeardown(id, record.session);
       record.session = undefined;
       this.clearParentSignal(id);
+      for (const [thread, threadId] of this.managedThreads) {
+        if (threadId !== id) continue;
+        this.managedThreads.delete(thread);
+        this.managedThreadPolicies.delete(thread);
+        this.managedThreadReservations.delete(thread);
+      }
       this.agents.delete(id);
       return true;
     } finally {
@@ -2688,6 +3024,13 @@ export class AgentManager {
   /** Quarantine a record before any late provider continuation can observe it. */
   private quarantineRecord(id: string, record: AgentRecord): void {
     record.detached = true;
+    const resumeControl = this.resumeControls.get(id);
+    if (resumeControl) {
+      this.restoreResumeSnapshot(record, resumeControl.snapshot);
+      this.cancelResumeControl(id);
+    } else {
+      record.abortController?.abort();
+    }
 
     if (record.status === "queued" || record.status === "running") {
       record.status = "stopped";
@@ -2789,6 +3132,7 @@ export class AgentManager {
    * notifications, or persistence into the replacement branch.
    */
   detachForBranchChange(): void {
+    this.clearManagedPersistenceRetries();
     const records = [...this.agents.values()]
       .filter((record) => !this.isFullyCleaned(record))
       .sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
@@ -2839,6 +3183,7 @@ export class AgentManager {
    * session shutdown does not block the event loop.
    */
   dispose(): Promise<readonly WorktreeCleanupFailure[]> {
+    this.clearManagedPersistenceRetries();
     if (this.disposePromise) return this.disposePromise;
     this.disposed = true;
     clearInterval(this.cleanupInterval);
@@ -2869,6 +3214,7 @@ export class AgentManager {
         record.status = "stopped";
         record.completedAt ??= Date.now();
       }
+      this.cancelResumeControl(record.id);
       record.pendingSteers = undefined;
       this.nestedSpawnSeals.add(record.id);
       this.removingRecords.add(record.id);
@@ -2877,6 +3223,7 @@ export class AgentManager {
         record.outputCleanup = undefined;
       }
     }
+    this.resumeControls.clear();
 
     this.disposePromise = this.finishDispose(records, reposToPrune);
     return this.disposePromise;
@@ -2978,6 +3325,9 @@ export class AgentManager {
     this.agents.clear();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedThreads.clear();
+    this.managedThreadPolicies.clear();
+    this.managedThreadReservations.clear();
     this.nestedSpawnSeals.clear();
     this.removingRecords.clear();
     this.settlingRecords.clear();

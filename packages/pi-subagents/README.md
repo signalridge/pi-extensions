@@ -26,7 +26,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Protocol v3 adds policy-free managed spawning plus owner-scoped stop/quiescence; workflow callers require the advertised `ownedStop` capability and never fall back to unowned stop. Standardized reply envelopes provide versioning. Emits `subagents:ready` on session start
+- **Cross-extension RPC** — other Pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Protocol v3 adds managed spawning, optional model/thinking/toolset/denylist/thread/worktree hints, owner-scoped stop/quiescence, and standardized reply envelopes; pi-subagents remains the final policy owner. Emits `subagents:ready` on session start
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model tiers** — name a (model, thinking) pair once and let the orchestrator pick it by name; the `Agent` tool exposes `tier` and never `model`/`thinking`, so which model runs stays a config decision. Manage the catalogue in `/agents → Model tiers`, pick the default in `/agents → Settings → Default tier`, or set a plain `defaultModel` when one line beats a catalogue
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
@@ -712,7 +712,7 @@ pi.events.emit("subagents:rpc:ping", { requestId });
 
 ### Managed spawn (protocol v3)
 
-Workflow-owned orchestration uses the additive `subagents:rpc:spawn-managed` channel. Its request is:
+Workflow-owned orchestration uses the additive `subagents:rpc:spawn-managed` channel. Its request may include the core identity fields plus optional `tier`, exact `model`, `thinking`, `toolset`, `excludeTools`, `thread`, and `isolation: "worktree"` hints:
 
 ```json
 {
@@ -721,12 +721,15 @@ Workflow-owned orchestration uses the additive `subagents:rpc:spawn-managed` cha
   "type": "Explore",
   "prompt": "Find the relevant files",
   "description": "Find relevant files",
+  "tier": "small",
+  "model": "provider/model:medium",
+  "excludeTools": ["workflow", "workflow_control"],
+  "isolation": "worktree",
   "owner": { "extension": "pi-workflows", "runId": "run-id", "nodeId": "node-id", "attemptId": "run-id/node-id/attempt-1" }
 }
 ```
 
-The managed contract rejects execution settings and arbitrary fields. `spawnKey` is idempotent within a root manager; the same normalized request returns the existing agent id and a conflicting request is rejected. Managed agents use the normal Agent execution path, queue, FleetView, activity, transcript, compaction, and lifecycle events. Only the automatic main-session completion nudge is suppressed for an owner-scoped record.
-Managed requests must carry an attempt-scoped owner. The manager validates the exact owner on `stop-owned` and `quiesce-owned`; callers cannot stop a different node or generation in the same run. `quiesce-owned` requires one exact owner per agent ID and fails closed when that metadata is missing. During branch replacement, timed-out records are detached and late callbacks are suppressed.
+The manager validates and resolves every hint against its own model scope, agent configuration, queue, tool, session, and worktree policy. `spawnKey` is idempotent within a root manager; the same normalized request returns the existing agent id and a conflicting request is rejected. A named managed `thread` re-enters one sequential session only while its effective model, thinking, toolset, denylist, isolation, and agent policy fingerprint remain unchanged; a policy change or concurrent call is rejected rather than silently reusing the old session. Managed agents use the normal Agent execution path, queue, FleetView, activity, transcript, compaction, and lifecycle events. Only the automatic main-session completion nudge is suppressed for an owner-scoped record. Managed requests must carry an attempt-scoped owner, and `stop-owned`/`quiesce-owned` fail closed when exact node/generation metadata is missing. During branch replacement, timed-out records are detached and late callbacks are suppressed.
 
 ### Spawn
 

@@ -164,7 +164,7 @@ You can also exit directly. Before implementation, direct exit discards the late
 
 ## ⚙️ Settings
 
-Open **Settings** from an inactive `/plan` menu to edit one flat group of four workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, and **Export destination**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands` remains JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
+Open **Settings** from an inactive `/plan` menu to edit one flat group of workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, **Export destination**, and **Plan mode shortcut**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands` remains JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
 
 ```json
 {
@@ -172,12 +172,15 @@ Open **Settings** from an inactive `/plan` menu to edit one flat group of four w
   "defaultPlanTools": ["read", "bash", "grep", "find", "ls"],
   "implementationPlanRetention": "keep",
   "defaultPlanExportPath": "PLAN.md",
+  "toggleShortcut": "ctrl+shift+p",
   "safeSubcommands": {
     "git": ["status", "log", "rev-parse", "blame"],
     "gh": ["pr view", "pr list", "issue view", "issue list"]
   }
 }
 ```
+
+`toggleShortcut` controls the global shortcut key used to toggle Plan mode on or off. Omit it or submit an empty value in Settings to disable the global shortcut. Use standard Pi key identifiers (such as `ctrl+alt+p` or `ctrl+shift+p`).
 
 ### Default Plan tools
 

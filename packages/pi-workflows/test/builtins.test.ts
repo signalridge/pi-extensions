@@ -29,7 +29,7 @@ describe("builtin workflow argument contract", () => {
     expect(BUILTIN_WORKFLOWS["adversarial-review"].primaryArg).toBe("task");
     expect(BUILTIN_WORKFLOWS["code-review"].primaryArg).toBe("diff");
     expect(BUILTIN_WORKFLOWS["multi-perspective"].primaryArg).toBe("topic");
-    expect(BUILTIN_WORKFLOWS["codebase-audit"].primaryArg).toBe("focus");
+    expect(BUILTIN_WORKFLOWS["codebase-audit"].primaryArg).toBe("scope");
   });
 
   it("keeps every script parseable as a meta-first module", () => {

@@ -832,9 +832,11 @@ async function selectWorktree(
       worktrees: () => ({
         kind: "choice",
         title,
+        enableSearch: true,
         items: records.map((record, index) => ({
           id: record.path,
           label: `${index + 1}. ${formatWorktree(record, currentPath)}`,
+          searchText: `${record.branch ?? ""} ${record.path} ${formatWorktree(record, currentPath)}`,
         })),
         action: "choose",
         hint: "close",

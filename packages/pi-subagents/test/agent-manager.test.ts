@@ -13,6 +13,7 @@ vi.mock("../src/agent-runner.js", () => ({
 
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
+  isWorktreeIsolationEnabled: vi.fn(() => true),
   cleanupWorktree: vi.fn(() => ({ hasChanges: false, cleanupSucceeded: true })),
   cleanupWorktreeAsync: vi.fn(async () => ({ hasChanges: false, cleanupSucceeded: true })),
   pruneWorktreesAsync: vi.fn(async () => {}),
@@ -852,6 +853,66 @@ describe("AgentManager — nested runtime propagation", () => {
     await vi.waitFor(() => {
       expect(manager.getRecordMutable(id)!.status).toBe("completed");
     });
+  });
+
+  it("foreground resume refuses to overlap a background resume", async () => {
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: mockSession(),
+      aborted: false,
+      steered: false,
+    });
+    let releaseResume!: (value: { text: string }) => void;
+    vi.mocked(resumeAgent).mockClear();
+    vi.mocked(resumeAgent).mockImplementation(
+      () => new Promise((resolve) => { releaseResume = resolve; }),
+    );
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "first",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(id)!.promise;
+
+    await expect(manager.resume(id, "background", undefined, { isBackground: true })).resolves.toBeDefined();
+    await expect(manager.resume(id, "foreground")).resolves.toBeUndefined();
+    expect(resumeAgent).toHaveBeenCalledTimes(1);
+
+    releaseResume({ text: "settled" });
+    await vi.waitFor(() => expect(manager.getRecordMutable(id)!.status).toBe("completed"));
+  });
+
+  it("disposal settles a queued background resume", async () => {
+    vi.mocked(runAgent).mockReset();
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce({
+        responseText: "first",
+        session: mockSession(),
+        aborted: false,
+        steered: false,
+      })
+      .mockImplementationOnce(() => new Promise(() => {}) as never);
+    vi.mocked(resumeAgent).mockClear();
+    manager = new AgentManager(undefined, 1);
+
+    const completedId = manager.spawn(mockPi, mockCtx, "general-purpose", "completed", {
+      description: "completed",
+      isBackground: true,
+    });
+    await manager.getRecordMutable(completedId)!.promise;
+    manager.spawn(mockPi, mockCtx, "general-purpose", "running", {
+      description: "running",
+      isBackground: true,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const resumed = await manager.resume(completedId, "queued", undefined, { isBackground: true });
+    expect(resumed?.status).toBe("queued");
+    const resumePromise = manager.getRecordMutable(completedId)!.promise!;
+
+    await manager.dispose();
+    await expect(resumePromise).resolves.toBe("");
   });
 
   it("captures immutable nested ancestor lineage in public snapshots", () => {

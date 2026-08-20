@@ -189,11 +189,43 @@ export function createRecallMenu(source: RecallMenuSource, ownership: { isCurren
                 pickerSelectedId = result.nextSelectedId;
                 continue;
               }
-              const confirmed = await ctx.ui.confirm("Delete saved message?", deleteConfirmationMessage(record), {
+              const { runConfirmation: confirmViaKit } = (await import("@narumitw/pi-tui-kit")) as unknown as {
+                runConfirmation: (
+                  ctx: ExtensionCommandContext,
+                  opts: unknown,
+                ) => Promise<{ kind: string; reason?: string; error?: unknown }>;
+              };
+              const confirmation = await confirmViaKit(ctx, {
+                title: "Delete saved message?",
+                message: deleteConfirmationMessage(record),
+                confirmLabel: "Delete message",
+                cancelLabel: "Keep message",
                 signal,
+                isCurrent: () => isCurrent(ownership),
+                onError: () => undefined,
               });
               if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
-              if (!confirmed) continue;
+              if (
+                confirmation.kind === "closed" ||
+                confirmation.kind === "cancelled" ||
+                confirmation.kind === "stale"
+              ) {
+                if (confirmation.kind === "closed" && confirmation.reason === "close") return { kind: "close" };
+                continue;
+              }
+              if (confirmation.kind === "unsupported") {
+                // Fallback to legacy confirm in unsupported mode
+                const legacyConfirmed = await ctx.ui.confirm(
+                  "Delete saved message?",
+                  deleteConfirmationMessage(record),
+                  { signal },
+                );
+                if (!legacyConfirmed) continue;
+              } else if (confirmation.kind === "error") {
+                throw confirmation.error;
+              } else if (confirmation.kind !== "confirmed") {
+                continue;
+              }
               const { runTask } = await import("@narumitw/pi-tui-kit");
               if (signal.aborted || !isCurrent(ownership)) return { kind: "close" };
               const deletion = await runTask(ctx, {

@@ -226,4 +226,35 @@ describe("workflow journal replay (schema v3)", () => {
     expect(journal.get("r6:1")?.storeDelta).toEqual({ k: "v" });
     expect(journal.get("r6:2")).toBeUndefined();
   });
+
+  it("deduplicates identical creation and honors durable removal", () => {
+    const created = runCreated("r7");
+    const revision = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind: "run_revision",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId: "r7",
+        revision: 1,
+        script: `${SCRIPT}\n// revised`,
+        scriptHash: "r".repeat(64),
+        meta: { name: "demo", description: "revised" },
+        timestamp: 2,
+      },
+    };
+    const removed = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: { kind: "run_removed", schemaVersion: JOURNAL_SCHEMA_VERSION, runId: "r7", timestamp: 3 },
+    };
+    expect(replayJournal([created, created, revision, removed]).has("r7")).toBe(false);
+  });
+
+  it("does not put failed call facts into the replay cache", () => {
+    const failed = callResult("r8", "0", 2, {
+      result: { status: "failed", error: "no", compactionCount: 0, updatedAt: 2 },
+    });
+    expect(buildResumeJournal([runCreated("r8"), failed]).size).toBe(0);
+  });
 });

@@ -515,6 +515,12 @@ export interface RunOptions {
    * the same precedence and the same fail-closed errors from one place.
    */
   agentTier?: string;
+  /** Optional toolset hint forwarded by managed workflow callers. */
+  toolset?: string;
+  /** Additional tool names denied by the caller, merged with agent frontmatter. */
+  excludeTools?: string[];
+  /** Named sequential-thread hint; used for stable session naming. */
+  thread?: string;
   /** Parent thinking level used only when a tier profile omits thinking. */
   parentThinking?: ThinkingLevel;
   /** Override working directory (e.g. for worktree isolation). */
@@ -1056,9 +1062,10 @@ export async function runAgent(
     if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
     if (scopeVerdict.kind === "warn" && ctx.hasUI) ctx.ui.notify(scopeVerdict.message, "warning");
   }
-  const disallowedSet = agentConfig?.disallowedTools
-    ? new Set(agentConfig.disallowedTools)
-    : undefined;
+  const disallowedSet = (() => {
+    const names = [...(agentConfig?.disallowedTools ?? []), ...(options.excludeTools ?? [])];
+    return names.length > 0 ? new Set(names) : undefined;
+  })();
 
   // Nested delegation tools (opt-in, ownership-scoped). Empty unless the agent
   // set `allowed_subagents` and a nestedRuntime was provided — and never when
@@ -1159,6 +1166,8 @@ export async function runAgent(
       for (const name of disallowedSet) denyTools.add(name);
     }
     sessionExcludeTools = [...denyTools];
+    // Named toolsets are advisory labels; they never widen the configured
+    // allowlist. Concrete tool availability remains owned by the agent config.
   }
 
   const settingsManager = SettingsManager.create(configCwd, agentDir);
@@ -1221,9 +1230,9 @@ export async function runAgent(
   try {
     throwIfAborted(options.signal);
 
-  const baseSessionName = agentConfig?.name ?? type;
+  const baseSessionName = options.thread ? `workflow-thread:${options.thread}` : (agentConfig?.name ?? type);
   session.setSessionName(
-    options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
+    options.agentId && !options.thread ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
 
   // Bind extensions so that session_start fires and extensions can initialize

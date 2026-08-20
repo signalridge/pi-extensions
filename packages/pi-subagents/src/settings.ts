@@ -269,12 +269,19 @@ export interface SubagentsSettings {
    * meaning one thing here and another in the resolver.
    */
   fallbackSubagent?: string;
+  /**
+   * Project-wide switch for worktree isolation (upstream #184). When false,
+   * no caller can create a worktree regardless of isolation param. Defaults to
+   * true (unchanged behaviour). Routed through worktree.ts singleton.
+   */
+  worktreeIsolation?: boolean;
 }
 
 export type ToolDescriptionMode = "full" | "compact" | "custom";
 
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
+  setWorktreeIsolation?: (enabled: boolean) => void;
   setMaxConcurrent: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
@@ -585,6 +592,9 @@ function sanitize(raw: unknown): SubagentsSettings {
     out.fallbackSubagent = NO_FALLBACK;
   } else if (typeof r.fallbackSubagent === "string" && r.fallbackSubagent.trim()) {
     out.fallbackSubagent = r.fallbackSubagent.trim();
+  }
+  if (typeof r.worktreeIsolation === "boolean") {
+    out.worktreeIsolation = r.worktreeIsolation;
   }
 
   const workflow = sanitizeWorkflow(r.workflow);
@@ -955,6 +965,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
     setDefaultToolTimeoutMs(s.defaultToolTimeoutMs);
   }
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
+  if (typeof s.worktreeIsolation === "boolean") appliers.setWorktreeIsolation?.(s.worktreeIsolation);
   // Applied whenever the key is present, `"inherit"` included: that spelling is
   // how a project cancels a global default model, so it has to reach the setter.
   if (typeof s.defaultModel === "string") appliers.setDefaultModel(s.defaultModel);

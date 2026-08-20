@@ -209,6 +209,43 @@ test("After Implement cycles outcomes and export destination saves, previews, re
   });
 });
 
+test("Plan mode shortcut can be set and reset in Settings", async () => {
+  await withSettingsMenu(async ({ settingsPath, tui, ctx, saved }) => {
+    const running = showPlanModeSettings(ctx, menuOptions(settingsPath, saved));
+    await tui.waitForOpen();
+    tui.press("tui.select.down");
+    tui.press("tui.select.down");
+    tui.press("tui.select.down");
+    tui.press("tui.select.down");
+    tui.press("tui.select.confirm");
+    await tui.waitForPending();
+    await tui.waitForOpen();
+    tui.type("ctrl+shift+p");
+    tui.press("tui.input.submit");
+    await tui.waitForPending();
+    await tui.waitForOpen();
+    assert.equal(saved.at(-1)?.toggleShortcut, "ctrl+shift+p");
+    const writtenShortcut = JSON.parse(await readFile(settingsPath, "utf8")) as {
+      toggleShortcut?: string;
+    };
+    assert.equal(writtenShortcut.toggleShortcut, "ctrl+shift+p");
+    assert.match(tui.render().join("\n"), /Plan mode shortcut\s+ctrl\+shift\+p/);
+
+    tui.press("tui.select.confirm");
+    await tui.waitForPending();
+    await tui.waitForOpen();
+    tui.press("tui.input.submit");
+    await tui.waitForPending();
+    await tui.waitForOpen();
+    assert.equal(saved.at(-1)?.toggleShortcut, undefined);
+    const resetFile = JSON.parse(await readFile(settingsPath, "utf8")) as Record<string, unknown>;
+    assert.equal(Object.hasOwn(resetFile, "toggleShortcut"), false);
+    assert.match(tui.render().join("\n"), /Plan mode shortcut\s+none/);
+    tui.press("ctrl+c");
+    await running;
+  });
+});
+
 test("long export previews stay within narrow terminal widths", async () => {
   await withSettingsMenu(async ({ settingsPath, tui, ctx, saved }) => {
     const longPath = `plans/${"nested-".repeat(16)}PLAN.md`;
@@ -290,6 +327,7 @@ test("RPC Settings changes retention and export destination with the same flat n
           "Plan tools (Automatic safe built-ins)",
           "After Implement (Keep plan active)",
           "Export destination (PLAN.md)",
+          "Plan mode shortcut (none)",
           "Back",
         ],
         response: "After Implement (Keep plan active)",
@@ -301,6 +339,7 @@ test("RPC Settings changes retention and export destination with the same flat n
           "Plan tools (Automatic safe built-ins)",
           "After Implement (Use plan for handoff only)",
           "Export destination (PLAN.md)",
+          "Plan mode shortcut (none)",
           "Back",
         ],
         response: "Export destination (PLAN.md)",
@@ -317,6 +356,7 @@ test("RPC Settings changes retention and export destination with the same flat n
           "Plan tools (Automatic safe built-ins)",
           "After Implement (Use plan for handoff only)",
           "Export destination (rpc/PLAN.md)",
+          "Plan mode shortcut (none)",
           "Back",
         ],
         response: undefined,
@@ -342,6 +382,7 @@ test("Plan settings adapt to RPC cancellation and disposal aborts an in-flight s
         "Plan tools (Automatic safe built-ins)",
         "After Implement (Keep plan active)",
         "Export destination (PLAN.md)",
+        "Plan mode shortcut (none)",
         "Back",
       ],
       response: undefined,

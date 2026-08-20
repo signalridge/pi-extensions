@@ -19,6 +19,18 @@ export interface DispatchTask {
   prompt: string;
   description: string;
   tier?: WorkflowTier;
+  /** Exact provider/model reference; resolution remains inside pi-subagents. */
+  model?: string;
+  /** Optional thinking suffix/override resolved by pi-subagents. */
+  thinking?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
+  /** Per-call worktree request owned by pi-subagents. */
+  isolation?: "worktree";
+  /** Forwarded toolset hint (e.g. "web-research") for pi-subagents to augment tools. */
+  toolset?: string;
+  /** Thread hint for sequential same-thread calls within one run. */
+  thread?: string;
+  /** Denied tools — prevents recursive workflow fan-out. */
+  excludeTools?: string[];
 }
 
 export interface WorkflowEventBus {
@@ -93,7 +105,7 @@ function callRpc<T>(
 
 export const REQUIRED_SUBAGENTS_PROTOCOL = PROTOCOL_VERSION;
 export const PROTOCOL_DIAGNOSTIC =
-  "@signalridge/pi-workflows requires @signalridge/pi-subagents protocol v3 with managedSpawn, lifecycleOwner, ownedStop, ownedQuiescence, and workflowTiers capabilities. " +
+  "@signalridge/pi-workflows requires @signalridge/pi-subagents protocol v3 with managedSpawn, lifecycleOwner, ownedStop, ownedQuiescence, workflowTiers, and managedPolicy capabilities. " +
   "Install @signalridge/pi-subagents and @signalridge/pi-workflows exactly once; Pi loads both from their configured pi.extensions manifests.";
 
 export const CHILD_CONTEXT_QUERY_TIMEOUT_MS = 250;
@@ -225,10 +237,11 @@ export async function checkManagedSpawnProtocol(events: WorkflowEventBus, signal
       reply.capabilities.managedSpawn !== true ||
       reply.capabilities.lifecycleOwner !== true ||
       reply.capabilities.ownedStop !== true ||
-      reply.capabilities.ownedQuiescence !== true
+      reply.capabilities.ownedQuiescence !== true ||
+      reply.capabilities.managedPolicy !== true
     ) {
       throw new Error(
-        `subagents protocol v${REQUIRED_SUBAGENTS_PROTOCOL} with managed spawning, owned stop, and owned quiescence capability is required`,
+        `subagents protocol v${REQUIRED_SUBAGENTS_PROTOCOL} with managed spawning, owned stop, owned quiescence, and managed policy capabilities is required`,
       );
     }
     throw new Error("subagents protocol ping did not return a valid version/capability envelope");
@@ -240,6 +253,9 @@ export async function checkManagedSpawnProtocol(events: WorkflowEventBus, signal
   }
   if (!workflowTierCapabilityMatch(ping.capabilities)) {
     throw new Error("subagents workflow tier capability is required before tiered managed spawning");
+  }
+  if (ping.capabilities.managedPolicy !== true) {
+    throw new Error("subagents managed policy capability is required before policy-bearing managed spawning");
   }
 }
 
@@ -260,11 +276,14 @@ export interface ManagedSpawnClient {
     nodeId: string,
     attemptId?: string,
     legacyAttemptId?: string,
+    signal?: AbortSignal,
   ): Promise<ManagedSpawnResponse | string>;
   /** Unscoped v2 stop, retained for existing callers. */
   stop(agentId: string): Promise<void>;
   /** Owner-scoped v3 stop used by workflow lifecycle operations. */
   stopOwned?(agentId: string, owner: WorkflowOwner): Promise<void>;
+  /** Best-effort reconciliation for a spawn whose reply was lost after allocation. */
+  reconcileManaged?(spawnKey: string, owner: WorkflowOwner): Promise<ManagedSpawnResponse | string | undefined>;
   quiesceOwned?(
     runId: string,
     agentIds: string[],
@@ -301,27 +320,48 @@ export function createManagedSpawnClient(
      * error for the same key with a different fingerprint. Same key + same
      * fingerprint still reuses the persisted tombstone (per-call cache).
      */
-    async spawn(task, runId, nodeId, attemptId) {
+    async spawn(task, runId, nodeId, attemptId, _legacyAttemptId, signal) {
       const effectiveAttemptId = attemptId ?? `attempt-1`;
       const spawnKey = `${runId}/${nodeId}/${effectiveAttemptId}`;
-      const data = await call<unknown>(
-        "subagents:rpc:spawn-managed",
-        {
-          requestId: requestId(),
-          spawnKey,
-          type: task.subagent_type,
-          prompt: task.prompt,
-          description: task.description,
-          ...(task.tier === undefined ? {} : { tier: task.tier }),
-          owner: {
-            extension: "pi-workflows",
-            runId,
-            nodeId,
-            attemptId: effectiveAttemptId,
+      const requestSignal =
+        signal && sessionSignal ? AbortSignal.any([signal, sessionSignal]) : (signal ?? sessionSignal);
+      let data: unknown;
+      try {
+        data = await call<unknown>(
+          "subagents:rpc:spawn-managed",
+          {
+            requestId: requestId(),
+            spawnKey,
+            type: task.subagent_type,
+            prompt: task.prompt,
+            description: task.description,
+            ...(task.tier === undefined ? {} : { tier: task.tier }),
+            ...(task.toolset === undefined ? {} : { toolset: task.toolset }),
+            ...(task.thread === undefined ? {} : { thread: task.thread }),
+            ...(task.excludeTools === undefined ? {} : { excludeTools: task.excludeTools }),
+            ...(task.model === undefined ? {} : { model: task.model }),
+            ...(task.thinking === undefined ? {} : { thinking: task.thinking }),
+            ...(task.isolation === undefined ? {} : { isolation: task.isolation }),
+            owner: { extension: "pi-workflows", runId, nodeId, attemptId: effectiveAttemptId },
           },
-        },
-        sessionSignal,
-      );
+          requestSignal,
+        );
+      } catch (error: unknown) {
+        // Reconciliation must not inherit the signal that caused the original
+        // request to fail: shutdown/abort can happen after allocation but before
+        // the reply. Fire it independently and preserve the original error.
+        void call<unknown>(
+          "subagents:rpc:reconcile-managed",
+          {
+            requestId: requestId(),
+            spawnKey,
+            owner: { extension: "pi-workflows", runId, nodeId, attemptId: effectiveAttemptId },
+          },
+          undefined,
+          5_000,
+        ).catch(() => undefined);
+        throw error;
+      }
       if (!isRecord(data) || typeof data.id !== "string" || data.id.length === 0) {
         throw new Error("subagents managed spawn returned an invalid agent id");
       }
@@ -340,6 +380,16 @@ export function createManagedSpawnClient(
         },
         sessionSignal,
       );
+    },
+    async reconcileManaged(spawnKey, owner) {
+      const data = await call<unknown>(
+        "subagents:rpc:reconcile-managed",
+        { requestId: requestId(), spawnKey, owner },
+        undefined,
+        5_000,
+      );
+      if (!isRecord(data) || typeof data.id !== "string") return undefined;
+      return parseManagedSpawnResponse(data);
     },
     async quiesceOwned(runId, agentIds, timeoutMs = 5_000, owners) {
       const data = await call<unknown>(

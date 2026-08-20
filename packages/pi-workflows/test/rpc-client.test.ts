@@ -48,6 +48,7 @@ describe("pi-subagents protocol capability check", () => {
             childContext: true,
             ownedQuiescence: true,
             workflowTiers: true,
+            managedPolicy: true,
           },
         },
       });
@@ -67,6 +68,7 @@ describe("pi-subagents protocol capability check", () => {
           ownedStop: true,
           ownedQuiescence: true,
           workflowTiers: true,
+          managedPolicy: true,
         },
       });
     }, 10);

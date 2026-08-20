@@ -6,7 +6,8 @@
       "packages/**/*.js",
       "packages/**/*.mjs",
       "scripts/**/*.mjs",
-      "!packages/pi-subagents/**"
+      "!packages/pi-subagents/**",
+      "!packages/pi-workflows/skills/**"
     ]
   },
   "formatter": {

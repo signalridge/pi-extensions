@@ -84,6 +84,19 @@ export function isTimeoutError(error: unknown): boolean {
   return /\btimeout\b/i.test(error.message) || error.name === "TimeoutError";
 }
 
+/** Recognize provider subscription/rate/quota exhaustion separately from run-local limits. */
+export function isProviderUsageLimit(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /(?:rate[ -]?limit|usage[ -]?limit|quota|too many requests|\b429\b|credits? exhausted|insufficient (?:quota|credits)|try again (?:in|after)|reset(?:s)? (?:in|at))/i.test(
+    error.message,
+  );
+}
+
+function providerResetHint(message: string): string | undefined {
+  const match = /((?:resets?|retry|try again)\s+(?:in|after)\s+[^.\n]+)/i.exec(message);
+  return match?.[1]?.trim();
+}
+
 /**
  * Wrap an unknown error into a WorkflowError with appropriate classification.
  */
@@ -96,6 +109,15 @@ export function wrapError(error: unknown, context?: { agentLabel?: string }): Wo
       WorkflowErrorCode.WORKFLOW_ABORTED,
       { recoverable: true },
     );
+  }
+
+  if (isProviderUsageLimit(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    return new WorkflowError(message, WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+      recoverable: true,
+      agentLabel: context?.agentLabel,
+      resetHint: providerResetHint(message),
+    });
   }
 
   if (isTimeoutError(error)) {

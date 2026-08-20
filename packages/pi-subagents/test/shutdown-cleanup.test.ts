@@ -43,6 +43,8 @@ vi.mock("../src/worktree.js", () => {
   const pruneWorktrees = vi.fn();
   return {
     createWorktree: vi.fn(),
+    isWorktreeIsolationEnabled: vi.fn(() => true),
+    setWorktreeIsolationEnabled: vi.fn(),
     cleanupWorktree,
     cleanupWorktreeAsync: vi.fn(async (...args: Parameters<typeof cleanupWorktree>) => cleanupWorktree(...args)),
     pruneWorktreesAsync: vi.fn(async (...args: Parameters<typeof pruneWorktrees>) => pruneWorktrees(...args)),

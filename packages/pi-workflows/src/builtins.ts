@@ -18,6 +18,8 @@ export interface BuiltinWorkflowDescriptor {
   name: string;
   description: string;
   script: string;
+  /** Optional toolset hint persisted with the run (e.g. "web-research"). */
+  toolset?: string;
   /**
    * The `args` key that a bare slash-command argument fills.
    *
@@ -157,6 +159,8 @@ const finders = await parallel([
   () => agent('You are a simplification reviewer. Find over-engineering, unnecessary complexity, and simpler alternatives.\\n\\n' + diff, { label: 'simplification', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
   () => agent('You are an efficiency reviewer. Find performance problems, avoidable allocations, and scaling risks.\\n\\n' + diff, { label: 'efficiency', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
   () => agent('You are an architecture reviewer. Assess the change at the right altitude: design fit, layering, boundaries, and future maintenance.\\n\\n' + diff, { label: 'altitude', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a security reviewer. Find trust-boundary, injection, secret-leak, permission, and unsafe-input risks in this diff.\\n\\n' + diff, { label: 'security', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a testability reviewer. Find missing regression tests, observability gaps, and rollout/recovery risks in this diff.\\n\\n' + diff, { label: 'testability', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
 ])
 const candidates = finders.filter(Boolean).flatMap((f) => (f && f.findings) || [])
 
@@ -216,14 +220,15 @@ const CODEBASE_AUDIT_SCRIPT = `export const meta = {
   ],
 }
 
-const root = (args && args.root) || cwd
-const focus = (args && args.focus) || ''
+const root = (args && (args.scope || args.root)) || cwd
+const checks = (args && Array.isArray(args.checks) ? args.checks : [])
+const focus = (args && args.focus) || (checks.length > 0 ? checks.join(', ') : '')
 
 phase('Map')
 const map = await agent(
   'Explore the codebase at ' + root + ' and produce a structural map: top-level modules, entry points, ' +
   'data flow, and where complexity concentrates. Use the available file tools.\\n' +
-  (focus ? 'Focus area: ' + focus + '\\n' : ''),
+  (focus ? 'Focus/checks requested: ' + focus + '\\n' : ''),
   { label: 'map', schema: { type: 'object', properties: { modules: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, purpose: { type: 'string' }, risk: { type: 'string' } }, required: ['name', 'purpose'] } }, entryPoints: { type: 'array', items: { type: 'string' } }, complexityHotspots: { type: 'array', items: { type: 'string' } } }, required: ['modules'] } }
 )
 
@@ -248,6 +253,7 @@ export const BUILTIN_WORKFLOWS: Readonly<Record<string, BuiltinWorkflowDescripto
     name: "deep-research",
     description: "Deep research: parallel queries, cross-checked claims, cited report",
     script: DEEP_RESEARCH_SCRIPT,
+    toolset: "web-research",
     primaryArg: "question",
   },
   "adversarial-review": {
@@ -274,9 +280,40 @@ export const BUILTIN_WORKFLOWS: Readonly<Record<string, BuiltinWorkflowDescripto
     script: CODEBASE_AUDIT_SCRIPT,
     // `root` already defaults to cwd, so free text is the more useful refinement:
     // "/codebase-audit packages/pi-goal" reads as a focus the map agent honours.
-    primaryArg: "focus",
+    primaryArg: "scope",
   },
 };
+
+export function validateBuiltinArgs(name: string, args: unknown): void {
+  const value = args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+  const required =
+    name === "deep-research"
+      ? "question"
+      : name === "adversarial-review"
+        ? "task"
+        : name === "code-review"
+          ? "diff"
+          : name === "multi-perspective"
+            ? "topic"
+            : undefined;
+  if (required !== undefined && (typeof value[required] !== "string" || !value[required].trim())) {
+    throw new Error(`Built-in workflow "${name}" requires args.${required} to be a non-empty string.`);
+  }
+  if (
+    name === "codebase-audit" &&
+    value.scope !== undefined &&
+    (typeof value.scope !== "string" || !value.scope.trim())
+  ) {
+    throw new Error('Built-in workflow "codebase-audit" requires args.scope to be a non-empty string when provided.');
+  }
+  if (
+    name === "codebase-audit" &&
+    value.checks !== undefined &&
+    (!Array.isArray(value.checks) || !value.checks.every((check) => typeof check === "string" && check.trim()))
+  ) {
+    throw new Error('Built-in workflow "codebase-audit" requires args.checks to contain non-empty strings.');
+  }
+}
 
 /**
  * Every `args.<key>` a builtin script reads, keyed by workflow name.
@@ -290,5 +327,5 @@ export const BUILTIN_SCRIPT_ARG_KEYS: Readonly<Record<string, readonly string[]>
   "adversarial-review": ["reviewers", "task", "threshold"],
   "code-review": ["diff", "diffSource"],
   "multi-perspective": ["perspectives", "topic"],
-  "codebase-audit": ["focus", "root"],
+  "codebase-audit": ["checks", "focus", "root", "scope"],
 };

@@ -15,6 +15,7 @@ vi.mock("../src/agent-runner.js", () => ({
 
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
+  isWorktreeIsolationEnabled: vi.fn(() => true),
   cleanupWorktree: vi.fn(() => ({ hasChanges: false, cleanupSucceeded: true })),
   cleanupWorktreeAsync: vi.fn(async () => ({
     hasChanges: false,

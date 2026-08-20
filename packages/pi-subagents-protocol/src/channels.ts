@@ -9,6 +9,7 @@ export const PROTOCOL_CAPABILITIES = {
   childContext: true,
   ownedQuiescence: true,
   workflowTiers: true,
+  managedPolicy: true,
 } as const;
 
 export const RPC_CHANNELS = {
@@ -19,6 +20,7 @@ export const RPC_CHANNELS = {
   stop: "subagents:rpc:stop",
   stopOwned: "subagents:rpc:stop-owned",
   quiesceOwned: "subagents:rpc:quiesce-owned",
+  reconcileManaged: "subagents:rpc:reconcile-managed",
 } as const;
 
 export const LIFECYCLE_CHANNELS = [

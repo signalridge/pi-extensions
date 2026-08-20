@@ -424,3 +424,32 @@ test("Plan-mode settings read legacy files without modifying them", async () => 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("Plan-mode settings validate and persist toggleShortcut", async () => {
+  assert.deepEqual(normalizePlanModeSettings({ toggleShortcut: "ctrl+shift+p" }), {
+    thinkingLevel: "inherit",
+    toggleShortcut: "ctrl+shift+p",
+  });
+  assert.deepEqual(normalizePlanModeSettings({ toggleShortcut: "Ctrl+Alt+P" }), {
+    thinkingLevel: "inherit",
+    toggleShortcut: "ctrl+alt+p",
+  });
+  assert.equal(normalizePlanModeSettings({ toggleShortcut: "invalid+key+combo" }), undefined);
+  assert.equal(normalizePlanModeSettings({ toggleShortcut: 123 }), undefined);
+
+  const directory = await mkdtemp(join(tmpdir(), "pi-plan-mode-shortcut-test-"));
+  try {
+    const path = join(directory, "pi-plan-mode.json");
+    await updatePlanModeSettings({ toggleShortcut: "ctrl+alt+p" }, { settingsPath: path });
+    const loaded = await readPlanModeSettings(path);
+    assert.equal(loaded.kind, "loaded");
+    assert.deepEqual(loaded.kind === "loaded" ? loaded.settings.toggleShortcut : undefined, "ctrl+alt+p");
+
+    await updatePlanModeSettings({ toggleShortcut: null }, { settingsPath: path });
+    const cleared = await readPlanModeSettings(path);
+    assert.equal(cleared.kind, "loaded");
+    assert.equal(cleared.kind === "loaded" ? cleared.settings.toggleShortcut : undefined, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

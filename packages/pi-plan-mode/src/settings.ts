@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import {
   SAFE_GH_SUBCOMMAND_PATHS,
   SAFE_GIT_SUBCOMMANDS,
@@ -26,6 +27,60 @@ export const PLAN_MODE_THINKING_LEVELS = [
 ] as const;
 export const IMPLEMENTATION_PLAN_RETENTIONS = ["keep", "clear-on-start", "clear-after-first-run"] as const;
 export const DEFAULT_PLAN_EXPORT_PATH = "PLAN.md";
+const MODIFIERS = new Set(["ctrl", "shift", "alt", "super"]);
+const BASE_KEYS = new Set([
+  ..."abcdefghijklmnopqrstuvwxyz0123456789",
+  "`",
+  "-",
+  "=",
+  "[",
+  "]",
+  "\\",
+  ";",
+  "'",
+  ",",
+  ".",
+  "/",
+  "!",
+  "@",
+  "#",
+  "$",
+  "%",
+  "^",
+  "&",
+  "*",
+  "(",
+  ")",
+  "_",
+  "+",
+  "|",
+  "~",
+  "{",
+  "}",
+  ":",
+  "<",
+  ">",
+  "?",
+  "escape",
+  "esc",
+  "enter",
+  "return",
+  "tab",
+  "space",
+  "backspace",
+  "delete",
+  "insert",
+  "clear",
+  "home",
+  "end",
+  "pageup",
+  "pagedown",
+  "up",
+  "down",
+  "left",
+  "right",
+  ...Array.from({ length: 12 }, (_unused, index) => `f${index + 1}`),
+]);
 const MAX_PLAN_EXPORT_PATH_LENGTH = 4096;
 
 export type PlanModeThinkingLevel = (typeof PLAN_MODE_THINKING_LEVELS)[number];
@@ -37,12 +92,14 @@ export interface PlanModeSettings {
   implementationPlanRetention?: ImplementationPlanRetention;
   defaultPlanExportPath?: string;
   safeSubcommands?: SafeSubcommands;
+  toggleShortcut?: KeyId;
 }
 export interface PlanModeSettingsPatch {
   thinkingLevel?: PlanModeThinkingLevel;
   defaultPlanTools?: readonly string[] | null;
   implementationPlanRetention?: ImplementationPlanRetention;
   defaultPlanExportPath?: string | null;
+  toggleShortcut?: KeyId | null;
 }
 export interface UpdatePlanModeSettingsOptions {
   settingsPath?: string;
@@ -97,6 +154,11 @@ export function normalizePlanModeSettings(value: unknown): PlanModeSettings | un
     if (!defaultPlanExportPath) return undefined;
     settings.defaultPlanExportPath = defaultPlanExportPath;
   }
+  if (Object.hasOwn(value, "toggleShortcut")) {
+    const toggleShortcut = normalizeKeyId(Reflect.get(value, "toggleShortcut"));
+    if (!toggleShortcut) return undefined;
+    settings.toggleShortcut = toggleShortcut;
+  }
   if (Object.hasOwn(value, "safeSubcommands")) {
     const safeSubcommands = normalizeSafeSubcommands(Reflect.get(value, "safeSubcommands"));
     if (!safeSubcommands) return undefined;
@@ -130,6 +192,27 @@ function normalizePlanExportPath(value: unknown) {
     return undefined;
   }
   return normalized;
+}
+
+export function normalizeKeyId(value: unknown): KeyId | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  const base = [...BASE_KEYS]
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => normalized === candidate || normalized.endsWith(`+${candidate}`));
+  if (!base) return undefined;
+  const prefix = normalized.slice(0, normalized.length - base.length);
+  if (!prefix) return base as KeyId;
+  if (/^f(?:[1-9]|1[0-2])$/.test(base) || !prefix.endsWith("+")) return undefined;
+  const modifiers = prefix.slice(0, -1).split("+");
+  if (
+    modifiers.length === 0 ||
+    modifiers.some((modifier) => !MODIFIERS.has(modifier)) ||
+    new Set(modifiers).size !== modifiers.length
+  ) {
+    return undefined;
+  }
+  return normalized as KeyId;
 }
 
 function normalizeSafeSubcommands(value: unknown): SafeSubcommands | undefined {
@@ -211,6 +294,10 @@ export function updatePlanModeSettings(
     if (patch.defaultPlanExportPath === null) delete updated.defaultPlanExportPath;
     else if (patch.defaultPlanExportPath !== undefined) {
       updated.defaultPlanExportPath = patch.defaultPlanExportPath;
+    }
+    if (patch.toggleShortcut === null) delete updated.toggleShortcut;
+    else if (patch.toggleShortcut !== undefined) {
+      updated.toggleShortcut = patch.toggleShortcut;
     }
     const settings = normalizePlanModeSettings(updated);
     if (!settings) throw invalidSettingsError(settingsPath, "invalid settings shape");
@@ -377,4 +464,8 @@ export function configuredImplementationPlanRetention(settings: PlanModeSettings
 
 export function configuredPlanExportPath(settings: PlanModeSettings) {
   return settings.defaultPlanExportPath ?? DEFAULT_PLAN_EXPORT_PATH;
+}
+
+export function configuredPlanModeToggleShortcut(settings: PlanModeSettings): KeyId | undefined {
+  return settings.toggleShortcut;
 }
