@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- b6cf242: New `/worktree → Browse worktree status`: a readable view of what has actually changed in a worktree, grouped as conflicted / staged / unstaged / untracked.
+  
+  It reads `git status --porcelain=v2`, not the v1 the existing safety check uses. That check is unchanged and stays on v1, correctly — it only needs to know whether a worktree is dirty, and v1's flat lines answer that in the fewest moving parts. This is the other job: a person reads the result before deciding whether to remove, switch away from, or commit in a worktree, and "3 changes" does not settle any of those. v2 is what makes the listing unambiguous — staged and unstaged as separate values rather than one overloaded pair of letters, a rename's similarity score *and* its original path, unmerged entries flagged as conflicts rather than rendered as a misleading staged/unstaged pair, and submodules distinguished from modified files.
+  
+  Read with `-z`, so a path containing a newline or a quote is shown exactly as git wrote it. Parsing is total: an unrecognized record is skipped rather than throwing, so a future git version adding one costs that row and not the screen. `git.ts` keeps its raw-output boundary and stays free of intra-package imports — a test loads it standalone under Node's strip-only TypeScript, which cannot resolve a sibling `./x.js` to `x.ts` — so the parser lives beside it and is applied at the consumer.
+
+### Patch Changes
+
+- b6cf242: Peer dependency ranges now name the versions actually validated against, so an untested host combination fails at install time instead of silently at runtime: `@earendil-works/pi-coding-agent`, `pi-ai`, `pi-tui`, and `pi-agent-core` move from `"*"` to `^0.84.0`, and `typebox` from `"*"` to `^1.3.11`.
+  
+  Shared dependencies now carry ONE declared range across every package that uses them, and `bun run check:shared-deps` keeps it that way.
+  
+  `@narumitw/pi-tui-kit` was declared at three disjoint floors — `^0.54.0`, `^0.51.0`, and `^0.49.1` across nine packages — and the lockfile duly resolved three copies (0.54.0, 0.51.0, 0.49.3) installed side by side. For a shared rendering surface drawing into one terminal inside one host process, that means a theme rendering one way in one extension and another way in the next, with nothing failing at install to say so. All nine now declare `^0.54.0` and the install resolves a single copy. `@sinclair/typebox` likewise converges on `^0.34.50`.
+  
+  The new check covers `dependencies` and `peerDependencies` and compares range strings rather than their semantics: two ranges that merely overlap are still a finding, because the goal is one intentional answer per dependency rather than an accidental intersection. `devDependencies` are deliberately out of scope — a build tool is not a shared surface, and `pi-subagents` intentionally carries its own toolchain. `docs/package-boundaries.md` documents the Kit as a shared surface for the first time.
+
 ## 1.2.1
 ### Patch Changes
 

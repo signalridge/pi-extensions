@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-worktime",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Per-prompt active worktime tracking for Pi.",
   "type": "module",
   "license": "MIT",
