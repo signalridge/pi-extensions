@@ -31,7 +31,7 @@
     "pack:check": "node scripts/pack-packages.mjs --dry-run --include-experimental",
     "changeset": "changeset",
     "changeset:status": "changeset status --verbose",
-    "version-packages": "changeset version && bun install --lockfile-only",
+    "version-packages": "changeset version && node scripts/check-capabilities.mjs --write && bun install --lockfile-only",
     "publish-packages": "node scripts/publish-changesets.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "release:check": "bun run check",
