@@ -41,6 +41,7 @@ export interface SpawnCapable {
   abort(id: string): boolean;
   abortOwned?(id: string, owner: AgentOwner): boolean;
   quiesceOwned?(runId: string, agentIds: string[], timeoutMs: number, owners?: AgentOwner[]): Promise<{ settled: boolean; pending: string[] }>;
+  reconcileManaged?(spawnKey: string, owner: AgentOwner): ManagedSpawnResult | undefined;
 }
 
 export interface RpcDeps {
@@ -56,6 +57,7 @@ export interface RpcHandle {
   unsubStop: () => void;
   unsubStopOwned: () => void;
   unsubSpawnManaged: () => void;
+  unsubReconcile: () => void;
   unsubQuiesce: () => void;
 }
 
@@ -157,7 +159,7 @@ function handleRpc(
 }
 
 /**
- * Register ping, legacy spawn/stop, and managed workflow spawn handlers.
+ * Register ping, legacy spawn/stop, and managed workflow spawn/reconciliation handlers.
  * Returns unsubscribe functions for cleanup.
  */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
@@ -204,13 +206,22 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     if (!ctx) throw new Error("No active session");
     if (!manager.spawnManaged) throw new Error("Managed spawn is unavailable");
     const request = validateManagedSpawnRequest(params);
-    // The wire request deliberately carries no execution policy. The production
-    // wrapper resolves it from the agent configuration; direct fixtures receive
-    // an explicit empty policy so the manager seam remains total.
+    // Policy hints are validated at the protocol boundary, then resolved by the
+    // production wrapper and AgentManager so the peer never bypasses local policy.
     const result = manager.spawnManaged(pi, ctx, request, {}) as ManagedSpawnResult | string;
     // Keep the additive handler tolerant of an older in-process manager fixture
     // while protocol-v3 managers return the richer state snapshot.
     if (typeof result === "string") return { id: result, state: "running" };
+    return result;
+  });
+
+  const unsubReconcile = handleRpc(events, "subagents:rpc:reconcile-managed", (params) => {
+    if (!manager.reconcileManaged) throw new Error("Managed reconciliation is unavailable");
+    rejectUnknownKeys(params, new Set(["requestId", "spawnKey", "owner"]), "managed reconciliation request");
+    const spawnKey = boundedString(params.spawnKey, "spawnKey", 256);
+    const owner = validateManagedOwner(params.owner, true);
+    const result = manager.reconcileManaged(spawnKey, owner);
+    if (!result) throw new Error("Managed spawn key not found or owner mismatch");
     return result;
   });
 
@@ -254,5 +265,5 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     return manager.quiesceOwned(runId, agentIds, rawTimeout, owners);
   });
 
-  return { unsubPing, unsubSpawn, unsubStop, unsubStopOwned, unsubSpawnManaged, unsubQuiesce };
+  return { unsubPing, unsubSpawn, unsubStop, unsubStopOwned, unsubSpawnManaged, unsubQuiesce, unsubReconcile };
 }

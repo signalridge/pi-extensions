@@ -37,18 +37,22 @@ interface FakeClientOptions {
 }
 
 interface FakeClient extends ManagedSpawnClient {
-  spawned: Array<{ task: DispatchTask; runId: string; nodeId: string; attemptId?: string }>;
+  spawned: Array<{ id: string; task: DispatchTask; runId: string; nodeId: string; attemptId?: string }>;
+  stopped: string[];
   complete(agentId: string, result: string): void;
+  fail(agentId: string, status: "stopped" | "interrupted" | "error" | "aborted"): void;
 }
 
 function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeClient {
-  const spawned: Array<{ task: DispatchTask; runId: string; nodeId: string; attemptId?: string }> = [];
+  const spawned: Array<{ id: string; task: DispatchTask; runId: string; nodeId: string; attemptId?: string }> = [];
+  const stopped: string[] = [];
   let seq = 0;
   return {
     spawned,
+    stopped,
     async spawn(task, runId, nodeId, attemptId) {
-      spawned.push({ task, runId, nodeId, attemptId });
       const id = `agent-${++seq}`;
+      spawned.push({ id, task, runId, nodeId, attemptId });
       const key = `${nodeId}`;
       const answer = opts.answers?.[key];
       if (answer) {
@@ -66,12 +70,50 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
       return { id, state: "running" };
     },
     async stop() {},
-    async stopOwned() {},
+    async stopOwned(agentId) {
+      stopped.push(agentId);
+    },
     async quiesceOwned() {
       return { settled: true, pending: [] };
     },
     complete(agentId: string, result: string) {
-      bus.emit("subagents:completed", { id: agentId, result, compactionCount: 0, completedAt: Date.now() });
+      const spawn = spawned.find((item) => item.id === agentId);
+      bus.emit("subagents:completed", {
+        id: agentId,
+        result,
+        compactionCount: 0,
+        completedAt: Date.now(),
+        ...(spawn
+          ? {
+              owner: {
+                extension: "pi-workflows",
+                runId: spawn.runId,
+                nodeId: spawn.nodeId,
+                attemptId: spawn.attemptId,
+              },
+            }
+          : {}),
+      });
+    },
+    fail(agentId: string, status: "stopped" | "interrupted" | "error" | "aborted") {
+      const spawn = spawned.find((item) => item.id === agentId);
+      bus.emit("subagents:failed", {
+        id: agentId,
+        status,
+        error: status === "error" || status === "aborted" ? "failed" : undefined,
+        compactionCount: 0,
+        completedAt: Date.now(),
+        ...(spawn
+          ? {
+              owner: {
+                extension: "pi-workflows",
+                runId: spawn.runId,
+                nodeId: spawn.nodeId,
+                attemptId: spawn.attemptId,
+              },
+            }
+          : {}),
+      });
     },
     checkProtocol: async () => {},
   };
@@ -119,6 +161,20 @@ describe("workflow engine", () => {
     expect(client.spawned[1].nodeId).toBe("call-1");
   });
 
+  it("refuses to start when the durable run identity cannot be written", async () => {
+    const bus = makeBus();
+    const client = makeClient(bus);
+    const engine = new WorkflowEngine(bus, client, {
+      append() {
+        throw new Error("journal is read-only");
+      },
+    });
+    await expect(engine.start(SIMPLE_SCRIPT, { background: true })).rejects.toMatchObject({
+      code: "PERSISTENCE_ERROR",
+    });
+    expect(engine.list()).toHaveLength(0);
+  });
+
   it("background start returns immediately and later settles via lifecycle events", async () => {
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
@@ -137,12 +193,65 @@ describe("workflow engine", () => {
     expect(run.status).toBe("completed");
   });
 
-  it("pause aborts execution and leaves the run interrupted", async () => {
-    const { engine } = makeEngine({ manual: true });
+  it("pause aborts execution, stops the owned agent, and leaves the run interrupted", async () => {
+    const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
     await engine.control("pause", started.runId);
     const state = engine.getState(started.runId);
     expect(state?.run.status).toBe("interrupted");
+    expect(client.stopped).toEqual([client.spawned[0]?.id]);
+  });
+
+  it("maps stopped lifecycle failures to a stopped call result", async () => {
+    const script = `export const meta = { name: "stopped", description: "s" };\nawait agent("work");\nreturn 0;`;
+    const { engine, client } = makeEngine({ manual: true });
+    const started = await engine.start(script, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    client.fail(client.spawned[0].id, "stopped");
+    const run = await engine.waitFor(started.runId);
+    expect(run.callResults["0"]?.status).toBe("stopped");
+    expect(run.status).toBe("completed");
+  });
+
+  it("maps error lifecycle failures to a failed call result", async () => {
+    const script = `export const meta = { name: "failed", description: "f" };\nawait agent("work");\nreturn 0;`;
+    const { engine, client } = makeEngine({ manual: true });
+    const started = await engine.start(script, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    client.fail(client.spawned[0].id, "error");
+    const run = await engine.waitFor(started.runId);
+    expect(run.callResults["0"]?.status).toBe("failed");
+    expect(run.status).toBe("completed");
+  });
+
+  it("suspends and aborts old branch runs before quiescence awaits", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    const started = await engine.start(SIMPLE_SCRIPT, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    const quiescing = engine.quiesceForBranchChange();
+    const oldState = engine.getState(started.runId);
+    expect(oldState?.lifecycleSuspended).toBe(true);
+    expect(oldState?.controller.signal.aborted).toBe(true);
+    await quiescing;
+    expect(client.spawned).toHaveLength(1);
+    await expect(engine.resume(started.runId, [], { background: true })).resolves.toBeUndefined();
+
+    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
+      type: "custom" as const,
+      customType: JOURNAL_ENTRY_TYPE,
+      data,
+    }));
+    engine.restore(sessionEntries);
+    expect(engine.getState(started.runId)?.lifecycleSuspended).toBe(false);
+  });
+
+  it("dispose rejects an unbounded waitFor instead of leaking it", async () => {
+    const { engine } = makeEngine({ manual: true });
+    const started = await engine.start(SIMPLE_SCRIPT, { background: true });
+    const waiting = engine.waitFor(started.runId);
+    engine.dispose();
+    await expect(waiting).rejects.toBeInstanceOf(Error);
   });
 
   it("stop marks the run stopped and non-resumable", async () => {
@@ -154,8 +263,8 @@ describe("workflow engine", () => {
     expect(state?.run.nonResumable).toBe(true);
   });
 
-  it("a failing agent call settles the run failed", async () => {
-    const { engine } = makeEngine({ answers: { "call-0": { error: "boom" } } });
+  it("lets a recoverable failing agent call return null and continue", async () => {
+    const { engine } = makeEngine({ answers: { "call-0": { error: "boom" }, "call-1": { result: "after" } } });
     const started = await engine
       .start(SIMPLE_SCRIPT, { background: false })
       .catch((error: unknown) => ({ status: "failed", error: error instanceof Error ? error.message : String(error) }));
@@ -241,6 +350,26 @@ describe("A4 spawnKey generation rotation", () => {
     expect(spawn.attemptId).toBe("attempt-1");
     expect(spawn.runId).toBe(started.runId);
     await engine.control("stop", started.runId);
+  });
+
+  it("executes an edited script when resumeFromRunId supplies a replacement", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    const original = `export const meta = { name: "edit-resume", description: "r" };\nawait agent("old prompt");\nreturn 0;`;
+    const revised = `export const meta = { name: "edit-resume", description: "r" };\nawait agent("new prompt");\nreturn 0;`;
+    const started = await engine.start(original, { background: true });
+    await engine.control("pause", started.runId);
+    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
+      type: "custom" as const,
+      customType: JOURNAL_ENTRY_TYPE,
+      data,
+    }));
+    await engine.resume(started.runId, sessionEntries, { background: true }, revised);
+    await new Promise((resolve) => setImmediate(resolve));
+    const latest = client.spawned.at(-1);
+    expect(latest?.task.prompt).toBe("new prompt");
+    if (latest) client.complete(`agent-${client.spawned.length}`, "done");
+    const run = await engine.waitFor(started.runId);
+    expect(run.status).toBe("completed");
   });
 
   it("same call index with different hash bumps generation (no fingerprint conflict)", async () => {

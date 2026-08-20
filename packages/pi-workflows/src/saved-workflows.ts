@@ -34,6 +34,14 @@ function savedPath(name: string, cwd: string): string {
   return join(savedDir(cwd), `${name}.js`);
 }
 
+function userSavedDir(): string {
+  return join(getAgentDir(), "workflows", "saved");
+}
+
+function userSavedPath(name: string): string {
+  return join(userSavedDir(), `${name}.js`);
+}
+
 /** Atomic write with backup: temp file + rename, keeping a .bak of the prior content. */
 function atomicWrite(path: string, content: string): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -67,40 +75,47 @@ export function saveWorkflow(name: string, script: string, cwd: string = process
 /** Load a saved workflow script by name; undefined when absent or invalid. */
 export function loadSavedWorkflow(name: string, cwd: string = process.cwd()): string | undefined {
   if (!isValidSavedName(name)) return undefined;
-  const path = savedPath(name, cwd);
-  if (!existsSync(path)) return undefined;
-  try {
-    const content = readFileSync(path, "utf8");
-    return content.length > 0 && content.length <= 200_000 ? content : undefined;
-  } catch {
-    return undefined;
+  for (const path of [savedPath(name, cwd), userSavedPath(name)]) {
+    if (!existsSync(path)) continue;
+    try {
+      const content = readFileSync(path, "utf8");
+      if (content.length > 0 && content.length <= 200_000) return content;
+    } catch {
+      // Project errors do not hide a valid user-scope fallback.
+    }
   }
+  return undefined;
 }
 
 /** List saved workflow names (bounded). */
 export function listSavedWorkflows(cwd: string = process.cwd()): string[] {
-  const dir = savedDir(cwd);
-  if (!existsSync(dir)) return [];
-  try {
-    return readdirSync(dir)
-      .filter((file) => file.endsWith(".js"))
-      .map((file) => basename(file, ".js"))
-      .filter(isValidSavedName)
-      .sort();
-  } catch {
-    return [];
+  const names = new Set<string>();
+  for (const dir of [savedDir(cwd), userSavedDir()]) {
+    if (!existsSync(dir)) continue;
+    try {
+      for (const file of readdirSync(dir)) {
+        const name = file.endsWith(".js") ? basename(file, ".js") : "";
+        if (isValidSavedName(name)) names.add(name);
+      }
+    } catch {
+      // An unreadable scope is simply unavailable; the other scope still works.
+    }
   }
+  return [...names].sort();
 }
 
 /** Remove a saved workflow; returns false when it did not exist. */
 export function removeSavedWorkflow(name: string, cwd: string = process.cwd()): boolean {
   if (!isValidSavedName(name)) return false;
-  const path = savedPath(name, cwd);
-  if (!existsSync(path)) return false;
-  try {
-    rmSync(path, { force: true });
-    return true;
-  } catch {
-    return false;
+  let removed = false;
+  for (const path of [savedPath(name, cwd), userSavedPath(name)]) {
+    if (!existsSync(path)) continue;
+    try {
+      rmSync(path, { force: true });
+      removed = true;
+    } catch {
+      // Keep trying the other scope; report whether anything was removed.
+    }
   }
+  return removed;
 }

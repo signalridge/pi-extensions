@@ -34,7 +34,7 @@ test("keeps protocol channels and capabilities stable", () => {
 });
 
 describe("managed request validation", () => {
-  test("accepts the policy-free request and requires exact owner attempt", () => {
+  test("accepts managed identity and optional policy fields, and requires exact owner attempt", () => {
     expect(
       parseManagedSpawnRequest({
         requestId: "request-1",
@@ -53,17 +53,28 @@ describe("managed request validation", () => {
       owner,
     });
 
-    expect(() =>
+    expect(
       parseManagedSpawnRequest({
         requestId: "request-1",
         spawnKey: "run-1/task-1/attempt-1",
         type: "general-purpose",
         prompt: "Return the result.",
         description: "Task 1",
+        model: "provider/model:high",
+        thinking: "high",
+        toolset: "web-research",
+        excludeTools: ["workflow"],
+        isolation: "worktree",
+        thread: "review",
         owner,
-        model: "should-not-cross-the-boundary",
       }),
-    ).toThrow(/unsupported field/);
+    ).toMatchObject({
+      model: "provider/model:high",
+      thinking: "high",
+      toolset: "web-research",
+      isolation: "worktree",
+      thread: "review",
+    });
   });
 
   test("accepts only semantic workflow tiers", () => {

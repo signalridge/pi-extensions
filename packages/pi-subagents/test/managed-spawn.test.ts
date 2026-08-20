@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AgentManager,
@@ -41,8 +42,8 @@ describe("managed spawn protocol", () => {
     await restoredManager?.dispose();
   });
 
-  it("rejects execution policy fields and invalid owners", () => {
-    expect(() => validateManagedSpawnRequest({ ...request, model: "provider/model" })).toThrow(/unsupported field/);
+  it("accepts managed policy hints and rejects invalid owners", () => {
+    expect(validateManagedSpawnRequest({ ...request, model: "provider/model", thinking: "medium", excludeTools: ["workflow"], isolation: "worktree" })).toMatchObject({ model: "provider/model", thinking: "medium", isolation: "worktree" });
     expect(() => validateManagedSpawnRequest({ ...request, owner: { ...owner, extension: "other" } })).toThrow(/owner.extension/);
     expect(() => validateManagedSpawnRequest({ ...request, prompt: "" })).toThrow(/prompt/);
   });
@@ -82,6 +83,64 @@ describe("managed spawn protocol", () => {
     expect(manager.getRecord(first.id)?.owner).toEqual(owner);
   });
 
+  it("accepts an exact schema-v1 legacy tombstone fingerprint", () => {
+    const legacyFingerprint = createHash("sha256")
+      .update(JSON.stringify([request.type, request.prompt, request.description, owner.extension, owner.runId, owner.nodeId, owner.attemptId]))
+      .digest("hex");
+    const tombstone: ManagedSpawnTombstone = {
+      schemaVersion: 1,
+      spawnKey: request.spawnKey,
+      fingerprint: legacyFingerprint,
+      id: "legacy-agent",
+      requestId: request.requestId,
+      type: request.type,
+      description: request.description,
+      owner,
+      state: "completed",
+      createdAt: 1,
+      updatedAt: 2,
+      compactionCount: 0,
+      terminal: { status: "completed", result: "legacy", compactionCount: 0, completedAt: 2 },
+    };
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager.restoreManagedSpawns([{ type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: tombstone }]);
+    const result = manager.spawnManaged(pi, ctx, { ...request, model: "provider/model" }, managedPolicy);
+    expect(result.id).toBe("legacy-agent");
+    expect(result.terminal?.result).toBe("legacy");
+  });
+
+  it("retries one transient terminal persistence failure without failing the agent", async () => {
+    let appendCalls = 0;
+    const entries: ManagedSpawnTombstone[] = [];
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: (entry) => {
+        appendCalls += 1;
+        if (appendCalls === 2) throw new Error("transient journal failure");
+        entries.push(entry);
+      },
+    });
+    const result = manager.spawnManaged(pi, ctx, { ...request, spawnKey: "run-1:retry" }, managedPolicy);
+    await manager.getRecordMutable(result.id)?.promise;
+    await vi.waitFor(() => expect(appendCalls).toBeGreaterThanOrEqual(3));
+    expect(manager.getRecordMutable(result.id)?.status).toBe("completed");
+    expect(entries.at(-1)?.state).toBe("completed");
+  });
+
+  it("does not reject the agent promise when terminal persistence stays unavailable", async () => {
+    let appendCalls = 0;
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {
+        appendCalls += 1;
+        if (appendCalls > 1) throw new Error("permanent journal failure");
+      },
+    });
+    const result = manager.spawnManaged(pi, ctx, { ...request, spawnKey: "run-1:permanent" }, managedPolicy);
+    await expect(manager.getRecordMutable(result.id)?.promise).resolves.toBe("done");
+    expect(manager.getRecordMutable(result.id)?.status).toBe("completed");
+  });
+
 
   it("passes the required execution policy to runAgent", () => {
     const policy: ManagedSpawnPolicy = {
@@ -102,6 +161,67 @@ describe("managed spawn protocol", () => {
       inheritContext: true,
     }));
     manager.abort(id);
+  });
+
+  it("rejects a changed model or denylist policy when reusing a managed thread", async () => {
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.({ dispose: vi.fn() } as never);
+      return {
+        responseText: "done",
+        session: { dispose: vi.fn() } as never,
+        aborted: false,
+        steered: false,
+      };
+    });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    const first = manager.spawnManaged(
+      pi,
+      ctx,
+      { ...request, thread: "review", excludeTools: ["workflow"], spawnKey: "run-1:thread-1" },
+      managedPolicy,
+    );
+    await manager.getRecordMutable(first.id)?.promise;
+    expect(() =>
+      manager.spawnManaged(
+        pi,
+        ctx,
+        {
+          ...request,
+          thread: "review",
+          excludeTools: ["bash"],
+          spawnKey: "run-1:thread-2",
+          owner: { ...owner, nodeId: "b" },
+        },
+        managedPolicy,
+      ),
+    ).toThrow(/thread policy conflict/);
+  });
+
+  it("cleans a reserved thread when durable allocation fails", async () => {
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {
+        throw new Error("journal unavailable");
+      },
+    });
+    expect(() =>
+      manager.spawnManaged(
+        pi,
+        ctx,
+        { ...request, thread: "review", spawnKey: "run-1:thread-persist-failure" },
+        managedPolicy,
+      ),
+    ).toThrow(/journal unavailable/);
+    await manager.dispose();
+
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    const retry = manager.spawnManaged(
+      pi,
+      ctx,
+      { ...request, thread: "review", spawnKey: "run-1:thread-persist-retry" },
+      managedPolicy,
+    );
+    expect(retry.created).toBe(true);
   });
 
   it("persists and restores the resolved workflow tier snapshot", () => {

@@ -221,7 +221,8 @@ import {
   getSessionContextPercent,
   type LifetimeUsage,
 } from "./usage.js";
-import { getWorkflowSettings, setWorkflowSettings } from "./workflow-tiers.js";
+import { getWorkflowSettings, resolveWorkflowTier, setWorkflowSettings } from "./workflow-tiers.js";
+import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
 
@@ -1215,6 +1216,7 @@ function activateRootRuntime(
           abortOwned: (id, owner) => manager.abortOwned(id, owner),
           quiesceOwned: (runId, agentIds, timeoutMs, owners) =>
             manager.quiesceOwned(runId, agentIds, timeoutMs, owners),
+          reconcileManaged: (spawnKey, owner) => manager.reconcileManaged(spawnKey, owner),
         },
       });
       // Emit only after RPC handlers are armed, and only for a bound session.
@@ -1332,6 +1334,7 @@ function activateRootRuntime(
       rpcHandle?.unsubStop();
       rpcHandle?.unsubStopOwned();
       rpcHandle?.unsubQuiesce();
+      rpcHandle?.unsubReconcile();
       rpcHandle?.unsubPing();
       rpcHandle = undefined;
       currentCtx = undefined;
@@ -1418,6 +1421,14 @@ function activateRootRuntime(
     fleet.ensureTimer();
   }
 
+  const splitManagedModelSpec = (spec: string): { model: string; thinking?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" } => {
+    const separator = spec.lastIndexOf(":");
+    const suffix = separator > spec.indexOf("/") ? spec.slice(separator + 1) : "";
+    const thinking = ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix)
+      ? (suffix as "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+      : undefined;
+    return thinking ? { model: spec.slice(0, separator), thinking } : { model: spec };
+  };
   /**
    * Add the same activity, transcript, and FleetView wiring used by Agent-tool
    * background runs without expanding the managed RPC's policy surface.
@@ -1450,44 +1461,71 @@ function activateRootRuntime(
     const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
       workflowTier: effectiveTier,
     });
-    // A managed request cannot carry a model override, but an agent's frontmatter
-    // model still needs the same scope validation as a normal Agent call when no
-    // workflow tier is active. Tiered runs validate their effective policy inside
-    // runAgent after the tier model has been resolved.
-    if (effectiveTier === undefined) {
-      let model =
-        resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(
-          resolvedConfig.modelInput,
-          ctxRef.modelRegistry,
-        );
-        if (typeof resolved === "object") model = resolved;
-      }
+    const requestedModel = request.model ? splitManagedModelSpec(request.model) : undefined;
+    const requestedThinking = request.thinking === "off" ? undefined : request.thinking;
+    const parentThinking = (() => {
+      const level = (piRef as unknown as { getThinkingLevel?: () => unknown }).getThinkingLevel?.();
+      return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
+        ? level
+        : undefined;
+    })();
+    const tierResolution = effectiveTier
+      ? resolveWorkflowTier({
+          tier: effectiveTier,
+          agentConfig: customConfig,
+          modelOverride: requestedModel?.model,
+          thinkingOverride: requestedThinking,
+          parentModel: ctxRef.model,
+          parentThinking,
+          modelRegistry: ctxRef.modelRegistry,
+        })
+      : undefined;
+    const resolvedRequestedModel = requestedModel
+      ? resolveModel(requestedModel.model, ctxRef.modelRegistry)
+      : undefined;
+    if (typeof resolvedRequestedModel === "string") throw new Error(resolvedRequestedModel);
+    const modelInput = requestedModel?.model ?? resolvedConfig.modelInput;
+    // An exact managed model is still checked by pi-subagents' model-scope policy;
+    // workflows never bypass the host's enabled-model restrictions.
+    if (effectiveTier === undefined || requestedModel !== undefined) {
+      const model = resolvedRequestedModel ?? resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model;
       const scopeVerdict = checkModelScope({
         model,
         cwd: ctxRef.cwd,
         modelRegistry: ctxRef.modelRegistry,
-        callerSupplied: false,
+        callerSupplied: requestedModel !== undefined,
         agentLabel: customConfig?.displayName ?? dispatch.type,
-        modelInput: resolvedConfig.modelInput,
+        modelInput,
       });
       if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
-      if (scopeVerdict.kind === "warn" && ctxRef.hasUI)
-        ctxRef.ui.notify(scopeVerdict.message, "warning");
+      if (scopeVerdict.kind === "warn" && ctxRef.hasUI) ctxRef.ui.notify(scopeVerdict.message, "warning");
     }
     const effectiveMaxTurns = normalizeMaxTurns(
       resolvedConfig.maxTurns ?? getDefaultMaxTurns(),
     );
+    const effectiveIsolation = request.isolation ?? resolvedConfig.isolation;
+    const configuredModel =
+      resolvedConfig.modelInput && resolvedConfig.modelInput !== "inherit"
+        ? resolveModel(resolvedConfig.modelInput, ctxRef.modelRegistry)
+        : undefined;
+    const effectiveModel =
+      resolvedRequestedModel ??
+      tierResolution?.model ??
+      (typeof configuredModel === "string" ? undefined : configuredModel) ??
+      (effectiveTier === undefined ? resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model : undefined);
+    const effectiveExcludeTools = [...new Set([...(customConfig?.disallowedTools ?? []), ...(request.excludeTools ?? [])])];
     const managedPolicy: ManagedSpawnPolicy = {
-      // Model and thinking are deliberately resolved by runAgent from the
-      // semantic tier, agent frontmatter, and parent session.
-      model: undefined,
+      // The managed request may select an exact model, but resolution and scope
+      // checks above remain owned by pi-subagents.
+      model: effectiveModel,
       maxTurns: effectiveMaxTurns,
       isolated: resolvedConfig.isolated,
       inheritContext: resolvedConfig.inheritContext,
-      thinkingLevel: undefined,
-      isolation: resolvedConfig.isolation,
+      thinkingLevel: (tierResolution?.thinkingLevel ?? requestedThinking ?? resolvedConfig.thinking ?? parentThinking ?? undefined) as "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined,
+      isolation: effectiveIsolation,
+      toolset: request.toolset,
+      excludeTools: effectiveExcludeTools,
+      policyFingerprint: JSON.stringify(customConfig ?? null),
       rootSessionId: ctxRef.sessionManager.getSessionId(),
       invocation: {
         tier: effectiveTier,
@@ -1495,7 +1533,7 @@ function activateRootRuntime(
         isolated: resolvedConfig.isolated,
         inheritContext: resolvedConfig.inheritContext,
         runInBackground: true,
-        isolation: resolvedConfig.isolation,
+        isolation: effectiveIsolation,
       },
     };
 
@@ -1861,6 +1899,7 @@ function activateRootRuntime(
     setMaxSubagentSpawnsPerBranch: (n) =>
       manager.setMaxSubagentSpawnsPerBranch(n),
     setFallbackSubagent,
+    setWorktreeIsolation: setWorktreeIsolationEnabled,
     setWorkflow: setWorkflowSettings,
     setAgentTiers: setAgentTiersSettings,
   });
@@ -2295,10 +2334,20 @@ Terse command-style prompts produce shallow, generic work.
           }),
         ),
         isolation: Type.Optional(
-          Type.Literal("worktree", {
-            description:
-              'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
-          }),
+          Type.Union(
+            [
+              Type.Literal("worktree", {
+                description:
+                  'Run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
+              }),
+              Type.Literal("off", {
+                description: 'Explicitly disable worktree isolation for this agent.',
+              }),
+            ],
+            {
+              description: 'Isolation mode: "worktree" for isolated git worktree, "off" to explicitly disable.',
+            },
+          ),
         ),
         ...scheduleParam,
       }),
@@ -4326,6 +4375,7 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       rememberAgents: manager.getRememberAgents(),
       agentMentions: getAgentMentionMode(),
       supervisorQuestions: isSupervisorQuestionsEnabled(),
+      worktreeIsolation: isWorktreeIsolationEnabled(),
       maxSubagentDepth: getMaxSubagentDepth(),
       maxSubagentSpawnsPerBranch: manager.getMaxSubagentSpawnsPerBranch(),
       ...(Object.keys(getWorkflowSettings().tiers ?? {}).length > 0 ||

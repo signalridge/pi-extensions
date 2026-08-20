@@ -12,8 +12,8 @@ isolation, retry, and session policy.
 
 ## Install
 
-`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.0.0`
-with protocol v3 managed-spawn support. They are separate Pi packages: the peer
+`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.5.0`
+with protocol v3 managed-spawn, workflow-tier, and managed-policy support. They are separate Pi packages: the peer
 dependency documents the requirement but intentionally does not auto-load or
 duplicate the subagent extension.
 
@@ -76,13 +76,14 @@ user's own LLM and run on the user's own machine.
 
 ### Runtime globals
 
-- `agent(prompt, { label, phase, schema, model, tier, agentType, timeoutMs, retries })`
+- `agent(prompt, { label, phase, schema, model, tier, isolation, thread, agentType, toolset, excludeTools, timeoutMs, retries })`
   — dispatch one subagent through the managed spawn protocol. Returns text, a
   schema-validated value, or recoverable `null` after retries. `schema` is a
   plain JSON Schema; the reply is parsed and validated client-side with bounded
   repair across attempts, and exhaustion throws `SCHEMA_NONCOMPLIANCE`.
-  Explicit per-call `model` is refused (the spawn-managed protocol routes by
-  `tier`; see "Model routing").
+  Explicit `model` and `isolation: "worktree"` are resolved and enforced by pi-subagents; `tier` remains the provider-neutral route.
+  `tier`; see "Model routing"). `thread` chains sequential turns within a named
+  conversation thread.
 - `parallel(thunks)` — run thunks concurrently, preserve input order. Recoverable
   thunk failures become `null`; non-recoverable failures (token budget, agent
   limit) halt the run. Fan-out that breaches `maxAgents` cancels only its own
@@ -116,13 +117,13 @@ never raises a fingerprint conflict.
 - `workflow`: run a script (`script`) or a saved/built-in workflow (`name`),
   with `args`, `background` (default true), `maxAgents`, `concurrency`,
   `agentRetries`, `tokenBudget`, `agentTimeoutMs`, and `resumeFromRunId`.
-- `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run.
+- `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
   `resume`, `rm`, and `save <name> [runId]` subcommands.
 - `/workflows-models`: points at pi-subagents' `/agents → Model tiers` — there
   is deliberately no second tier configuration file.
-- `/effort` and `/ultracode`: effort presets that map to the `small`/`medium`/
-  `large` workflow tiers.
+- `/effort` and `/ultracode`: standing `off|high|ultra` effort guidance that auto-arms substantive messages.
+- `/workflows-progress`: `compact|detailed|status|max <N>` controls the persisted live panel.
 - `/deep-research`, `/adversarial-review`, `/code-review`,
   `/multi-perspective`, `/codebase-audit`: the five built-in workflows. A
   saved workflow with the same name takes precedence.
@@ -149,33 +150,17 @@ sentence-ending dot is not a filename dot: "please run a workflow." arms, and
 <word>` (matched exactly — only the default word also matches its plural) or
 turn it off entirely with `/workflows-trigger off`.
 
-Saved workflows live at `~/.pi/workflows/projects/<basename>-<sha256(cwd)[0:12]>/{saved,settings.json}`,
+Saved workflows use project scope first and a user scope fallback; writes are atomic and names are path-safe.
 written atomically with a backup.
 
 ## Model routing
 
-The spawn-managed protocol carries `tier` (small/medium/large) but no per-call
-`model`; pi-subagents resolves the tier against its `workflow.tiers` settings
-(frontmatter > tier > `defaultModel` > parent). `agent({ tier })` maps directly
-to that field. A per-call `model` is refused rather than silently ignored —
-that needs a protocol extension. Worktree isolation is likewise agent-owned:
-declare `isolation: worktree` in an agent's frontmatter; per-call isolation is
-not part of the protocol (documented divergence).
+The managed protocol carries semantic tiers plus optional exact model/thinking, toolset, denylist, thread, and worktree requests. pi-subagents resolves model references, validates scope, creates/cleans worktrees, and owns tool/session policy. Workflows fail closed with a diagnostic when the peer does not advertise managed-policy support; explicit selectors otherwise fail closed when unavailable, and workflows never bypass the companion's policy.
 
-## Intentional divergences from upstream
+## Intentional adaptations from upstream
 
-- **No host-side web tools.** Upstream injects `web_search`/`web_fetch` from
-  the host process; agents here reach the web through their own configured
-  tools (pi-web-access / MCP).
-- **No agent registry.** Upstream parses `.pi/agents/*.md` itself; here
-  `agentType` resolves in pi-subagents, which owns the agent system.
-- **No `model-tiers.json`.** Tier routing uses pi-subagents' `workflow.tiers`.
-- **Schema validation is client-side.** The spawn-managed request has no
-  structured-output tool; the runtime asks for JSON, parses, validates, and
-  repairs across attempts.
+- **No host-side web tools.** Agents reach the web through configured pi-web-access/MCP tools or an agent type's tool policy.
+- **Agent registry and tier catalogue ownership.** `agentType` and `small|medium|large` profiles resolve in pi-subagents, avoiding a second registry/config schema.
+- **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
-State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom
-entries (schema v3). Interrupted runs replay from the journal; schema-v2
-(declarative DAG) journals are quarantined rather than replayed. Foreground
-`AbortSignal`s cancel only the caller's wait; managed children are stopped only
-through explicit stop/pause/quiescence.
+State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v3), including script revisions and durable removals. Interrupted/provider-limited runs replay from the journal; schema-v2 declarative journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters.

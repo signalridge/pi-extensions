@@ -18,6 +18,7 @@ export type {
   ManagedSpawnResponse,
   ManagedSpawnState,
   ManagedTerminalSnapshot,
+  ManagedThinking,
   RpcReply,
   WorkflowTier,
 } from "./types.js";
@@ -26,6 +27,7 @@ export {
   asRecord,
   boundedString,
   isCurrentProtocolVersion,
+  isManagedThinking,
   isRecord,
   isWorkflowTier,
   parseChildContextReply,

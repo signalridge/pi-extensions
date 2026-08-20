@@ -289,14 +289,41 @@ return await agent("say nothing");`,
     expect(result).toBeNull();
   });
 
-  it("refuses an explicit per-call model (spawn-managed divergence)", async () => {
+  it("forwards an explicit per-call model for managed resolution", async () => {
+    let selected: string | undefined;
+    const { result } = await runWorkflow(
+      `export const meta = { name: "model", description: "m" };
+return await agent("x", { model: "anthropic/claude-sonnet" });`,
+      {
+        agent: {
+          run: async (_prompt, options) => {
+            selected = options?.model;
+            return "ok";
+          },
+        },
+      },
+    );
+    expect(result).toBe("ok");
+    expect(selected).toBe("anthropic/claude-sonnet");
+  });
+});
+
+describe("runtime hardening", () => {
+  it("returns undefined for an empty judge panel", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "empty-judge", description: "e" };\nreturn await judgePanel([]);`,
+      { agent: { run: async () => ({ score: 1 }) } },
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("enforces additionalProperties false in nested schemas", async () => {
     await expect(
       runWorkflow(
-        `export const meta = { name: "model", description: "m" };
-return await agent("x", { model: "anthropic/claude-sonnet" });`,
-        { agent: nullRunner() },
+        `export const meta = { name: "strict-schema", description: "s" };\nreturn await agent("x", { schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false } });`,
+        { agent: { run: async () => JSON.stringify({ ok: true, extra: "reject" }) } },
       ),
-    ).rejects.toThrow(/not supported by the spawn-managed protocol/);
+    ).rejects.toThrow(/unexpected property/);
   });
 });
 
@@ -1111,5 +1138,70 @@ return "done";`,
       ),
     ).rejects.toThrow(/Agent limit exceeded/);
     expect(peak).toBeLessThanOrEqual(10);
+  });
+
+  describe("agent threads", () => {
+    it("runs sequential turns on the same thread with thread session name", async () => {
+      const sessions: string[] = [];
+      const { result } = await runWorkflow(
+        `export const meta = { name: "threads", description: "t" };
+const a = await agent("turn 1", { thread: "planner" });
+const b = await agent("turn 2", { thread: "planner" });
+return [a, b];`,
+        {
+          agent: {
+            run: async (prompt, opts) => {
+              sessions.push(opts?.sessionName ?? "");
+              return `reply to ${prompt}`;
+            },
+          },
+        },
+      );
+      expect(result).toEqual(["reply to turn 1", "reply to turn 2"]);
+      expect(sessions.every((s) => s.includes("thread:planner"))).toBe(true);
+    });
+
+    it("rejects concurrent calls to the same thread name", async () => {
+      await expect(
+        runWorkflow(
+          `export const meta = { name: "threads-conc", description: "t" };
+await parallel([
+  () => agent("task 1", { thread: "worker" }),
+  () => agent("task 2", { thread: "worker" }),
+]);
+return 0;`,
+          {
+            agent: {
+              run: async () => {
+                await new Promise((r) => setTimeout(r, 50));
+                return "x";
+              },
+            },
+          },
+        ),
+      ).rejects.toThrow(/same-thread calls must be sequential/);
+    });
+
+    it("rejects empty thread string", async () => {
+      await expect(
+        runWorkflow(
+          `export const meta = { name: "threads-empty", description: "t" };
+await agent("task", { thread: "   " });
+return 0;`,
+          { agent: { run: async () => "x" } },
+        ),
+      ).rejects.toThrow(/thread must be a non-empty string/);
+    });
+
+    it("rejects thread combined with worktree isolation", async () => {
+      await expect(
+        runWorkflow(
+          `export const meta = { name: "threads-wt", description: "t" };
+await agent("task", { thread: "architect", isolation: "worktree" });
+return 0;`,
+          { agent: { run: async () => "x" } },
+        ),
+      ).rejects.toThrow(/cannot use worktree isolation/);
+    });
   });
 });

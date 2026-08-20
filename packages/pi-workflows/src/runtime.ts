@@ -31,7 +31,11 @@ import { SharedStore } from "./shared-store.js";
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
-  /** Phase-level model route. Routed to the tier under spawn-managed (see README). */
+  /**
+   * Phase-level model preference — currently validated but not routed.
+   * Per-call model routing requires a protocol extension (see README
+   * "Intentional divergences"); use agent({ tier }) instead.
+   */
   model?: string;
 }
 
@@ -39,7 +43,11 @@ export interface WorkflowMeta {
   name: string;
   description: string;
   phases?: WorkflowMetaPhase[];
-  /** Run-level model route; phases override it. Routed to the tier under spawn-managed. */
+  /**
+   * Run-level model preference — currently validated but not routed.
+   * Per-call model routing requires a protocol extension (see README
+   * "Intentional divergences"); use agent({ tier }) instead.
+   */
   model?: string;
 }
 
@@ -71,6 +79,7 @@ export interface SharedRuntime {
   nestedCallSeq: number;
   runFatalController: AbortController;
   inFlight: Set<Promise<unknown>>;
+  activeThreads: Set<string>;
 }
 
 /** Counting semaphore with a FIFO resolve queue. */
@@ -99,6 +108,13 @@ export interface AgentRunOptions {
   callHash?: string;
   /** One-based attempt number within this call's retry loop. */
   attempt?: number;
+  thread?: string;
+  /** Per-call worktree request forwarded to pi-subagents. */
+  isolation?: "worktree";
+  /** Named toolset hint forwarded to pi-subagents. */
+  toolset?: string;
+  /** Additional tool names denied for this call. */
+  excludeTools?: string[];
   onModelResolved?: (id: string) => void;
   onModelFallback?: (info: { tier: string; requestedSpec: string }) => void;
   onUsage?: (usage: AgentUsage) => void;
@@ -115,6 +131,9 @@ export interface AgentOptions {
   agentType?: string;
   timeoutMs?: number | null;
   retries?: number;
+  thread?: string;
+  toolset?: string;
+  excludeTools?: string[];
 }
 
 export interface CheckpointOptions {
@@ -145,6 +164,8 @@ export interface WorkflowRunOptions {
   runId?: string;
   resumeJournal?: Map<string, JournalEntry>;
   resumeFromRunId?: string;
+  toolset?: string;
+  excludeTools?: string[];
   onAgentJournal?: (entry: JournalEntry) => void;
   onRetrySpend?: (tokens: number) => void;
   sharedRuntime?: SharedRuntime;
@@ -198,6 +219,7 @@ export const MAX_AGENTS_PER_RUN = 1000;
 export const MAX_CONCURRENCY = 16;
 export const MAX_AGENT_RETRIES = 3;
 export const DEFAULT_AGENT_TIMEOUT_MS: number | null = 300_000;
+export const MAX_SCRIPT_SYNC_MS = 1_000;
 
 // ── Determinism guardrail ────────────────────────────────────────────────────
 
@@ -380,15 +402,25 @@ function propertyKey(node: unknown, path: string): string {
 function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (!meta || typeof meta !== "object") throw new Error("meta must be an object");
   const value = meta as WorkflowMeta;
-  if (typeof value.name !== "string" || !value.name.trim()) throw new Error("meta.name must be a non-empty string");
-  if (typeof value.description !== "string" || !value.description.trim())
-    throw new Error("meta.description must be a non-empty string");
+  if (typeof value.name !== "string" || !value.name.trim() || value.name.length > 512)
+    throw new Error("meta.name must be a non-empty string of at most 512 characters");
+  if (typeof value.description !== "string" || !value.description.trim() || value.description.length > 100_000)
+    throw new Error("meta.description must be a non-empty string of at most 100000 characters");
   if (value.model !== undefined && typeof value.model !== "string") throw new Error("meta.model must be a string");
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
     for (const phase of value.phases) {
-      if (!phase || typeof phase !== "object" || typeof phase.title !== "string") {
+      if (
+        !phase ||
+        typeof phase !== "object" ||
+        typeof phase.title !== "string" ||
+        !phase.title.trim() ||
+        phase.title.length > 512
+      ) {
         throw new Error("each meta phase must have a title string");
+      }
+      if ((phase as WorkflowMetaPhase).model !== undefined && typeof (phase as WorkflowMetaPhase).model !== "string") {
+        throw new Error("each meta phase model must be a string when present");
       }
     }
   }
@@ -439,8 +471,12 @@ function hashAgentCall(
     tier: options.tier ?? null,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
+    thread: options.thread ?? null,
     agentDef: agentDefKey,
     schema: options.schema ?? null,
+    isolation: options.isolation ?? null,
+    toolset: options.toolset ?? null,
+    excludeTools: options.excludeTools ?? null,
   });
 }
 
@@ -495,6 +531,24 @@ function normalizeConcurrency(value: unknown): number {
   return Math.min(MAX_CONCURRENCY, Math.floor(value));
 }
 
+function normalizeMaxAgents(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return MAX_AGENTS_PER_RUN;
+  return Math.min(MAX_AGENTS_PER_RUN, Math.floor(value));
+}
+
+function normalizeAgentTimeout(value: unknown): number | null {
+  if (value === null) return null;
+  if (value === undefined) return DEFAULT_AGENT_TIMEOUT_MS;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return DEFAULT_AGENT_TIMEOUT_MS;
+  return Math.floor(value);
+}
+
+function normalizeTokenBudget(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return null;
+  return Math.floor(value);
+}
+
 function normalizeAgentRetries(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
@@ -536,14 +590,29 @@ async function withTimeout<T>(
 
 /** Extract the first balanced JSON value ({...} or [...]) from text. */
 export function findJsonBlock(text: string): string | undefined {
-  const start = text.search(/[{[]/);
-  if (start === -1) return undefined;
-  const open = text[start];
-  const close = open === "{" ? "}" : "]";
-  let depth = 0;
-  for (let i = start; i < text.length; i++) {
-    if (text[i] === open) depth++;
-    else if (text[i] === close && --depth === 0) return text.slice(start, i + 1);
+  for (let start = 0; start < text.length; start += 1) {
+    if (text[start] !== "{" && text[start] !== "[") continue;
+    const stack: string[] = [];
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i += 1) {
+      const char = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+      if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
+      else if (char === "}" || char === "]") {
+        if (stack.pop() !== char) break;
+        if (stack.length === 0) return text.slice(start, i + 1);
+      }
+    }
   }
   return undefined;
 }
@@ -590,6 +659,11 @@ function validateValue(value: unknown, schema: SchemaNode, path: string): string
       if (!(key in obj)) continue;
       errors.push(...validateValue(obj[key], propSchema as SchemaNode, `${path}.${key}`));
     }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(obj)) {
+        if (!Object.hasOwn(props, key)) errors.push(`${path}: unexpected property "${key}"`);
+      }
+    }
   } else if (type === "array" || Array.isArray(value)) {
     const arr = value as unknown[];
     if (typeof schema.minItems === "number" && arr.length < schema.minItems) {
@@ -627,6 +701,7 @@ export function validateJsonSchema(value: unknown, schema: unknown): string[] {
       { recoverable: false },
     );
   }
+  validateSchemaShape(schema, "$schema");
   const allowed = new Set([
     "type",
     "properties",
@@ -654,6 +729,68 @@ export function validateJsonSchema(value: unknown, schema: unknown): string[] {
     }
   }
   return validateValue(value, schema as SchemaNode, "$");
+}
+
+function validateSchemaShape(schema: unknown, path: string, seen = new WeakSet<object>()): void {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema))
+    throw new WorkflowError(`invalid JSON Schema at ${path}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+    });
+  if (seen.has(schema))
+    throw new WorkflowError(`cyclic JSON Schema at ${path}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+    });
+  seen.add(schema);
+  const node = schema as SchemaNode;
+  const allowed = new Set([
+    "type",
+    "properties",
+    "required",
+    "items",
+    "enum",
+    "const",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+    "description",
+    "title",
+    "additionalProperties",
+  ]);
+  for (const key of Object.keys(node))
+    if (!allowed.has(key))
+      throw new WorkflowError(
+        `agent({ schema }) uses unsupported JSON Schema keyword "${key}" at ${path}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+  if (node.additionalProperties !== undefined && typeof node.additionalProperties !== "boolean")
+    throw new WorkflowError(
+      `additionalProperties must be boolean at ${path}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  if (
+    node.required !== undefined &&
+    (!Array.isArray(node.required) || !node.required.every((key) => typeof key === "string"))
+  )
+    throw new WorkflowError(
+      `required must be an array of strings at ${path}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  if (node.properties !== undefined) {
+    if (!node.properties || typeof node.properties !== "object" || Array.isArray(node.properties))
+      throw new WorkflowError(`properties must be an object at ${path}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    for (const [key, child] of Object.entries(node.properties as Record<string, unknown>))
+      validateSchemaShape(child, `${path}.${key}`, seen);
+  }
+  if (node.items !== undefined) validateSchemaShape(node.items, `${path}[]`, seen);
+  seen.delete(schema);
 }
 
 // ── Runtime globals shape ────────────────────────────────────────────────────
@@ -712,8 +849,8 @@ export async function runWorkflow<T = unknown>(
 ): Promise<WorkflowRunResult<T>> {
   const started = Date.now();
   const { meta, body } = parseWorkflowScript(script);
-  const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
+  const maxAgents = normalizeMaxAgents(options.maxAgents ?? MAX_AGENTS_PER_RUN);
+  const agentTimeoutMs = normalizeAgentTimeout(options.agentTimeoutMs);
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
 
@@ -750,6 +887,7 @@ export async function runWorkflow<T = unknown>(
     nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
+    activeThreads: new Set<string>(),
   };
   const limiter = shared.limiter;
   const isTopLevelRun = !options.sharedRuntime;
@@ -778,9 +916,9 @@ export async function runWorkflow<T = unknown>(
   };
 
   const budget = Object.freeze({
-    total: options.tokenBudget ?? null,
+    total: normalizeTokenBudget(options.tokenBudget),
     spent: () => shared.spent,
-    remaining: () => (options.tokenBudget == null ? Infinity : Math.max(0, options.tokenBudget - shared.spent)),
+    remaining: () => (budget.total == null ? Infinity : Math.max(0, budget.total - shared.spent)),
   });
 
   const agentLimitError = () =>
@@ -799,10 +937,34 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agent = (promptText: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    const rawThread = agentOptions.thread;
+    const thread = rawThread === undefined ? undefined : typeof rawThread === "string" ? rawThread.trim() : "";
+    if (rawThread !== undefined && !thread) {
+      throw new WorkflowError("agent() thread must be a non-empty string", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+        recoverable: false,
+      });
+    }
+    if (thread && agentOptions.isolation === "worktree") {
+      throw new WorkflowError(
+        `agent thread "${thread}" cannot use worktree isolation because worktrees are removed after each call`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (thread && shared.activeThreads.has(thread)) {
+      throw new WorkflowError(
+        `agent thread "${thread}" is already running; same-thread calls must be sequential`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    if (thread) shared.activeThreads.add(thread);
+    const normalizedOptions = thread && thread !== rawThread ? { ...agentOptions, thread } : agentOptions;
+    let call = agentImpl(promptText, normalizedOptions);
+    if (thread) call = call.finally(() => shared.activeThreads.delete(thread));
     // Track every call (awaited or not) so the top-level run can drain
     // outstanding calls before completing — a forgotten `await` cannot let an
     // agent mutate state after the run is torn down.
-    const call = agentImpl(promptText, agentOptions);
     shared.inFlight.add(call);
     call.catch(() => {}).finally(() => shared.inFlight.delete(call));
     return call;
@@ -856,21 +1018,12 @@ export async function runWorkflow<T = unknown>(
       log(`agentType "${agentOptions.agentType}" resolves in pi-subagents at dispatch`);
     }
 
-    // Model precedence mirrors upstream's contract where the protocol allows
-    // it: explicit model > tier. Spawn-managed does not carry per-call models
-    // (see README "model routing"), so an explicit `model` is refused loudly
-    // rather than silently routed to the tier — matching the fail-closed rule
-    // for explicit selectors. meta.phases[].model is a default, so it degrades
-    // to the tier with a one-time log.
-    const explicitModel = agentOptions.model;
-    if (explicitModel !== undefined) {
-      throw new WorkflowError(
-        `agent({ model: "${explicitModel}" }) is not supported by the spawn-managed protocol; route via agent({ tier }) instead`,
-        WorkflowErrorCode.MODEL_NOT_FOUND,
-        { recoverable: false },
-      );
-    }
-    const modelSpec: string | undefined = undefined;
+    // Model precedence: explicit per-call model > phase/run model. A tier is
+    // deliberately left to pi-subagents so its configured profile wins over the
+    // phase default. The model string may carry a `:thinking` suffix understood by
+    // the managed protocol.
+    const phaseModel = meta.phases?.find((candidate) => candidate.title === assignedPhase)?.model ?? meta.model;
+    const modelSpec = agentOptions.model ?? (agentOptions.tier === undefined ? phaseModel : undefined);
 
     // Deterministic resume key: assigned at lexical call time, before the limiter.
     const callIndex = state.callSeq++;
@@ -889,7 +1042,7 @@ export async function runWorkflow<T = unknown>(
     // prefix is still intact. Once any call misses, it AND everything after it
     // run live, so an edited upstream call never leaves stale downstream
     // results served from the journal.
-    const cached = options.resumeJournal?.get(deltaKey);
+    const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
     const hashMatches = cached != null && cached.hash === callHash;
     const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
@@ -904,7 +1057,8 @@ export async function runWorkflow<T = unknown>(
       if (cached.storeDelta) store.applyDelta(cached.storeDelta);
       return cached.result;
     }
-    if (!hashMatches || cachedEmptyOutput) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (!hashMatches || cachedEmptyOutput || agentOptions.thread)
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
@@ -913,15 +1067,9 @@ export async function runWorkflow<T = unknown>(
 
       options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt: promptText });
 
-      // Per-call worktree isolation is not routable through spawn-managed; the
-      // resolved isolation for agentType-owned worktrees is applied by
-      // pi-subagents at dispatch. Keep the annotation contract honest.
+      // Worktree creation and cleanup remain owned by pi-subagents; the request
+      // carries the explicit per-call policy without touching the host filesystem here.
       const resolvedIsolation = agentOptions.isolation;
-      if (resolvedIsolation === "worktree") {
-        log(
-          `isolation ignored for "${label}" — per-call worktree isolation is not supported by the spawn-managed protocol`,
-        );
-      }
 
       // Captured from the subagent's real session usage; falls back to an
       // estimate when the provider reports none. Reset per retry attempt so a
@@ -982,16 +1130,22 @@ export async function runWorkflow<T = unknown>(
 
             const runPromise = agentRunner.run(promptText + schemaInstruction, {
               label,
-              sessionName: `workflow:${runId} ${label}`,
+              sessionName: agentOptions.thread
+                ? `workflow:${runId} thread:${agentOptions.thread}`
+                : `workflow:${runId} ${label}`,
               schema,
               signal: agentController.signal,
               instructions: buildAgentInstructions(assignedPhase, agentOptions, resolvedIsolation),
               model: modelSpec,
               tier: agentOptions.tier,
               agentType: agentOptions.agentType,
+              isolation: resolvedIsolation,
+              toolset: options.toolset ?? agentOptions.toolset,
+              excludeTools: options.excludeTools ?? agentOptions.excludeTools,
               callIndex,
               callHash,
               attempt,
+              thread: agentOptions.thread,
               onModelResolved: (id: string) => {
                 void id; // display model tracking is engine-side
               },
@@ -1076,6 +1230,7 @@ export async function runWorkflow<T = unknown>(
             // rolling back here its writes would stay live in the store and merge
             // into whatever a later, successful attempt commits.
             store.discardDelta(deltaKey);
+            if (workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) throw workflowError;
 
             if (workflowError.recoverable && attempt < maxAttempts) {
               log(
@@ -1135,7 +1290,7 @@ export async function runWorkflow<T = unknown>(
           } catch (error) {
             if (isAborted()) throw error;
             const workflowError = wrapError(error);
-            if (!workflowError.recoverable) {
+            if (!workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
               if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
               throw workflowError;
             }
@@ -1169,7 +1324,7 @@ export async function runWorkflow<T = unknown>(
             } catch (error) {
               if (isAborted()) throw error;
               const workflowError = wrapError(error);
-              if (!workflowError.recoverable) {
+              if (!workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
                 if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
                 throw workflowError;
               }
@@ -1276,7 +1431,11 @@ export async function runWorkflow<T = unknown>(
     { index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } | undefined
   > => {
     options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "judgePanel" });
-    const judges = Math.max(1, opts.judges ?? 3);
+    if (!Array.isArray(attempts) || attempts.length === 0) {
+      options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+      return undefined;
+    }
+    const judges = Math.min(16, Math.max(1, Math.floor(opts.judges ?? 3)));
     const rubric = opts.rubric ?? "overall quality and correctness";
     const scored = (
       await parallel(
@@ -1313,6 +1472,10 @@ export async function runWorkflow<T = unknown>(
       score: s.score,
       judgments: s.judgments.map((j) => ({ score: Number(j?.score) || 0, reason: j?.reason })),
     }));
+    if (normalized.length === 0) {
+      options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+      return undefined;
+    }
     let best = normalized[0];
     for (const s of normalized) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
     options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
@@ -1497,7 +1660,19 @@ export async function runWorkflow<T = unknown>(
 
   const wrapped = `${DETERMINISM_PRELUDE}\n(async () => {\n${body}\n})()`;
   try {
-    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context);
+    const result = await new vm.Script(wrapped, { filename: `${meta.name || "workflow"}.js` }).runInContext(context, {
+      timeout: MAX_SCRIPT_SYNC_MS,
+    });
+    try {
+      const serialized = JSON.stringify(result);
+      if (result !== undefined && serialized === undefined) throw new Error("workflow result is not JSON-serializable");
+    } catch (error: unknown) {
+      throw new WorkflowError(
+        `workflow result is not JSON-serializable: ${error instanceof Error ? error.message : String(error)}`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
 
     options.onTokenUsage?.(shared.tokenUsage);
 

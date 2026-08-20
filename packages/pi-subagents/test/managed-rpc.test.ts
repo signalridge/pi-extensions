@@ -46,7 +46,7 @@ describe("managed spawn RPC", () => {
     );
   });
 
-  it("advertises protocol v3 capabilities through ping", async () => {
+  it("advertises protocol v3 managed-policy capabilities through ping", async () => {
     const events = bus();
     registerRpcHandlers({ events, pi: {}, getCtx: () => ({}), manager: { spawn: vi.fn(), spawnManaged: vi.fn(), abort: vi.fn() } });
     const reply = vi.fn();
@@ -56,7 +56,7 @@ describe("managed spawn RPC", () => {
       success: true,
       data: {
         version: 3,
-        capabilities: { managedSpawn: true, lifecycleOwner: true, ownedStop: true, childContext: true, ownedQuiescence: true, workflowTiers: true },
+        capabilities: { managedSpawn: true, lifecycleOwner: true, ownedStop: true, childContext: true, ownedQuiescence: true, workflowTiers: true, managedPolicy: true },
       },
     }));
   });

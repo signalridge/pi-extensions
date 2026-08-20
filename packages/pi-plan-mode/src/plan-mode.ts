@@ -36,6 +36,7 @@ import { preflightSavedPlanImplementation, savedPlanBlocksNewWorkflow } from "./
 import {
   awaitPlanModeSettingsWrites,
   configuredImplementationPlanRetention,
+  configuredPlanModeToggleShortcut,
   configuredThinkingLevel,
   type PlanModeSettings,
   readPlanModeSettings,
@@ -85,6 +86,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   };
   let state: PlanModeState = { enabled: false, awaitingAction: false };
   let settings: PlanModeSettings = { thinkingLevel: "inherit" };
+  let toggleShortcut: ReturnType<typeof configuredPlanModeToggleShortcut>;
   let previousTools: string[] | undefined;
   let readyPresentationIntent: ReadyPresentationIntent | undefined;
   let latestCommandContext: ExtensionCommandContext | undefined;
@@ -95,6 +97,27 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   let menuController = new AbortController();
   const implementationRetention = createImplementationRetentionCoordinator();
   const persistState = () => pi.appendEntry<PlanModeState>(STATE_ENTRY_TYPE, state);
+
+  const clearPlanModeShortcutHandler = () => {};
+  const applyPlanModeShortcut = (nextShortcut: ReturnType<typeof configuredPlanModeToggleShortcut>) => {
+    if (toggleShortcut && toggleShortcut !== nextShortcut) {
+      pi.registerShortcut(toggleShortcut, {
+        handler: clearPlanModeShortcutHandler,
+      });
+    }
+    if (!nextShortcut) {
+      toggleShortcut = undefined;
+      return;
+    }
+    if (toggleShortcut === nextShortcut) return;
+    pi.registerShortcut(nextShortcut, {
+      description: "Toggle Plan mode",
+      handler: (ctx) => {
+        togglePlanMode(ctx);
+      },
+    });
+    toggleShortcut = nextShortcut;
+  };
   const planExports = createPlanExportController({
     getState: () => state,
     getSettings: () => settings,
@@ -304,8 +327,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     implementationRetention.restore(state.activeImplementation);
     const loadedSettings = await (dependencies.readSettings?.() ?? readPlanModeSettings());
     if (generation !== menuGeneration || menuController.signal.aborted) return;
-    if (loadedSettings.kind === "loaded") settings = loadedSettings.settings;
-    else if (loadedSettings.kind === "invalid") {
+    if (loadedSettings.kind === "loaded") {
+      settings = loadedSettings.settings;
+      applyPlanModeShortcut(configuredPlanModeToggleShortcut(settings));
+    } else if (loadedSettings.kind === "invalid") {
       ctx.ui.notify(`pi-plan-mode settings ignored: ${loadedSettings.reason}`, "warning");
     }
     if (loadedSettings.notice) ctx.ui.notify(loadedSettings.notice, "warning");
@@ -531,6 +556,27 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
     persistState();
     updateUi(ctx);
+  }
+
+  function togglePlanMode(ctx: ExtensionContext) {
+    if (state.enabled) {
+      ctx.ui.notify(planModeDisableNotification(), "info");
+      exitPlanMode(ctx);
+      return;
+    }
+    if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined)) return;
+    enterPlanMode(ctx);
+    ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+  }
+
+  function planModeDisableNotification() {
+    return state.activeImplementation
+      ? "Active implementation plan cleared."
+      : state.savedPlan
+        ? "Saved plan cleared."
+        : state.latestPlan
+          ? "Plan mode disabled. Proposed plan discarded."
+          : "Plan mode disabled.";
   }
 
   function sendPlanModeUserMessage(message: string, ctx: ExtensionContext) {
@@ -792,7 +838,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       isCurrent,
       settingsPath: dependencies.settingsPath,
       onSaved: (saved) => {
-        if (isCurrent()) settings = saved;
+        if (isCurrent()) {
+          settings = saved;
+          applyPlanModeShortcut(configuredPlanModeToggleShortcut(saved));
+        }
       },
       ...(dependencies.readSettings
         ? { readSettings: async () => dependencies.readSettings?.() ?? { kind: "missing" } }

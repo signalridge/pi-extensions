@@ -335,11 +335,11 @@ describe("cleanupWorktree — failure path", () => {
 });
 
 /**
- * The project switch itself (`worktreeIsolation`, #184). Its consumers —
- * agent-manager, both tool schemas, the invocation resolver — all mock this
- * module, so without this block the real singleton is never executed and its
- * default is never exercised. That default is what every "worktree isolation
- * still behaves as before" claim rests on.
+ * The project switch itself (`worktreeIsolation`, #184). It gates
+ * agent-manager before createWorktree; createWorktree itself remains
+ * unconditional so a direct caller that has already decided still gets a real
+ * worktree. The default (enabled) is what every "worktree isolation still
+ * behaves as before" claim rests on.
  */
 describe("worktree isolation switch", () => {
   afterEach(() => setWorktreeIsolationEnabled(true));

@@ -1,6 +1,7 @@
 /** Pure wire types shared by managed Pi extension peers. */
 
 export type WorkflowTier = "small" | "medium" | "large";
+export type ManagedThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export interface EventBus {
   on(event: string, handler: (data: unknown) => void): () => void;
   emit(event: string, data: unknown): void;
@@ -26,8 +27,20 @@ export interface ManagedSpawnRequest {
   type: string;
   prompt: string;
   description: string;
-  /** Semantic workflow profile; model and thinking stay owned by pi-subagents. */
+  /** Semantic workflow profile; model and thinking are resolved by pi-subagents. */
   tier?: WorkflowTier;
+  /** Optional exact provider/model reference, optionally suffixed with `:thinking`. */
+  model?: string;
+  /** Optional thinking override; `off` omits a thinking-level override. */
+  thinking?: ManagedThinking;
+  /** Optional named toolset hint owned by pi-subagents/host configuration. */
+  toolset?: string;
+  /** Additional tool names to deny for this managed child. */
+  excludeTools?: string[];
+  /** Per-call worktree request; creation and cleanup remain owned by pi-subagents. */
+  isolation?: "worktree";
+  /** Named sequential-thread hint; session reuse policy remains owned by pi-subagents. */
+  thread?: string;
   owner: ManagedOwner & { attemptId: string };
 }
 
@@ -65,6 +78,8 @@ export interface ManagedProtocolCapabilities {
   ownedQuiescence: boolean;
   /** Optional in v3 for older peers; required before sending tiered requests. */
   workflowTiers?: boolean;
+  /** True when managed model/tool/isolation overrides are accepted. */
+  managedPolicy?: boolean;
 }
 
 export interface ManagedProtocolPing {

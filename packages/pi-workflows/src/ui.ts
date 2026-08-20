@@ -22,10 +22,24 @@ export function snapshotRunLine(run: ScriptRun): string {
 }
 
 /** Live-widget lines for all non-terminal runs (A10). */
-export function liveWidgetLines(runs: readonly ScriptRun[]): string[] {
+export function liveWidgetLines(
+  runs: readonly ScriptRun[],
+  mode: "compact" | "detailed" = "compact",
+  maxAgentsShown = 6,
+): string[] {
   const active = runs.filter((run) => !isTerminal(run.status));
   if (active.length === 0) return [];
-  return ["Workflows", ...active.slice(0, 6).map((run) => `  ${snapshotRunLine(run)}`)].slice(0, 8);
+  const boundedMax = Math.max(1, Math.min(32, Math.floor(maxAgentsShown)));
+  const lines = ["Workflows"];
+  for (const run of active.slice(0, boundedMax)) {
+    lines.push(`  ${snapshotRunLine(run)}`);
+    if (mode === "detailed") {
+      for (const [nodeId, status] of Object.entries(run.callStatus).slice(0, boundedMax)) {
+        lines.push(`    ${nodeId}: ${status}`);
+      }
+    }
+  }
+  return lines.slice(0, 1 + boundedMax * (mode === "detailed" ? boundedMax + 1 : 1));
 }
 
 export type RunStatus = ScriptRun["status"];

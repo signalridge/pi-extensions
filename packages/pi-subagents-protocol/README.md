@@ -8,8 +8,4 @@ listeners, read settings, own lifecycle state, or start timers. The runtime owne
 remains `pi-subagents`; workflow state and journal ownership remain in
 `pi-workflows`.
 
-The v3 contract validates policy-free managed spawn requests, exact workflow
-owners, bounded terminal snapshots, owned quiescence responses, capability
-negotiation, and RPC envelopes. It deliberately does not expose model, thinking,
-queue, concurrency, retry, tools, skills, cwd, or isolation settings across the
-boundary.
+The v3 contract validates managed spawn requests, exact workflow owners, bounded terminal snapshots, owned quiescence responses, capability negotiation, and RPC envelopes. Optional managed policy hints can carry an exact model/thinking selector, named toolset, tool denylist, thread name, or worktree intent; `pi-subagents` remains the final resolver and enforces model scope, tool policy, concurrency, retries, skills, cwd, and isolation.

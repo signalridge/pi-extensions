@@ -8,6 +8,7 @@ import type {
   ManagedSpawnRequest,
   ManagedSpawnResponse,
   ManagedTerminalSnapshot,
+  ManagedThinking,
   RpcReply,
   WorkflowTier,
 } from "./types.js";
@@ -38,7 +39,21 @@ export function rejectUnknownKeys(value: RecordValue, allowed: ReadonlySet<strin
 }
 
 const OWNER_KEYS = new Set(["extension", "runId", "nodeId", "attemptId"]);
-const MANAGED_REQUEST_KEYS = new Set(["requestId", "spawnKey", "type", "prompt", "description", "tier", "owner"]);
+const MANAGED_REQUEST_KEYS = new Set([
+  "requestId",
+  "spawnKey",
+  "type",
+  "prompt",
+  "description",
+  "tier",
+  "model",
+  "thinking",
+  "toolset",
+  "excludeTools",
+  "isolation",
+  "thread",
+  "owner",
+]);
 const TERMINAL_KEYS = new Set([
   "status",
   "result",
@@ -57,10 +72,23 @@ const CAPABILITY_KEYS = new Set([
   "childContext",
   "ownedQuiescence",
   "workflowTiers",
+  "managedPolicy",
 ]);
 
 export function isWorkflowTier(value: unknown): value is WorkflowTier {
   return value === "small" || value === "medium" || value === "large";
+}
+
+export function isManagedThinking(value: unknown): value is ManagedThinking {
+  return (
+    value === "off" ||
+    value === "minimal" ||
+    value === "low" ||
+    value === "medium" ||
+    value === "high" ||
+    value === "xhigh" ||
+    value === "max"
+  );
 }
 export function parseRpcRequestId(raw: unknown): string {
   return boundedString(asRecord(raw, "RPC request").requestId, "requestId", 128);
@@ -107,6 +135,21 @@ export function parseManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
   if (tier !== undefined && !isWorkflowTier(tier)) {
     throw new Error("managed spawn tier must be one of small, medium, or large");
   }
+  const model = value.model === undefined ? undefined : boundedString(value.model, "model", 512);
+  const thinking = value.thinking === undefined ? undefined : value.thinking;
+  if (thinking !== undefined && !isManagedThinking(thinking)) throw new Error("managed spawn thinking is invalid");
+  const toolset = value.toolset === undefined ? undefined : boundedString(value.toolset, "toolset", 128);
+  const thread = value.thread === undefined ? undefined : boundedString(value.thread, "thread", 128);
+  const excludeTools =
+    value.excludeTools === undefined
+      ? undefined
+      : (() => {
+          if (!Array.isArray(value.excludeTools) || value.excludeTools.length > 64)
+            throw new Error("excludeTools must contain at most 64 names");
+          return value.excludeTools.map((name, index) => boundedString(name, `excludeTools[${index}]`, 128));
+        })();
+  const isolation = value.isolation === undefined ? undefined : value.isolation;
+  if (isolation !== undefined && isolation !== "worktree") throw new Error("managed spawn isolation must be worktree");
   return {
     requestId: boundedString(value.requestId, "requestId", 128),
     spawnKey: boundedString(value.spawnKey, "spawnKey", 256),
@@ -114,6 +157,12 @@ export function parseManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
     prompt: boundedString(value.prompt, "prompt", 100_000),
     description: boundedString(value.description, "description", 512),
     ...(tier === undefined ? {} : { tier }),
+    ...(model === undefined ? {} : { model }),
+    ...(thinking === undefined ? {} : { thinking }),
+    ...(toolset === undefined ? {} : { toolset }),
+    ...(excludeTools === undefined ? {} : { excludeTools }),
+    ...(isolation === undefined ? {} : { isolation }),
+    ...(thread === undefined ? {} : { thread }),
     owner: { ...owner, attemptId: owner.attemptId },
   };
 }
@@ -209,7 +258,8 @@ function parseCapabilities(raw: unknown): ManagedProtocolCapabilities {
   const value = asRecord(raw, "protocol capabilities");
   rejectUnknownKeys(value, CAPABILITY_KEYS, "protocol capabilities");
   for (const key of CAPABILITY_KEYS) {
-    if ((key === "childContext" || key === "workflowTiers") && value[key] === undefined) continue;
+    if ((key === "childContext" || key === "workflowTiers" || key === "managedPolicy") && value[key] === undefined)
+      continue;
     if (typeof value[key] !== "boolean") throw new Error(`protocol capability ${key} is invalid`);
   }
   return {
@@ -219,6 +269,7 @@ function parseCapabilities(raw: unknown): ManagedProtocolCapabilities {
     ...(value.childContext === undefined ? {} : { childContext: value.childContext as boolean }),
     ownedQuiescence: value.ownedQuiescence as boolean,
     ...(value.workflowTiers === undefined ? {} : { workflowTiers: value.workflowTiers as boolean }),
+    ...(value.managedPolicy === undefined ? {} : { managedPolicy: value.managedPolicy as boolean }),
   };
 }
 
