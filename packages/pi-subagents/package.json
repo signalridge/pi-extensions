@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-subagents",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Signalridge's managed subagent runtime with workflow-owned orchestration RPC.",
   "author": "tintinweb and signalridge contributors",
   "license": "MIT",
