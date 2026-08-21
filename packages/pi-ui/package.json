@@ -1,0 +1,52 @@
+{
+  "name": "@signalridge/pi-ui",
+  "version": "1.2.0",
+  "description": "Shared bordered custom-UI adapter for Signalridge Pi packages.",
+  "author": "signalridge contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-ui"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-ui",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "signalridgePackage": {
+    "kind": "library"
+  },
+  "type": "module",
+  "private": false,
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "check": "biome check src/ test/ --error-on-warnings && npm run typecheck && npm run test",
+    "format": "biome check --write src/ test/ --error-on-warnings",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test --config vitest.config.ts",
+    "lint": "biome check src/ test/ --error-on-warnings"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.7",
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "typescript": "7.0.2",
+    "vitest": "4.0.18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

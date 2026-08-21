@@ -10,6 +10,7 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { completeStatuslineArguments } from "./command-contract.js";
 import {
   INFORMATION_PROFILE_NAMES,
@@ -234,7 +235,7 @@ async function showMainMenu(ctx: ExtensionCommandContext, options: StatuslineCom
     },
   });
   try {
-    await runMenu(ctx, menu, {
+    await runMenu(withBorderedCustomUi(ctx), menu, {
       getState: () => undefined,
       signal: owner.signal,
       isCurrent: owner.isCurrent,
@@ -304,12 +305,12 @@ async function showPalettePresetPicker(
   const selectedIndex = PALETTE_PRESET_NAMES.indexOf(current);
   const result = await ctx.ui.custom<PalettePreset | null>((tui, theme, _keybindings, done) => {
     const container = new Container();
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    container.addChild(new DynamicBorder((text: string) => theme.fg("borderAccent", text)));
     const title = new Text("", 1, 0);
     container.addChild(title);
     const list = new SelectList(items, Math.min(items.length, 10), {
-      selectedPrefix: (text) => theme.fg("accent", text),
-      selectedText: (text) => theme.fg("accent", text),
+      selectedPrefix: (text) => theme.fg("borderAccent", text),
+      selectedText: (text) => theme.fg("borderAccent", text),
       description: (text) => theme.fg("muted", text),
       scrollInfo: (text) => theme.fg("dim", text),
       noMatch: (text) => theme.fg("warning", text),
@@ -323,7 +324,7 @@ async function showPalettePresetPicker(
     container.addChild(list);
     const hint = new Text("", 1, 0);
     container.addChild(hint);
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    container.addChild(new DynamicBorder((text: string) => theme.fg("borderAccent", text)));
     const updateThemedText = () => {
       title.setText(theme.fg("accent", theme.bold(`Palette preset (current: ${current})`)));
       hint.setText(theme.fg("dim", "↑↓ preview • enter apply • esc cancel"));
@@ -502,11 +503,11 @@ async function chooseSegments(ctx: ExtensionCommandContext, options: StatuslineC
     };
 
     const container = new Container();
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    container.addChild(new DynamicBorder((text: string) => theme.fg("borderAccent", text)));
     const title = new Text("", 1, 0);
     container.addChild(title);
     container.addChild({ render: renderList, invalidate() {} });
-    container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
+    container.addChild(new DynamicBorder((text: string) => theme.fg("borderAccent", text)));
     const updateThemedText = () => {
       title.setText(theme.fg("accent", theme.bold("Statusline segments")));
     };

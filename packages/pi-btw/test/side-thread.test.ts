@@ -626,15 +626,15 @@ test("adaptive bring-to-main preview preserves content, bounds, resize, Back sta
   await host.tui.waitForOpen();
   const initial = host.tui.render(40);
   assert.ok(initial.every((line) => visibleWidth(line) <= 40));
-  assert.ok(initial.length <= 6);
+  assert.ok(initial.length <= 8);
   assert.match(initial.join("\n"), /Preview · 2 messages · 13 lines/);
   assert.match(initial.join("\n"), /The following context/);
 
   const constrained = host.tui.resize({ width: 17, rows: 5 });
   assert.ok(constrained.every((line) => visibleWidth(line) <= 17));
-  assert.ok(constrained.length <= 2);
+  assert.ok(constrained.length <= 4);
   const expanded = host.tui.resize({ width: 100, rows: 14 });
-  assert.ok(expanded.length <= 11);
+  assert.ok(expanded.length <= 13);
   host.tui.press("tui.select.pageDown");
   assert.match(host.tui.render().join("\n"), /answer line/);
   host.changeEditor("newer main draft");

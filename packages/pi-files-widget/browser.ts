@@ -917,7 +917,7 @@ export function createFileBrowser(
         width,
       ),
     );
-    lines.push(theme.fg("borderMuted", "─".repeat(width)));
+    lines.push(theme.fg("borderAccent", "─".repeat(width)));
 
     const displayList = getDisplayList();
     if (displayList.length === 0) {
@@ -967,7 +967,7 @@ export function createFileBrowser(
       lines.push(theme.fg("dim", `  ${browser.selectedIndex + 1}/${displayList.length} (${pct}%)`));
     }
 
-    lines.push(theme.fg("borderMuted", "─".repeat(width)));
+    lines.push(theme.fg("borderAccent", "─".repeat(width)));
     const changedIndicator = browser.showOnlyChanged ? theme.fg("warning", " [changed only]") : "";
     const help = browser.searchMode
       ? theme.fg("dim", "Type to search  ↑↓: nav  Enter: confirm  Esc: cancel")

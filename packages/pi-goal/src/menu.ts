@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ActionMenuItem } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { formatTokenCount as formatCompactTokenCount, formatDuration } from "./accounting.js";
 import { parseTokenBudget } from "./command.js";
 import type { GoalCommandController } from "./commands.js";
@@ -561,7 +562,7 @@ export async function showGoalManager(
       back: async () => ({ kind: "back" }),
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: ownerSignal,
     isCurrent: isMenuCurrent,

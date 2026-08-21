@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 
 export interface PlanLaunchTool {
   name: string;
@@ -111,7 +112,7 @@ export async function showPlanLaunchMenu(ctx: ExtensionContext, options: PlanLau
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: options.signal,
     isCurrent: options.isCurrent,

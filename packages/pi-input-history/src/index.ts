@@ -441,7 +441,7 @@ export class HistoryPopupComponent implements Component, Focusable {
 
   render(width: number): string[] {
     const t = this.theme;
-    const border = (s: string) => t.fg("border", s);
+    const border = (s: string) => t.fg("borderAccent", s);
     const total = this.matchIndices.length;
     const { rows, showHelp } = this.layout();
     const now = Date.now();

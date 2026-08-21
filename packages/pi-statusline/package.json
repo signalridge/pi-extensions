@@ -52,7 +52,8 @@
     "format": "biome check --write ."
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.54.0"
+    "@narumitw/pi-tui-kit": "^0.54.0",
+    "@signalridge/pi-ui": "^1.2.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",

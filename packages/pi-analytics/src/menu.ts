@@ -2,6 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
 import { runConfirmation, runMenu, runTask } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import type { ClearAnalyticsResult } from "./storage/files.js";
 import type { AnalyticsSnapshot, SkillStats, TimeRange, TimeRangeId, ToolStats } from "./storage/queries.js";
 import { resolveTimeRange } from "./storage/queries.js";
@@ -124,7 +125,7 @@ export function createAnalyticsMenu(
         if (state.result.kind !== "ready") return { kind: "stay" };
         if (!options) throw new Error("Analytics confirmation is unavailable");
         const count = state.result.snapshot.overview.responseCycles;
-        const confirmation = await options.runConfirmation(ctx, {
+        const confirmation = await options.runConfirmation(withBorderedCustomUi(ctx), {
           title: "Delete analytics data?",
           message: `This will clear all local analytics history from:\n\n${safeDisplayText(state.path)}\n\nThe selected range currently shows ${count} response cycles. Other running Pi processes may add new records afterward.`,
           confirmLabel: "Delete data",
@@ -200,7 +201,7 @@ export async function showAnalyticsMenu(
     }
     return;
   }
-  await runMenu(ctx, controller.menu, {
+  await runMenu(withBorderedCustomUi(ctx), controller.menu, {
     getState: controller.getState,
     signal: options.signal,
     isCurrent: options.isCurrent,

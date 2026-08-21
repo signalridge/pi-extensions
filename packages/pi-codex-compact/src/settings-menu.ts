@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import type { CodexCompactSettings, CodexCompactSettingsRuntime, CodexCompactSettingsState } from "./settings.js";
 
 type Screen = "main" | "settings" | "invalid";
@@ -172,7 +173,7 @@ export async function showCodexCompactMenu(
   if (owner.signal.aborted || !owner.isCurrent()) return;
   let compactRequested = false;
   await runMenu(
-    ctx,
+    withBorderedCustomUi(ctx),
     createCodexCompactMenu(runtime, {
       onCompactRequested: () => {
         compactRequested = true;

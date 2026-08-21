@@ -37,6 +37,7 @@ import {
   Spacer,
   Text,
 } from "@earendil-works/pi-tui";
+import { wrapCustomUi } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import {
@@ -3435,7 +3436,7 @@ Terse command-style prompts produce shallow, generic work.
     if (hasCustom) legendParts.push("source labels: project and global");
     if (hasDisabled) legendParts.push("disabled = unavailable");
 
-    const selected = await ctx.ui.custom<string | undefined>(
+    const selected = await wrapCustomUi(ctx.ui).custom<string | undefined>(
       (_tui, _theme, _kb, done) => {
         const slTheme = getSettingsListTheme();
         const list = new SettingsList(
@@ -3501,7 +3502,7 @@ Terse command-style prompts produce shallow, generic work.
     const session = record.session;
     const activity = agentActivity.get(record.id);
 
-    await ctx.ui.custom<undefined>(
+    await wrapCustomUi(ctx.ui).custom<undefined>(
       (tui, theme, keybindings, done) => {
         return new ConversationViewer(
           tui,
@@ -5038,7 +5039,7 @@ Do not wrap the response in a markdown code fence. Return only the file contents
     // Updated on arrow keys so Enter knows which field is selected immediately.
     let currentIndex = 0;
 
-    const result = await ctx.ui.custom<string | undefined>(
+    const result = await wrapCustomUi(ctx.ui).custom<string | undefined>(
       (_tui, _theme, _kb, done) => {
         const items = buildItems();
 

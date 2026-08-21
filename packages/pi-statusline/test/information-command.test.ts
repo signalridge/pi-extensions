@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import { registerStatuslineCommand } from "../src/commands.js";
@@ -143,7 +144,13 @@ test("Advanced provides a shallow Back path to the refreshed main menu", async (
   await mock.commands.get("statusline")?.handler("", context.ctx);
 
   assert.deepEqual(
-    titles.map((title) => title.split("\n")[0]),
+    titles.map(
+      (title) =>
+        title
+          .split("\n")
+          .map((line) => stripVTControlCharacters(line).trim())
+          .find((line) => line.length > 0 && !/^[─━═\-=_+*]+$/u.test(line)) ?? title,
+    ),
     ["pi-statusline", "pi-statusline — Advanced", "pi-statusline"],
   );
 });

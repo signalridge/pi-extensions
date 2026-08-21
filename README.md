@@ -12,6 +12,7 @@ After publication, install packages individually:
 pi install npm:@signalridge/pi-subagents
 pi install npm:@signalridge/pi-workflows
 pi install npm:@signalridge/pi-lsp
+pi install npm:@signalridge/pi-ask-user-question
 ```
 
 The package's own `pi.extensions` manifest controls what Pi loads. Install any
@@ -26,9 +27,13 @@ Stable packages:
   `pi-github-pr`, `pi-stamp`, and `pi-btw`
 - `pi-statusline`, `pi-input-history`, `pi-input-prefix`, `pi-welcome`,
   `pi-files-widget`, `pi-agent-guidance`, `pi-code-actions`,
-  `pi-session-recap`, `pi-usage-extension`, `pi-ralph-wiggum`, and
+  `pi-ask-user-question`, `pi-session-recap`, `pi-usage-extension`, `pi-ralph-wiggum`, and
   `pi-tab-status`
 - `pi-herdr-state` and `pi-gpt-fast`
+
+Shared library:
+
+- `pi-ui` provides the consistent border adapter used by extension-owned custom dialogs; it is not a Pi resource by itself.
 - `pi-worktree` and `pi-worktime` are publishable and opt-in: install them
   deliberately rather than as part of a default set. `pi-worktree` in
   particular needs a project that allows git worktrees.

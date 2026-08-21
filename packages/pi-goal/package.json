@@ -50,7 +50,8 @@
     "typescript": "7.0.2"
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.54.0"
+    "@narumitw/pi-tui-kit": "^0.54.0",
+    "@signalridge/pi-ui": "^1.2.0"
   },
   "repository": {
     "type": "git",

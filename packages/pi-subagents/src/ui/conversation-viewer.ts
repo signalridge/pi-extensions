@@ -183,7 +183,7 @@ export class ConversationViewer implements Component {
     // agent's conversation ends and the parent's resumes. An inner rule would be
     // a third horizontal line competing with the two that mark the boundary, and
     // a four-sided box would cost two columns on every row for the same job.
-    const rule = () => th.fg("border", "─".repeat(Math.max(0, width)));
+    const rule = () => th.fg("borderAccent", "─".repeat(Math.max(0, width)));
     const hrMid = row("");
 
     lines.push(rule());
