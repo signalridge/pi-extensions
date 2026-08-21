@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-ask-user-question",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Claude/Kimi-style user question tool for Pi agents.",
   "type": "module",
   "license": "MIT",
