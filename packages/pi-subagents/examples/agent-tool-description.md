@@ -20,7 +20,7 @@ If the target is already known, use a direct tool — `read` for a known path, `
 - Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
+- Use steer_subagent to send mid-run messages to a running or queued background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use tier to pick the model profile for this spawn, by name. A tier overrides the agent's own default tier. Model and thinking are not callable parameters — they are what a tier resolves to.

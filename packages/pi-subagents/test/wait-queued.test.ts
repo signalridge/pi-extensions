@@ -114,6 +114,18 @@ describe("get_subagent_result wait:true on a queued agent", () => {
     }
     expect(queuedId, "expected to hit the concurrency limit within 10 spawns").toBeDefined();
 
+    // An immediate read must describe the queue instead of falling through to
+    // the terminal-state "No output." branch.
+    const queuedResult = await tools
+      .get("get_subagent_result")
+      .execute("tc-queued-read", { agent_id: queuedId }, undefined, undefined, ctx());
+    expect(textOf(queuedResult)).toContain("Agent is queued and has not started yet");
+
+    const queuedChat = await tools
+      .get("steer_subagent")
+      .execute("tc-queued-chat", { agent_id: queuedId, message: "prioritize tests" }, undefined, undefined, ctx());
+    expect(textOf(queuedChat)).toContain("Chat message queued for agent");
+
     // wait:true on the QUEUED agent — must not return "still running".
     const waitPromise = tools
       .get("get_subagent_result")

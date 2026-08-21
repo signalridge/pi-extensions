@@ -389,30 +389,32 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
 
   const steerTool = defineTool({
     name: NESTED_TOOL_NAMES[2],
-    label: "Steer Nested Agent",
-    description: "Send guidance to a running nested agent owned by this parent.",
+    label: "Chat with Nested Agent",
+    description: "Send guidance to a running or queued nested agent owned by this parent.",
     parameters: Type.Object({
       agent_id: Type.String(),
       message: Type.String(),
     }),
     execute: async (_toolCallId, params) => {
       const record = lookupRecord(context, params.agent_id);
-      if (!ownsRecord(record, context.parentAgentId) || record.status !== "running") {
-        return textResult(`Running nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
+      if (!ownsRecord(record, context.parentAgentId) ||
+        (record.status !== "running" && record.status !== "queued")) {
+        return textResult(`Running or queued nested agent not found or not owned by this parent: "${params.agent_id}".`, true);
       }
-      // Session not ready yet — queue the steer. The manager flushes pending
-      // steers when the session is created (same contract as the top-level tool).
-      if (!record.session) {
+      // Queue chat for any queued run, even when a background resume already
+      // has its old session attached. The manager flushes it only when the run
+      // actually starts, so cancellation cannot leak it into a later resume.
+      if (record.status === "queued" || !record.session) {
         if (!record.pendingSteers) record.pendingSteers = [];
         record.pendingSteers.push(params.message);
-        return textResult(`Steering message queued for nested agent ${params.agent_id}.`);
+        return textResult(`Chat message queued for nested agent ${params.agent_id}.`);
       }
       try {
         await record.session.steer(params.message);
       } catch (err) {
         return textResult(`Failed to steer nested agent: ${err instanceof Error ? err.message : String(err)}`, true);
       }
-      return textResult(`Steering message sent to nested agent ${params.agent_id}.`);
+      return textResult(`Chat message sent to nested agent ${params.agent_id}.`);
     },
   });
 

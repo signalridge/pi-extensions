@@ -19,12 +19,12 @@ test("frames an unbordered component and preserves width", () => {
 
 test("does not double-frame an existing bordered component", () => {
   const component = {
-    render: () => ["────────", "content", "────────"],
+    render: () => ["╭──────╮", "│ content │", "╰──────╯"],
     invalidate() {},
   };
   const framed = borderedComponent(component, (text) => `color(${text})`);
 
-  assert.deepEqual(framed.render(8), ["────────", "content", "────────"]);
+  assert.deepEqual(framed.render(8), ["╭──────╮", "│ content │", "╰──────╯"]);
   assert.equal(hasBorderRules(framed.render(8)), true);
 });
 

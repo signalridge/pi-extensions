@@ -257,6 +257,48 @@ describe("ConversationViewer", () => {
     });
   });
 
+  describe("height safety", () => {
+    it("keeps the complete box within the overlay height budget", () => {
+      const rows = 40;
+      const maxRows = Math.floor(rows * 0.7);
+      const cases = [
+        new ConversationViewer(
+          mockTui(rows, 80), mockSession(), mockRecord(), undefined, ansiTheme(), vi.fn(),
+        ),
+        new ConversationViewer(
+          mockTui(rows, 80), mockSession(), mockRecord({ invocation: { modelName: "provider/model" } as any }),
+          undefined, ansiTheme(), vi.fn(),
+        ),
+      ];
+
+      for (const viewer of cases) {
+        const lines = viewer.render(80);
+        expect(lines.length).toBeLessThanOrEqual(maxRows);
+        expect(lines.at(-1)).toContain("╰");
+      }
+    });
+
+    it("does not render a clipped half-box when the terminal is too short", () => {
+      const viewer = new ConversationViewer(
+        mockTui(8, 80), mockSession(), mockRecord(), undefined, ansiTheme(), vi.fn(),
+      );
+      expect(viewer.render(80)).toEqual([]);
+    });
+
+    it("accounts for the extra composer row in the height budget", () => {
+      const rows = 40;
+      const viewer = new ConversationViewer(
+        mockTui(rows, 80), mockSession(), mockRecord({ status: "running" }),
+        undefined, ansiTheme(), vi.fn(), undefined, undefined, vi.fn(),
+      );
+      viewer.handleInput("\r");
+
+      const lines = viewer.render(80);
+      expect(lines.length).toBeLessThanOrEqual(Math.floor(rows * 0.7));
+      expect(lines.at(-1)).toContain("╰");
+    });
+  });
+
   describe("safety net against upstream wrapTextWithAnsi bugs", () => {
     // These tests call buildContentLines() directly (via the private method)
     // because render() has its own truncation via row(). The safety net in
@@ -415,16 +457,16 @@ describe("ConversationViewer", () => {
       return { viewer, tui, onSteer };
     }
 
-    it("offers the steer affordance for a running agent and opens on Enter", () => {
+    it("offers the chat affordance for a running agent and opens on Enter", () => {
       const { viewer } = makeViewer();
-      expect(viewer.render(W).join("\n")).toContain("Enter steer");
+      expect(viewer.render(W).join("\n")).toContain("Enter chat");
 
       viewer.handleInput("\r"); // Enter
       // Composer is shown (its prompt + send/cancel hint), idle footer is gone.
       const out = viewer.render(W).join("\n");
       expect(out).toContain("Enter send · Esc cancel");
       expect(out).not.toContain("> ");
-      expect(out).not.toContain("Enter steer");
+      expect(out).not.toContain("Enter chat");
     });
 
     it("typing then Enter sends the trimmed message and closes the composer", () => {
@@ -463,19 +505,19 @@ describe("ConversationViewer", () => {
       expect(viewer.render(W).join("\n")).toContain("Enter send · Esc cancel");
     });
 
-    it("no steer affordance once the agent is no longer running", () => {
+    it("no chat affordance once the agent is no longer running", () => {
       const { viewer, onSteer } = makeViewer({ status: "completed" });
-      expect(viewer.render(W).join("\n")).not.toContain("Enter steer");
+      expect(viewer.render(W).join("\n")).not.toContain("Enter chat");
       viewer.handleInput("\r");
       expect(viewer.render(W).join("\n")).not.toContain("Enter send");
       expect(onSteer).not.toHaveBeenCalled();
     });
 
-    it("no steer affordance when no onSteer handler is provided", () => {
+    it("no chat affordance when no onSteer handler is provided", () => {
       const viewer = new ConversationViewer(
         mockTui(30, W), mockSession(), mockRecord({ status: "running" }), undefined, ansiTheme(), vi.fn(),
       );
-      expect(viewer.render(W).join("\n")).not.toContain("Enter steer");
+      expect(viewer.render(W).join("\n")).not.toContain("Enter chat");
       expect(() => viewer.handleInput("\r")).not.toThrow();
     });
 
@@ -492,18 +534,17 @@ describe("ConversationViewer", () => {
       }
     });
 
-    it("marks its own edges with a rule at the top and the bottom, and none between", () => {
+    it("renders a complete box around the conversation and composer", () => {
       const viewer = new ConversationViewer(
         mockTui(30, 80), mockSession(), mockRecord({ status: "running" }), undefined, ansiTheme(), vi.fn(),
       );
       const lines = viewer.render(80);
+      const top = `╭${"─".repeat(78)}╮`;
+      const bottom = `╰${"─".repeat(78)}╯`;
 
-      // The overlay floats over the transcript; without these there is no
-      // telling where the agent's conversation ends and the parent's resumes.
-      expect(lines[0]).toContain("─".repeat(80));
-      expect(lines.at(-1)).toContain("─".repeat(80));
-      // Exactly two, so an inner rule never competes with the boundary pair.
-      expect(lines.filter((line) => line.includes("─".repeat(80)))).toHaveLength(2);
+      expect(lines[0]).toContain(top);
+      expect(lines.at(-1)).toContain(bottom);
+      expect(lines.slice(1, -1).every((line) => line.includes("│"))).toBe(true);
     });
 
     it("leads each status with its single-column mark and text label", () => {
