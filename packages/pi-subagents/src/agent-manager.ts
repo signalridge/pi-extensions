@@ -2193,6 +2193,8 @@ export class AgentManager {
       onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
       onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
       onCompaction?: (info: unknown) => void;
+      /** Called once a queued background resume has acquired its run slot. */
+      onStarted?: () => void;
     },
   ): Promise<AgentRecord | undefined> {
     if (this.disposed) return undefined;
@@ -2311,6 +2313,8 @@ export class AgentManager {
       onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
       onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
       onCompaction?: (info: unknown) => void;
+      /** Called once a queued background resume has acquired its run slot. */
+      onStarted?: () => void;
     },
   ): Promise<string> {
     const snapshot = control.snapshot;
@@ -2340,6 +2344,28 @@ export class AgentManager {
       record.result = undefined;
       record.error = undefined;
       this.syncManagedRecord(record);
+      try {
+        options?.onStarted?.();
+      } catch {
+        // Observability hooks must not prevent the resumed agent from running.
+      }
+
+      // A queued background resume reuses an existing session, so messages
+      // sent while it waits must be flushed here rather than through the
+      // session's idle steering queue. Otherwise cancelling this queued run
+      // would leave those messages behind for a later resume.
+      const pendingSteers = record.pendingSteers;
+      record.pendingSteers = undefined;
+      if (pendingSteers?.length) {
+        for (const message of pendingSteers) {
+          if (control.controller.signal.aborted) break;
+          try {
+            await record.session!.steer(message);
+          } catch {
+            // A malformed or stale queued message must not prevent the resume.
+          }
+        }
+      }
 
       try {
         const { text, failure } = await resumeAgent(record.session!, prompt, {
@@ -2397,21 +2423,25 @@ export class AgentManager {
 
   /**
    * Send a steering message to an agent from the UI (mirrors the steer_subagent
-   * tool). A live session delivers it now — it interrupts the agent after its
-   * current tool execution and appears as a user message. If the session isn't
-   * ready yet, the message is queued on `pendingSteers` and flushed when the
-   * session is created. Returns false if the agent can't accept steering
-   * (unknown id, or no longer running/queued).
+   * tool). A running session delivers it now — it interrupts the agent after
+   * its current tool execution and appears as a user message. Queued runs keep
+   * it on `pendingSteers` until their run actually starts, including background
+   * resumes that already have an old session attached. Returns false if the
+   * agent can't accept steering (unknown id, or no longer running/queued).
    */
   steer(id: string, message: string): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
     if (record.status !== "running" && record.status !== "queued") return false;
-    if (record.session) {
-      record.session.steer(message).catch(() => {});
-    } else {
+    // A queued background resume already has its old session attached. Keep
+    // messages in the manager until that resume actually starts; putting them
+    // into AgentSession's idle queue would survive cancellation into a future
+    // resume of the same conversation.
+    if (record.status === "queued" || !record.session) {
       if (!record.pendingSteers) record.pendingSteers = [];
       record.pendingSteers.push(message);
+    } else {
+      record.session.steer(message).catch(() => {});
     }
     return true;
   }
@@ -2461,6 +2491,9 @@ export class AgentManager {
       resumeControl?.controller.abort();
       resumeControl?.cleanup();
       resumeControl?.deferred?.resolve("");
+      // Do not let chat messages queued for a cancelled queued run leak into
+      // the session when the same agent is resumed later.
+      record.pendingSteers = undefined;
       this.syncManagedRecord(record);
       // Queued agents have no run promise yet. Still use the normal terminal
       // callback so lifecycle consumers (including workflow waits) cannot hang.

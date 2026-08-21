@@ -17,9 +17,9 @@ import { PREVIEW_SCAN_LIMIT, safeTerminalText, sanitizeDisplayText, truncateCode
 import { getAgentStatusColor, getAgentStatusLabel, getAgentStatusMark } from "./status-label.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
-/** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
+/** Base lines consumed by chrome: top border + header + two separators + footer + bottom border. */
 const CHROME_LINES_BASE = 6;
-const MIN_VIEWPORT = 3;
+const MIN_VIEWPORT = 1;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
@@ -165,8 +165,14 @@ export class ConversationViewer implements Component {
   render(width: number): string[] {
     if (width < 6) return [];
     this.refreshRecord();
+    // A custom overlay is clipped by pi after rendering. At very low heights
+    // there is no room for the complete header/footer chrome, so render nothing
+    // rather than showing a misleading half-box with a missing bottom border.
+    if (this.maxOverlayRows() < this.chromeLines() + MIN_VIEWPORT) return [];
     const th = this.theme;
-    const innerW = width - 2;
+    // Match pi's overlay style: a complete box with two columns reserved for
+    // the side borders and one padding column on each side of the content.
+    const innerW = width - 4;
     this.lastInnerW = innerW;
     const lines: string[] = [];
 
@@ -176,18 +182,20 @@ export class ConversationViewer implements Component {
     };
     const row = (content: string) => {
       const fitted = truncateToWidth(pad(content, innerW), innerW, "...", true);
-      return ` ${fitted} `;
+      return `${th.fg("borderAccent", "│")} ${fitted} ${th.fg("borderAccent", "│")}`;
     };
-    // Two full-width rules, top and bottom, and none in between. The overlay
-    // floats over the transcript, so without them there is no telling where the
-    // agent's conversation ends and the parent's resumes. An inner rule would be
-    // a third horizontal line competing with the two that mark the boundary, and
-    // a four-sided box would cost two columns on every row for the same job.
-    const rule = () => th.fg("borderAccent", "─".repeat(Math.max(0, width)));
-    const hrMid = row("");
+    // Keep the border in the viewer rather than relying on the host overlay's
+    // transparent background. This makes the dialog boundary obvious and
+    // matches the reference pi-subagents viewer (╭─╮ / │ / ╰─╯).
+    const rule = (left: string, right: string) =>
+      th.fg("borderAccent", `${left}${"─".repeat(Math.max(0, width - 2))}${right}`);
+    const topRule = rule("╭", "╮");
+    const bottomRule = rule("╰", "╯");
+    // Match the reference viewer's internal separator: it keeps the header,
+    // transcript, and controls visually distinct without adding another row.
+    const hrMid = row(th.fg("dim", "─".repeat(innerW)));
 
-    lines.push(rule());
-    lines.push(row(th.bold("Agent conversation")));
+    lines.push(topRule);
     const name = renderAgentName(this.record.type, th, { bold: true });
     const modeLabel = getPromptModeLabel(this.record.type);
     const modeTag = modeLabel ? th.fg("dim", `mode ${modeLabel}`) : undefined;
@@ -238,13 +246,13 @@ export class ConversationViewer implements Component {
       const composerLine = renderedComposer.startsWith("> ") ? renderedComposer.slice(2) : renderedComposer;
       lines.push(row(composerLine));
       const composeHint = th.fg("dim", "Enter send · Esc cancel");
-      const composeLeft = th.fg("accent", "steer");
+      const composeLeft = th.fg("accent", "chat");
       const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
       lines.push(row(composeLeft + " ".repeat(composeGap) + composeHint));
     } else {
       const sep = th.fg("dim", " · ");
       const actions: string[] = [];
-      if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
+      if (this.canSteer()) actions.push(th.fg("dim", "Enter chat"));
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
@@ -262,7 +270,7 @@ export class ConversationViewer implements Component {
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
     }
-    lines.push(rule());
+    lines.push(bottomRule);
 
     return lines;
   }
@@ -309,11 +317,14 @@ export class ConversationViewer implements Component {
 
   // ---- Private ----
 
+  private maxOverlayRows(): number {
+    return Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
+  }
+
   private viewportHeight(): number {
     // Cap mirrors the overlay's maxHeight — otherwise the viewer would render
     // more lines than the overlay shows and clip the footer.
-    const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
-    return Math.max(MIN_VIEWPORT, maxRows - this.chromeLines());
+    return Math.max(MIN_VIEWPORT, this.maxOverlayRows() - this.chromeLines());
   }
 
   private chromeLines(): number {

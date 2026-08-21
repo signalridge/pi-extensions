@@ -4,7 +4,7 @@
  * Tools:
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
- *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   steer_subagent       — LLM-callable: chat with a running or queued agent
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -2168,7 +2168,7 @@ Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
+- resume continues a previous agent by ID; steer_subagent messages a running or queued one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -2193,7 +2193,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
+- Use steer_subagent to send mid-run messages to a running or queued background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use tier to pick the model profile for this spawn, by name. A tier overrides the agent's own default tier. Model and thinking are not callable parameters — they are what a tier resolves to.
@@ -2758,6 +2758,16 @@ Terse command-style prompts produce shallow, generic work.
             // run starts. The resumed prompt lands as an ordinary user message at
             // this index, so it is written exactly once.
             const transcriptAnchor = existing.session.messages.length ?? 0;
+            const attachTranscript = (): void => {
+              if (!existing.outputFile || existing.outputCleanup) return;
+              existing.outputCleanup = streamToOutputFile(
+                existing.session!,
+                existing.outputFile,
+                params.resume!,
+                ctx.cwd,
+                transcriptAnchor,
+              );
+            };
             const record = await manager.resume(
               params.resume,
               params.prompt,
@@ -2766,23 +2776,13 @@ Terse command-style prompts produce shallow, generic work.
                 isBackground: true,
                 onToolActivity: bgCallbacks.onToolActivity,
                 onAssistantUsage: bgCallbacks.onAssistantUsage,
+                onStarted: attachTranscript,
               },
             );
             if (!record) {
               return textResult(
                 `Cannot resume agent "${params.resume}" in background — it is already running. ` +
                   "Wait for it to settle, or steer it with steer_subagent.",
-              );
-            }
-            // Wire streaming once the run actually starts (immediately, or on
-            // queue drain).
-            if (existing.outputFile) {
-              existing.outputCleanup = streamToOutputFile(
-                existing.session,
-                existing.outputFile,
-                params.resume,
-                ctx.cwd,
-                transcriptAnchor,
               );
             }
             agentActivity.set(params.resume, bgState);
@@ -3128,6 +3128,9 @@ Terse command-style prompts produce shallow, generic work.
         if (record.status === "running") {
           output +=
             "Agent is still running. Use wait: true or check back later.";
+        } else if (record.status === "queued") {
+          output +=
+            "Agent is queued and has not started yet. Use wait: true or check back later.";
         } else if (record.status === "error") {
           output += `Error: ${record.error}${partialOutputSuffix(record)}`;
         } else {
@@ -3158,19 +3161,19 @@ Terse command-style prompts produce shallow, generic work.
   pi.registerTool(
     defineTool({
       name: SUBAGENT_TOOL_NAMES.STEER,
-      label: "Steer Agent",
+      label: "Chat with Agent",
       description:
-        "Send a steering message to a running agent. The message will interrupt the agent after its current tool execution " +
-        "and be injected into its conversation, allowing you to redirect its work mid-run. Only works on running agents.",
+        "Send a chat message to a running or queued agent. A running agent receives it after its current tool execution; " +
+        "a queued agent receives it when its session starts. The message is injected into the agent's conversation.",
       promptSnippet:
-        "Send a steering message to redirect a running background agent",
+        "Chat with or redirect a running or queued background agent",
       parameters: Type.Object({
         agent_id: Type.String({
-          description: "The agent ID to steer (must be currently running).",
+          description: "The agent ID to message (must be currently running or queued).",
         }),
         message: Type.String({
           description:
-            "The steering message to send. This will appear as a user message in the agent's conversation.",
+            "The chat message to send. This will appear as a user message in the agent's conversation.",
         }),
       }),
       execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
@@ -3180,13 +3183,16 @@ Terse command-style prompts produce shallow, generic work.
             `Agent not found: "${params.agent_id}". It may have been cleaned up.`,
           );
         }
-        if (record.status !== "running") {
+        if (record.status !== "running" && record.status !== "queued") {
           return textResult(
-            `Agent "${params.agent_id}" is not running (status: ${record.status}). Cannot steer a non-running agent.`,
+            `Agent "${params.agent_id}" is not running or queued (status: ${record.status}). Cannot send a chat message.`,
           );
         }
-        if (!record.session) {
-          // Session not ready yet — queue the steer for delivery once initialized
+        if (record.status === "queued" || !record.session) {
+          // Keep queued messages in the manager record until the run starts.
+          // This also covers a queued background resume whose old session is
+          // already attached; sending directly to that session would survive
+          // cancellation into a later resume.
           if (!record.pendingSteers) record.pendingSteers = [];
           record.pendingSteers.push(params.message);
           if (!record.detached)
@@ -3194,8 +3200,9 @@ Terse command-style prompts produce shallow, generic work.
               id: record.id,
               message: params.message,
             });
+          const delivery = record.status === "queued" ? "when the agent starts" : "once the session initializes";
           return textResult(
-            `Steering message queued for agent ${record.id}. It will be delivered once the session initializes.`,
+            `Chat message queued for agent ${record.id}. It will be delivered ${delivery}.`,
           );
         }
 
@@ -3220,7 +3227,7 @@ Terse command-style prompts produce shallow, generic work.
               `${record.compactionCount} compaction${record.compactionCount === 1 ? "" : "s"}`,
             );
           return textResult(
-            `Steering message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
+            `Chat message sent to agent ${record.id}. The agent will process it after its current tool execution.\n` +
               `Current state: ${stateParts.join(" · ")}`,
           );
         } catch (err) {
@@ -3492,10 +3499,20 @@ Terse command-style prompts produce shallow, generic work.
     record: AgentRecord,
   ) {
     if (!record.session) {
-      ctx.ui.notify(
-        `Agent is ${record.status === "queued" ? "queued" : "expired"}; no session available.`,
-        "info",
-      );
+      if (record.status === "queued") {
+        const handleHint = record.handle
+          ? ` Use @${record.handle} <message> to chat while it waits.`
+          : " Use steer_subagent or wait until it starts to chat.";
+        const stop = await ctx.ui.confirm(
+          "Queued agent",
+          `"${sanitizeDisplayText(record.description)}" has not started yet.${handleHint}\n\nStop this queued run?`,
+        );
+        if (stop && manager.abort(record.id)) {
+          ctx.ui.notify(`Stopped queued agent "${sanitizeDisplayText(record.description)}".`, "info");
+        }
+        return;
+      }
+      ctx.ui.notify("Agent is expired; no session available.", "info");
       return;
     }
 

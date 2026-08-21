@@ -2296,3 +2296,85 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
     expect(record.result).toBe("new partial progress"); // salvageable, this-run text
   });
 });
+
+describe("AgentManager — queued resume chat isolation", () => {
+  let manager: AgentManager;
+
+  afterEach(async () => { await manager?.dispose(); });
+
+  it("keeps queued-resume chat out of the reused session and clears it on cancel", async () => {
+    const targetSession = { ...mockSession(), steer: vi.fn(async () => {}) };
+    let releaseBlocker!: (value: unknown) => void;
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce({ responseText: "target", session: targetSession, aborted: false, steered: false })
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseBlocker = resolve; }));
+    vi.mocked(resumeAgent).mockClear();
+    manager = new AgentManager(undefined, 1);
+
+    const targetId = manager.spawn(mockPi, mockCtx, "X", "target", {
+      description: "target", isBackground: true,
+    });
+    await manager.getRecordMutable(targetId)!.promise;
+
+    const blockerId = manager.spawn(mockPi, mockCtx, "X", "blocker", {
+      description: "blocker", isBackground: true,
+    });
+    await vi.waitFor(() => expect(manager.getRecordMutable(blockerId)?.status).toBe("running"));
+
+    const resumed = await manager.resume(targetId, "later", undefined, { isBackground: true });
+    const target = manager.getRecordMutable(targetId)!;
+    expect(resumed?.status).toBe("queued");
+
+    expect(manager.steer(targetId, "old queued message")).toBe(true);
+    expect(target.pendingSteers).toEqual(["old queued message"]);
+    expect(targetSession.steer).not.toHaveBeenCalled();
+
+    expect(manager.abort(targetId)).toBe(true);
+    expect(target.status).toBe("stopped");
+    expect(target.pendingSteers).toBeUndefined();
+
+    releaseBlocker({ responseText: "blocker done", session: mockSession(), aborted: false, steered: false });
+    await manager.getRecordMutable(blockerId)!.promise;
+    expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it("flushes queued-resume chat when the queued run actually starts", async () => {
+    const targetSession = { ...mockSession(), steer: vi.fn(async () => {}) };
+    let releaseBlocker!: (value: unknown) => void;
+    vi.mocked(runAgent)
+      .mockResolvedValueOnce({ responseText: "target", session: targetSession, aborted: false, steered: false })
+      .mockImplementationOnce(() => new Promise((resolve) => { releaseBlocker = resolve; }));
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "resumed" });
+    manager = new AgentManager(undefined, 1);
+
+    const targetId = manager.spawn(mockPi, mockCtx, "X", "target", {
+      description: "target", isBackground: true,
+    });
+    await manager.getRecordMutable(targetId)!.promise;
+
+    const blockerId = manager.spawn(mockPi, mockCtx, "X", "blocker", {
+      description: "blocker", isBackground: true,
+    });
+    await vi.waitFor(() => expect(manager.getRecordMutable(blockerId)?.status).toBe("running"));
+
+    const onStarted = vi.fn();
+    const resumed = await manager.resume(targetId, "later", undefined, {
+      isBackground: true,
+      onStarted,
+    });
+    const target = manager.getRecordMutable(targetId)!;
+    const resumeLifecycle = target.promise!;
+    expect(resumed?.status).toBe("queued");
+    expect(onStarted).not.toHaveBeenCalled();
+    expect(manager.steer(targetId, "queued message")).toBe(true);
+
+    releaseBlocker({ responseText: "blocker done", session: mockSession(), aborted: false, steered: false });
+    await manager.getRecordMutable(blockerId)!.promise;
+    await resumeLifecycle;
+
+    expect(onStarted).toHaveBeenCalledTimes(1);
+    expect(targetSession.steer).toHaveBeenCalledWith("queued message");
+    expect(target.pendingSteers).toBeUndefined();
+    expect(target.status).toBe("completed");
+  });
+});
