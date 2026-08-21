@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.3
+### Patch Changes
+
+- 07350d4: Use the theme's `borderAccent` color for extension-owned outer borders so the popup and welcome-card framing follows the purple Signalridge palette.
+
 ## 1.2.2
 ### Patch Changes
 

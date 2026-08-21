@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-worktree",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "description": "Pi extension for safe interactive Git worktree management and workspace switching.",
   "type": "module",
   "license": "MIT",
@@ -60,7 +60,7 @@
   },
   "dependencies": {
     "@narumitw/pi-tui-kit": "^0.54.0",
-    "@signalridge/pi-ui": "^1.2.0",
+    "@signalridge/pi-ui": "^1.3.0",
     "proper-lockfile": "^4.1.2"
   }
 }
