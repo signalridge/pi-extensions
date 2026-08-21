@@ -432,7 +432,7 @@ export class WelcomeCard implements Component {
     if (safeWidth < MIN_WIDTH) return this.renderCompact(safeWidth);
 
     const t = this.theme;
-    const border = (text: string) => t.fg("border", text);
+    const border = (text: string) => t.fg("borderAccent", text);
     const inner = safeWidth - 2;
     const line = (content: string) => border("│") + this.fit(content, inner) + border("│");
     const blank = () => line("");

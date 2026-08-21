@@ -967,6 +967,12 @@ export default function (pi: ExtensionAPI) {
           (s: string) => theme.fg("muted", s),
           "Loading Usage...",
         );
+        const borderedLoader = new Container();
+        borderedLoader.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
+        borderedLoader.addChild(new Spacer(1));
+        borderedLoader.addChild(loader);
+        borderedLoader.addChild(new Spacer(1));
+        borderedLoader.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
         let finished = false;
         const finish = (value: UsageData | null) => {
           if (finished) return;
@@ -994,7 +1000,12 @@ export default function (pi: ExtensionAPI) {
           .then(finish)
           .catch(() => finish(null));
 
-        return loader;
+        return {
+          render: (width: number) => borderedLoader.render(width),
+          handleInput: (input: string) => loader.handleInput(input),
+          invalidate: () => borderedLoader.invalidate(),
+          dispose: () => loader.dispose(),
+        };
       });
 
       if (!data) {
@@ -1006,7 +1017,7 @@ export default function (pi: ExtensionAPI) {
 
         // Top border
         container.addChild(new Spacer(1));
-        container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
         container.addChild(new Spacer(1));
 
         const usage = new UsageComponent(
@@ -1020,7 +1031,7 @@ export default function (pi: ExtensionAPI) {
           render: (w: number) => {
             const borderLines = clampLines(container.render(w), w);
             const usageLines = usage.render(w);
-            const bottomBorder = theme.fg("border", "─".repeat(w));
+            const bottomBorder = theme.fg("borderAccent", "─".repeat(w));
             return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
           },
           invalidate: () => container.invalidate(),

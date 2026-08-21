@@ -54,7 +54,8 @@
     "directory": "packages/pi-stamp"
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.54.0"
+    "@narumitw/pi-tui-kit": "^0.54.0",
+    "@signalridge/pi-ui": "^1.2.0"
   },
   "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-stamp",
   "bugs": {

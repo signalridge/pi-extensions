@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { type PlanExportDestinationProvider, planExportInputScreen } from "./plan-export-screen.js";
 
 interface MenuLifecycle {
@@ -103,7 +104,7 @@ export async function showPlanModeMenu(ctx: ExtensionContext, options: PlanMenuO
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: options.signal,
     isCurrent: options.isCurrent,
@@ -179,7 +180,7 @@ export async function showReadyPlanMenu(ctx: ExtensionContext, options: ReadyPla
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: options.signal,
     isCurrent: options.isCurrent,

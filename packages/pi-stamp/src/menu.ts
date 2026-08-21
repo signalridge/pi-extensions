@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import {
   canonicalizeLocale,
   canonicalizeTimeZone,
@@ -328,7 +329,7 @@ export async function showStampMenu(
 ) {
   const { runMenu } = await import("@narumitw/pi-tui-kit");
   if (owner.signal.aborted || !owner.isCurrent()) return { kind: "stale" } as const;
-  return runMenu(ctx, createStampMenu(runtime), {
+  return runMenu(withBorderedCustomUi(ctx), createStampMenu(runtime), {
     getState: () => runtime.get(),
     signal: owner.signal,
     isCurrent: owner.isCurrent,

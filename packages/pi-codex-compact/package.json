@@ -35,7 +35,8 @@
     "lint": "biome check ."
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.54.0"
+    "@narumitw/pi-tui-kit": "^0.54.0",
+    "@signalridge/pi-ui": "^1.2.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "^0.84.0",

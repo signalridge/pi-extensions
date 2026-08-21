@@ -340,7 +340,7 @@ export function createViewer(
 
     if (state.mode === "comment") {
       lines.push(...renderCommentEditor(width));
-      lines.push(theme.fg("borderMuted", "─".repeat(width)));
+      lines.push(theme.fg("borderAccent", "─".repeat(width)));
     }
 
     let help: string;
@@ -411,7 +411,7 @@ export function createViewer(
 
       const lines: string[] = [];
       lines.push(renderHeader(width));
-      lines.push(theme.fg("borderMuted", "─".repeat(width)));
+      lines.push(theme.fg("borderAccent", "─".repeat(width)));
 
       const visible = state.content.slice(state.scroll, state.scroll + state.height);
       for (let i = 0; i < state.height; i++) {
@@ -431,7 +431,7 @@ export function createViewer(
         }
       }
 
-      lines.push(theme.fg("borderMuted", "─".repeat(width)));
+      lines.push(theme.fg("borderAccent", "─".repeat(width)));
       lines.push(...renderFooter(width));
 
       return lines;

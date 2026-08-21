@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext, KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
+import { wrapCustomUi } from "@signalridge/pi-ui";
 import {
   type BtwSettings,
   btwSettingsPath,
@@ -215,7 +216,7 @@ export async function runBtwMenuPreservingEditor(
 ): Promise<RunMenuResult> {
   let liveEditorText = ctx.ui.getEditorText();
   let completed = false;
-  const ui = new Proxy(ctx.ui, {
+  const ui = new Proxy(wrapCustomUi(ctx.ui), {
     get(target, property) {
       if (property === "custom") {
         return <Value>(factory: BtwCustomFactory<Value>, customOptions?: BtwCustomOptions) =>

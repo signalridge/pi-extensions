@@ -2,6 +2,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import {
   type AdministrativePruneCandidate,
   addWorktree,
@@ -135,7 +136,7 @@ export function registerWorktreeCommand(
             configure: async () => runFlow(() => configureRootFlow(ctx, settings)),
           },
         });
-        await runMenu(ctx, menu, {
+        await runMenu(withBorderedCustomUi(ctx), menu, {
           getState: () => undefined,
           signal: owner.signal,
           isCurrent: owner.isCurrent,
@@ -849,7 +850,7 @@ async function selectWorktree(
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal,
     isCurrent: () => !signal?.aborted,

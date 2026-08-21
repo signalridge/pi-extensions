@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { MenuContext, RunMenuResult } from "@narumitw/pi-tui-kit";
+import { wrapCustomUi } from "@signalridge/pi-ui";
 import {
   type BtwBringToMainSegment,
   type BtwBringToMainSummary,
@@ -398,7 +399,7 @@ async function resolveBtwModelWithLoader(
   settings: BtwSettings,
   ctx: ExtensionCommandContext,
 ): Promise<ModelResolutionOutcome> {
-  return ctx.ui.custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
+  return wrapCustomUi(ctx.ui).custom<ModelResolutionOutcome>((tui, theme, _keybindings, done) => {
     const loader = new BorderedLoader(tui, theme, "Resolving /btw model credentials...");
     let settled = false;
     loader.onAbort = () => {

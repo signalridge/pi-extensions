@@ -34,7 +34,7 @@ export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippe
   const selectedIndex = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
     const container = new Container();
 
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
     const title = new Text(theme.fg("accent", theme.bold("Select Code Snippet")), 1, 0);
     container.addChild(title);
 
@@ -56,7 +56,7 @@ export async function pickSnippet(ctx: ExtensionCommandContext, snippets: Snippe
       0,
     );
     container.addChild(help);
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 
     let filter = "";
     const updateFilter = (next: string) => {

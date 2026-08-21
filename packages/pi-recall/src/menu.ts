@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import {
   candidateIdentity,
   filterRecallMessages,
@@ -195,7 +196,7 @@ export function createRecallMenu(source: RecallMenuSource, ownership: { isCurren
                   opts: unknown,
                 ) => Promise<{ kind: string; reason?: string; error?: unknown }>;
               };
-              const confirmation = await confirmViaKit(ctx, {
+              const confirmation = await confirmViaKit(withBorderedCustomUi(ctx), {
                 title: "Delete saved message?",
                 message: deleteConfirmationMessage(record),
                 confirmLabel: "Delete message",
@@ -308,7 +309,7 @@ export async function showRecallMenu(
   const { runMenu } = await import("@narumitw/pi-tui-kit");
   if (ownership.signal.aborted || !ownership.isCurrent()) return;
   const controller = createRecallMenu(source, ownership);
-  await runMenu(ctx, controller.menu, {
+  await runMenu(withBorderedCustomUi(ctx), controller.menu, {
     getState: controller.getState,
     signal: ownership.signal,
     isCurrent: ownership.isCurrent,
@@ -381,7 +382,7 @@ async function chooseSavedInTui(
 ): Promise<ScopedRecallPickerResult | undefined> {
   const { runCustomInteraction } = await import("@narumitw/pi-tui-kit");
   if (signal.aborted || !isCurrent(ownership)) return undefined;
-  const interaction = await runCustomInteraction<ScopedRecallPickerResult>(ctx, {
+  const interaction = await runCustomInteraction<ScopedRecallPickerResult>(withBorderedCustomUi(ctx), {
     signal,
     isCurrent: () => isCurrent(ownership),
     create: ({ tui, theme, keybindings, complete }) =>

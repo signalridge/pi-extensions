@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { type ExtensionCommandContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { checkpointGoalActiveTime } from "./accounting.js";
 import { notifyTerminal, safeTerminalText } from "./errors.js";
 import { abortCurrentTurn, type GoalRuntime, STATUS_KEY } from "./runtime.js";
@@ -205,7 +206,7 @@ export async function showGoalSettings(
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: runtime.menuController.signal,
     isCurrent: isMenuCurrent,

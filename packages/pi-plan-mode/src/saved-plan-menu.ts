@@ -1,5 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineMenu, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { type PlanExportDestinationProvider, planExportInputScreen } from "./plan-export-screen.js";
 
 interface SavedPlanMenuOptions {
@@ -83,7 +84,7 @@ export async function showSavedPlanMenu(ctx: ExtensionContext, options: SavedPla
       },
     },
   });
-  await runMenu(ctx, menu, {
+  await runMenu(withBorderedCustomUi(ctx), menu, {
     getState: () => undefined,
     signal: options.signal,
     isCurrent: options.isCurrent,

@@ -12,6 +12,7 @@
  */
 
 import { Editor, isKeyRelease, Key, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { borderedComponent } from "@signalridge/pi-ui";
 import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
@@ -302,7 +303,7 @@ export class FleetList {
     void this.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
         this.viewerClose = () => done(undefined);
-        return new ConversationViewer(
+        return borderedComponent(new ConversationViewer(
           tui,
           session,
           record,
@@ -315,7 +316,7 @@ export class FleetList {
           keybindings,
           (message: string) => this.manager.steer(record.id, message),
           () => this.manager.getRecord?.(record.id),
-        );
+        ), (text) => theme.fg("borderAccent", text));
       },
       {
         overlay: true,

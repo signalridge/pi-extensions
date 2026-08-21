@@ -74,9 +74,10 @@ worktrees.
 
 `pi-lsp`, `pi-github-pr`, `pi-files-widget`, `pi-code-actions`, `pi-btw`, and
 `pi-recall` each own their tools, schemas, bounded output, and TUI guards. They do
-not become a shared developer-tool coordinator. A future shared library is only
-justified for a pure parser or wire contract whose semantics are demonstrably
-identical in at least two packages.
+not become a shared developer-tool coordinator. Shared UI framing is intentionally
+owned by `@signalridge/pi-ui`: it only adapts Pi's public custom-component boundary,
+does not own extension state or menu semantics, and is used when multiple packages
+need the same visual contract.
 
 ## Shared third-party surfaces
 
@@ -118,6 +119,8 @@ Directories under `packages/` are either:
   no `pi.extensions`, no lifecycle listeners, no settings access, and no side
   effects at import time.
 
-Libraries must expose only named, dependency-free contracts and are included as
-normal npm dependencies of the extensions that use them. They are packed and
-published independently, but never listed in Pi's extension package map.
+Libraries must expose only named, side-effect-free contracts and are included as
+normal npm dependencies of the extensions that use them. A library may depend on
+public Pi types or rendering primitives, but it must not register resources, listen
+to lifecycle events, access settings, or perform import-time work. Libraries are
+packed and published independently, but never listed in Pi's extension package map.

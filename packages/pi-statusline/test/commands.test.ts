@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, test } from "vitest";
@@ -25,7 +26,12 @@ interface PickerComponent {
 }
 
 function screenTitle(title: string) {
-  return title.split("\n")[0] ?? title;
+  return (
+    title
+      .split("\n")
+      .map((line) => stripVTControlCharacters(line).trim())
+      .find((line) => line.length > 0 && !/^[─━═\-=_+*]+$/u.test(line)) ?? title
+  );
 }
 
 function selectCustomLayout(title: string, choices: string[]): string | undefined {

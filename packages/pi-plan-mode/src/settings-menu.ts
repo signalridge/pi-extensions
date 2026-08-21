@@ -1,5 +1,6 @@
 import type { ExtensionContext, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { defineMenu, type RunMenuResult, runMenu } from "@narumitw/pi-tui-kit";
+import { withBorderedCustomUi } from "@signalridge/pi-ui";
 import { PLAN_MODE_COMPLETE_TOOL_NAME } from "./completion-tool.js";
 import { retentionLabel } from "./implementation-retention.js";
 import { planExportDestination } from "./plan-export.js";
@@ -262,7 +263,7 @@ export async function showPlanModeSettings(
     },
   });
 
-  return runMenu(ctx, menu, {
+  return runMenu(withBorderedCustomUi(ctx), menu, {
     getState: loadState,
     signal: options.signal,
     isCurrent: options.isCurrent,

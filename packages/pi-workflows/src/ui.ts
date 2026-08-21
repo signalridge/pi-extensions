@@ -148,7 +148,7 @@ async function selectList<T>(
   if (ctx.mode !== "tui") return undefined;
   return ctx.ui.custom<T | undefined>((_tui, theme, _keybindings, done) => {
     const container = new Container();
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
     container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
     container.addChild(new Text(theme.fg("dim", renderExtra(theme)), 1, 0));
     const list = new SelectList(items, Math.min(12, Math.max(1, items.length)), {
@@ -162,7 +162,7 @@ async function selectList<T>(
     list.onCancel = () => done(undefined);
     container.addChild(list);
     container.addChild(new Text(theme.fg("dim", "↑↓ select · enter confirm · esc back"), 1, 0));
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
     return {
       render: (width) => container.render(width),
       invalidate: () => container.invalidate(),

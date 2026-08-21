@@ -88,14 +88,14 @@ export async function runSnippet(pi: ExtensionAPI, ctx: ExtensionCommandContext,
 
   await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
     const container = new Container();
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
     container.addChild(new Text(theme.fg("accent", theme.bold("Command Output")), 1, 0));
 
     const text = new Text(output, 1, 0);
     container.addChild(text);
 
     container.addChild(new Text(theme.fg("dim", "Enter/Esc to close"), 1, 0));
-    container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 
     return {
       render: (width: number) => container.render(width).map((line) => truncateToWidth(line, width)),
