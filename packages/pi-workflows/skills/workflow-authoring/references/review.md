@@ -11,10 +11,10 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 
 ## Topology and identity
 
-- Does topology match dependencies: thunks for independent parallel work, stages for per-item pipelines, barriers before whole-set synthesis?
-- Is cardinality bounded before fan-out?
+- Does topology match dependencies: `orchestrate` for named graphs, thunks for independent parallel work, stages for per-item pipelines, barriers before whole-set synthesis?
+- Is cardinality bounded before graph construction and fan-out?
 - Is every agent label short and unique?
-- Are stable work-unit IDs retained beside ordered results?
+- Are stable graph/work-unit IDs retained beside ordered results?
 - Are failed/null identities recorded before any filtering?
 
 ## Data and routing
@@ -30,12 +30,14 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 - Are loops, agents, concurrency, timeout, and token spend bounded appropriately?
 - Are budget claims honest about soft gates and in-flight overshoot?
 - Are checkpoints limited to implemented confirmation/headless behavior?
-- Does nesting stay one level and account for shared limits/store?
-- Would lexical call order remain stable under resume?
+- Does nesting stay one level, allow only safe sibling concurrency, and account for shared limits/store?
+- Are helper attempts and graph retries finite and separately visible?
+- Would lexical call order and generated graph order remain stable under resume?
 
 ## Compatibility and publication
 
 - Does new code use `log()` rather than compatibility-only `console`?
+- Are runtime progress events and background result delivery described without promising durability the engine does not provide?
 - Is compatibility behavior clearly distinguished from supported authoring behavior and VM substrate?
 - Do package, skill, and generated contract versions match?
 - Do all relative links resolve within the publishable package?

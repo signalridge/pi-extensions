@@ -4,6 +4,7 @@ Read only the recipe matching the concern. Change task prompts, schemas, bounds,
 
 | Concern | Preserve when adapting | Tested recipe |
 | --- | --- | --- |
+| Named dependencies | Validate stable task IDs before dispatch; use the default skip policy unless dependents can consume `statuses` and null results. | [Named task graph](../examples/named-task-graph.js) |
 | Phased budgets | Phase and run budgets are soft pre-call gates; active work can overshoot. Report shared spend and bound calls independently. | [Phased budgets](../examples/phased-budgets.js) |
 | Saved workflows | Use a context-supplied name, await jobs sequentially, nest one level, and treat shared limits, counters, tokens, limiter, and store as parent capacity. | [Saved nested workflows](../examples/saved-nested-workflows.js) |
 | Semantic retry | Separate it from recoverable runtime retries. Use a new unique label per bounded attempt and return the attempt ledger plus exhausted outcome. | [Bounded semantic retry](../examples/bounded-semantic-retry.js) |

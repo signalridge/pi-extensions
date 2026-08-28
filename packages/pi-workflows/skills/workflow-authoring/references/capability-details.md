@@ -28,6 +28,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded repair attempts is nonrecoverable
 - Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
+- Constraint: replayed calls do not consume the real-dispatch maxAgents or token/phase budgets
 - Constraint: spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict
 - Constraint: explicit model is resolved and scope-checked by pi-subagents; unavailable selectors fail closed
 - Constraint: same-thread calls must be sequential and preserve a stable workflow thread name
@@ -41,8 +42,9 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `parallel(thunks) => Promise<Array<unknown \| null>>`
 - Constraint: requires functions rather than promises
 - Constraint: result order matches input order
-- Constraint: recoverable thunk failures become null; nonrecoverable failures throw
+- Constraint: recoverable thunk failures become null; nonrecoverable failures throw after the batch barrier settles
 - Constraint: a breached agent cap cancels only its own batch
+- Constraint: accepts at most 4096 thunks per call
 
 <a id="runtime-global-pipeline"></a>
 ## pipeline
@@ -53,6 +55,21 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: items run concurrently while stages per item run sequentially
 - Constraint: each stage receives previousValue, originalItem, and zero-based index
 - Constraint: a null stage result is passed to the next stage
+- Constraint: accepts at most 4096 items per call and awaits the whole batch before surfacing fatal errors
+
+<a id="runtime-global-orchestrate"></a>
+## orchestrate
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `orchestrate(tasks, options?) => Promise<{ results, tasks }>`
+- `onError`: "skip-dependents"\|"continue"\|"fail-fast" (optional); default: "skip-dependents"
+- Constraint: task ids and dependencies are validated before any callback runs
+- Constraint: ready tasks run in declaration-order layers with a barrier between layers
+- Constraint: task context carries detached named results and statuses
+- Constraint: ordinary task failures can retry up to three times; fatal workflow errors propagate
+- Constraint: failed or skipped dependencies skip descendants by default; continue runs them with null values
+- Constraint: the graph accepts at most 128 tasks and emits task start/retry/end/skip runtime events
 
 <a id="runtime-global-workflow"></a>
 ## workflow
@@ -60,9 +77,9 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `runtime-global`
 - Support: `supported`
 - Signature: `workflow(savedName, childArgs?) => Promise<unknown>`
-- Constraint: one nested level
+- Constraint: one nested level; concurrent sibling nested calls are allowed
 - Constraint: shares limiter, counters, token accounting, and store
-- Constraint: nested runs get unique runIds via nestedCallSeq
+- Constraint: nested calls use call-index/generation namespaces and replay as one parent result
 
 <a id="runtime-global-verify"></a>
 ## verify
@@ -270,6 +287,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `resumeFromRunId?: string`
 - Constraint: resumes a prior incomplete run with an edited script
+- Constraint: original args and execution limits are reused on resume
 - Constraint: unchanged positional calls replay from cache until the first changed call
 - Constraint: always runs in the background
 

@@ -41,6 +41,11 @@ const RELEASE_GENERATED = new Set([
   "skills/workflow-authoring/references/capabilities.md",
   "skills/workflow-authoring/references/capability-details.md",
 ]);
+const RELEASE_VERSIONED_SKILLS = new Set([
+  "skills/workflow-authoring/SKILL.md",
+  "skills/workflow-patterns/SKILL.md",
+  "skills/workflow-review/SKILL.md",
+]);
 
 function git(args) {
   return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
@@ -52,6 +57,18 @@ function tryGit(args) {
   } catch {
     return undefined;
   }
+}
+
+function normalizeGeneratedSkillVersion(source) {
+  return source.replace(/^ {2}version: "[^"]+"$/mu, '  version: "<release>"').trim();
+}
+
+function isReleaseVersionOnlySkillChange(file, relative, mergeBase) {
+  if (!RELEASE_VERSIONED_SKILLS.has(relative)) return false;
+  const before = tryGit(["show", `${mergeBase}:${file}`]);
+  if (before === undefined || !existsSync(resolve(root, file))) return false;
+  const after = readFileSync(resolve(root, file), "utf8");
+  return normalizeGeneratedSkillVersion(before) === normalizeGeneratedSkillVersion(after);
 }
 
 /** First ref that exists, so a local checkout and a CI checkout both resolve. */
@@ -140,6 +157,7 @@ for (const directory of readdirSync(packagesRoot).sort()) {
   const touched = changedFiles.filter((file) => {
     const relative = file.startsWith(packagePrefix) ? file.slice(packagePrefix.length) : undefined;
     if (relative !== undefined && RELEASE_GENERATED.has(relative)) return false;
+    if (relative !== undefined && isReleaseVersionOnlySkillChange(file, relative, mergeBase)) return false;
     return prefixes.some((prefix) => (prefix.endsWith("/") ? file.startsWith(prefix) : file === prefix));
   });
   if (touched.length > 0) missing.push({ name: manifest.name, touched });

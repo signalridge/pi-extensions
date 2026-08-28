@@ -420,17 +420,18 @@ by name and nothing else: the `Agent` tool exposes `tier` and does **not** expos
 `subagents.json`, not by the orchestrator improvising per call.
 
 Names are yours. `small`/`medium`/`large` below are only an example — `research`,
-`cheap`, `nightly` are equally valid keys.
+`cheap`, `nightly` are equally valid keys. Replace the illustrative provider/model
+values with models available in your environment.
 
 ```json
 {
   "agentTiers": {
     "defaultTier": "medium",
     "profiles": {
-      "small":    { "description": "Fast, cheap exploration",        "model": "deepseek/deepseek-v4-flash", "thinking": "max" },
-      "medium":   { "description": "Ordinary planning and review",   "model": "openai-codex/gpt-5.6-luna",  "thinking": "max" },
-      "large":    { "description": "Architecture and risky review",  "model": "openai-codex/gpt-5.6-sol",   "thinking": "xhigh" },
-      "research": { "description": "Long-context research",          "model": "kimi/k3",                    "thinking": "max" }
+      "small":    { "description": "Fast, cheap exploration",        "model": "provider/fast-model", "thinking": "max" },
+      "medium":   { "description": "Ordinary planning and review",   "model": "provider/reasoning-model", "thinking": "max" },
+      "large":    { "description": "Architecture and risky review",  "model": "provider/architecture-model", "thinking": "xhigh" },
+      "research": { "description": "Long-context research",          "model": "provider/long-context-model",       "thinking": "max" }
     }
   }
 }
@@ -450,7 +451,7 @@ remember. It sees:
 Available agent tiers:
 
 - small: Fast, cheap exploration
-  model: deepseek/deepseek-v4-flash
+  model: provider/fast-model
   thinking: max
 ...
 Default tier: medium
@@ -608,11 +609,13 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
     "tiers": {
       "small": { "model": "inherit", "thinking": "low" },
       "medium": { "model": "inherit", "thinking": "medium" },
-      "large": { "model": "openai-codex/gpt-5.6-luna", "thinking": "max" }
+      "large": { "model": "provider/architecture-model", "thinking": "max" }
     }
   }
 }
 ```
+
+Replace the illustrative `provider/architecture-model` value with a model available in your environment.
 
 Profiles are complete `model` + `thinking` tuples. Each field may use `inherit`; a project profile replaces the whole matching global tier entry. Malformed or incomplete entries are retained as durable blocked-tier tombstones and fail closed rather than falling back to a built-in profile or merging field-by-field. An explicit `defaultTier` applies when a workflow task omits its tier. Without a task tier or configured default, the parent model and thinking level are inherited. Agent frontmatter remains authoritative for its explicit `model` and `thinking`; thinking is clamped to the selected model's native supported levels.
 

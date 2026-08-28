@@ -22,6 +22,7 @@ describe("workflow capability contract", () => {
       "agent",
       "parallel",
       "pipeline",
+      "orchestrate",
       "workflow",
       "verify",
       "judgePanel",
@@ -43,7 +44,7 @@ describe("workflow capability contract", () => {
 
   it("every declared global is actually usable in the script realm", async () => {
     const script = `export const meta = { name: "capability", description: "c" };
-const names = [typeof agent, typeof parallel, typeof pipeline, typeof workflow, typeof verify,
+const names = [typeof agent, typeof parallel, typeof pipeline, typeof orchestrate, typeof workflow, typeof verify,
   typeof judgePanel, typeof loopUntilDry, typeof completenessCheck, typeof retry, typeof gate,
   typeof checkpoint, typeof log, typeof phase, typeof args, typeof cwd, typeof process, typeof budget, typeof console];
 return names;`;

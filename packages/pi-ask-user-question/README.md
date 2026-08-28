@@ -1,6 +1,6 @@
 # @signalridge/pi-ask-user-question
 
-A stable Pi extension that registers a Claude/Kimi-style `ask_user_question` tool. It lets an LLM pause for focused user decisions and receives a bounded, structured JSON answer.
+A stable Pi extension that registers a structured `ask_user_question` tool. It lets an LLM pause for focused user decisions and receives a bounded, structured JSON answer.
 
 ## Install
 
