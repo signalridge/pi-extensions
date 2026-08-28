@@ -52,7 +52,7 @@
     },
     "packages/pi-ask-user-question": {
       "name": "@signalridge/pi-ask-user-question",
-      "version": "1.3.0",
+      "version": "1.3.1",
       "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "@earendil-works/pi-coding-agent": "0.84.1",
@@ -183,7 +183,7 @@
     },
     "packages/pi-input-history": {
       "name": "@signalridge/pi-input-history",
-      "version": "1.2.3",
+      "version": "1.2.4",
       "peerDependencies": {
         "@earendil-works/pi-ai": "^0.84.0",
         "@earendil-works/pi-coding-agent": "^0.84.0",
@@ -320,7 +320,7 @@
     },
     "packages/pi-subagents": {
       "name": "@signalridge/pi-subagents",
-      "version": "1.8.0",
+      "version": "1.8.1",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.3.1",
         "@signalridge/pi-ui": "^1.2.0",
@@ -399,7 +399,7 @@
     },
     "packages/pi-workflows": {
       "name": "@signalridge/pi-workflows",
-      "version": "1.3.2",
+      "version": "1.4.0",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.0.0",
         "@sinclair/typebox": "^0.34.50",
