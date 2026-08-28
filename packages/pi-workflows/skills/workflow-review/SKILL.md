@@ -2,7 +2,7 @@
 name: workflow-review
 description: Audit an existing Pi JavaScript workflow for topology, prompt/data flow, limits, failure handling, cancellation, resume safety, and publication compatibility. Use when reviewing or debugging a workflow script or saved run; do not use to run a standard named workflow.
 metadata:
-  version: "1.3.2"
+  version: "1.4.0"
 ---
 
 # Workflow review

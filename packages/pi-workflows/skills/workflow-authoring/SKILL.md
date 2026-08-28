@@ -2,7 +2,7 @@
 name: workflow-authoring
 description: Design, write, review, and debug Pi JavaScript workflows that coordinate multiple subagents. Use when a request needs named dependencies, bounded fan-out, per-item pipelines, quality gates, saved or nested workflows, pause/resume, or workflow progress; do not use it merely to run an existing named workflow.
 metadata:
-  version: "1.3.2"
+  version: "1.4.0"
 ---
 
 # Workflow authoring

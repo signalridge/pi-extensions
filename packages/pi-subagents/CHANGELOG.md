@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.8.1
+### Patch Changes
+
+- 28c8aa1: Remove non-functional references to external product names from package descriptions, examples, and comments. Provider identifiers required for runtime compatibility remain unchanged.
+
 ## 1.8.0
 ### Minor Changes
 
