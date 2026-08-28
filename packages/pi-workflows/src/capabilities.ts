@@ -58,6 +58,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       "recoverable failures return null after retries; nonrecoverable failures throw",
       "schema noncompliance after bounded repair attempts is nonrecoverable",
       "resume replays only the longest unchanged prefix; the first miss and every later call execute live",
+      "replayed calls do not consume the real-dispatch maxAgents or token/phase budgets",
       "spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict",
       "explicit model is resolved and scope-checked by pi-subagents; unavailable selectors fail closed",
       "same-thread calls must be sequential and preserve a stable workflow thread name",
@@ -72,8 +73,9 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     constraints: [
       "requires functions rather than promises",
       "result order matches input order",
-      "recoverable thunk failures become null; nonrecoverable failures throw",
+      "recoverable thunk failures become null; nonrecoverable failures throw after the batch barrier settles",
       "a breached agent cap cancels only its own batch",
+      "accepts at most 4096 thunks per call",
     ],
   },
   {
@@ -85,6 +87,28 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       "items run concurrently while stages per item run sequentially",
       "each stage receives previousValue, originalItem, and zero-based index",
       "a null stage result is passed to the next stage",
+      "accepts at most 4096 items per call and awaits the whole batch before surfacing fatal errors",
+    ],
+  },
+  {
+    name: "orchestrate",
+    classification: "runtime-global",
+    signature: "orchestrate(tasks, options?) => Promise<{ results, tasks }>",
+    options: [
+      {
+        name: "onError",
+        kind: '"skip-dependents"|"continue"|"fail-fast"',
+        optional: true,
+        default: '"skip-dependents"',
+      },
+    ],
+    constraints: [
+      "task ids and dependencies are validated before any callback runs",
+      "ready tasks run in declaration-order layers with a barrier between layers",
+      "task context carries detached named results and statuses",
+      "ordinary task failures can retry up to three times; fatal workflow errors propagate",
+      "failed or skipped dependencies skip descendants by default; continue runs them with null values",
+      "the graph accepts at most 128 tasks and emits task start/retry/end/skip runtime events",
     ],
   },
   {
@@ -93,9 +117,9 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     signature: "workflow(savedName, childArgs?) => Promise<unknown>",
     options: [],
     constraints: [
-      "one nested level",
+      "one nested level; concurrent sibling nested calls are allowed",
       "shares limiter, counters, token accounting, and store",
-      "nested runs get unique runIds via nestedCallSeq",
+      "nested calls use call-index/generation namespaces and replay as one parent result",
     ],
   },
   {
@@ -271,6 +295,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     options: [],
     constraints: [
       "resumes a prior incomplete run with an edited script",
+      "original args and execution limits are reused on resume",
       "unchanged positional calls replay from cache until the first changed call",
       "always runs in the background",
     ],

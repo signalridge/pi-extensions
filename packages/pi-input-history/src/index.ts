@@ -74,8 +74,8 @@ export default function (pi: ExtensionAPI) {
     const generation = ++loadGeneration;
     historyCache = [];
 
-    // Do not block later session_start handlers: the Kimi editor must replace
-    // Pi's bootstrap editor immediately instead of waiting for session I/O.
+    // Do not block later session_start handlers: the replacement editor must
+    // replace Pi's bootstrap editor immediately instead of waiting for session I/O.
     historyReady = loadRecentPrompts(ctx.cwd, MAX_MESSAGES)
       .then((items) => {
         if (generation !== loadGeneration) return;

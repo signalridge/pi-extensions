@@ -2,7 +2,7 @@
 
 ## Bounds and budget
 
-Set finite bounds that match the work for `maxAgents`, `concurrency`, and `agentRetries`; bound loops and semantic retries inside the script. Treat invocation-level `agentTimeoutMs` and `tokenBudget` as opt-in user constraints, not precautionary defaults. Omit `tokenBudget` unless the user supplies a cap or explicitly asks you to choose one. If asked to choose, allow for every planned agent call, retry, synthesis, and verification pass, with headroom. A tight gate can terminate coverage; it does not reduce work already in flight. An omitted `agentTimeoutMs` uses the configured `defaultAgentTimeoutMs` and is otherwise unbounded. An omitted `tokenBudget` uses the configured `defaultTokenBudget` and is otherwise unlimited.
+Set finite bounds that match the work for `maxAgents`, `concurrency`, and `agentRetries`; bound graph tasks, fan-out items, loops, and semantic retries inside the script. A journal replay is logical work and does not consume the real-dispatch `maxAgents` cap, but it still counts toward reported call totals. Treat invocation-level `agentTimeoutMs` and `tokenBudget` as opt-in user constraints, not precautionary defaults. Omit `tokenBudget` unless the user supplies a cap or explicitly asks you to choose one. If asked to choose, allow for every planned agent call, retry, synthesis, and verification pass, with headroom. A tight gate can terminate coverage; it does not reduce work already in flight. An omitted `agentTimeoutMs` uses the configured `defaultAgentTimeoutMs` and is otherwise unbounded. An omitted `tokenBudget` uses the configured `defaultTokenBudget` and is otherwise unlimited.
 
 Enter a phase budget with `phase("Name", { budget: N })`; phase metadata does not carry budgets. `N` is a token allowance, not a call or round count: size it for the intended agent work instead of copying a small iteration limit. Token and phase budgets are soft pre-call gates. Spend lands after agents finish, so concurrent work can overshoot. A phase budget gates later calls in that phase; it neither reserves tokens nor cancels active calls. `budget.spent()` and `budget.remaining()` include nested work.
 
@@ -22,9 +22,9 @@ Always retain `{ id, status, result }` or an equivalent ledger for each intended
 
 ## Resume
 
-Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live. Stable lexical call ordering, prompts, labels, routing options, and inputs therefore matter. Retry chains can cascade after an upstream miss. Nested workflows do not reuse the parent's resume journal.
+Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live. Stable lexical call ordering, prompts, labels, routing options, and inputs therefore matter. Retry chains can cascade after an upstream miss. A nested workflow is cached as one parent call; an unchanged child replays its complete result, while a changed or interrupted child runs live in a generation-scoped namespace.
 
-Only a call that finishes with a real result is journaled. A call whose every attempt was recoverable (including one that only ever produced `AGENT_EMPTY_OUTPUT`) contributes no journal entry, so resuming that run reruns exactly that call and everything lexically after it live; the earlier, already-succeeded prefix still replays from cache.
+Only a call that finishes with a real result is journaled. A call whose every attempt was recoverable (including one that only ever produced `AGENT_EMPTY_OUTPUT`) contributes no journal entry, so resuming that run reruns exactly that call and everything lexically after it live; the earlier, already-succeeded prefix still replays from cache. Schema repair retries include the concrete validation errors in the next prompt.
 
 The runtime blocks common accidental nondeterminism, but this is not a security boundary. Pass timestamps, randomness, and external decisions through `args`.
 

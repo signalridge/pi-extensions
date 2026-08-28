@@ -24,6 +24,12 @@ import vm from "node:vm";
 import { parse } from "acorn";
 import { checkRuntimeBindings } from "./capabilities.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import {
+  executeOrchestration,
+  normalizeOrchestration,
+  type OrchestrationResult,
+  type OrchestrationTaskContext,
+} from "./orchestrator.js";
 import { SharedStore } from "./shared-store.js";
 
 // ── Meta contract ────────────────────────────────────────────────────────────
@@ -59,6 +65,10 @@ export interface JournalEntry {
   hash: string;
   result: unknown;
   storeDelta?: Record<string, unknown>;
+  /** Generation for a nested workflow replay boundary. */
+  generation?: number;
+  /** Logical agents represented by a nested workflow replay boundary. */
+  agentCount?: number;
 }
 
 export interface AgentUsage {
@@ -72,11 +82,12 @@ export interface AgentUsage {
 
 export interface SharedRuntime {
   limiter: Limiter;
+  /** Logical calls, including replayed calls, used for reporting/labels. */
   agentCount: number;
+  /** Real dispatches only; replayed journal values do not consume maxAgents. */
+  physicalAgentCount: number;
   spent: number;
   tokenUsage: AgentUsage;
-  depth: number;
-  nestedCallSeq: number;
   runFatalController: AbortController;
   inFlight: Set<Promise<unknown>>;
   activeThreads: Set<string>;
@@ -102,6 +113,8 @@ export interface AgentRunOptions {
   cwd?: string;
   /** Named subagent type; resolved by pi-subagents at dispatch. */
   agentType?: string;
+  /** The runtime frame that owns this call (used to namespace nested workflows). */
+  runId?: string;
   /** Lexical call index — engine-side spawnKey identity (A4). */
   callIndex?: number;
   /** Stable hash of the call inputs — engine-side resume comparison (A4). */
@@ -145,7 +158,7 @@ export interface CheckpointOptions {
 }
 
 export interface WorkflowRuntimeEvent {
-  type: "phase" | "workflow" | "quality" | "control-attempt";
+  type: "phase" | "workflow" | "quality" | "control-attempt" | "task";
   [key: string]: unknown;
 }
 
@@ -154,6 +167,10 @@ export interface WorkflowRunOptions {
   agent?: WorkflowAgentRunner;
   /** The session's main model (provider/id), shown for default agents. */
   mainModel?: string;
+  /** Engine-owned execution nonce used to isolate stale nested managed calls. */
+  executionNonce?: string;
+  /** Runtime frame depth; siblings inherit the same depth and may run concurrently. */
+  workflowDepth?: number;
   cwd?: string;
   concurrency?: number;
   agentRetries?: number;
@@ -167,6 +184,8 @@ export interface WorkflowRunOptions {
   toolset?: string;
   excludeTools?: string[];
   onAgentJournal?: (entry: JournalEntry) => void;
+  /** Journal one completed nested workflow as a stable parent call. */
+  onWorkflowJournal?: (entry: JournalEntry) => void;
   onRetrySpend?: (tokens: number) => void;
   sharedRuntime?: SharedRuntime;
   initialTokenUsage?: AgentUsage;
@@ -212,10 +231,16 @@ export interface RuntimeState {
   currentPhase?: string;
   phaseBudgets: Map<string, { budget: number; startSpent: number; warned: boolean }>;
   callSeq: number;
+  /** Live generation counters for nested workflow replay boundaries. */
+  workflowGenerations: Map<number, number>;
   firstMiss: number;
 }
 
 export const MAX_AGENTS_PER_RUN = 1000;
+/** Maximum journal-compatible lexical calls in one workflow frame (indices 0..999). */
+export const MAX_CALLS_PER_WORKFLOW = 1_000;
+/** Per-call item cap, matching the bounded batch contract used by reference engines. */
+export const MAX_FANOUT_ITEMS = 4_096;
 export const MAX_CONCURRENCY = 16;
 export const MAX_AGENT_RETRIES = 3;
 export const DEFAULT_AGENT_TIMEOUT_MS: number | null = 300_000;
@@ -223,7 +248,55 @@ export const MAX_SCRIPT_SYNC_MS = 1_000;
 
 // ── Determinism guardrail ────────────────────────────────────────────────────
 
-const DETERMINISM_BLOCKLIST = /\bDate\s*\.\s*now\b|\bMath\s*\.\s*random\b|\bnew\s+Date\s*\(\s*\)/;
+interface AstRecord {
+  readonly [key: string]: unknown;
+}
+
+function isAstRecord(value: unknown): value is AstRecord {
+  return typeof value === "object" && value !== null;
+}
+
+/** Detect actual nondeterministic expressions, not words inside user prompt strings. */
+function containsNondeterminism(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (Array.isArray(value)) return value.some((item) => containsNondeterminism(item, seen));
+  if (!isAstRecord(value)) return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+
+  const type = value.type;
+  if (type === "MemberExpression") {
+    const object = value.object;
+    const property = value.property;
+    const objectName =
+      isAstRecord(object) && object.type === "Identifier" && typeof object.name === "string" ? object.name : undefined;
+    // Leave computed properties to the in-realm stubs so the runtime still
+    // guards aliases such as Math["random"] while this precheck ignores text
+    // embedded in prompt literals.
+    const propertyName =
+      isAstRecord(property) && property.type === "Identifier" && typeof property.name === "string"
+        ? property.name
+        : undefined;
+    if ((objectName === "Date" && propertyName === "now") || (objectName === "Math" && propertyName === "random")) {
+      return true;
+    }
+  }
+  if (
+    type === "NewExpression" &&
+    isAstRecord(value.callee) &&
+    value.callee.type === "Identifier" &&
+    value.callee.name === "Date" &&
+    Array.isArray(value.arguments) &&
+    value.arguments.length === 0
+  ) {
+    return true;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "loc" || key === "start" || key === "end") continue;
+    if (containsNondeterminism(child, seen)) return true;
+  }
+  return false;
+}
 
 /**
  * Run inside the vm realm BEFORE the user script. Neutered builtins would break
@@ -264,14 +337,6 @@ const DETERMINISM_PRELUDE = [
  * is rejected so the meta is fully static and deterministic.
  */
 export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body: string } {
-  if (DETERMINISM_BLOCKLIST.test(script)) {
-    throw new WorkflowError(
-      "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
-      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-      { recoverable: false },
-    );
-  }
-
   const ast = parse(script, {
     ecmaVersion: "latest",
     sourceType: "module",
@@ -279,6 +344,13 @@ export function parseWorkflowScript(script: string): { meta: WorkflowMeta; body:
     allowReturnOutsideFunction: true,
     ranges: false,
   });
+  if (containsNondeterminism(ast)) {
+    throw new WorkflowError(
+      "Workflow scripts must be deterministic: Date.now()/Math.random()/new Date() are unavailable",
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
 
   const first = ast.body?.[0] as { type?: string } | undefined;
   if (first?.type !== "ExportNamedDeclaration") {
@@ -477,6 +549,8 @@ function hashAgentCall(
     isolation: options.isolation ?? null,
     toolset: options.toolset ?? null,
     excludeTools: options.excludeTools ?? null,
+    timeoutMs: options.timeoutMs ?? null,
+    retries: options.retries ?? null,
   });
 }
 
@@ -526,30 +600,30 @@ function estimateTokens(value: unknown): number {
   return Math.ceil(JSON.stringify(value ?? "").length / 4);
 }
 
-function normalizeConcurrency(value: unknown): number {
+export function normalizeConcurrency(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 1;
   return Math.min(MAX_CONCURRENCY, Math.floor(value));
 }
 
-function normalizeMaxAgents(value: unknown): number {
+export function normalizeMaxAgents(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return MAX_AGENTS_PER_RUN;
   return Math.min(MAX_AGENTS_PER_RUN, Math.floor(value));
 }
 
-function normalizeAgentTimeout(value: unknown): number | null {
+export function normalizeAgentTimeout(value: unknown): number | null {
   if (value === null) return null;
   if (value === undefined) return DEFAULT_AGENT_TIMEOUT_MS;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return DEFAULT_AGENT_TIMEOUT_MS;
   return Math.floor(value);
 }
 
-function normalizeTokenBudget(value: unknown): number | null {
+export function normalizeTokenBudget(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return null;
   return Math.floor(value);
 }
 
-function normalizeAgentRetries(value: unknown): number {
+export function normalizeAgentRetries(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return 0;
   return Math.min(MAX_AGENT_RETRIES, Math.floor(value));
 }
@@ -802,6 +876,7 @@ export interface WorkflowRuntimeBindings {
     items: unknown[],
     ...stages: Array<(prev: unknown, original: unknown, index: number) => unknown>
   ) => Promise<Array<unknown | null>>;
+  orchestrate: (tasks: unknown, options?: unknown) => Promise<OrchestrationResult>;
   workflow: (savedName: string, childArgs?: unknown) => Promise<unknown>;
   verify: (
     item: unknown,
@@ -840,6 +915,8 @@ export interface WorkflowRuntimeBindings {
 
 /** Fan-out cancellation scope: parallel()/pipeline() batches mark themselves. */
 const fanoutScope = new AsyncLocalStorage<{ cancelled: boolean }>();
+/** Task-local phase attribution for named orchestration callbacks. */
+const orchestrationScope = new AsyncLocalStorage<{ taskId: string; phase?: string }>();
 
 // ── The run ──────────────────────────────────────────────────────────────────
 
@@ -863,6 +940,7 @@ export async function runWorkflow<T = unknown>(
     currentPhase: meta.phases?.[0]?.title,
     phaseBudgets: new Map(),
     callSeq: 0,
+    workflowGenerations: new Map(),
     firstMiss: Number.POSITIVE_INFINITY,
   };
 
@@ -879,12 +957,11 @@ export async function runWorkflow<T = unknown>(
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
     agentCount: 0,
+    physicalAgentCount: 0,
     spent: options.initialTokenUsage?.total ?? 0,
     tokenUsage: options.initialTokenUsage
       ? { ...options.initialTokenUsage }
       : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
-    depth: 0,
-    nestedCallSeq: 0,
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     activeThreads: new Set<string>(),
@@ -892,11 +969,22 @@ export async function runWorkflow<T = unknown>(
   const limiter = shared.limiter;
   const isTopLevelRun = !options.sharedRuntime;
   const store: SharedStore = options.sharedStore ?? new SharedStore();
+  let frameAgentCount = 0;
+  /** agent() promises owned by this runWorkflow frame only. */
+  const frameInFlight = new Set<Promise<unknown>>();
 
   const log = (message: unknown) => {
     const text = String(message);
     state.logs.push(text);
     options.onLog?.(text);
+  };
+
+  const emitRuntimeEvent = (event: WorkflowRuntimeEvent): void => {
+    try {
+      options.onRuntimeEvent?.(event);
+    } catch {
+      // Runtime observers are diagnostic surfaces and must not change execution.
+    }
   };
 
   const phase = (title: string, phaseOptions?: { budget?: number }) => {
@@ -908,7 +996,7 @@ export async function runWorkflow<T = unknown>(
       state.phaseBudgets.set(title, { budget: phaseOptions.budget, startSpent: shared.spent, warned: false });
     }
     options.onPhase?.(title);
-    options.onRuntimeEvent?.({
+    emitRuntimeEvent({
       type: "phase",
       title,
       budget: typeof phaseOptions?.budget === "number" && phaseOptions.budget > 0 ? phaseOptions.budget : null,
@@ -923,7 +1011,7 @@ export async function runWorkflow<T = unknown>(
 
   const agentLimitError = () =>
     new WorkflowError(
-      `Agent limit exceeded (${shared.agentCount}/${maxAgents}). Re-call workflow with resumeFromRunId="${runId}", the same script, and maxAgents: N (N>${maxAgents}) — journaled prefix replays free. /workflows resume alone cannot raise the cap.`,
+      `Agent limit exceeded (${shared.physicalAgentCount}/${maxAgents} real dispatches). Re-call workflow with resumeFromRunId="${runId}", the same script, and maxAgents: N (N>${maxAgents}) — journaled prefix replays free. /workflows resume alone cannot raise the cap.`,
       WorkflowErrorCode.AGENT_LIMIT_EXCEEDED,
       { recoverable: false },
     );
@@ -934,6 +1022,17 @@ export async function runWorkflow<T = unknown>(
     if (isAborted()) {
       throw new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
     }
+  };
+
+  const nextCallIndex = (): number => {
+    if (state.callSeq >= MAX_CALLS_PER_WORKFLOW) {
+      throw new WorkflowError(
+        `Workflow call limit exceeded (${MAX_CALLS_PER_WORKFLOW} agent/workflow/checkpoint calls)`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    return state.callSeq++;
   };
 
   const agent = (promptText: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
@@ -962,11 +1061,16 @@ export async function runWorkflow<T = unknown>(
     const normalizedOptions = thread && thread !== rawThread ? { ...agentOptions, thread } : agentOptions;
     let call = agentImpl(promptText, normalizedOptions);
     if (thread) call = call.finally(() => shared.activeThreads.delete(thread));
-    // Track every call (awaited or not) so the top-level run can drain
-    // outstanding calls before completing — a forgotten `await` cannot let an
-    // agent mutate state after the run is torn down.
+    // Track every call (awaited or not) both globally and in its owning frame.
+    // A nested workflow drains only its own forgotten calls before exposing its
+    // result/journal boundary; the top-level frame still drains all shared work.
     shared.inFlight.add(call);
-    call.catch(() => {}).finally(() => shared.inFlight.delete(call));
+    frameInFlight.add(call);
+    const removeSettledCall = () => {
+      shared.inFlight.delete(call);
+      frameInFlight.delete(call);
+    };
+    void call.then(removeSettledCall, removeSettledCall);
     return call;
   };
 
@@ -977,22 +1081,64 @@ export async function runWorkflow<T = unknown>(
     // synchronously, before suspending on the limiter below.
     const batch = fanoutScope.getStore();
 
-    // Check agent limit. A fan-out that overshoots the cap has already reserved
-    // and queued up to `maxAgents` agents; the breaching call throws here, and
-    // parallel()/pipeline() mark their own batch cancelled so the already-queued
-    // agents short-circuit before their real API call (see the limiter body).
-    if (shared.agentCount >= maxAgents) {
-      throw agentLimitError();
+    const taskScope = orchestrationScope.getStore();
+    const assignedPhase = agentOptions.phase ?? taskScope?.phase ?? state.currentPhase;
+
+    const requestedLabel = agentOptions.label?.trim();
+    // agentType resolution lives in pi-subagents; the name is the observable key.
+    if (agentOptions.agentType) {
+      log(`agentType "${agentOptions.agentType}" resolves in pi-subagents at dispatch`);
     }
 
+    // Model precedence: explicit per-call model > phase/run model. A tier is
+    // deliberately left to pi-subagents so its configured profile wins over the
+    // phase default. The model string may carry a `:thinking` suffix understood by
+    // the managed protocol.
+    const phaseModel = meta.phases?.find((candidate) => candidate.title === assignedPhase)?.model ?? meta.model;
+    const modelSpec = agentOptions.model ?? (agentOptions.tier === undefined ? phaseModel : undefined);
+
+    // Deterministic resume key: assigned at lexical call time, before the limiter.
+    const callIndex = nextCallIndex();
+    const callHash = hashAgentCall(promptText, modelSpec, assignedPhase, agentOptions, agentOptions.agentType ?? null);
+    // Store delta key: runId-namespaced so a nested workflow() call's
+    // callIndex-0 can never collide with the parent's (see SharedStore doc).
+    const deltaKey = `${runId}:${callIndex}`;
+
+    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount + 1);
+
+    // Longest-unchanged-prefix resume: replay a cached result only while the
+    // prefix is still intact. Once any call misses, it AND everything after it
+    // run live, so an edited upstream call never leaves stale downstream
+    // results served from the journal. Replay is logical work, not a real
+    // dispatch: it consumes neither the agent cap nor token/phase budget.
+    const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
+    const hashMatches = cached != null && cached.hash === callHash;
+    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
+    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
+      shared.agentCount++;
+      frameAgentCount++;
+      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt: promptText });
+      options.onAgentEnd?.({
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        result: cached.result,
+        tokens: 0,
+      });
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
+      return cached.result;
+    }
+    if (!hashMatches || cachedEmptyOutput || agentOptions.thread)
+      state.firstMiss = Math.min(state.firstMiss, callIndex);
+
+    // Reserve a real dispatch synchronously — no await occurs between this
+    // check and the increments, so a parallel() burst cannot overshoot the cap.
+    if (shared.physicalAgentCount >= maxAgents) throw agentLimitError();
     if (budget.total !== null && budget.remaining() <= 0) {
       throw new WorkflowError("workflow token budget exhausted", WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED, {
         recoverable: false,
       });
     }
-
-    const assignedPhase = agentOptions.phase ?? state.currentPhase;
-
     // Per-phase soft sub-budget gate: warns once at ~80%, throws at 100%.
     if (assignedPhase) {
       const pb = state.phaseBudgets.get(assignedPhase);
@@ -1011,54 +1157,9 @@ export async function runWorkflow<T = unknown>(
         }
       }
     }
-
-    const requestedLabel = agentOptions.label?.trim();
-    // agentType resolution lives in pi-subagents; the name is the observable key.
-    if (agentOptions.agentType) {
-      log(`agentType "${agentOptions.agentType}" resolves in pi-subagents at dispatch`);
-    }
-
-    // Model precedence: explicit per-call model > phase/run model. A tier is
-    // deliberately left to pi-subagents so its configured profile wins over the
-    // phase default. The model string may carry a `:thinking` suffix understood by
-    // the managed protocol.
-    const phaseModel = meta.phases?.find((candidate) => candidate.title === assignedPhase)?.model ?? meta.model;
-    const modelSpec = agentOptions.model ?? (agentOptions.tier === undefined ? phaseModel : undefined);
-
-    // Deterministic resume key: assigned at lexical call time, before the limiter.
-    const callIndex = state.callSeq++;
-    const callHash = hashAgentCall(promptText, modelSpec, assignedPhase, agentOptions, agentOptions.agentType ?? null);
-    // Store delta key: runId-namespaced so a nested workflow() call's
-    // callIndex-0 can never collide with the parent's (see SharedStore doc).
-    const deltaKey = `${runId}:${callIndex}`;
-
-    // Reserve the agent slot synchronously — atomic with the limit/budget gate
-    // above (no await in between) so a parallel() fan-out cannot all observe the
-    // same agentCount and overshoot maxAgents.
     shared.agentCount++;
-    const label = requestedLabel || defaultAgentLabel(assignedPhase, shared.agentCount);
-
-    // Longest-unchanged-prefix resume: replay a cached result only while the
-    // prefix is still intact. Once any call misses, it AND everything after it
-    // run live, so an edited upstream call never leaves stale downstream
-    // results served from the journal.
-    const cached = agentOptions.thread ? undefined : options.resumeJournal?.get(deltaKey);
-    const hashMatches = cached != null && cached.hash === callHash;
-    const cachedEmptyOutput = hashMatches && isEmptyTextAgentResult(cached.result, agentOptions.schema);
-    if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt: promptText });
-      options.onAgentEnd?.({
-        id: deltaKey,
-        label,
-        phase: assignedPhase,
-        result: cached.result,
-        tokens: 0,
-      });
-      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
-      return cached.result;
-    }
-    if (!hashMatches || cachedEmptyOutput || agentOptions.thread)
-      state.firstMiss = Math.min(state.firstMiss, callIndex);
+    frameAgentCount++;
+    shared.physicalAgentCount++;
 
     return limiter(async () => {
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
@@ -1097,6 +1198,7 @@ export async function runWorkflow<T = unknown>(
         schema !== undefined
           ? `\n\nReply with a single raw JSON value (object or array) matching exactly this JSON Schema:\n${JSON.stringify(schema)}\nDo not wrap it in prose or markdown fences.`
           : "";
+      let repairFeedback = "";
 
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1128,7 +1230,7 @@ export async function runWorkflow<T = unknown>(
               );
             }
 
-            const runPromise = agentRunner.run(promptText + schemaInstruction, {
+            const runPromise = agentRunner.run(promptText + schemaInstruction + repairFeedback, {
               label,
               sessionName: agentOptions.thread
                 ? `workflow:${runId} thread:${agentOptions.thread}`
@@ -1142,6 +1244,7 @@ export async function runWorkflow<T = unknown>(
               isolation: resolvedIsolation,
               toolset: options.toolset ?? agentOptions.toolset,
               excludeTools: options.excludeTools ?? agentOptions.excludeTools,
+              runId,
               callIndex,
               callHash,
               attempt,
@@ -1186,7 +1289,9 @@ export async function runWorkflow<T = unknown>(
               if (errors.length > 0) {
                 const detail = errors.join("; ");
                 if (attempt < maxAttempts) {
-                  // Repair: re-dispatch with the validation errors as feedback.
+                  // Repair: re-dispatch with the concrete validation errors so
+                  // the next model attempt can correct the actual failure.
+                  repairFeedback = `\n\nThe previous reply was invalid. Correct these validation errors and return only the corrected JSON value:\n${detail.slice(0, 4_000)}`;
                   throw new WorkflowError(
                     `Subagent reply did not match the schema: ${detail}`,
                     WorkflowErrorCode.AGENT_EXECUTION_ERROR,
@@ -1275,31 +1380,45 @@ export async function runWorkflow<T = unknown>(
   const parallel = async (thunks: Array<() => Promise<unknown>>) => {
     throwIfAborted();
     if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
+    if (thunks.length > MAX_FANOUT_ITEMS) {
+      throw new WorkflowError(
+        `parallel() accepts at most ${MAX_FANOUT_ITEMS} items`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     if (thunks.some((thunk) => typeof thunk !== "function")) {
       throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
     }
     // Batch-scoped cancellation: a breach in THIS fan-out flips `cancelled` so
     // its own still-queued agents bail, without touching a sibling or enclosing
-    // fan-out.
+    // fan-out. Await all wrappers before surfacing a fatal error so the barrier
+    // never returns while a sibling is still mutating the run.
     const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
+    const outcomes = await fanoutScope.run(batch, () =>
       Promise.all(
-        thunks.map(async (thunk, index) => {
+        thunks.map(async (thunk, index): Promise<{ value: unknown } | { fatal: unknown }> => {
           try {
-            return await thunk();
+            return { value: await thunk() };
           } catch (error) {
-            if (isAborted()) throw error;
             const workflowError = wrapError(error);
-            if (!workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
+            if (
+              isAborted() ||
+              !workflowError.recoverable ||
+              workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+            ) {
               if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-              throw workflowError;
+              return { fatal: workflowError };
             }
             log(`parallel[${index}] failed: ${workflowError.message}`);
-            return null;
+            return { value: null };
           }
         }),
       ),
     );
+    const fatal = outcomes.find((outcome): outcome is { fatal: unknown } => "fatal" in outcome);
+    if (fatal) throw fatal.fatal;
+    return outcomes.map((outcome) => ("value" in outcome ? outcome.value : null));
   };
 
   const pipeline = async (
@@ -1308,13 +1427,20 @@ export async function runWorkflow<T = unknown>(
   ) => {
     throwIfAborted();
     if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array as the first argument");
+    if (items.length > MAX_FANOUT_ITEMS) {
+      throw new WorkflowError(
+        `pipeline() accepts at most ${MAX_FANOUT_ITEMS} items`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
     if (stages.some((stage) => typeof stage !== "function")) {
       throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
     }
     const batch = { cancelled: false };
-    return fanoutScope.run(batch, () =>
+    const outcomes = await fanoutScope.run(batch, () =>
       Promise.all(
-        items.map(async (item, index) => {
+        items.map(async (item, index): Promise<{ value: unknown } | { fatal: unknown }> => {
           let value: unknown = item;
           for (const stage of stages) {
             try {
@@ -1322,58 +1448,138 @@ export async function runWorkflow<T = unknown>(
               value = await stage(value, item, index);
               throwIfAborted();
             } catch (error) {
-              if (isAborted()) throw error;
               const workflowError = wrapError(error);
-              if (!workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT) {
+              if (
+                isAborted() ||
+                !workflowError.recoverable ||
+                workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT
+              ) {
                 if (workflowError.code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) batch.cancelled = true;
-                throw workflowError;
+                return { fatal: workflowError };
               }
               log(`pipeline[${index}] failed: ${workflowError.message}`);
-              return null;
+              return { value: null };
             }
           }
-          return value;
+          return { value };
         }),
       ),
     );
+    const fatal = outcomes.find((outcome): outcome is { fatal: unknown } => "fatal" in outcome);
+    if (fatal) throw fatal.fatal;
+    return outcomes.map((outcome) => ("value" in outcome ? outcome.value : null));
+  };
+
+  /**
+   * Run a named dependency graph in deterministic declaration-order layers.
+   * The graph is deliberately a runtime primitive rather than a second top-level
+   * engine: agent/session policy still belongs to the enclosing workflow and
+   * pi-subagents, while this helper owns only task dependencies and results.
+   */
+  const orchestrate = async (rawTasks: unknown, rawOptions?: unknown): Promise<OrchestrationResult> => {
+    throwIfAborted();
+    const normalized = normalizeOrchestration(rawTasks, rawOptions);
+    const tasks = normalized.tasks.map((task) => ({
+      ...task,
+      run: (context: OrchestrationTaskContext) =>
+        orchestrationScope.run({ taskId: task.id, ...(task.phase === undefined ? {} : { phase: task.phase }) }, () =>
+          task.run(context),
+        ),
+    }));
+    return executeOrchestration(tasks, normalized.options, {
+      throwIfAborted,
+      isFatal: (error: unknown) => {
+        if (isAborted()) return true;
+        const workflowError = wrapError(error);
+        return !workflowError.recoverable || workflowError.code === WorkflowErrorCode.PROVIDER_USAGE_LIMIT;
+      },
+      formatError: (error: unknown) => wrapError(error).message,
+      onEvent: emitRuntimeEvent,
+    });
   };
 
   // Nested workflow(): run a saved workflow (or raw script) inline, sharing this
-  // run's limiter/counters/budget. One level deep only.
+  // run's limiter/counters/budget. One level deep only. The whole child result is
+  // journaled as one stable parent call so resume does not silently re-spend every
+  // nested agent when the parent prefix is unchanged.
   const workflowFn = async (nameOrScript: string, childArgs?: unknown) => {
     throwIfAborted();
-    if (shared.depth >= 1) {
+    const workflowDepth = options.workflowDepth ?? 0;
+    if (workflowDepth >= 1) {
       throw new WorkflowError("workflow() can nest only one level deep", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
         recoverable: false,
       });
     }
+    const callIndex = nextCallIndex();
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
     const childScript = resolved ?? String(nameOrScript);
     const workflowName = String(nameOrScript);
-    options.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
-    shared.depth++;
+    const argsPresent = childArgs !== undefined;
+    const callHash = hashIdentity({
+      kind: "workflow",
+      name: workflowName,
+      script: childScript,
+      argsPresent,
+      args: argsPresent ? childArgs : null,
+    });
+    const cached = options.resumeJournal?.get(`${runId}:${callIndex}`);
+    if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
+      state.workflowGenerations.set(callIndex, cached.generation ?? 1);
+      if (cached.storeDelta) store.applyDelta(cached.storeDelta);
+      const replayedAgentCount = cached.agentCount ?? 0;
+      shared.agentCount += replayedAgentCount;
+      frameAgentCount += replayedAgentCount;
+      return cached.result;
+    }
+    if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    const generation = (state.workflowGenerations.get(callIndex) ?? cached?.generation ?? 0) + 1;
+    state.workflowGenerations.set(callIndex, generation);
+    emitRuntimeEvent({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
     try {
-      // Propagate the resume journal into the child frame ONLY while the
-      // parent's own prefix is still intact (state.firstMiss === Infinity).
-      // SharedStore content is not part of any call's hash, so a cached child
-      // result computed against OLD store state would be stale once an upstream
-      // parent call misses and re-runs live with different store writes.
-      const prefixIntact = state.firstMiss === Number.POSITIVE_INFINITY;
+      const childDeltas = new Map<number, Record<string, unknown>>();
       const child = await runWorkflow(childScript, {
         ...options,
         args: childArgs,
         sharedRuntime: shared,
         sharedStore: store,
-        resumeJournal: prefixIntact ? options.resumeJournal : undefined,
+        workflowDepth: workflowDepth + 1,
+        // The parent call caches the complete child value. Replaying child
+        // call results here would duplicate nested calls and make the synthetic
+        // parent journal entry ambiguous.
+        resumeJournal: undefined,
         resumeFromRunId: undefined,
-        // shared.nestedCallSeq, not depth: depth returns to 0 between sequential
-        // sibling calls, which would otherwise mint colliding child runIds.
-        runId: `${runId}-nested${++shared.nestedCallSeq}`,
+        onWorkflowJournal: undefined,
+        onAgentJournal: (entry) => {
+          if (entry.storeDelta) childDeltas.set(entry.index, entry.storeDelta);
+          // Preserve nested lifecycle visibility for direct runtime consumers;
+          // the engine's top-level agent journal intentionally ignores child ids.
+          options.onAgentJournal?.(entry);
+        },
+        // The call index + generation keeps changed nested calls distinct across
+        // resume. The engine nonce additionally fences an interrupted child whose
+        // result was never durable before a process/branch restart.
+        runId: `${runId}-nested-call-${callIndex}-g${generation}${options.executionNonce ? `-${options.executionNonce}` : ""}`,
       });
-      return child.result;
+      const normalizedChildResult = child.result === undefined ? null : child.result;
+      const storeDelta: Record<string, unknown> = {};
+      for (const delta of [...childDeltas.entries()].sort(([a], [b]) => a - b).map(([, value]) => value)) {
+        Object.assign(storeDelta, delta);
+      }
+      // Do not append a nested result after pause/stop has claimed the parent;
+      // terminal recovery must remain the last durable fact for that execution.
+      throwIfAborted();
+      options.onWorkflowJournal?.({
+        index: callIndex,
+        runId,
+        hash: callHash,
+        result: normalizedChildResult,
+        generation,
+        agentCount: child.agentCount,
+        ...(Object.keys(storeDelta).length > 0 ? { storeDelta } : {}),
+      });
+      return normalizedChildResult;
     } finally {
-      shared.depth--;
-      options.onRuntimeEvent?.({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
+      emitRuntimeEvent({ type: "workflow", stage: "end", name: workflowName, args: childArgs });
     }
   };
 
@@ -1393,7 +1599,7 @@ export async function runWorkflow<T = unknown>(
     total: number;
     votes: Array<{ real: boolean; reason?: string }>;
   }> => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "verify" });
+    emitRuntimeEvent({ type: "quality", stage: "start", helper: "verify" });
     const reviewers = Math.max(1, opts.reviewers ?? 2);
     const threshold = opts.threshold ?? 0.5;
     const lenses = opts.lens ? (Array.isArray(opts.lens) ? opts.lens : [opts.lens]) : [];
@@ -1430,9 +1636,9 @@ export async function runWorkflow<T = unknown>(
   ): Promise<
     { index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } | undefined
   > => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "judgePanel" });
+    emitRuntimeEvent({ type: "quality", stage: "start", helper: "judgePanel" });
     if (!Array.isArray(attempts) || attempts.length === 0) {
-      options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+      emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
       return undefined;
     }
     const judges = Math.min(16, Math.max(1, Math.floor(opts.judges ?? 3)));
@@ -1473,12 +1679,12 @@ export async function runWorkflow<T = unknown>(
       judgments: s.judgments.map((j) => ({ score: Number(j?.score) || 0, reason: j?.reason })),
     }));
     if (normalized.length === 0) {
-      options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+      emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
       return undefined;
     }
     let best = normalized[0];
     for (const s of normalized) if (s.score > best.score || (s.score === best.score && s.index < best.index)) best = s;
-    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "judgePanel" });
+    emitRuntimeEvent({ type: "quality", stage: "end", helper: "judgePanel" });
     return best;
   };
 
@@ -1530,12 +1736,12 @@ export async function runWorkflow<T = unknown>(
     taskArgs: unknown,
     results: unknown,
   ): Promise<{ complete: boolean; missing?: string[] } | null> => {
-    options.onRuntimeEvent?.({ type: "quality", stage: "start", helper: "completenessCheck" });
+    emitRuntimeEvent({ type: "quality", stage: "start", helper: "completenessCheck" });
     const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
       { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
     );
-    options.onRuntimeEvent?.({ type: "quality", stage: "end", helper: "completenessCheck" });
+    emitRuntimeEvent({ type: "quality", stage: "end", helper: "completenessCheck" });
     return verdict as { complete: boolean; missing?: string[] } | null;
   };
 
@@ -1549,7 +1755,7 @@ export async function runWorkflow<T = unknown>(
       throwIfAborted();
       last = await thunk(i);
       const accepted = !opts.until || opts.until(last);
-      options.onRuntimeEvent?.({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
+      emitRuntimeEvent({ type: "control-attempt", helper: "retry", attempt: i + 1, accepted });
       if (accepted) return last;
     }
     return last;
@@ -1568,7 +1774,7 @@ export async function runWorkflow<T = unknown>(
       last = await thunk(feedback, i);
       const verdict = await validator(last);
       const accepted = Boolean(verdict?.ok);
-      options.onRuntimeEvent?.({ type: "control-attempt", helper: "gate", attempt: i + 1, accepted });
+      emitRuntimeEvent({ type: "control-attempt", helper: "gate", attempt: i + 1, accepted });
       if (accepted) return { ok: true, value: last, attempts: i + 1 };
       feedback = verdict?.feedback;
     }
@@ -1581,19 +1787,20 @@ export async function runWorkflow<T = unknown>(
   const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
     throwIfAborted();
     if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
-    if (shared.agentCount >= maxAgents) {
-      throw agentLimitError();
-    }
-    const callIndex = state.callSeq++;
+    const callIndex = nextCallIndex();
     const callHash = hashCheckpoint(promptText, checkpointOptions);
     const journalKey = `${runId}:${callIndex}`;
     const cached = options.resumeJournal?.get(journalKey);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
       shared.agentCount++;
-      return cached.result; // replay the journaled human reply
+      frameAgentCount++;
+      return cached.result; // replay the journaled human reply without spending a slot
     }
     if (cached == null || cached.hash !== callHash) state.firstMiss = Math.min(state.firstMiss, callIndex);
+    if (shared.physicalAgentCount >= maxAgents) throw agentLimitError();
     shared.agentCount++;
+    frameAgentCount++;
+    shared.physicalAgentCount++;
 
     let reply: unknown;
     if (options.confirm) {
@@ -1616,6 +1823,7 @@ export async function runWorkflow<T = unknown>(
     agent,
     parallel,
     pipeline,
+    orchestrate,
     workflow: workflowFn,
     verify,
     judgePanel,
@@ -1681,7 +1889,7 @@ export async function runWorkflow<T = unknown>(
       result: result as T,
       logs: state.logs,
       phases: state.phases,
-      agentCount: shared.agentCount,
+      agentCount: isTopLevelRun ? shared.agentCount : frameAgentCount,
       durationMs: Date.now() - started,
       runId,
       tokenUsage: shared.tokenUsage,
@@ -1695,14 +1903,15 @@ export async function runWorkflow<T = unknown>(
     if (isTopLevelRun) shared.runFatalController.abort();
     throw error;
   } finally {
-    if (isTopLevelRun) {
-      if (shared.inFlight.size > 0) {
-        log(`waiting for ${shared.inFlight.size} outstanding agent() call(s) to settle before this run completes`);
-      }
-      while (shared.inFlight.size > 0) {
-        await Promise.allSettled(Array.from(shared.inFlight));
-      }
-      store.dispose();
+    const ownedInFlight = isTopLevelRun ? shared.inFlight : frameInFlight;
+    if (ownedInFlight.size > 0) {
+      log(
+        `waiting for ${ownedInFlight.size} outstanding agent() call(s) to settle before this workflow frame completes`,
+      );
     }
+    while (ownedInFlight.size > 0) {
+      await Promise.allSettled(Array.from(ownedInFlight));
+    }
+    if (isTopLevelRun) store.dispose();
   }
 }

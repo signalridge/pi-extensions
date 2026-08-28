@@ -576,7 +576,7 @@ test("empty cache activity collapses its configured row and context falls back t
   ]);
 });
 
-test("Kimi subscription cost is marked while API-key cost is unchanged", () => {
+test("subscription-backed cost is marked while API-key cost is unchanged", () => {
   const config = createDefaultConfig();
   config.segments = ["cost"];
   const footerData: ReadonlyFooterDataProvider = {

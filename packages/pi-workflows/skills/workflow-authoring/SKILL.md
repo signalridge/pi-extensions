@@ -1,30 +1,178 @@
 ---
 name: workflow-authoring
-description: Guidance for writing, editing, reviewing, and debugging JavaScript workflow code for @signalridge/pi-workflows. Use when authoring or changing workflow scripts; not for merely running an existing workflow.
+description: Design, write, review, and debug Pi JavaScript workflows that coordinate multiple subagents. Use when a request needs named dependencies, bounded fan-out, per-item pipelines, quality gates, saved or nested workflows, pause/resume, or workflow progress; do not use it merely to run an existing named workflow.
 metadata:
-  version: "1.2.1"
+  version: "1.3.2"
 ---
 
 # Workflow authoring
 
-Load this skill when workflow JavaScript changes. Running an existing workflow needs no authoring reference.
+A workflow is a small program that coordinates subagents; it is not a long prompt
+that asks one agent to do every step. Keep semantic work in agents and keep
+identity, ordering, bounds, failure handling, and aggregation deterministic in
+JavaScript.
 
-## Choose a branch
+## Operating contract
 
-Read only what the task needs:
+- Use a workflow only when the task benefits from multiple agents, explicit
+  stages, independent coverage, or a quality/recovery loop. One or two simple
+  delegations should use the ordinary agent surface.
+- Start every script with literal `export const meta = { name, description,
+  phases? }`. Return plain JSON data explicitly.
+- Use `orchestrate()` for named dependencies, `parallel()` for a small
+  independent barrier, and `pipeline()` for independent items that each need a
+  sequential stage chain. Do not encode a dependency graph only in comments.
+- Give every work unit a stable ID and every agent call a short unique label.
+  Keep IDs beside results before filtering; `null` is missing coverage, not a
+  successful finding.
+- Bound graph tasks, fan-out items, loops, retries, agents, concurrency, and
+  evidence size. Invocation-level token and time caps are user constraints, not
+  substitutes for algorithmic bounds.
+- Route an agent call with `tier: "small"`, `"medium"`, or `"large"`; omit
+  `tier` to use the pi-subagents workflow default. Never guess nonstandard model
+  routes, tiers, or agent types—use a name supplied by the current environment
+  and follow [registry ownership](references/registry-ownership.md).
+- Workflows have no imports, filesystem/network APIs, timers, or unrestricted
+  Node APIs. Pass timestamps, randomness, and external decisions through `args`.
 
-- **Write or edit:** start with [runtime](references/runtime.md). Add [pattern selection](references/pattern-selection.md) for topology, [lifecycle](references/lifecycle.md) for limits or resume, and [focused recipes](references/focused-recipes.md) for the matching concern.
-- **Helper task:** read [quality helpers](references/quality-helpers.md) only for `verify` or `judgePanel`, the [retry helper](references/retry-helper.md) only for `retry`, and [specialized helpers](references/specialized-helpers.md) only for `completenessCheck`, `loopUntilDry`, `gate`, or `checkpoint`.
-- **Review:** use the [review checklist](references/review.md), plus only the matching [quality](references/quality-helpers.md) or [specialized](references/specialized-helpers.md) helper contracts.
-- **Debug:** use the [debugging map](references/debugging.md).
-- **Routing:** read [registry ownership](references/registry-ownership.md) before using `model`, `tier`, phase models, or `agentType`; use environment-specific names only when context supplies them.
-- **Exact lookup or portability:** start with the generated [capability index](references/capabilities.md). Follow its exhaustive-facts pointer only for constraints or support boundaries. Use [versions](references/versions.md) when moving scripts between installations.
+## The authoring pass
 
-## Invariants
+1. **Classify the topology.** Decide whether the work is direct, a named DAG,
+   homogeneous fan-out, a per-item pipeline, iterative discovery, or a quality
+   gate. Read [pattern selection](references/pattern-selection.md) only for the
+   chosen shape.
+2. **Declare inputs and bounds.** Read `args` once, normalize the input, reject
+   or cap untrusted cardinality, and decide what incomplete coverage means.
+3. **Write the envelope.** Declare only phases that are actually entered. Use
+   `phase(title, { budget })` for a soft token sub-budget, not as a scheduler.
+4. **Build the smallest work ledger.** Store `{ id, status, result, error }`
+   (or an equivalent object) for each intended unit. Do not lose identity when
+   applying `.filter(Boolean)`.
+5. **Dispatch with the right primitive.** Await every batch. For a dependent
+   prompt, include both the dependency ID and its actual result; do not assume
+   the child can see the parent conversation.
+6. **Add quality only where it changes a decision.** Use a schema before reading
+   structured fields, then use `verify`, `judgePanel`, `gate`, or
+   `completenessCheck` with explicit bounds.
+7. **Aggregate and report.** Return a bounded JSON result containing the answer,
+   coverage, and important failures. If the workflow runs in the background,
+   the run ID is the handle for later control/resume.
+8. **Review the script.** Use [the review checklist](references/review.md), then
+   test with deterministic fake agents when changing topology or recovery.
 
-- Start with literal `export const meta = { name, description }`; declare phases as an array of used `{ title }` objects and enter each named phase.
-- Call `agent()` at least once, give every call a short unique `label`, and return plain JSON data explicitly.
-- Pair ordered results with stable work IDs before filtering. When one agent consumes another's selected result, include both its stable ID and actual data in the downstream prompt. Treat recoverable `null` as missing coverage and report it.
-- Bound fan-out, loops, retries, agents, and concurrency to the task. Treat invocation-level token and time caps as opt-in user constraints, not defaults.
-- Use `log()` for new code; `console` is compatibility-only.
-- Write plain JavaScript without imports or filesystem modules. Pass nondeterminism through `args`; `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable.
+## Topology rules
+
+### Named dependencies: `orchestrate`
+
+Use a task graph when a later step consumes a named earlier step:
+
+```js
+const graph = await orchestrate([
+  { id: "scan", run: () => agent("Inspect the target", { label: "scan" }) },
+  { id: "security", run: () => agent("Check security risks", { label: "security" }) },
+  {
+    id: "report",
+    dependsOn: ["scan", "security"],
+    run: ({ results, statuses }) =>
+      agent(
+        "Synthesize the named findings; mention unavailable coverage.\n\n" +
+          JSON.stringify({ results, statuses }),
+        { label: "report" },
+      ),
+  },
+]);
+return graph;
+```
+
+`orchestrate()` validates IDs, missing dependencies, duplicate edges, and
+cycles before callbacks run. It executes ready tasks in declaration-order
+layers with a barrier between layers and returns `{ results, tasks }`. Each task
+callback receives detached `{ id, attempt, results, statuses }` snapshots.
+`retries` retries ordinary task-callback failures up to three times. The default
+`onError: "skip-dependents"` prevents a failed dependency from feeding a stale
+prompt; use `onError: "continue"` only when the dependent explicitly handles
+failed statuses. `fail-fast` stops discovery of later layers after the current
+layer settles.
+
+### Independent fan-out: `parallel`
+
+Pass thunks, not already-started promises. Results preserve input order and a
+recoverable item failure becomes `null`; fatal errors surface after the whole
+batch barrier settles. Keep a ledger with IDs before filtering:
+
+```js
+const work = items.map((item) => ({ id: item.id, item }));
+const outputs = await parallel(work.map(({ item }) => () =>
+  agent("Handle item " + item.id, { label: "item-" + item.id }),
+));
+const ledger = work.map(({ id }, index) => ({ id, result: outputs[index] }));
+```
+
+Each `parallel()` call accepts at most 4096 thunks. It is a barrier: do not
+start synthesis until the returned array is complete.
+
+### Per-item stages: `pipeline`
+
+Use `pipeline(items, ...stages)` when every item follows the same chain. Items
+run concurrently, but stages for one item are sequential and receive
+`(previousValue, originalItem, index)`. A stage failure drops that item to
+`null`; guard missing values before the next stage. There is no cross-item
+barrier between stages, and each call accepts at most 4096 items.
+
+### Saved or nested workflows
+
+`workflow(name, childArgs)` resolves a context-supplied saved workflow and runs
+it inline with the parent's limiter, agent accounting, token accounting, and
+store. One nested level is allowed; concurrent siblings are allowed. An
+unchanged child is replayed as one parent journal call, while a changed or
+interrupted child receives a generation-scoped managed identity. Do not use
+nesting as an unbounded recursion mechanism.
+
+## Prompt and result discipline
+
+Every child prompt must be self-contained: state the role, exact task, relevant
+inputs, expected output shape, and what the child must not do. Prefer a small
+`schema` for values JavaScript will inspect. When a child consumes another
+child's output, include the stable ID and actual bounded data, for example:
+
+```js
+const prompt = "Review result " + JSON.stringify({ id: "scan", result: scan });
+```
+
+Do not pass whole transcripts when a summary or structured fields are enough.
+Use `log()` for progress and return a result that distinguishes completed work,
+missing coverage, and failed/skipped work.
+
+## Failure, limits, and recovery
+
+- Recoverable child failures return `null` after agent retries. Fatal workflow
+  errors (invalid hooks, exhausted hard limits, unsupported selectors, and
+  schema exhaustion) throw and must not be dissolved into a normal result.
+- Runtime `agent({ retries })` retries execution failures. `orchestrate` task
+  `retries` retries the callback. Semantic `retry()`/`gate()` attempts are a
+  third, intentional layer. Bound and ledger every layer separately.
+- `agent()` schema repair includes concrete validation feedback in the next
+  attempt. Do not read fields from an unvalidated text response.
+- `checkpoint()` is headless by default for background runs. Use
+  `background: false` only when a human decision must be shown.
+- `budget` and phase budgets are soft pre-call gates; concurrent work may
+  overshoot. Do not promise an exact token ceiling unless the caller supplied
+  and accepted that policy.
+
+## Resume and publication gate
+
+Resume replays the longest unchanged prefix of journaled calls. Keep call order,
+labels, prompts, routing options, and inputs stable. `orchestrate` layer order
+and named dependency results make dynamic plans easier to replay, but arbitrary
+branch/loop call counts can still invalidate the positional prefix. Never use
+`Date.now()`, `Math.random()`, or no-argument `new Date()` in a script.
+
+Before shipping a workflow change:
+
+- read [lifecycle](references/lifecycle.md) for pause, stop, budget, and resume;
+- read [debugging](references/debugging.md) when reproducing a failure;
+- read [the review checklist](references/review.md) before accepting topology;
+- read [the generated capability index](references/capabilities.md) when a
+  signature, default, or support boundary is disputed;
+- ensure every package-relative example/reference link remains inside the
+  publishable package.

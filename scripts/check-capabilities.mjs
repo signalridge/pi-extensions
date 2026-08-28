@@ -9,6 +9,11 @@ const packagePath = resolve(root, "packages/pi-workflows/package.json");
 const readmePath = resolve(root, "packages/pi-workflows/README.md");
 const indexPath = resolve(root, "packages/pi-workflows/skills/workflow-authoring/references/capabilities.md");
 const detailsPath = resolve(root, "packages/pi-workflows/skills/workflow-authoring/references/capability-details.md");
+const skillPaths = [
+  resolve(root, "packages/pi-workflows/skills/workflow-authoring/SKILL.md"),
+  resolve(root, "packages/pi-workflows/skills/workflow-patterns/SKILL.md"),
+  resolve(root, "packages/pi-workflows/skills/workflow-review/SKILL.md"),
+];
 
 const source = readFileSync(capabilitiesPath, "utf8");
 const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
@@ -132,20 +137,36 @@ function renderDetails() {
   ].join("\n");
 }
 
+function skillVersion(source, skillPath) {
+  const version = /^ {2}version: "([^"]+)"$/mu.exec(source)?.[1];
+  if (!version) throw new Error(`check:capabilities: skill metadata version is missing: ${skillPath}`);
+  return version;
+}
+
+function writeSkillVersion(skillPath) {
+  const source = readFileSync(skillPath, "utf8");
+  skillVersion(source, skillPath);
+  writeFileSync(skillPath, source.replace(/^ {2}version: "[^"]+"$/mu, `  version: "${packageJson.version}"`), "utf8");
+}
+
 const expectedIndex = renderIndex();
 const expectedDetails = renderDetails();
 if (process.argv.includes("--write")) {
   writeFileSync(indexPath, expectedIndex, "utf8");
   writeFileSync(detailsPath, expectedDetails, "utf8");
+  for (const skillPath of skillPaths) writeSkillVersion(skillPath);
 } else {
   const actualIndex = readFileSync(indexPath, "utf8");
   const actualDetails = readFileSync(detailsPath, "utf8");
   const stale = [];
   if (actualIndex !== expectedIndex) stale.push(indexPath);
   if (actualDetails !== expectedDetails) stale.push(detailsPath);
+  for (const skillPath of skillPaths) {
+    if (skillVersion(readFileSync(skillPath, "utf8"), skillPath) !== packageJson.version) stale.push(skillPath);
+  }
   if (stale.length > 0) {
     throw new Error(
-      `check:capabilities: generated capability docs are stale; run node scripts/check-capabilities.mjs --write (${stale.join(", ")})`,
+      `check:capabilities: generated capability docs or skill versions are stale; run node scripts/check-capabilities.mjs --write (${stale.join(", ")})`,
     );
   }
 }

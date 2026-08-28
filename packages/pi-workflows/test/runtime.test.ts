@@ -18,6 +18,7 @@ import {
   type AgentRunOptions,
   DEFAULT_AGENT_TIMEOUT_MS,
   findJsonBlock,
+  type JournalEntry,
   parseWorkflowScript,
   runWorkflow,
   validateJsonSchema,
@@ -70,12 +71,12 @@ const x = 1;`,
     expect(() => parseWorkflowScript(`export const meta = { name: \`a\${x}\`, description: "b" };`)).toThrow(
       /template interpolation/,
     );
-    // Date.now() trips the determinism blocklist before the AST gate — the
-    // blocklist is the outer precheck, the realm stubs the inner guard.
+    // Direct Date.now() trips the AST determinism gate; computed spellings are
+    // left for the in-realm stubs so prompt literals are never false positives.
     expect(() =>
       parseWorkflowScript(`export const meta = { name: "a", description: "b", phases: [Date.now()] };`),
     ).toThrow(/must be deterministic/);
-    // A non-literal that does not trip the blocklist still fails the AST gate.
+    // A non-literal that is not nondeterministic still fails the AST gate.
     expect(() =>
       parseWorkflowScript(`export const meta = { name: "a", description: "b", phases: [new Object()] };`),
     ).toThrow(/non-literal node type/);
@@ -90,7 +91,7 @@ const x = 1;`,
     );
   });
 
-  it("rejects the determinism blocklist before parsing", () => {
+  it("rejects direct nondeterminism before execution", () => {
     expect(() =>
       parseWorkflowScript(`export const meta = { name: "a", description: "b" };\nconst t = Date.now();`),
     ).toThrow(/must be deterministic/);
@@ -111,9 +112,8 @@ describe("determinism prelude", () => {
       agent: nullRunner(),
     });
 
-  // The blocklist regex catches the plain spellings before parsing, so the
-  // realm stubs are exercised through blocklist-bypassing spellings — the
-  // reason the prelude exists at all.
+  // The AST gate catches direct spellings before execution. Computed spellings
+  // exercise the in-realm stubs — the reason the prelude exists at all.
 
   it("Math.random() throws inside the realm", async () => {
     await expect(run(`const r = Math["random"](); return r;`)).rejects.toThrow(/Math\.random\(\) is unavailable/);
@@ -132,6 +132,13 @@ describe("determinism prelude", () => {
   it("Date.UTC and Date.parse survive", async () => {
     const { result } = await run(`return [Date.UTC(2024, 0, 1), Date.parse("1970-01-02T00:00:00Z")];`);
     expect(result).toEqual([1704067200000, 86400000]);
+  });
+
+  it("does not reject determinism-looking text inside a prompt string", () => {
+    const parsed = parseWorkflowScript(
+      `export const meta = { name: "prompt", description: "p" };\nconst text = "Please explain Date.now() and Math.random()";\nreturn text;`,
+    );
+    expect(parsed.body).toContain("Date.now()");
   });
 });
 
@@ -230,6 +237,7 @@ return await agent("answer", { schema: { type: "object", properties: { real: { t
 
   it("repairs an invalid schema reply across attempts and throws SCHEMA_NONCOMPLIANCE on exhaustion", async () => {
     let calls = 0;
+    const prompts: string[] = [];
     await expect(
       runWorkflow(
         `export const meta = { name: "schema-bad", description: "s" };
@@ -237,8 +245,9 @@ return await agent("answer", { schema: { type: "object", properties: { n: { type
         {
           agentRetries: 1,
           agent: {
-            run: async () => {
+            run: async (prompt: string) => {
               calls++;
+              prompts.push(prompt);
               return '{"n": "not-a-number"}';
             },
           },
@@ -246,6 +255,7 @@ return await agent("answer", { schema: { type: "object", properties: { n: { type
       ),
     ).rejects.toThrow(WorkflowError);
     expect(calls).toBe(2); // initial + one repair attempt
+    expect(prompts[1]).toContain("expected type number");
   });
 
   it("recovers to null after a recoverable failure exhausts attempts", async () => {
@@ -392,6 +402,194 @@ return await pipeline([1, 2, 3], async (prev, original, index) => {
     );
     // item 1: stage1 2, stage2 2+0=2; item 2: stage1 4, stage2 4+1=5; item 3: 6+2=8
     expect(result).toEqual([2, 5, 8]);
+  });
+});
+
+// ── named orchestration graph ────────────────────────────────────────────────
+
+describe("orchestrate()", () => {
+  it("runs dependency layers in declaration order and exposes named results", async () => {
+    const prompts: string[] = [];
+    const events: string[] = [];
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph", description: "g" };
+return await orchestrate([
+  { id: "scan", phase: "research", run: () => agent("scan") },
+  { id: "security", phase: "research", run: () => agent("security") },
+  { id: "synthesize", dependsOn: ["scan", "security"], run: ({ results, statuses }) => {
+    if (statuses.scan !== "completed" || statuses.security !== "completed") throw new Error("bad barrier");
+    return agent("synthesize " + results.scan + " + " + results.security);
+  } },
+]);`,
+      {
+        agent: {
+          run: async (prompt) => {
+            prompts.push(prompt);
+            return `done:${prompt}`;
+          },
+        },
+        onRuntimeEvent: (event) => {
+          if (event.type === "task" && event.stage === "start") events.push(String(event.taskId));
+        },
+      },
+    );
+    expect(result.results).toEqual({
+      scan: "done:scan",
+      security: "done:security",
+      synthesize: "done:synthesize done:scan + done:security",
+    });
+    expect(Object.keys(result.tasks)).toEqual(["scan", "security", "synthesize"]);
+    expect(events).toEqual(["scan", "security", "synthesize"]);
+    expect(prompts).toEqual(["scan", "security", "synthesize done:scan + done:security"]);
+  });
+
+  it("skips descendants of failed tasks while independent tasks continue", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph-skip", description: "g" };
+return await orchestrate([
+  { id: "bad", run: () => { throw new Error("broken"); } },
+  { id: "independent", run: () => "ok" },
+  { id: "dependent", dependsOn: ["bad"], run: () => "must not run" },
+]);`,
+      { agent: nullRunner() },
+    );
+    expect(result.results).toEqual({ bad: null, independent: "ok", dependent: null });
+    expect(result.tasks.bad).toMatchObject({ status: "failed", attempts: 1 });
+    expect(result.tasks.independent).toMatchObject({ status: "completed", value: "ok" });
+    expect(result.tasks.dependent).toMatchObject({ status: "skipped", attempts: 0 });
+  });
+
+  it("propagates skips to a fixed point for reverse-declared descendants", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph-reverse-skip", description: "g" };
+return await orchestrate([
+  { id: "grandchild", dependsOn: ["child"], run: () => "must not run" },
+  { id: "child", dependsOn: ["root"], run: () => "must not run" },
+  { id: "root", run: () => { throw new Error("broken"); } },
+]);`,
+      { agent: nullRunner() },
+    );
+    expect(result.results).toEqual({ grandchild: null, child: null, root: null });
+    expect(result.tasks.root).toMatchObject({ status: "failed" });
+    expect(result.tasks.child).toMatchObject({ status: "skipped" });
+    expect(result.tasks.grandchild).toMatchObject({ status: "skipped" });
+  });
+
+  it("detaches nested callback results from siblings and the final ledger", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph-detached-results", description: "g" };
+return await orchestrate([
+  { id: "source", run: () => ({ nested: { value: "stable" } }) },
+  { id: "mutator", dependsOn: ["source"], run: ({ results }) => {
+    results.source.nested.value = "mutated";
+    return results.source.nested.value;
+  } },
+  { id: "sibling", dependsOn: ["source"], run: ({ results }) => results.source.nested.value },
+]);`,
+      { agent: nullRunner() },
+    );
+    expect(result.results).toEqual({
+      source: { nested: { value: "stable" } },
+      mutator: "mutated",
+      sibling: "stable",
+    });
+    expect(result.tasks.source.value).toEqual({ nested: { value: "stable" } });
+  });
+
+  it("fails explicitly before exposing a result that cannot be structured-cloned", async () => {
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "graph-undetachable", description: "g" };
+return await orchestrate([
+  { id: "source", run: () => () => "not cloneable" },
+  { id: "consumer", dependsOn: ["source"], run: ({ results }) => results.source },
+], { onError: "fail-fast" });`,
+        { agent: nullRunner() },
+      ),
+    ).rejects.toThrow(/results cannot be detached/);
+  });
+
+  it("can continue through failed dependencies with status-aware context", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph-continue", description: "g" };
+return await orchestrate([
+  { id: "bad", run: () => { throw new Error("broken"); } },
+  { id: "after", dependsOn: ["bad"], run: ({ results, statuses }) => ({ value: results.bad, status: statuses.bad }) },
+], { onError: "continue" });`,
+      { agent: nullRunner() },
+    );
+    expect(result.results.after).toEqual({ value: null, status: "failed" });
+    expect(result.tasks.after).toMatchObject({ status: "completed" });
+  });
+
+  it("stops after the failed layer with fail-fast without starting later dependents", async () => {
+    const started: string[] = [];
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "graph-fail-fast", description: "g" };
+return await orchestrate([
+  { id: "bad", run: () => { throw new Error("stop here"); } },
+  { id: "later", dependsOn: ["bad"], run: () => "must not run" },
+], { onError: "fail-fast" });`,
+        {
+          agent: nullRunner(),
+          onRuntimeEvent: (event) => {
+            if (event.type === "task" && event.stage === "start") started.push(String(event.taskId));
+          },
+        },
+      ),
+    ).rejects.toThrow(/stop here/);
+    expect(started).toEqual(["bad"]);
+  });
+
+  it("retries ordinary task failures with a stable attempt number", async () => {
+    const attempts: number[] = [];
+    const { result } = await runWorkflow(
+      `export const meta = { name: "graph-retry", description: "g" };
+return await orchestrate([{ id: "eventual", retries: 1, run: ({ attempt }) => {
+  if (attempt === 1) throw new Error("transient");
+  return "ok";
+} }]);`,
+      {
+        agent: nullRunner(),
+        onRuntimeEvent: (event) => {
+          if (event.type === "task" && event.taskId === "eventual" && event.stage === "retry")
+            attempts.push(Number(event.attempt));
+        },
+      },
+    );
+    expect(result.results.eventual).toBe("ok");
+    expect(result.tasks.eventual).toMatchObject({ status: "completed", attempts: 2 });
+    expect(attempts).toEqual([1]);
+  });
+
+  it("validates cycles, duplicate dependencies, and the task cap before execution", async () => {
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "graph-cycle", description: "g" };
+return await orchestrate([
+  { id: "a", dependsOn: ["b"], run: () => 1 },
+  { id: "b", dependsOn: ["a"], run: () => 2 },
+]);`,
+        { agent: nullRunner() },
+      ),
+    ).rejects.toThrow(/contain a cycle/);
+
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "graph-duplicate", description: "g" };
+return await orchestrate([{ id: "a", dependsOn: ["a", "a"], run: () => 1 }]);`,
+        { agent: nullRunner() },
+      ),
+    ).rejects.toThrow(/repeats/);
+
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "graph-cap", description: "g" };
+return await orchestrate(Array.from({ length: 129 }, (_, i) => ({ id: "t" + i, run: () => i })));`,
+        { agent: nullRunner() },
+      ),
+    ).rejects.toThrow(/at most 128 tasks/);
   });
 });
 
@@ -659,6 +857,39 @@ await parallel([
     expect(calls).toBeLessThanOrEqual(3);
   });
 
+  it("rejects the 1001st mixed lexical call before emitting an incompatible journal fact", async () => {
+    let checkpointFacts = 0;
+    let workflowFacts = 0;
+    let childStarts = 0;
+    const script = `export const meta = { name: "call-bound", description: "b" };
+for (let i = 0; i < 999; i++) await checkpoint("checkpoint-" + i, { default: true });
+await workflow("empty-child");
+return await workflow("empty-child");`;
+
+    await expect(
+      runWorkflow(script, {
+        maxAgents: 1_000,
+        agent: nullRunner(),
+        loadSavedWorkflow: (name) =>
+          name === "empty-child"
+            ? `export const meta = { name: "empty-child", description: "e" };\nreturn "ok";`
+            : undefined,
+        onAgentJournal: () => {
+          checkpointFacts += 1;
+        },
+        onWorkflowJournal: () => {
+          workflowFacts += 1;
+        },
+        onRuntimeEvent: (event) => {
+          if (event.type === "workflow" && event.stage === "start") childStarts += 1;
+        },
+      }),
+    ).rejects.toThrow(/Workflow call limit exceeded \(1000/);
+    expect(checkpointFacts).toBe(999);
+    expect(workflowFacts).toBe(1);
+    expect(childStarts).toBe(1);
+  });
+
   it("token budget is a soft gate: exhausted after in-flight work settles", async () => {
     const { result } = await runWorkflow(
       `export const meta = { name: "budget", description: "b" };
@@ -722,6 +953,87 @@ return 1;`
     expect(agentCount).toBe(9); // 6 parent + 3 child, all through one counter
   });
 
+  it("allows concurrent sibling nested workflows without confusing depth", async () => {
+    const { result } = await runWorkflow(
+      `export const meta = { name: "siblings", description: "s" };
+return await parallel([
+  () => workflow("child", { tag: "one" }),
+  () => workflow("child", { tag: "two" }),
+]);`,
+      {
+        loadSavedWorkflow: (name) =>
+          name === "child"
+            ? `export const meta = { name: "child", description: "c" };\nawait agent("child-work");\nreturn args.tag;`
+            : undefined,
+        agent: { run: async () => "x" },
+      },
+    );
+    expect(result).toEqual(["one", "two"]);
+  });
+
+  it("settles a nested frame's unawaited agents before journaling its replay boundary", async () => {
+    const journal = new Map<string, JournalEntry>();
+    const order: string[] = [];
+    let dispatches = 0;
+    let childAgentSettled = false;
+    let releaseAgent!: (value: string) => void;
+    const childAgent = new Promise<string>((resolve) => {
+      releaseAgent = resolve;
+    });
+    const parentScript = `export const meta = { name: "drain-parent", description: "d" };
+return await workflow("child");`;
+    const childScript = `export const meta = { name: "drain-child", description: "d" };
+agent("slow child", { label: "slow-child" });
+return { child: "done" };`;
+    const firstRun = runWorkflow(parentScript, {
+      runId: "nested-frame-drain",
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      agent: {
+        run: async () => {
+          dispatches += 1;
+          const value = await childAgent;
+          childAgentSettled = true;
+          order.push("agent-settled");
+          return value;
+        },
+      },
+      onWorkflowJournal: (entry) => {
+        order.push("journal");
+        journal.set(`${entry.runId}:${entry.index}`, entry);
+      },
+    });
+    let firstRunSettled = false;
+    void firstRun.then(() => {
+      firstRunSettled = true;
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(dispatches).toBe(1);
+    expect(childAgentSettled).toBe(false);
+    expect(firstRunSettled).toBe(false);
+    expect(journal.size).toBe(0);
+
+    releaseAgent("settled");
+    const first = await firstRun;
+    expect(first.result).toEqual({ child: "done" });
+    expect(order).toEqual(["agent-settled", "journal"]);
+    expect(journal.size).toBe(1);
+
+    const replayed = await runWorkflow(parentScript, {
+      runId: "nested-frame-drain",
+      resumeJournal: journal,
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      agent: {
+        run: async () => {
+          dispatches += 1;
+          return "must not dispatch";
+        },
+      },
+    });
+    expect(replayed.result).toEqual({ child: "done" });
+    expect(dispatches).toBe(1);
+  });
+
   it("rejects nesting two levels deep", async () => {
     await expect(
       runWorkflow(
@@ -744,7 +1056,7 @@ return 0;`
     ).rejects.toThrow(/only one level deep/);
   });
 
-  it("nested runs get unique runIds via nestedCallSeq, not depth", async () => {
+  it("nested runs get unique generation-scoped runIds, not depth", async () => {
     const journal = new Map<string, unknown>();
     const runIds: string[] = [];
     await runWorkflow(
@@ -767,6 +1079,106 @@ return args.tag;`
       },
     );
     expect(new Set(runIds).size).toBe(2); // two distinct nested runs share the top-level namespace prefix
+  });
+
+  it("does not replay an explicit-null child result when edited args become omitted", async () => {
+    const journal = new Map<
+      string,
+      { index: number; runId?: string; hash: string; result: unknown; generation?: number }
+    >();
+    const childScript = `export const meta = { name: "arg-child", description: "a" };\nreturn args === null ? "NULL" : "UNDEFINED";`;
+    const options = {
+      runId: "nested-arg-presence",
+      agent: nullRunner(),
+      loadSavedWorkflow: (name: string) => (name === "child" ? childScript : undefined),
+      onWorkflowJournal: (entry: {
+        index: number;
+        runId?: string;
+        hash: string;
+        result: unknown;
+        generation?: number;
+      }) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    };
+    const withNull = `export const meta = { name: "arg-parent", description: "a" };\nreturn await workflow("child", null);`;
+    const withOmitted = `export const meta = { name: "arg-parent", description: "a" };\nreturn await workflow("child");`;
+
+    expect((await runWorkflow(withNull, options)).result).toBe("NULL");
+    expect((await runWorkflow(withOmitted, { ...options, resumeJournal: journal })).result).toBe("UNDEFINED");
+    expect(journal.get("nested-arg-presence:0")?.generation).toBe(2);
+  });
+
+  it("normalizes an undefined child result to null and replays it without respawning", async () => {
+    const journal = new Map<
+      string,
+      { index: number; runId?: string; hash: string; result: unknown; agentCount?: number }
+    >();
+    let childCalls = 0;
+    const script = `export const meta = { name: "undefined-parent", description: "u" };\nreturn await workflow("child");`;
+    const options = {
+      runId: "undefined-child-parent",
+      loadSavedWorkflow: (name: string) =>
+        name === "child"
+          ? `export const meta = { name: "undefined-child", description: "u" };\nawait agent("side effect");`
+          : undefined,
+      agent: {
+        run: async () => {
+          childCalls += 1;
+          return "done";
+        },
+      },
+      onWorkflowJournal: (entry: {
+        index: number;
+        runId?: string;
+        hash: string;
+        result: unknown;
+        agentCount?: number;
+      }) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    };
+
+    const first = await runWorkflow(script, options);
+    const resumed = await runWorkflow(script, { ...options, resumeJournal: journal });
+    expect(first.result).toBeNull();
+    expect(resumed.result).toBeNull();
+    expect(journal.get("undefined-child-parent:0")?.result).toBeNull();
+    expect(childCalls).toBe(1);
+  });
+
+  it("journals and replays a nested workflow as one stable parent call", async () => {
+    const journal = new Map<
+      string,
+      { index: number; runId?: string; hash: string; result: unknown; agentCount?: number }
+    >();
+    let childCalls = 0;
+    const script = `export const meta = { name: "nested-resume", description: "r" };
+const child = await workflow("child", { tag: "stable" });
+return child;`;
+    const options = {
+      runId: "nested-parent",
+      loadSavedWorkflow: (name: string) =>
+        name === "child"
+          ? `export const meta = { name: "child", description: "c" };
+const value = await agent("child-work");
+return args.tag + ":" + value;`
+          : undefined,
+      agent: {
+        run: async () => {
+          childCalls += 1;
+          return "answer";
+        },
+      },
+      onWorkflowJournal: (entry: { index: number; runId?: string; hash: string; result: unknown }) => {
+        journal.set(`${entry.runId}:${entry.index}`, entry);
+      },
+    };
+    const first = await runWorkflow(script, options);
+    const second = await runWorkflow(script, { ...options, resumeJournal: journal });
+    expect(first.result).toBe("stable:answer");
+    expect(second.result).toBe("stable:answer");
+    expect(first.agentCount).toBe(1);
+    expect(second.agentCount).toBe(1);
+    expect(childCalls).toBe(1);
+    expect(journal.size).toBe(1);
+    expect(journal.get("nested-parent:0")?.agentCount).toBe(1);
   });
 });
 
@@ -816,6 +1228,29 @@ return [a, b, c];`;
       onAgentJournal: () => {},
     });
     expect(calls2).toEqual(["second EDITED", "third"]);
+  });
+
+  it("replayed calls do not consume the real-dispatch maxAgents cap", async () => {
+    const journal = new Map<string, { index: number; runId: string; hash: string; result: unknown }>();
+    const script = `export const meta = { name: "resume-cap", description: "r" };
+const a = await agent("first");
+const b = await agent("second");
+return [a, b];`;
+    await expect(
+      runWorkflow(script, {
+        runId: "run-cap",
+        maxAgents: 1,
+        agent: { run: async (prompt: string) => prompt },
+        onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry as never),
+      }),
+    ).rejects.toThrow(/Agent limit exceeded/);
+    const resumed = await runWorkflow(script, {
+      runId: "run-cap",
+      maxAgents: 1,
+      resumeJournal: journal,
+      agent: { run: async (prompt: string) => prompt },
+    });
+    expect(resumed.result).toEqual(["first", "second"]);
   });
 
   it("cache hits report zero tokens", async () => {

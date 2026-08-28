@@ -39,6 +39,18 @@ const runCreated = (runId: string, overrides: Record<string, unknown> = {}) => (
   },
 });
 
+const runArgs = (runId: string, args: unknown, timestamp: number) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "run_args",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    args,
+    timestamp,
+  },
+});
+
 const transition = (runId: string, status: string, timestamp: number, overrides: Record<string, unknown> = {}) => ({
   type: "custom" as const,
   customType: "pi-workflows:journal",
@@ -67,15 +79,105 @@ const callResult = (runId: string, nodeId: string, timestamp: number, overrides:
   },
 });
 
+const workflowResult = (runId: string, nodeId: string, timestamp: number, overrides: Record<string, unknown> = {}) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "workflow_result",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    nodeId,
+    result: { status: "completed", result: { nested: true }, compactionCount: 0, updatedAt: timestamp },
+    generation: 1,
+    callHash: `workflow-hash-${nodeId}`,
+    timestamp,
+    ...overrides,
+  },
+});
+
 describe("workflow journal replay (schema v3)", () => {
-  it("replays a run_created with script text, hash, and meta", () => {
-    const runs = replayJournal([runCreated("r1")]);
+  it("replays a run_created with script text, hash, meta, and frozen args", () => {
+    const runs = replayJournal([runCreated("r1", { args: { target: "x" }, frozenArgsPresent: true })]);
     const run = runs.get("r1");
     expect(run).toBeDefined();
     expect(run?.script).toBe(SCRIPT);
     expect(run?.scriptHash).toBe("h".repeat(64));
     expect(run?.meta.name).toBe("demo");
+    expect(run?.args).toEqual({ target: "x" });
+    expect(run?.frozenArgsPresent).toBe(true);
     expect(run?.status).toBe("pending");
+  });
+
+  it("deduplicates matching args facts and quarantines conflicting facts", () => {
+    const matching = replayJournal([
+      runCreated("args-fact"),
+      runArgs("args-fact", { target: "stable" }, 2),
+      runArgs("args-fact", { target: "stable" }, 3),
+    ]);
+    expect(matching.get("args-fact")?.args).toEqual({ target: "stable" });
+
+    const diagnostics: string[] = [];
+    const conflicting = replayJournal(
+      [
+        runCreated("args-conflict"),
+        runArgs("args-conflict", { target: "one" }, 2),
+        runArgs("args-conflict", { target: "two" }, 3),
+      ],
+      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
+    );
+    expect(conflicting.has("args-conflict")).toBe(false);
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("conflicting workflow run args"))).toBe(true);
+  });
+
+  it("freezes current omitted args and rejects run_args fallback for marked runs", () => {
+    const current = replayJournal([runCreated("current-omitted", { frozenArgsPresent: false })]).get("current-omitted");
+    expect(current).toMatchObject({ frozenArgsPresent: false });
+    expect(current?.args).toBeUndefined();
+
+    const diagnostics: string[] = [];
+    const rejected = replayJournal(
+      [
+        runCreated("current-fallback", { frozenArgsPresent: false }),
+        runArgs("current-fallback", { target: "must-not-apply" }, 2),
+      ],
+      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
+    );
+    expect(rejected.has("current-fallback")).toBe(false);
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("cannot override frozen workflow args presence"))).toBe(
+      true,
+    );
+  });
+
+  it("validates frozen args marker consistency and conflicting duplicate markers", () => {
+    const inconsistent = replayJournal([
+      runCreated("inconsistent", { frozenArgsPresent: false, args: { target: "x" } }),
+    ]);
+    expect(inconsistent.has("inconsistent")).toBe(false);
+
+    const duplicate = replayJournal([
+      runCreated("duplicate-marker", { frozenArgsPresent: false }),
+      runCreated("duplicate-marker"),
+    ]);
+    expect(duplicate.has("duplicate-marker")).toBe(false);
+  });
+
+  it("normalizes fractional frozen execution limits during restore", () => {
+    const run = replayJournal([
+      runCreated("fractional", {
+        frozenMaxAgents: 9.8,
+        frozenConcurrency: 4.7,
+        frozenAgentRetries: 2.9,
+        frozenTokenBudget: 500.6,
+        frozenAgentTimeoutMs: 1_500.4,
+      }),
+    ]).get("fractional");
+    expect(run).toMatchObject({
+      frozenMaxAgents: 9,
+      frozenConcurrency: 4,
+      frozenAgentRetries: 2,
+      frozenTokenBudget: 500,
+      frozenAgentTimeoutMs: 1_500,
+    });
   });
 
   it("quarantines a schema-v2 declarative run instead of replaying it", () => {
@@ -101,12 +203,13 @@ describe("workflow journal replay (schema v3)", () => {
       runCreated("r2"),
       transition("r2", "running", 2),
       callResult("r2", "0", 3, { result: { status: "completed", result: "ok", compactionCount: 0, updatedAt: 3 } }),
-      transition("r2", "completed", 4),
+      transition("r2", "completed", 4, { finalResult: { report: "done" } }),
     ]);
     const run = runs.get("r2");
     expect(run?.status).toBe("completed");
     expect(run?.callResults["0"]?.result).toBe("ok");
     expect(run?.callStatus["0"]).toBe("completed");
+    expect(run?.finalResult).toEqual({ report: "done" });
   });
 
   it("rejects an unknown run reference", () => {
@@ -197,6 +300,57 @@ describe("workflow journal replay (schema v3)", () => {
     expect(run.error).toBe("workflow stopped");
   });
 
+  it("replays nested workflow results without a managed attempt id", () => {
+    const runs = replayJournal([runCreated("nested"), workflowResult("nested", "0", 2)]);
+    const run = runs.get("nested");
+    expect(run?.callResults["0"]?.result).toEqual({ nested: true });
+    expect(run?.callStatus["0"]).toBe("completed");
+    expect(buildResumeJournal([runCreated("nested"), workflowResult("nested", "0", 2)]).get("nested:0")).toMatchObject({
+      result: { nested: true },
+    });
+  });
+
+  it("restores the newest nested generation and ignores a later stale fact", () => {
+    const generationOne = workflowResult("nested-generation", "0", 2, {
+      result: { status: "completed", result: "old", compactionCount: 0, updatedAt: 2 },
+      agentCount: 1,
+    });
+    const generationTwo = workflowResult("nested-generation", "0", 3, {
+      generation: 2,
+      result: { status: "completed", result: "new", compactionCount: 0, updatedAt: 3 },
+      agentCount: 2,
+    });
+    const stale = workflowResult("nested-generation", "0", 4, {
+      result: { status: "completed", result: "stale", compactionCount: 0, updatedAt: 4 },
+      agentCount: 1,
+    });
+    const entries = [runCreated("nested-generation"), generationOne, generationTwo, stale];
+    const run = replayJournal(entries).get("nested-generation");
+    expect(run?.callResults["0"]?.result).toBe("new");
+    expect(run?.workflowResultGenerations["0"]).toBe(2);
+    expect(buildResumeJournal(entries).get("nested-generation:0")).toMatchObject({
+      result: "new",
+      generation: 2,
+      agentCount: 2,
+    });
+  });
+
+  it("rejects contradictory nested results only within the same generation", () => {
+    const diagnostics: string[] = [];
+    const runs = replayJournal(
+      [
+        runCreated("nested-conflict"),
+        workflowResult("nested-conflict", "0", 2),
+        workflowResult("nested-conflict", "0", 3, {
+          result: { status: "completed", result: { nested: false }, compactionCount: 0, updatedAt: 3 },
+        }),
+      ],
+      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
+    );
+    expect(runs.has("nested-conflict")).toBe(false);
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("contradictory nested workflow result"))).toBe(true);
+  });
+
   it("buildResumeJournal reconstructs the runtime cache map keyed by runId:callIndex", () => {
     const entries = [
       runCreated("r6"),
@@ -249,6 +403,20 @@ describe("workflow journal replay (schema v3)", () => {
       data: { kind: "run_removed", schemaVersion: JOURNAL_SCHEMA_VERSION, runId: "r7", timestamp: 3 },
     };
     expect(replayJournal([created, created, revision, removed]).has("r7")).toBe(false);
+  });
+
+  it("restores a completed script that handled a failed child result", () => {
+    const failed = callResult("handled", "0", 3, {
+      result: { status: "failed", error: "handled", compactionCount: 0, updatedAt: 3 },
+    });
+    const runs = replayJournal([
+      runCreated("handled"),
+      transition("handled", "running", 2),
+      failed,
+      transition("handled", "completed", 4),
+    ]);
+    expect(runs.get("handled")?.status).toBe("completed");
+    expect(runs.get("handled")?.callStatus["0"]).toBe("failed");
   });
 
   it("does not put failed call facts into the replay cache", () => {

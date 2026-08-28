@@ -5,9 +5,12 @@
  * store. `run_created` carries the raw script, its hash, and its parsed meta
  * (the runtime re-derives call indexes from the script itself, so no task
  * array is persisted). Each completed `agent()`/`checkpoint()` call journals a
- * `call_result` keyed by its lexical call index; a resume rebuilds the
+ * `call_result` keyed by its lexical call index; a nested workflow journals a
+ * `workflow_result` at its parent call index; a resume rebuilds the
  * runtime's `resumeJournal` map from these entries and replays the longest
- * unchanged prefix.
+ * unchanged prefix. Nested `workflow()` calls are represented by one
+ * `workflow_result` boundary in the parent namespace, so child calls can be
+ * replayed without re-spawning the whole nested run.
  *
  * The atomic recovery machinery (run/terminal/attempt recovery with generation
  * rotations, quarantine of malformed runs, stale-generation rejection) is
@@ -21,7 +24,15 @@
 
 import { createHash } from "node:crypto";
 import type { ManagedOwner } from "@signalridge/pi-subagents-protocol";
-import type { WorkflowMeta } from "./runtime.js";
+import {
+  MAX_CALLS_PER_WORKFLOW,
+  normalizeAgentRetries,
+  normalizeAgentTimeout,
+  normalizeConcurrency,
+  normalizeMaxAgents,
+  normalizeTokenBudget,
+  type WorkflowMeta,
+} from "./runtime.js";
 
 export const JOURNAL_ENTRY_TYPE = "pi-workflows:journal";
 export const JOURNAL_SCHEMA_VERSION = 3;
@@ -37,8 +48,8 @@ export const JOURNAL_RECOVERY_ID_PREFIX = "r3-";
 export const JOURNAL_RECOVERY_ID_LIMIT = JOURNAL_RECOVERY_ID_PREFIX.length + 64;
 /** Maximum number of distinct atomic recoveries retained while replaying one run. */
 export const JOURNAL_RECOVERY_SEEN_LIMIT = 4_096;
-/** A script run may issue up to 1000 agent()/checkpoint() calls. */
-export const JOURNAL_CALL_LIMIT = 1_000;
+/** A script run may issue up to 1000 agent()/workflow()/checkpoint() calls. */
+export const JOURNAL_CALL_LIMIT = MAX_CALLS_PER_WORKFLOW;
 /** One atomic recovery event may rotate every active call in a run. */
 export const JOURNAL_RECOVERY_NODE_LIMIT = JOURNAL_CALL_LIMIT;
 const RECOVERY_ID_PATTERN = /^r3-[0-9a-f]{64}$/;
@@ -77,6 +88,7 @@ const WORKFLOW_STATUS_VALUES = new Set<WorkflowStatus>([
 const CALL_STATUS_VALUES = new Set<CallStatus>(["running", "completed", "failed", "stopped"]);
 const JOURNAL_KINDS = new Set([
   "run_created",
+  "run_args",
   "run_revision",
   "run_removed",
   "workflow_transition",
@@ -86,6 +98,7 @@ const JOURNAL_KINDS = new Set([
   "call_transition",
   "call_attempt",
   "call_result",
+  "workflow_result",
 ]);
 
 export type WorkflowOwner = ManagedOwner;
@@ -110,6 +123,10 @@ export interface ScriptRun {
   script: string;
   scriptHash: string;
   meta: WorkflowMeta;
+  /** Frozen invocation input reused by automatic and manual resume. */
+  args?: unknown;
+  /** Explicit on current runs; absent only for legacy schema-v3 run_created facts. */
+  frozenArgsPresent?: boolean;
   /** Number of the latest edited-script revision. */
   revision?: number;
   /** Toolset marker persisted across resume (e.g. "web-research" for deep-research). */
@@ -131,10 +148,14 @@ export interface ScriptRun {
   attemptTracking?: boolean;
   /** Call index → journaled result (the resume journal source). */
   callResults: Record<string, CallResult>;
+  /** Call index → latest accepted nested workflow result generation. */
+  workflowResultGenerations: Record<string, number>;
   compactions: Record<string, number>;
   startedAt: number;
   updatedAt: number;
   error?: string;
+  /** Bounded JSON-serializable terminal script value for restored inspection. */
+  finalResult?: unknown;
   nonResumable?: boolean;
   /** Terminal cleanup intent while active agents settle. */
   terminalIntent?: "stop" | "failure";
@@ -206,6 +227,9 @@ export type JournalEvent =
       script: string;
       scriptHash: string;
       meta: WorkflowMeta;
+      args?: unknown;
+      /** Explicit args presence marker; absent only on legacy schema-v3 facts. */
+      frozenArgsPresent?: boolean;
       toolset?: string;
       frozenMaxAgents?: number;
       frozenConcurrency?: number;
@@ -215,6 +239,11 @@ export type JournalEvent =
       frozenExcludeTools?: string[];
       attempts?: Record<string, number>;
       attemptIds?: Record<string, string>;
+    })
+  | (JournalBase & {
+      /** Canonical invocation args backfilled when resuming an older schema-v3 run. */
+      kind: "run_args";
+      args: unknown;
     })
   | (JournalBase & {
       kind: "run_revision";
@@ -230,6 +259,7 @@ export type JournalEvent =
       kind: "workflow_transition";
       status: WorkflowStatus;
       error?: string;
+      finalResult?: unknown;
       terminalIntent?: "stop" | "failure";
     })
   | RunRecoveryEvent
@@ -260,6 +290,20 @@ export type JournalEvent =
       storeDelta?: Record<string, unknown>;
       attemptId?: string;
       owner?: WorkflowOwner;
+    })
+  | (JournalBase & {
+      /** A completed nested workflow result, without managed-spawn attempt identity. */
+      kind: "workflow_result";
+      nodeId: string;
+      result: CallResult;
+      /** Monotonic nested-call generation used to fence changed/resumed children. */
+      generation: number;
+      /** Logical agents represented by this nested replay boundary. */
+      agentCount?: number;
+      /** Stable hash of the nested workflow name/script/args. */
+      callHash: string;
+      /** Store writes produced by the child, merged in child call order. */
+      storeDelta?: Record<string, unknown>;
     });
 
 export interface JournalWriter {
@@ -300,6 +344,18 @@ function parseCallIndex(value: unknown, label: string): string {
     throw new Error(`${label} is not a valid call index`);
   }
   return index;
+}
+
+function parsePersistedValue(raw: unknown, label: string): unknown {
+  try {
+    const cloned = structuredClone(raw);
+    const serialized = JSON.stringify(cloned);
+    if (serialized === undefined) throw new Error(`${label} is not JSON-serializable`);
+    if (serialized.length > JOURNAL_SCRIPT_LIMIT) throw new Error(`${label} exceeds the persistence limit`);
+    return cloned;
+  } catch (error: unknown) {
+    throw new Error(error instanceof Error ? error.message : `${label} is not structured-cloneable`);
+  }
 }
 
 function parseMeta(raw: unknown): WorkflowMeta {
@@ -589,7 +645,24 @@ function parseDuplicateTerminalRecovery(raw: Record<string, unknown>, run: Scrip
   };
 }
 
-function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
+function parseFrozenArgsPresence(raw: Record<string, unknown>): boolean | undefined {
+  if (raw.frozenArgsPresent === undefined) return undefined;
+  if (typeof raw.frozenArgsPresent !== "boolean") throw new Error("frozen args presence marker must be boolean");
+  const hasArgs = Object.hasOwn(raw, "args");
+  if (raw.frozenArgsPresent && (!hasArgs || raw.args === undefined)) {
+    throw new Error("frozen args presence marker requires workflow args");
+  }
+  if (!raw.frozenArgsPresent && hasArgs) {
+    throw new Error("frozen args presence marker conflicts with workflow args");
+  }
+  return raw.frozenArgsPresent;
+}
+
+function parseEvent(
+  raw: unknown,
+  runs: Map<string, ScriptRun>,
+  legacyArgsBackfilled: ReadonlySet<string>,
+): JournalEvent {
   if (!isRecord(raw)) throw new Error("journal event is not an object");
   if (typeof raw.kind !== "string" || !JOURNAL_KINDS.has(raw.kind)) throw new Error("journal event kind is unknown");
   if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION && raw.schemaVersion !== JOURNAL_LEGACY_SCHEMA_VERSION) {
@@ -603,6 +676,8 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
     const script = boundedString(raw.script, "script", JOURNAL_SCRIPT_LIMIT);
     const scriptHash = boundedString(raw.scriptHash, "scriptHash", 128);
     const meta = parseMeta(raw.meta);
+    const frozenArgsPresent = parseFrozenArgsPresence(raw);
+    const args = raw.args === undefined ? undefined : parsePersistedValue(raw.args, "workflow args");
     const toolset =
       raw.toolset === undefined
         ? undefined
@@ -610,18 +685,18 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
           ? raw.toolset
           : undefined;
     const frozenMaxAgents =
-      typeof raw.frozenMaxAgents === "number" && Number.isInteger(raw.frozenMaxAgents) && raw.frozenMaxAgents >= 1
-        ? raw.frozenMaxAgents
+      typeof raw.frozenMaxAgents === "number" && Number.isFinite(raw.frozenMaxAgents) && raw.frozenMaxAgents >= 1
+        ? normalizeMaxAgents(raw.frozenMaxAgents)
         : undefined;
     const frozenConcurrency =
-      typeof raw.frozenConcurrency === "number" && Number.isInteger(raw.frozenConcurrency) && raw.frozenConcurrency >= 1
-        ? raw.frozenConcurrency
+      typeof raw.frozenConcurrency === "number" && Number.isFinite(raw.frozenConcurrency) && raw.frozenConcurrency >= 1
+        ? normalizeConcurrency(raw.frozenConcurrency)
         : undefined;
     const frozenAgentRetries =
       typeof raw.frozenAgentRetries === "number" &&
-      Number.isInteger(raw.frozenAgentRetries) &&
+      Number.isFinite(raw.frozenAgentRetries) &&
       raw.frozenAgentRetries >= 0
-        ? raw.frozenAgentRetries
+        ? normalizeAgentRetries(raw.frozenAgentRetries)
         : undefined;
     const frozenTokenBudget =
       raw.frozenTokenBudget === null
@@ -629,7 +704,7 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
         : typeof raw.frozenTokenBudget === "number" &&
             Number.isFinite(raw.frozenTokenBudget) &&
             raw.frozenTokenBudget >= 1
-          ? raw.frozenTokenBudget
+          ? normalizeTokenBudget(raw.frozenTokenBudget)
           : undefined;
     const frozenAgentTimeoutMs =
       raw.frozenAgentTimeoutMs === null
@@ -637,7 +712,7 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
         : typeof raw.frozenAgentTimeoutMs === "number" &&
             Number.isFinite(raw.frozenAgentTimeoutMs) &&
             raw.frozenAgentTimeoutMs >= 1
-          ? raw.frozenAgentTimeoutMs
+          ? normalizeAgentTimeout(raw.frozenAgentTimeoutMs)
           : undefined;
     const frozenExcludeTools =
       Array.isArray(raw.frozenExcludeTools) && raw.frozenExcludeTools.every((v) => typeof v === "string")
@@ -650,6 +725,8 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
       script,
       scriptHash,
       meta,
+      ...(args === undefined ? {} : { args }),
+      ...(frozenArgsPresent === undefined ? {} : { frozenArgsPresent }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -665,6 +742,21 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
 
   const run = runs.get(runId);
   if (!run) throw new Error("journal event references an unknown run");
+  if (raw.kind === "run_args") {
+    if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) throw new Error("run args schema version is unsupported");
+    if (!Object.hasOwn(raw, "args") || raw.args === undefined) throw new Error("run args fact is missing args");
+    if (run.schemaVersion !== JOURNAL_SCHEMA_VERSION || run.frozenArgsPresent !== undefined) {
+      throw new Error("run args fact cannot override frozen workflow args presence");
+    }
+    const args = parsePersistedValue(raw.args, "run args");
+    if (
+      run.args !== undefined &&
+      (!legacyArgsBackfilled.has(runId) || JSON.stringify(run.args) !== JSON.stringify(args))
+    ) {
+      throw new Error("conflicting workflow run args");
+    }
+    return { kind: "run_args", schemaVersion: JOURNAL_SCHEMA_VERSION, runId, args, timestamp };
+  }
   if (raw.kind === "run_revision") {
     const revision = raw.revision;
     if (typeof revision !== "number" || !Number.isInteger(revision) || revision <= (run.revision ?? 0))
@@ -695,12 +787,21 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
     if (raw.terminalIntent !== undefined && raw.terminalIntent !== "stop" && raw.terminalIntent !== "failure") {
       throw new Error("workflow terminal intent is invalid");
     }
+    let finalResult: unknown;
+    if (raw.finalResult !== undefined) {
+      try {
+        finalResult = structuredClone(raw.finalResult);
+      } catch {
+        throw new Error("workflow finalResult is not structured-cloneable");
+      }
+    }
     return {
       kind: "workflow_transition",
       schemaVersion: JOURNAL_SCHEMA_VERSION,
       runId,
       status: raw.status as WorkflowStatus,
       timestamp,
+      ...(finalResult === undefined ? {} : { finalResult }),
       ...(raw.error === undefined ? {} : { error: boundedString(raw.error, "error", JOURNAL_ERROR_LIMIT) }),
       ...(raw.terminalIntent === undefined ? {} : { terminalIntent: raw.terminalIntent }),
     };
@@ -714,6 +815,60 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
   }
 
   const nodeId = parseCallIndex(raw.nodeId, "nodeId");
+  if (raw.kind === "workflow_result") {
+    if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) throw new Error("workflow result schema version is unsupported");
+    if (raw.owner !== undefined || raw.attemptId !== undefined)
+      throw new Error("workflow result cannot carry a managed attempt");
+    const result = parseResult(raw.result, "workflow result");
+    if (result.status !== "completed") throw new Error("workflow result must be completed");
+    if (result.attemptId !== undefined) throw new Error("workflow result payload cannot carry a managed attempt");
+    const generation = raw.generation;
+    if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1 || generation > 1_000_000) {
+      throw new Error("workflow result generation is invalid");
+    }
+    const latestGeneration = run.workflowResultGenerations[nodeId] ?? 0;
+    if (generation < latestGeneration) {
+      throw new StaleJournalGenerationError("nested workflow result generation is stale");
+    }
+    if (
+      generation === latestGeneration &&
+      run.callResults[nodeId] &&
+      JSON.stringify(run.callResults[nodeId]) !== JSON.stringify(result)
+    ) {
+      throw new Error("contradictory nested workflow result");
+    }
+    const agentCount =
+      raw.agentCount === undefined
+        ? undefined
+        : typeof raw.agentCount === "number" &&
+            Number.isInteger(raw.agentCount) &&
+            raw.agentCount >= 0 &&
+            raw.agentCount <= JOURNAL_CALL_LIMIT
+          ? raw.agentCount
+          : (() => {
+              throw new Error("workflow result agentCount is invalid");
+            })();
+    const callHash = boundedString(raw.callHash, "workflow result callHash", 128);
+    const storeDelta =
+      raw.storeDelta === undefined
+        ? undefined
+        : (() => {
+            if (!isRecord(raw.storeDelta)) throw new Error("workflow result storeDelta is invalid");
+            return raw.storeDelta as Record<string, unknown>;
+          })();
+    return {
+      kind: "workflow_result",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId,
+      nodeId,
+      result,
+      generation,
+      ...(agentCount === undefined ? {} : { agentCount }),
+      callHash,
+      ...(storeDelta === undefined ? {} : { storeDelta }),
+      timestamp,
+    };
+  }
   const owner = raw.owner === undefined ? undefined : parseOwner(raw.owner, runId, nodeId);
   const rawAttemptId =
     raw.attemptId === undefined ? undefined : boundedString(raw.attemptId, "attemptId", JOURNAL_ID_LIMIT);
@@ -814,6 +969,7 @@ export function replayJournal(
   const runs = new Map<string, ScriptRun>();
   const quarantined = new Set<string>();
   const removed = new Set<string>();
+  const legacyArgsBackfilled = new Set<string>();
   /** Recovery identities are scoped to one replayed run and bounded explicitly. */
   const seenRecoveries = new Map<string, Map<string, string>>();
   let reported = false;
@@ -835,7 +991,9 @@ export function replayJournal(
           existing &&
           existing.script === raw.script &&
           existing.scriptHash === raw.scriptHash &&
-          JSON.stringify(existing.meta) === JSON.stringify(raw.meta)
+          JSON.stringify(existing.meta) === JSON.stringify(raw.meta) &&
+          existing.frozenArgsPresent === parseFrozenArgsPresence(raw) &&
+          JSON.stringify(existing.args) === JSON.stringify(raw.args)
         )
           continue;
         throw new Error("conflicting duplicate workflow run_created event");
@@ -869,7 +1027,7 @@ export function replayJournal(
         }
       }
 
-      const event = parseEvent(raw, runs);
+      const event = parseEvent(raw, runs, legacyArgsBackfilled);
       if (quarantined.has(event.runId)) continue;
       if (event.kind === "run_created") {
         applyJournalEvent(runs, event);
@@ -895,8 +1053,10 @@ export function replayJournal(
         continue;
       }
       applyJournalEvent(runs, event);
+      if (event.kind === "run_args") legacyArgsBackfilled.add(event.runId);
       if (event.kind === "run_removed") {
         removed.add(event.runId);
+        legacyArgsBackfilled.delete(event.runId);
       }
     } catch (error: unknown) {
       if (error instanceof StaleJournalGenerationError) continue;
@@ -904,6 +1064,7 @@ export function replayJournal(
         quarantined.add(rawRunId);
         runs.delete(rawRunId);
         seenRecoveries.delete(rawRunId);
+        legacyArgsBackfilled.delete(rawRunId);
       }
       report(error instanceof Error ? error.message : String(error));
     }
@@ -983,6 +1144,8 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       script: event.script,
       scriptHash: event.scriptHash,
       meta: event.meta,
+      ...(event.args === undefined ? {} : { args: structuredClone(event.args) }),
+      ...(event.frozenArgsPresent === undefined ? {} : { frozenArgsPresent: event.frozenArgsPresent }),
       revision: 0,
       ...(event.toolset ? { toolset: event.toolset } : {}),
       ...(event.frozenMaxAgents !== undefined ? { frozenMaxAgents: event.frozenMaxAgents } : {}),
@@ -998,6 +1161,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       attemptIds,
       attemptTracking: event.attemptIds !== undefined,
       callResults: {},
+      workflowResultGenerations: {},
       compactions: {},
       startedAt: event.timestamp,
       updatedAt: event.timestamp,
@@ -1013,6 +1177,9 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
   }
   run.updatedAt = event.timestamp;
   switch (event.kind) {
+    case "run_args":
+      run.args = structuredClone(event.args);
+      break;
     case "run_revision":
       run.revision = event.revision;
       run.script = event.script;
@@ -1022,6 +1189,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
     case "workflow_transition":
       run.status = event.status;
       if (event.error !== undefined) run.error = event.error;
+      if (event.finalResult !== undefined) run.finalResult = structuredClone(event.finalResult);
       if (event.terminalIntent !== undefined) run.terminalIntent = event.terminalIntent;
       break;
     case "run_recovery":
@@ -1047,6 +1215,12 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       run.callStatus[event.nodeId] = event.status;
       if (event.agentId) run.agentIds[event.nodeId] = event.agentId;
       break;
+    case "workflow_result":
+      run.workflowResultGenerations[event.nodeId] = event.generation;
+      run.callResults[event.nodeId] = event.result;
+      run.callStatus[event.nodeId] = event.result.status;
+      run.compactions[event.nodeId] = event.result.compactionCount;
+      break;
     case "call_result":
       if (event.attemptId && event.attemptId !== run.attemptIds[event.nodeId]) {
         throw new Error("call result references a superseded attempt");
@@ -1066,6 +1240,12 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
 }
 
 function validateAggregate(run: ScriptRun): void {
+  if (run.frozenArgsPresent === true && run.args === undefined) {
+    throw new Error("frozen args presence marker requires workflow args");
+  }
+  if (run.frozenArgsPresent === false && run.args !== undefined) {
+    throw new Error("frozen args presence marker conflicts with workflow args");
+  }
   for (const nodeId of Object.keys(run.attemptIds)) {
     if (!Number.isInteger(run.attempts[nodeId]) || run.attempts[nodeId] < 1) {
       throw new Error(`missing attempt generation for ${nodeId}`);
@@ -1074,8 +1254,11 @@ function validateAggregate(run: ScriptRun): void {
   }
   if (isTerminalWorkflowStatus(run.status)) {
     const statuses = Object.values(run.callStatus);
-    if (run.status === "completed" && statuses.some((status) => status !== "completed")) {
-      throw new Error("completed workflow has non-completed calls");
+    if (
+      run.status === "completed" &&
+      statuses.some((status) => status !== "completed" && status !== "failed" && status !== "stopped")
+    ) {
+      throw new Error("completed workflow has active calls");
     }
     if (
       run.status === "stopped" &&
@@ -1126,22 +1309,44 @@ export function snapshotRun(run: ScriptRun): ScriptRun {
  *
  * The runtime keys its cache by `${runId}:${callIndex}` (the same namespacing
  * the store deltas use), so a nested workflow() call with its own runId can
- * never replay the parent's entry. Every `call_result` event that carries a
- * `callHash` is a replayable agent()/checkpoint() fact; entries without a hash
+ * never replay the parent's entry. Every `call_result` or `workflow_result`
+ * event that carries a `callHash` is a replayable fact; entries without a hash
  * (legacy or malformed) are skipped rather than quarantined — a resume must
  * tolerate a foreign or partial journal and simply re-run the misses live.
  */
-export function buildResumeJournal(
-  entries: readonly SessionEntryLike[],
-): Map<string, { index: number; runId?: string; hash: string; result: unknown; storeDelta?: Record<string, unknown> }> {
+export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
+  string,
+  {
+    index: number;
+    runId?: string;
+    hash: string;
+    result: unknown;
+    storeDelta?: Record<string, unknown>;
+    generation?: number;
+    agentCount?: number;
+  }
+> {
   const journal = new Map<
     string,
-    { index: number; runId?: string; hash: string; result: unknown; storeDelta?: Record<string, unknown> }
+    {
+      index: number;
+      runId?: string;
+      hash: string;
+      result: unknown;
+      storeDelta?: Record<string, unknown>;
+      generation?: number;
+      agentCount?: number;
+    }
   >();
   for (const entry of entries) {
     if (entry.type !== "custom" || entry.customType !== JOURNAL_ENTRY_TYPE) continue;
     const raw = entry.data;
-    if (!isRecord(raw) || raw.kind !== "call_result" || typeof raw.callHash !== "string") continue;
+    if (
+      !isRecord(raw) ||
+      (raw.kind !== "call_result" && raw.kind !== "workflow_result") ||
+      typeof raw.callHash !== "string"
+    )
+      continue;
     if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) continue;
     const runId = boundedString(raw.runId, "runId", JOURNAL_ID_LIMIT);
     let nodeId: string;
@@ -1155,15 +1360,49 @@ export function buildResumeJournal(
     // replay values. Replaying them as `undefined` would silently skip a call
     // and bypass the runtime's retry/error policy.
     if (result?.status !== "completed" || !Object.hasOwn(result, "result")) continue;
-    journal.set(`${runId}:${nodeId}`, {
+    const generation =
+      raw.kind === "workflow_result" && raw.generation !== undefined
+        ? typeof raw.generation === "number" &&
+          Number.isInteger(raw.generation) &&
+          raw.generation >= 1 &&
+          raw.generation <= 1_000_000
+          ? raw.generation
+          : undefined
+        : undefined;
+    if (raw.kind === "workflow_result" && generation === undefined) continue;
+    const agentCount =
+      raw.kind === "workflow_result" && raw.agentCount !== undefined
+        ? typeof raw.agentCount === "number" &&
+          Number.isInteger(raw.agentCount) &&
+          raw.agentCount >= 0 &&
+          raw.agentCount <= JOURNAL_CALL_LIMIT
+          ? raw.agentCount
+          : undefined
+        : undefined;
+    if (raw.kind === "workflow_result" && raw.agentCount !== undefined && agentCount === undefined) continue;
+    const candidate = {
       index: Number(nodeId),
       runId,
       hash: raw.callHash,
       result: result.result,
+      ...(generation === undefined ? {} : { generation }),
+      ...(agentCount === undefined ? {} : { agentCount }),
       ...(isRecord(raw.storeDelta) && Object.keys(raw.storeDelta).length > 0
         ? { storeDelta: raw.storeDelta as Record<string, unknown> }
         : {}),
-    });
+    };
+    const key = `${runId}:${nodeId}`;
+    const existing = journal.get(key);
+    if (generation !== undefined && existing?.generation !== undefined) {
+      if (generation < existing.generation) continue;
+      if (generation === existing.generation) {
+        if (JSON.stringify(existing) !== JSON.stringify(candidate)) {
+          throw new Error("contradictory nested workflow result");
+        }
+        continue;
+      }
+    }
+    journal.set(key, candidate);
   }
   return journal;
 }

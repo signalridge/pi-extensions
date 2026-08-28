@@ -118,6 +118,117 @@ function formatStart(result: ScriptStartResult): string {
   return lines.join("\n");
 }
 
+/** Build the bounded planner → graph → synthesis script used by `/workflows run`. */
+export function buildAdHocWorkflowScript(prompt: string): string {
+  return `export const meta = { name: "ad-hoc", description: "Plan, execute, and synthesize a bounded multi-agent task graph" };
+const originalPrompt = ${JSON.stringify(prompt)};
+const plan = await agent("Design a bounded execution plan for this user task. Return 1-8 independent or dependency-linked tasks. Use unique short ids, concise descriptions, exact worker prompts, and only dependencies that appear in the task list. Prefer independent tasks when possible. User task:\\n\\n" + originalPrompt, {
+  label: "planner",
+  schema: {
+    type: "object",
+    properties: {
+      tasks: {
+        type: "array",
+        minItems: 1,
+        maxItems: 8,
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string", minLength: 1, maxLength: 64 },
+            description: { type: "string", minLength: 1, maxLength: 500 },
+            prompt: { type: "string", minLength: 1, maxLength: 8000 },
+            dependsOn: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 64 } },
+          },
+          required: ["id", "description", "prompt"],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ["tasks"],
+    additionalProperties: false,
+  },
+});
+const graph = await orchestrate(plan.tasks.map((task) => ({
+  id: task.id,
+  description: task.description,
+  dependsOn: task.dependsOn || [],
+  run: ({ results, statuses }) => agent(task.prompt + "\\n\\nDependency results (null means unavailable):\\n" + JSON.stringify({ results, statuses }), { label: task.id }),
+})), { onError: "continue" });
+const SYNTHESIS_CONTEXT_LIMIT = 78000;
+function renderContextValue(value) {
+  const rendered = JSON.stringify(value);
+  return rendered === undefined ? String(value) : rendered;
+}
+function boundContextText(value, maxEncodedChars) {
+  const text = String(value);
+  const encodedLength = (candidate) => JSON.stringify(candidate).length - 2;
+  if (encodedLength(text) <= maxEncodedChars) return { text, truncated: false, marker: null };
+  let low = 0;
+  let high = text.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (encodedLength(text.slice(0, middle)) <= maxEncodedChars) low = middle;
+    else high = middle - 1;
+  }
+  return {
+    text: text.slice(0, low),
+    truncated: true,
+    marker: "[TRUNCATED " + (text.length - low) + " SOURCE CHARACTERS]",
+  };
+}
+const planMetadata = {
+  taskCount: plan.tasks.length,
+  tasks: plan.tasks.map((task) => {
+    const description = boundContextText(task.description, 500);
+    return {
+      id: task.id,
+      description: description.text,
+      descriptionTruncated: description.truncated,
+      descriptionTruncationMarker: description.marker,
+      dependsOn: task.dependsOn || [],
+    };
+  }),
+};
+function makeSynthesisContext(valuePreviewBudget, originalPromptBudget) {
+  const boundedOriginalPrompt = boundContextText(originalPrompt, originalPromptBudget);
+  const tasks = Object.keys(graph.tasks).map((id) => {
+    const task = graph.tasks[id];
+    const error = task.error == null ? null : boundContextText(task.error, 1000);
+    const value = boundContextText(renderContextValue(task.value), valuePreviewBudget);
+    return {
+      id,
+      status: task.status,
+      attempts: task.attempts,
+      error: error == null ? null : error.text,
+      errorTruncated: error == null ? false : error.truncated,
+      errorTruncationMarker: error == null ? null : error.marker,
+      valuePreview: value.text,
+      valueTruncated: value.truncated,
+      valueTruncationMarker: value.marker,
+    };
+  });
+  return {
+    originalPrompt: boundedOriginalPrompt.text,
+    originalPromptTruncated: boundedOriginalPrompt.truncated,
+    originalPromptTruncationMarker: boundedOriginalPrompt.marker,
+    plan: planMetadata,
+    tasks,
+  };
+}
+let valuePreviewBudget = 6000;
+let originalPromptBudget = 16000;
+let synthesisContext = makeSynthesisContext(valuePreviewBudget, originalPromptBudget);
+let synthesisJson = JSON.stringify(synthesisContext);
+while (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT && (valuePreviewBudget > 128 || originalPromptBudget > 256)) {
+  valuePreviewBudget = Math.max(128, Math.floor(valuePreviewBudget * 0.75));
+  originalPromptBudget = Math.max(256, Math.floor(originalPromptBudget * 0.75));
+  synthesisContext = makeSynthesisContext(valuePreviewBudget, originalPromptBudget);
+  synthesisJson = JSON.stringify(synthesisContext);
+}
+if (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT) throw new Error("Unable to fit the synthesis context within its managed prompt budget");
+return await agent("Synthesize the worker results into a direct answer to the original task. Mention incomplete or failed coverage explicitly.\\n\\nOriginal task, execution plan, and graph ledger:\\n" + synthesisJson, { label: "synthesizer" });`;
+}
+
 export default function piWorkflows(pi: ExtensionAPI): void {
   let engine: WorkflowEngine | undefined;
   let protocolError: string | undefined;
@@ -190,11 +301,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         name: "workflow",
         label: "Workflow",
         description:
-          "Run a JavaScript workflow script through the pi-subagents managed spawning protocol. The script declares `export const meta = { name, description, phases }` first and uses the runtime globals agent(), parallel(), pipeline(), workflow(), verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), checkpoint(), phase(), log(), args, cwd, process, and budget. Determinism is enforced: Date.now()/Math.random()/new Date() are unavailable.",
+          "Run a JavaScript workflow script through the pi-subagents managed spawning protocol. The script declares `export const meta = { name, description, phases }` first and uses the runtime globals agent(), parallel(), pipeline(), orchestrate(), workflow(), verify(), judgePanel(), loopUntilDry(), completenessCheck(), retry(), gate(), checkpoint(), phase(), log(), args, cwd, process, and budget. Determinism is enforced: Date.now()/Math.random()/new Date() are unavailable.",
         promptSnippet: "Run a JavaScript workflow script",
         promptGuidelines: [
           "Provide either a full `script` (raw JavaScript with the meta contract first) or a `name` of a saved/built-in workflow.",
-          "Use parallel(() => agent(...), ...) for concurrent agents; pipeline(items, ...stages) for sequential per-item stages.",
+          "Use orchestrate([{ id, dependsOn, run }]) for named dependency graphs; use parallel(() => agent(...), ...) for a simple fan-out and pipeline(items, ...stages) for sequential per-item stages.",
           "Use background: true for long runs; retrieve results with workflow_control.",
           "Use resumeFromRunId with an edited script to replay the unchanged prefix from cache and re-run the rest live.",
           "Do not include model, thinking, concurrency, retry, timeout, or turn-limit settings beyond the declared options.",
@@ -731,7 +842,13 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     const run = await engine.waitFor(runId).catch(() => undefined);
     if (!run) return;
     const header = `Workflow ${run.runId} ${run.status}`;
-    const body = run.error ?? `completed with ${Object.keys(run.callResults).length} agent call(s).`;
+    const state = engine.getState(runId);
+    const finalResult = state?.result ?? run.finalResult;
+    const body =
+      run.error ??
+      (finalResult === undefined
+        ? `completed with ${Object.keys(run.callResults).length} agent call(s).`
+        : `result:\n${typeof finalResult === "string" ? finalResult : (JSON.stringify(finalResult, null, 2) ?? String(finalResult))}`);
     const text = `${header}: ${body}`;
     if (deliverResult) {
       try {
@@ -772,17 +889,17 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
   /** Build a script from a natural-language prompt and run it in background. */
   const runWorkflowFromPrompt = async (ctx: ExtensionCommandContext, prompt: string): Promise<string | undefined> => {
-    // A bounded, deterministic script that dispatches the user's instruction
-    // through a general-purpose agent and returns its answer.
-    const script = `export const meta = { name: "ad-hoc", description: "Run a user-requested task with a general-purpose agent" };
-const answer = await agent(${JSON.stringify(prompt)});
-return answer;`;
+    // A bounded planner → named DAG → synthesis script. Keeping the planner's
+    // output inside the workflow makes /workflows run useful for broad tasks,
+    // while the graph validates dependencies before dispatching any workers.
+    const script = buildAdHocWorkflowScript(prompt);
     try {
+      await protocolCheck;
       const result = await currentEngine().start(script, { background: true, mainModel: ctx.model?.id });
       void deliverBackgroundResult(currentEngine(), result.runId);
       return result.runId;
     } catch (error: unknown) {
-      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      ctx.ui.notify(protocolError ?? (error instanceof Error ? error.message : String(error)), "error");
       return undefined;
     }
   };

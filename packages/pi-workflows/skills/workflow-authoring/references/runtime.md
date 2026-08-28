@@ -6,13 +6,14 @@ Use this page for routine scripts. Open the generated capability index only when
 
 Start with the only legal export: `export const meta = { name, description, phases?: [{ title, detail?, model? }] }`. Values are nonblank literals; declare only used phases and call `phase()` before each phase's work. The remaining body already runs inside an async function: write helpers as ordinary declarations; `export default` and other exports are invalid. Return the result explicitly.
 
-The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
+The runtime supplies `agent`, `parallel`, `pipeline`, `orchestrate`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
 
 ## Topology
 
 - `parallel()` takes thunks, runs independent work, and preserves input order. Await the whole array before whole-set synthesis.
 - `pipeline()` runs stages sequentially per item while items proceed concurrently. Each stage receives `(previousValue, originalItem, index)` and forwards `null` to the next stage, so guard missing coverage first.
-- `workflow(name, childArgs?)` runs a context-supplied saved workflow. Nesting is one level and shares limits, counters, tokens, and store.
+- `orchestrate()` is the preferred topology for named dependencies. Give each task a unique `id`, optional `dependsOn`, and a `run({ id, attempt, results, statuses })` callback. The runtime validates the graph, executes declaration-order ready layers behind barriers, and returns `{ results, tasks }`; use `onError: "continue"` only when a downstream task can handle failed dependencies.
+- `workflow(name, childArgs?)` runs a context-supplied saved workflow. Nesting is one level, shares limits/counters/tokens/store, and journals the complete child result as one parent replay boundary.
 
 ## Data and failure
 
@@ -24,6 +25,6 @@ When JavaScript reads fields, pass a small plain JSON Schema. Schema noncomplian
 
 ## Routing and support
 
-Selector priority is explicit `model` > named `tier` > phase/run model > pi-subagents agent configuration > parent session. An unavailable explicit selector fails closed rather than silently choosing another model. Worktree isolation is also fail-closed and remains owned by pi-subagents. See [registry ownership](registry-ownership.md).
+An explicit per-call `model` wins. A named `agentType` model overrides `tier`; specifying `tier` suppresses the phase/run model and delegates model/thinking resolution to pi-subagents. Without a per-call selector, the phase/run model is used when present, followed by pi-subagents defaults and the parent session. Explicit unavailable models and tiers fail closed. Worktree isolation is also fail-closed and remains owned by pi-subagents. See [registry ownership](registry-ownership.md).
 
 Generated entries marked `supported` are authoring API. `console` and whole-script Markdown fences are compatibility-only. VM realm facilities are internal. Active model routes and agent types are dynamic. Use `log()` in new scripts.

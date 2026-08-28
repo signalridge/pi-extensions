@@ -12,6 +12,6 @@ The agent registry owns agent-type names and their bound instructions, tools, mo
 
 ## Priority
 
-Routing priority is explicit `model` > named `tier` > phase/run model > pi-subagents agent configuration > parent session. Higher priority means selection, not "try this then fall back to the next selector." Avoid specifying competing selectors unless deliberately overriding a lower-priority default.
+An explicit per-call `model` wins. A named `agentType` model overrides a tier; an explicit `tier` suppresses the phase/run model so pi-subagents can apply the agent definition and then the selected workflow tier. Without a per-call model or tier, the phase/run model is used when present, followed by pi-subagents defaults and the parent session. Model and thinking fields are resolved independently. Avoid specifying competing selectors unless the override is deliberate.
 
 Unavailability is fail-closed for explicit `model` and named tiers: pi-subagents reports the selector and does not silently run a different model. An omitted selector may inherit the parent session according to the companion's current settings.

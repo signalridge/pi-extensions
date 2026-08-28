@@ -1,9 +1,9 @@
 # Open decisions
 
-Three questions this repository cannot answer for itself. Each is written up
-here rather than acted on, because each is a policy or ownership choice rather
-than a defect: implementing any of them unilaterally would decide something the
-maintainer has not decided.
+Three questions this repository cannot answer for itself are followed by one
+completed reference review. The questions are written up rather than acted on,
+because each is a policy or ownership choice rather than a defect: implementing
+any of them unilaterally would decide something the maintainer has not decided.
 
 Each section states the current state, the options, and a recommendation. None
 is blocking; the code is coherent as it stands under every option below.
@@ -114,3 +114,25 @@ should be stated against that, not alongside it.
 **Recommendation: decide them individually, not as a batch,** and only when
 there is a specific use for one. Nothing else in the roadmap depends on any of
 them.
+
+---
+
+## 4. Workflow orchestration reference review
+
+External coding-agent implementations suggest two complementary patterns:
+
+- A script/engine seam with worker isolation, explicit fatal-vs-child-failure
+  classification, paired lifecycle events, and bounded cancellation. A simple
+  `parallel()`/`pipeline()` API is useful, but does not by itself provide named
+  dependencies, durable nested runs, or provider-aware recovery.
+- A subagent batch with ordered per-item outcomes, background controls, and
+  adaptive admission after provider rate limits. This is useful for homogeneous
+  batches, but it is not a general dependency graph and needs provider-specific
+  rate-limit signals.
+
+The package adopts the safe subset: named dependency graphs with deterministic
+layer barriers, status-aware results, bounded task retries/failure policies,
+whole-batch fatal barriers, and a replayable nested-workflow boundary. Worker
+isolation and provider-specific adaptive scheduling remain separate follow-up
+seams because adding them without changing ownership and lifecycle contracts
+would make recovery less honest, not more capable.

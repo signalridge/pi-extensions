@@ -5,6 +5,7 @@ Choose from data dependencies, then read only the matching example. JavaScript o
 <a id="fan-out-and-synthesize"></a>
 | Dependency shape | Pattern | Preserve when adapting | Example |
 | --- | --- | --- | --- |
+| Named steps have explicit dependencies | Named task graph | Give every task a stable ID; let `orchestrate()` validate cycles, run declaration-order layers, and pass named results/statuses to dependents | [Adapt](../examples/named-task-graph.js) |
 | Heterogeneous items need different handling | Classify and act | Finish all classification before routed action; ledger classification and action failures by item ID | [Adapt](../examples/classify-and-act.js) |
 | Independent work needs whole-set judgment | Fan out and synthesize | Pass thunks; await the full set; give synthesis every intended ID, including `null` | [Adapt](../examples/fan-out-and-synthesize.js) |
 | Claims need skeptical checks | Adversarial verification | Use separate producer and skeptic calls; start skepticism after production; ledger both failures | [Adapt](../examples/adversarial-verification.js) |
