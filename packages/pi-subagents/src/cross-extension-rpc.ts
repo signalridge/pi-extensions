@@ -8,6 +8,7 @@
 
 import {
   CHILD_CONTEXT_CAPABILITY,
+  type ManagedRoutingPolicySnapshot,
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   parseManagedSpawnRequest,
@@ -16,6 +17,7 @@ import {
 export { CHILD_CONTEXT_CAPABILITY, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION };
 
 import type { ManagedSpawnPolicy, ManagedSpawnRequest, ManagedSpawnResult } from "./agent-manager.js";
+import { getRoutingPolicySnapshot } from "./agent-tiers.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import type { AgentOwner } from "./types.js";
 
@@ -49,6 +51,8 @@ export interface RpcDeps {
   pi: unknown;
   getCtx: () => unknown | undefined;
   manager: SpawnCapable;
+  /** Override for focused consumers/tests; production reads live policy state. */
+  getRoutingPolicy?: () => ManagedRoutingPolicySnapshot;
 }
 
 export interface RpcHandle {
@@ -164,10 +168,12 @@ function handleRpc(
  */
 export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   const { events, pi, getCtx, manager } = deps;
+  const getRoutingPolicy = deps.getRoutingPolicy ?? getRoutingPolicySnapshot;
 
   const unsubPing = handleRpc(events, "subagents:rpc:ping", () => ({
     version: PROTOCOL_VERSION,
     capabilities: PROTOCOL_CAPABILITIES,
+    routingPolicy: getRoutingPolicy(),
   }));
 
   const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", (params) => {

@@ -537,7 +537,11 @@ function collectBranchHistory(ctx: ExtensionContext): HistoryEntry[] {
         history.push({ text, timestamp: parseTimestamp(entry.timestamp) });
       }
     }
-  } catch {}
+  } catch {
+    // Best-effort history recovery: a session file that is missing, truncated,
+    // or mid-write yields whatever was read so far rather than failing the
+    // history surface entirely.
+  }
   return history.reverse(); // newest first
 }
 

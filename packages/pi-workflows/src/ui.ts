@@ -172,12 +172,30 @@ async function selectList<T>(
 }
 
 /** Interactive `/workflows` navigator. TUI-only by design. */
-export async function showWorkflowNavigator(ctx: ExtensionCommandContext, engine: WorkflowEngine): Promise<void> {
+export async function showWorkflowNavigator(
+  ctx: ExtensionCommandContext,
+  engineSource: WorkflowEngine | (() => WorkflowEngine),
+): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify("/workflows requires TUI mode; use workflow_control for machine-readable access.", "warning");
     return;
   }
+  const resolveEngine = typeof engineSource === "function" ? engineSource : () => engineSource;
+  let inactiveNotified = false;
+  const currentEngine = (): WorkflowEngine | undefined => {
+    try {
+      return resolveEngine();
+    } catch (error: unknown) {
+      if (!inactiveNotified) {
+        inactiveNotified = true;
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+      }
+      return undefined;
+    }
+  };
   while (true) {
+    const engine = currentEngine();
+    if (!engine) return;
     const states = engine
       .list()
       .map((summary) => engine.getRun(String(summary.runId)))
@@ -198,7 +216,9 @@ export async function showWorkflowNavigator(ctx: ExtensionCommandContext, engine
     );
     if (!selected) return;
     while (true) {
-      const run = engine.getRun(selected);
+      const latest = currentEngine();
+      if (!latest) return;
+      const run = latest.getRun(selected);
       if (!run) break;
       const name = sanitizeDisplayText(run.meta.name, MAX_NAME_CHARS);
       const action = await selectList<WorkflowAction>(
@@ -208,7 +228,10 @@ export async function showWorkflowNavigator(ctx: ExtensionCommandContext, engine
           value: item.value,
           label: item.label,
         })),
-        () => formatWorkflowDetail(engine, selected),
+        () => {
+          const current = currentEngine();
+          return current ? formatWorkflowDetail(current, selected) : "Workflow surface is no longer active.";
+        },
       );
       if (action === undefined || action === "back") break;
       if (action === "refresh") continue;
@@ -217,7 +240,9 @@ export async function showWorkflowNavigator(ctx: ExtensionCommandContext, engine
         if (!confirmed) continue;
       }
       try {
-        await engine.control(action, selected);
+        const current = currentEngine();
+        if (!current) return;
+        await current.control(action, selected);
         ctx.ui.notify(`Workflow ${action} requested.`, "info");
       } catch (error: unknown) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");

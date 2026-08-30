@@ -6,13 +6,28 @@
  *    agent() calls through the spawn-managed client with A4 spawnKeys
  *  - pause/stop lifecycle
  *  - background runs settle via lifecycle events
- *  - v2 journals are quarantined on restore
+ *  - pre-v4 journals are quarantined on restore
  */
 
-import { describe, expect, it } from "vitest";
+import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
+import { describe, expect, it, vi } from "vitest";
 import { WorkflowEngine } from "../src/engine.js";
 import { JOURNAL_ENTRY_TYPE, type JournalEvent } from "../src/journal.js";
-import type { DispatchTask, ManagedSpawnClient, WorkflowEventBus } from "../src/rpc-client.js";
+import type { DispatchTask, ManagedProtocolCheck, ManagedSpawnClient, WorkflowEventBus } from "../src/rpc-client.js";
+
+/**
+ * Adapt a test's name → script map to the nested-workflow resolver contract.
+ *
+ * The resolver reports where each script came from, because shipped-ness
+ * travels with the script rather than with the frame that called it. Test
+ * scripts are never shipped, so this only has to supply the script itself.
+ */
+function savedScript(resolve: (name: string) => string | undefined): (name: string) => { script: string } | undefined {
+  return (name) => {
+    const script = resolve(name);
+    return script === undefined ? undefined : { script };
+  };
+}
 
 function makeBus(): WorkflowEventBus {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -29,15 +44,33 @@ function makeBus(): WorkflowEventBus {
   };
 }
 
+const TEST_ROUTING_POLICY: ManagedRoutingPolicy = {
+  defaultTier: "medium",
+  profiles: {
+    low: { model: "inherit", thinking: "low" },
+    medium: { model: "inherit", thinking: "medium" },
+    high: { model: "inherit", thinking: "high" },
+    "custom-small": { model: "inherit", thinking: "minimal" },
+  },
+  blockedProfiles: [],
+  blockedDefaultTier: false,
+};
+
 interface FakeClientOptions {
   /** Answer per spawn call (by runId/nodeId), returning terminal snapshots. */
-  answers?: Record<string, { result?: string; error?: string }>;
+  answers?: Record<string, { result?: string; error?: string; tier?: string }>;
   /** Completes agents only when told (manual lifecycle). */
   manual?: boolean;
   /** Emits completion before spawn returns; the engine's lifecycle buffer must recover it. */
   completeBeforeReply?: string;
+  /** Emits the manager's resolved tier before the spawn reply is available. */
+  identityBeforeReply?: { tier?: string };
   /** Token usage carried by the early terminal lifecycle event. */
   fastTokenCount?: number;
+  /** Capability negotiation result used by engine start/resume gates. */
+  protocolCheck?: () => Promise<undefined | ManagedProtocolCheck>;
+  /** Provider-like failure used to exercise automatic resume scheduling. */
+  spawnError?: string;
 }
 
 interface FakeClient extends ManagedSpawnClient {
@@ -60,6 +93,14 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
     async spawn(task, runId, nodeId, attemptId) {
       const id = `agent-${++seq}`;
       spawned.push({ id, task, runId, nodeId, attemptId });
+      if (opts.spawnError) throw new Error(opts.spawnError);
+      if (opts.identityBeforeReply) {
+        bus.emit("subagents:started", {
+          id,
+          ...opts.identityBeforeReply,
+          owner: { extension: "pi-workflows", runId, nodeId, attemptId },
+        });
+      }
       if (opts.completeBeforeReply !== undefined) {
         bus.emit("subagents:completed", {
           id,
@@ -76,6 +117,8 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
       if (answer) {
         return {
           id,
+          ...(answer.tier === undefined ? {} : { tier: answer.tier }),
+          ...(answer.agentTier === undefined ? {} : { agentTier: answer.agentTier }),
           terminal: {
             status: answer.error ? "failed" : "completed",
             ...(answer.result ? { result: answer.result } : {}),
@@ -141,7 +184,11 @@ function makeClient(bus: WorkflowEventBus, opts: FakeClientOptions = {}): FakeCl
           : {}),
       });
     },
-    checkProtocol: async () => {},
+    checkProtocol: async () =>
+      (await opts.protocolCheck?.()) ?? {
+        routingPolicy: TEST_ROUTING_POLICY,
+        routingPolicyFingerprint: "test-routing-policy",
+      },
   };
 }
 
@@ -174,6 +221,109 @@ async function completeAllInflight(client: FakeClient): Promise<void> {
 }
 
 describe("workflow engine", () => {
+  it("gates start and resume through the managed protocol check", async () => {
+    let protocolAvailable = false;
+    const { engine, client } = makeEngine({
+      manual: true,
+      protocolCheck: async () => {
+        if (!protocolAvailable) throw new Error("protocol unavailable");
+        return undefined;
+      },
+    });
+
+    await expect(engine.start(SIMPLE_SCRIPT, { background: true })).rejects.toThrow("protocol unavailable");
+    expect(engine.list()).toHaveLength(0);
+
+    protocolAvailable = true;
+    const started = await engine.start(SIMPLE_SCRIPT, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    await engine.control("pause", started.runId);
+    const spawnCount = client.spawned.length;
+
+    protocolAvailable = false;
+    await expect(engine.resume(started.runId, [], { background: true })).rejects.toThrow("protocol unavailable");
+    expect(client.spawned).toHaveLength(spawnCount);
+    expect(engine.getRun(started.runId)?.status).toBe("interrupted");
+    engine.dispose();
+  });
+
+  it("captures a fresh routing policy for each resumed execution", async () => {
+    let thinking: "low" | "high" = "low";
+    const { engine, client, entries } = makeEngine({
+      manual: true,
+      protocolCheck: async () => ({
+        routingPolicy: {
+          ...TEST_ROUTING_POLICY,
+          profiles: { ...TEST_ROUTING_POLICY.profiles, low: { model: "inherit", thinking } },
+        },
+        routingPolicyFingerprint: `policy-${thinking}`,
+      }),
+    });
+    const script = `export const meta = { name: "policy-engine", description: "p" };
+await agent("first", { tier: "low" });
+await agent("second", { tier: "low" });
+return 0;`;
+    const started = await engine.start(script, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    client.complete(client.spawned[0]?.id ?? "", "first result");
+    await new Promise((resolve) => setImmediate(resolve));
+    await engine.control("pause", started.runId);
+    const beforeResume = client.spawned.length;
+    thinking = "high";
+    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
+      type: "custom" as const,
+      customType: JOURNAL_ENTRY_TYPE,
+      data,
+    }));
+    await engine.resume(started.runId, sessionEntries, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.spawned.length).toBe(beforeResume + 1);
+    expect(client.spawned.at(-1)?.nodeId).toBe("call-0");
+    await engine.control("stop", started.runId);
+  });
+
+  it("does not append a run when disposal wins a pending protocol check", async () => {
+    let releaseProtocol!: () => void;
+    const protocolCheck = new Promise<undefined>((resolve) => {
+      releaseProtocol = resolve;
+    });
+    const { engine, entries } = makeEngine({ protocolCheck: () => protocolCheck });
+    const starting = engine.start(SIMPLE_SCRIPT, { background: true });
+    engine.dispose();
+    releaseProtocol();
+
+    await expect(starting).rejects.toThrow("Workflow engine is disposed");
+    expect(entries.some((entry) => (entry as JournalEvent).kind === "run_created")).toBe(false);
+  });
+
+  it("does not automatically resume a provider-paused run before protocol negotiation succeeds", async () => {
+    let protocolAvailable = true;
+    const { engine, client } = makeEngine({
+      protocolCheck: async () => {
+        if (!protocolAvailable) throw new Error("protocol unavailable");
+        return undefined;
+      },
+      spawnError: "rate limit; try again in 1 seconds",
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const started = await engine.start(
+        `export const meta = { name: "provider-limit", description: "p" };\nreturn await agent("work");`,
+        { background: true },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(engine.getRun(started.runId)?.status).toBe("paused");
+
+      protocolAvailable = false;
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(client.spawned).toHaveLength(1);
+      expect(engine.getRun(started.runId)?.status).toBe("paused");
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it("starts a script, journals run_created, dispatches per call, and settles completed", async () => {
     const { engine, client, entries } = makeEngine({
       answers: { "call-0": { result: "a" }, "call-1": { result: "b" } },
@@ -190,6 +340,35 @@ describe("workflow engine", () => {
     const run = engine.getRun(started.runId);
     if (!run) throw new Error("run missing");
     expect(engine.summary(run)).toMatchObject({ resultPreview: expect.stringContaining('"a"') });
+  });
+
+  it("sends the tier verbatim and journals it", async () => {
+    const { engine, client, entries } = makeEngine({ answers: { "call-0": { result: "done" } } });
+    const script = `export const meta = { name: "tiered", description: "t" };\nreturn await agent("work", { tier: "low" });`;
+    const result = await engine.start(script, { background: false });
+
+    expect(result.status).toBe("completed");
+    // One field, no mapping: the script names a key from the host's catalogue.
+    expect(client.spawned[0]?.task).toMatchObject({ tier: "low" });
+    expect(client.spawned[0]?.task).not.toHaveProperty("agentTier");
+    const callResult = (entries as JournalEvent[]).find((entry) => entry.kind === "call_result");
+    expect(callResult && callResult.kind === "call_result" ? callResult.result : undefined).toMatchObject({
+      tier: "low",
+    });
+  });
+
+  it("records the tier the host selected when the call named none", async () => {
+    const { engine, entries } = makeEngine({ answers: { "call-0": { result: "done", tier: "medium" } } });
+    const script = `export const meta = { name: "defaulted-tier", description: "t" };\nreturn await agent("work");`;
+    const result = await engine.start(script, { background: false });
+
+    expect(result.status).toBe("completed");
+    // The run's own record of what ran should say what ran, even when the
+    // resolution happened on the other side of the wire.
+    const callResult = (entries as JournalEvent[]).find((entry) => entry.kind === "call_result");
+    expect(callResult && callResult.kind === "call_result" ? callResult.result : undefined).toMatchObject({
+      tier: "medium",
+    });
   });
 
   it("fails instead of completing when the terminal result exceeds the durable limit", async () => {
@@ -239,11 +418,12 @@ describe("workflow engine", () => {
 return await workflow("child", { payload: { tag: "original" } });`;
     const started = await engine.start(script, {
       background: true,
-      loadSavedWorkflow: (name) =>
+      loadSavedWorkflow: savedScript((name) =>
         name === "child"
           ? `export const meta = { name: "event-child", description: "c" };
 return await agent("tag=" + args.payload.tag);`
           : undefined,
+      ),
     });
     await new Promise((resolve) => setImmediate(resolve));
     expect(uiTag).toBe("original");
@@ -258,10 +438,11 @@ return await agent("tag=" + args.payload.tag);`
 return await workflow("child");`;
     const started = await engine.start(script, {
       background: true,
-      loadSavedWorkflow: (name) =>
+      loadSavedWorkflow: savedScript((name) =>
         name === "child"
           ? `export const meta = { name: "child", description: "c" };\nreturn await agent("child work");`
           : undefined,
+      ),
     });
     await new Promise((resolve) => setImmediate(resolve));
     expect(client.spawned[0]?.nodeId).toMatch(new RegExp(`^call-${started.runId}-nested-call-0-g1-[0-9a-f-]+:0$`));
@@ -350,14 +531,39 @@ return await workflow("child");`;
     expect(client.stopped).toEqual([client.spawned[0]?.id]);
   });
 
+  it("retains the host-normalized raw tier across a redispatch before reply", async () => {
+    const script = `export const meta = { name: "redispatch-tier", description: "r" };\nawait agent("work");\nreturn 0;`;
+    const { engine, client } = makeEngine({
+      manual: true,
+      identityBeforeReply: { tier: "high" },
+    });
+    const started = await engine.start(script, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    await engine.control("pause", started.runId);
+    await engine.resume(started.runId, [], { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.spawned).toHaveLength(2);
+
+    await engine.control("stop", started.runId);
+    const run = engine.getRun(started.runId);
+    expect(run?.callResults["0"]).toMatchObject({ tier: "high", status: "stopped" });
+  });
+
   it("maps stopped lifecycle failures to a stopped call result", async () => {
-    const script = `export const meta = { name: "stopped", description: "s" };\nawait agent("work");\nreturn 0;`;
-    const { engine, client } = makeEngine({ manual: true });
+    const script = `export const meta = { name: "stopped", description: "s" };\nawait agent("work", { tier: "low" });\nreturn 0;`;
+    const { engine, client, entries } = makeEngine({
+      manual: true,
+      identityBeforeReply: { tier: "custom-small" },
+    });
     const started = await engine.start(script, { background: true });
     await new Promise((resolve) => setImmediate(resolve));
     client.fail(client.spawned[0].id, "stopped");
     const run = await engine.waitFor(started.runId);
     expect(run.callResults["0"]?.status).toBe("stopped");
+    expect(run.callResults["0"]?.tier).toBe("custom-small");
+    expect((entries as JournalEvent[]).find((entry) => entry.kind === "call_transition")).toMatchObject({
+      tier: "custom-small",
+    });
     expect(run.status).toBe("completed");
   });
 
@@ -432,9 +638,28 @@ return await workflow("child");`;
     expect(started.status).toBe("completed");
   });
 
-  it("restore replays journaled v3 runs and quarantines v2", () => {
+  it("restore replays schema-v4 runs and quarantines pre-schema-v4 runs", () => {
     const { engine } = makeEngine();
     const entries = [
+      {
+        type: "custom",
+        customType: JOURNAL_ENTRY_TYPE,
+        data: {
+          kind: "run_created",
+          schemaVersion: 4,
+          runId: "r-schema-v4",
+          script: SIMPLE_SCRIPT,
+          scriptHash: "h".repeat(64),
+          meta: { name: "demo", description: "d" },
+          frozenArgsPresent: false,
+          timestamp: 1,
+        },
+      },
+      {
+        type: "custom",
+        customType: JOURNAL_ENTRY_TYPE,
+        data: { kind: "workflow_transition", schemaVersion: 4, runId: "r-schema-v4", status: "running", timestamp: 2 },
+      },
       {
         type: "custom",
         customType: JOURNAL_ENTRY_TYPE,
@@ -444,31 +669,16 @@ return await workflow("child");`;
           runId: "r-v3",
           script: SIMPLE_SCRIPT,
           scriptHash: "h".repeat(64),
-          meta: { name: "demo", description: "d" },
-          timestamp: 1,
-        },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "workflow_transition", schemaVersion: 3, runId: "r-v3", status: "running", timestamp: 2 },
-      },
-      {
-        type: "custom",
-        customType: JOURNAL_ENTRY_TYPE,
-        data: {
-          kind: "run_created",
-          schemaVersion: 2,
-          runId: "r-v2",
-          definition: { name: "old", phases: [], tasks: [], background: true },
+          meta: { name: "old", description: "old" },
+          frozenArgsPresent: false,
           timestamp: 1,
         },
       },
     ];
     engine.restore(entries);
-    // A restored non-terminal run is marked interrupted (cut off mid-execution).
-    expect(engine.getRun("r-v3")?.status).toBe("interrupted");
-    expect(engine.getRun("r-v2")).toBeUndefined(); // quarantined
+    // A restored non-terminal schema-v4 run is marked interrupted (cut off mid-execution).
+    expect(engine.getRun("r-schema-v4")?.status).toBe("interrupted");
+    expect(engine.getRun("r-v3")).toBeUndefined(); // quarantined
   });
 
   it("control list/get return bounded summaries", async () => {
@@ -544,15 +754,14 @@ return await agent("target=" + (args === undefined ? "undefined" : args.target))
     await new Promise((resolve) => setImmediate(resolve));
     expect(client.spawned.at(-1)?.task.prompt).toBe("target=undefined");
     expect(engine.getRun(started.runId)?.args).toBeUndefined();
-    expect(entries.some((entry) => (entry as JournalEvent).kind === "run_args")).toBe(false);
     await engine.control("stop", started.runId);
   });
 
-  it("durably canonicalizes fallback args for later restored resumes", async () => {
-    const { engine, client, entries: appended } = makeEngine({ manual: true });
+  it("does not restore or resume an incomplete pre-schema-v4 run", async () => {
+    const { engine } = makeEngine({ manual: true });
     const script = `export const meta = { name: "legacy-args", description: "a" };
 return await agent("target=" + args.target);`;
-    const restoredEntries = [
+    const oldEntries = [
       {
         type: "custom" as const,
         customType: JOURNAL_ENTRY_TYPE,
@@ -563,42 +772,16 @@ return await agent("target=" + args.target);`;
           script,
           scriptHash: "h".repeat(64),
           meta: { name: "legacy-args", description: "a" },
+          frozenArgsPresent: false,
           timestamp: 1,
         },
       },
-      {
-        type: "custom" as const,
-        customType: JOURNAL_ENTRY_TYPE,
-        data: { kind: "workflow_transition", schemaVersion: 3, runId: "legacy-args", status: "running", timestamp: 2 },
-      },
     ];
-    engine.restore(restoredEntries);
-    await engine.resume("legacy-args", restoredEntries, { background: true, args: { target: "caller" } });
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(client.spawned.at(-1)?.task.prompt).toBe("target=caller");
-    expect(engine.getRun("legacy-args")?.args).toEqual({ target: "caller" });
-    expect(appended.find((entry) => (entry as JournalEvent).kind === "run_args")).toMatchObject({
-      kind: "run_args",
-      args: { target: "caller" },
-    });
-
-    await engine.control("pause", "legacy-args");
-    await new Promise((resolve) => setImmediate(resolve));
-    const durableEntries = [
-      ...restoredEntries,
-      ...(appended as JournalEvent[]).map((data) => ({
-        type: "custom" as const,
-        customType: JOURNAL_ENTRY_TYPE,
-        data,
-      })),
-    ];
-    engine.restore(durableEntries);
-    expect(engine.getRun("legacy-args")?.args).toEqual({ target: "caller" });
-
-    await engine.resume("legacy-args", durableEntries, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(client.spawned.at(-1)?.task.prompt).toBe("target=caller");
-    await engine.control("stop", "legacy-args");
+    engine.restore(oldEntries);
+    expect(engine.getRun("legacy-args")).toBeUndefined();
+    await expect(
+      engine.resume("legacy-args", oldEntries, { background: true, args: { target: "caller" } }),
+    ).resolves.toBeUndefined();
   });
 
   it("normalizes fractional execution limits before journaling, restore, and resume", async () => {
@@ -662,11 +845,11 @@ return await agent("work");`;
   });
 
   it("dispatches tier through to the spawn request", async () => {
-    const script = `export const meta = { name: "tiered", description: "t" };\nawait agent("work", { tier: "small" });\nreturn 0;`;
+    const script = `export const meta = { name: "tiered", description: "t" };\nawait agent("work", { tier: "high" });\nreturn 0;`;
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(script, { background: true });
     await new Promise((resolve) => setImmediate(resolve));
-    expect(client.spawned[0]?.task.tier).toBe("small");
+    expect(client.spawned[0]?.task.tier).toBe("high");
     // Complete it to avoid a dangling run.
     await engine.control("stop", started.runId);
     void completeAllInflight;

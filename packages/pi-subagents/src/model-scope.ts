@@ -55,14 +55,17 @@ export function checkModelScope(args: {
   const allowed = resolveEnabledModels(readEnabledModels(cwd), modelRegistry, cwd);
   if (!allowed || isModelInScope(model, allowed)) return { kind: "ok" };
 
+  // A tier whose profile says `inherit` names no model of its own, so fall back
+  // to what it actually resolved to. Without this the refusal reads
+  // `Model not in scope: "undefined"`, which tells the caller nothing it can act on.
+  const modelLabel = modelInput ?? `${model.provider}/${model.id}`;
   if (callerSupplied) {
     const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
     return {
       kind: "error",
-      message: `Model not in scope: "${modelInput}".\n\nAllowed models (from enabledModels):\n${list}`,
+      message: `Model not in scope: "${modelLabel}".\n\nAllowed models (from enabledModels):\n${list}`,
     };
   }
-  const modelLabel = modelInput ?? `${model.provider}/${model.id}`;
   return {
     kind: "warn",
     message: `Agent "${agentLabel}" using out-of-scope model "${modelLabel}"`,

@@ -6,6 +6,7 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 
 - Is literal `export const meta` the first statement, with a short unique name and useful description?
 - Are only used phases declared, and does each named phase begin at the intended boundary?
+- Are workflow meta and phase objects free of retired `model`/`thinking` fields?
 - Does the script call at least one agent and explicitly return JSON-serializable data?
 - Are imports and nondeterministic APIs absent?
 
@@ -21,8 +22,9 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 
 - Does JavaScript consume structured fields only after a small plain JSON Schema guarantees them?
 - Does synthesis receive complete coverage and failure ledgers?
-- Are `model`, `tier`, and `agentType` used according to selector priority?
-- Did every nonstandard route or agent type come from context with a name and purpose?
+- Does every `tier` name a key the destination host actually defines, rather than a guessed one?
+- Is the tier the only model/thinking policy source, via pi-subagents' `resolveAgentTier()`?
+- Did every tier or agent-type name come from context with a name and purpose?
 
 ## Lifecycle
 
@@ -33,6 +35,7 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 - Does nesting stay one level, allow only safe sibling concurrency, and account for shared limits/store?
 - Are helper attempts and graph retries finite and separately visible?
 - Would lexical call order and generated graph order remain stable under resume?
+- Does the journal/tombstone retain the resolved `tier`, including one the host defaulted to?
 
 ## Compatibility and publication
 

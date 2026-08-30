@@ -274,19 +274,20 @@ return recovered;`;
   const append = (event) => session.sessionManager.appendCustomEntry("pi-workflows:journal", event);
   append({
     kind: "run_created",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     script,
     scriptHash: "smoke-recovery-script-hash",
     meta: { name: "recovery smoke", description: "Recover one call" },
+    frozenArgsPresent: false,
     attempts: { [nodeId]: 1 },
     attemptIds: { [nodeId]: attemptId },
     timestamp: timestamp++,
   });
-  append({ kind: "workflow_transition", schemaVersion: 3, runId, status: "running", timestamp: timestamp++ });
+  append({ kind: "workflow_transition", schemaVersion: 4, runId, status: "running", timestamp: timestamp++ });
   append({
     kind: "call_attempt",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     nodeId,
     attemptId,
@@ -296,7 +297,7 @@ return recovered;`;
   });
   append({
     kind: "call_transition",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     nodeId,
     status: "running",
@@ -591,7 +592,18 @@ try {
     mkdirSync(join(consumer, ".pi"), { recursive: true });
     writeFileSync(
       join(consumer, ".pi", "subagents.json"),
-      JSON.stringify({ maxConcurrent: 2, schedulingEnabled: false }),
+      JSON.stringify({
+        maxConcurrent: 2,
+        schedulingEnabled: false,
+        agentTiers: {
+          defaultTier: "medium",
+          profiles: {
+            low: { model: "inherit", thinking: "inherit" },
+            medium: { model: "inherit", thinking: "inherit" },
+            high: { model: "inherit", thinking: "inherit" },
+          },
+        },
+      }),
     );
     mkdirSync(join(consumer, ".pi", "agents"), { recursive: true });
     writeFileSync(

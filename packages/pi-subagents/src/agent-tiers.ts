@@ -1,29 +1,22 @@
 /**
- * agent-tiers.ts — user-named model tiers for ordinary subagent spawns.
+ * agent-tiers.ts — user-named model tiers. The one tier catalogue.
  *
  * A tier is one name for a (model, thinking) pair. The host agent picks a tier
  * key and nothing else: the LLM-facing `Agent` tool exposes `tier` and does not
  * expose `model` or `thinking`, so the choice of which model runs stays with
  * whoever writes `subagents.json` rather than with the model deciding per call.
  *
- * Deliberately separate from `workflow-tiers.ts`. Workflow tiers are the fixed
- * `small | medium | large` vocabulary of the `pi-workflows` protocol and are
- * typed as that union; agent tiers are arbitrary user-chosen names. Sharing one
- * field between them would force `WorkflowTier` open to `string` and take the
- * protocol's exhaustiveness with it, so the two keep separate settings, separate
- * snapshot types, and separate fields on `AgentInvocation`. The mechanics they
- * both use — resolving a model reference, clamping thinking — are short enough
- * to state twice; `workflow-tiers.ts` keeps its own copy so this change cannot
- * alter the protocol-facing resolver's behavior.
- *
- * The two also disagree on precedence, which is why they are not one function:
- * a workflow tier only fills what agent frontmatter left blank, while an agent
- * tier overrides frontmatter's legacy `model:`/`thinking:`. That is the point of
- * agent tiers — the tier is the policy, and a per-agent pin is the older, weaker
- * statement of the same thing.
+ * Managed `pi-workflows` calls name a key from this same catalogue. There is no
+ * separate workflow-tier vocabulary and no mapping layer: a workflow that wants
+ * cheap work asks for the tier the user defined for cheap work, and gets the
+ * same resolver, the same precedence, and the same fail-closed errors an
+ * ordinary spawn gets. `getRoutingPolicySnapshot()` publishes the part of this
+ * catalogue a managed peer needs to reason about replay.
  */
 
 import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
+import type { ManagedRoutingPolicy, ManagedRoutingPolicySnapshot } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier, MAX_AGENT_TIER_KEY_LENGTH, routingPolicyFingerprint } from "@signalridge/pi-subagents-protocol";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { type AgentTierProfile, type AgentTiersSettings, TIER_THINKING_LEVELS, type TierThinking } from "./settings.js";
 import type { AgentConfig, ThinkingLevel } from "./types.js";
@@ -33,32 +26,98 @@ function effectiveModelId(model: Model<Api> | undefined): string | undefined {
   return model ? `${model.provider}/${model.id}` : undefined;
 }
 
-/** Longest accepted tier key. Long enough for any real name, short enough to render. */
-export const MAX_AGENT_TIER_KEY_LENGTH = 64;
+/**
+ * The tier-key bound and predicate, re-exported from the protocol package.
+ *
+ * They are defined once, on the wire, because that is the narrower of the two
+ * gates: a key this package accepted but the protocol rejected could never be
+ * sent to a managed peer. Everything in pi-subagents imports them from here so
+ * there is still one import site inside the package.
+ */
+export { isManagedAgentTier as isValidAgentTierKey, MAX_AGENT_TIER_KEY_LENGTH };
 
 /**
- * The tier every fresh install gets: a cheap, low-thinking tier named `fast`.
- *
- * Explore — the highest-frequency built-in spawn — points its `tier:` at it, so
- * read-only search does not silently inherit the parent session's most
- * expensive model on a machine that never configured `agentTiers`. This is the
- * tier strategy, not a per-agent vendor pin: the shipped profile is
- * provider-neutral (`inherit` model, low thinking), and any user who defines
- * `fast` in `subagents.json` replaces it wholesale.
- *
- * It is not shown as an available tier until settings are loaded; the merge in
- * `setAgentTiersSettings` is where a worktree that explicitly disables/renames
- * `fast` can win.
+ * Fresh installs receive an effort ladder: `low`, `medium`, `high`. Every
+ * shipped profile inherits its model, so a new machine gets a usable vocabulary
+ * without this package ever pinning a vendor. A user definition in
+ * `subagents.json` replaces a shipped profile wholesale; a blocked profile is
+ * never resurrected.
  */
-const SHIPPED_FAST_PROFILE: AgentTierProfile = {
+const SHIPPED_LOW_PROFILE: AgentTierProfile = {
   model: "inherit",
   thinking: "low",
-  description: "Fast, low-cost tier for cheap read-only work (shipped default)",
+  description: "Cheap, shallow work (shipped)",
+};
+const SHIPPED_MEDIUM_PROFILE: AgentTierProfile = {
+  model: "inherit",
+  thinking: "medium",
+  description: "Ordinary work (shipped)",
+};
+const SHIPPED_HIGH_PROFILE: AgentTierProfile = {
+  model: "inherit",
+  thinking: "high",
+  description: "Deep or risky work (shipped)",
 };
 
 export const SHIPPED_AGENT_TIER_PROFILES: Readonly<Record<string, AgentTierProfile>> = {
-  fast: SHIPPED_FAST_PROFILE,
+  low: SHIPPED_LOW_PROFILE,
+  medium: SHIPPED_MEDIUM_PROFILE,
+  high: SHIPPED_HIGH_PROFILE,
 };
+
+/**
+ * The tier a *managed* call gets when nobody named one.
+ *
+ * Deliberately not a global `defaultTier`. A managed workflow call fails closed
+ * without a tier, and "install the package, run a workflow, get a hard error"
+ * is not a defensible first experience — but that is the only case that needs a
+ * shipped answer. Making it the catalogue's default instead would take over
+ * every ordinary spawn as well, which would silence `defaultModel` and pin a
+ * thinking level on machines that asked for neither.
+ *
+ * `medium` inherits its model, so this commits to an effort level, not to a
+ * vendor — and, being `inherit`, it lands on the parent session's model. That
+ * is the honest trade: this fallback exists so a managed call has a *named*
+ * policy with a durable snapshot on a machine that configured none, not so it
+ * runs somewhere cheaper. A workspace that wants cheaper managed work names a
+ * `defaultTier` whose profile pins a model.
+ *
+ * It applies only while the user has expressed no opinion: any configured
+ * `defaultTier` wins, `noDefaultTier` suppresses it outright, a tombstoned
+ * default still blocks, and deleting the `medium` profile removes this fallback
+ * with it.
+ */
+export const SHIPPED_DEFAULT_AGENT_TIER = "medium";
+
+/**
+ * The default a managed call resolves against, or `undefined` when it must fail
+ * closed. The single definition of the shipped fallback: `selectAgentTier` consults
+ * it for a `requireTier` spawn and `getRoutingPolicySnapshot` publishes it, so a
+ * managed peer's replay identity can never disagree with what the host will do.
+ */
+export function managedDefaultAgentTier(settings: AgentTiersSettings): string | undefined {
+  if (settings.blockedDefaultTier === true) return undefined;
+  if (settings.defaultTier !== undefined) return settings.defaultTier;
+  if (settings.noDefaultTier === true) return undefined;
+  return settings.profiles?.[SHIPPED_DEFAULT_AGENT_TIER] ? SHIPPED_DEFAULT_AGENT_TIER : undefined;
+}
+
+/**
+ * What leaving `defaultTier` unset would actually give a managed call, whatever
+ * the user has chosen right now.
+ *
+ * The Settings menu offers `unset` as a distinct choice from `none`, and the
+ * difference between them is exactly this value — which is `undefined` on a
+ * catalogue whose `medium` profile has been edited away or tombstoned. A menu
+ * that says "unset uses the shipped medium" there would be describing a
+ * fallback that no longer exists, and `unset` would behave identically to
+ * `none` while claiming otherwise. Asked of the same function that decides it,
+ * with the current choice stripped, so the answer cannot drift from the
+ * behavior.
+ */
+export function shippedFallbackAgentTier(settings: AgentTiersSettings = agentTiersSettings): string | undefined {
+  return managedDefaultAgentTier({ ...settings, defaultTier: undefined, noDefaultTier: false });
+}
 
 let agentTiersSettings: AgentTiersSettings = {}; // effective view (shipped tiers merged)
 let agentTiersConfigured: AgentTiersSettings = {}; // exactly what the user configured
@@ -81,12 +140,12 @@ function sameProfile(a: AgentTierProfile, b: AgentTierProfile): boolean {
 /**
  * Install the effective tier catalogue.
  *
- * The shipped `fast` tier is merged in unless the caller already defined it or
- * explicitly blocked it — a user catalogue wins over the shipped default, and a
- * tombstone means "do not substitute", which applies to shipped defaults too.
+ * Each shipped tier is merged in unless the caller already defined it or
+ * explicitly blocked it — a user catalogue wins over a shipped profile, and a
+ * tombstone means "do not substitute", which applies to shipped profiles too.
  *
  * The configured view is derived from the same input by stripping profiles that
- * exactly equal a shipped default, so the UI can operate on the effective view
+ * exactly equal a shipped profile, so the UI can operate on the effective view
  * and send it back without materializing untouched shipped tiers into
  * `subagents.json`. Editing a shipped tier (changing its model, thinking, or
  * description) makes it a user-owned profile and it is then persisted; deleting
@@ -107,6 +166,11 @@ export function setAgentTiersSettings(settings: AgentTiersSettings): void {
     if (!blocked.has(key) && profiles[key] === undefined) profiles[key] = profile;
   }
 
+  // `defaultTier` is passed through untouched. The shipped fallback is not
+  // merged in here: it is scoped to managed calls (see
+  // `managedDefaultAgentTier`), so the effective catalogue keeps saying "the
+  // user named no default" and an ordinary spawn still falls through to
+  // `defaultModel` and the parent session.
   agentTiersSettings = { ...effective, profiles };
   const configured: AgentTiersSettings = { ...effective };
   if (Object.keys(configuredProfiles).length > 0) configured.profiles = configuredProfiles;
@@ -115,22 +179,12 @@ export function setAgentTiersSettings(settings: AgentTiersSettings): void {
 }
 
 /**
- * A key is usable when it is a bounded, non-blank, whitespace-free string.
+ * Where the tier that was used came from; recorded for audit.
  *
- * Whitespace is excluded because the key appears in tool descriptions and error
- * messages as a bare token; a key with a space in it reads as two keys.
+ * A managed workflow call is a `call`: an orchestrator naming a tier per
+ * dispatch is the same act whether the orchestrator is the host model or a
+ * workflow script, so it gets the same precedence and the same scope policy.
  */
-export function isValidAgentTierKey(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= MAX_AGENT_TIER_KEY_LENGTH &&
-    value.trim() === value &&
-    !/\s/u.test(value)
-  );
-}
-
-/** Where the tier that was used came from; recorded for audit. */
 export type AgentTierSource = "call" | "frontmatter" | "default";
 
 /** Durable, JSON-safe record of how one spawn's model and thinking were chosen. */
@@ -162,6 +216,12 @@ export interface AgentTierResolution {
 export interface ResolveAgentTierInput {
   /** Tier key from the spawn call. Highest precedence. */
   requestedTier?: string;
+  /**
+   * This spawn cannot fall back to the parent session's model, so the shipped
+   * fallback applies when nothing else named a tier. Managed workflow calls set
+   * it; an ordinary spawn leaves it off and simply resolves no tier.
+   */
+  requireTier?: boolean;
   /** The agent's own config; supplies its default tier and legacy model/thinking. */
   agentConfig?: AgentConfig;
   /** Overrides the module-level settings; tests and callers with their own load. */
@@ -170,6 +230,12 @@ export interface ResolveAgentTierInput {
   parentThinking?: ThinkingLevel;
   modelRegistry: ModelRegistry<Model<Api>>;
 }
+
+/** The part of a resolve request that decides *which* tier applies. */
+export type TierSelectionInput = Pick<
+  ResolveAgentTierInput,
+  "requestedTier" | "requireTier" | "agentConfig" | "settings"
+>;
 
 /** Thrown for every fail-closed tier condition so callers can report it verbatim. */
 export class AgentTierError extends Error {
@@ -208,6 +274,7 @@ function withoutBlocked(blocked: string[] | undefined, key: string): string[] | 
 function compactTierSettings(settings: AgentTiersSettings): AgentTiersSettings {
   const out: AgentTiersSettings = {};
   if (settings.defaultTier !== undefined) out.defaultTier = settings.defaultTier;
+  else if (settings.noDefaultTier) out.noDefaultTier = true;
   if (settings.profiles && Object.keys(settings.profiles).length > 0) out.profiles = settings.profiles;
   if (settings.blockedProfiles && settings.blockedProfiles.length > 0) {
     out.blockedProfiles = settings.blockedProfiles;
@@ -242,13 +309,11 @@ export function upsertAgentTierProfile(
  * turn every later spawn that names no tier into a hard refusal, which is a
  * strange thing to get from deleting a tier you had stopped using.
  *
- * Deleting a shipped tier (the default `fast`) tombstones it instead of just
- * dropping it: the shipped merge in `setAgentTiersSettings` would otherwise
- * silently re-add it on the next load, and a user who deletes it means it. The
- * tombstone says "do not substitute", which is exactly the semantics the load
- * path already honors for malformed profiles. Explore still names `fast` in its
- * frontmatter, so the spawn refusal then says so loudly until the agent file or
- * the tier is fixed.
+ * Deleting a shipped tier tombstones it instead of just dropping it: the
+ * shipped merge in `setAgentTiersSettings` would otherwise silently re-add it
+ * on the next load, and a user who deletes it means it. The tombstone says
+ * "do not substitute", which is exactly the semantics the load path already
+ * honors for malformed profiles.
  */
 export function removeAgentTierProfile(settings: AgentTiersSettings, key: string): AgentTiersSettings {
   const { [key]: _removed, ...profiles } = settings.profiles ?? {};
@@ -288,7 +353,30 @@ export function offerableTierThinking(
 }
 
 /**
- * Set or clear the default tier.
+ * What the user chose for the default tier.
+ *
+ * `none` and `unset` are different policies, and a single "no default" value
+ * cannot express both: an absent `defaultTier` still lets a managed workflow
+ * call reach the shipped fallback, while `none` is the statement that managed
+ * calls should fail closed as well. Typed rather than modelled as
+ * `string | undefined` so a caller has to say which one it means, and so a menu
+ * can render the difference instead of showing one word for two behaviors.
+ */
+export type DefaultAgentTierSelection =
+  | { kind: "tier"; tier: string }
+  | { kind: "none" }
+  | { kind: "unset" };
+
+/** Which of the three states the catalogue is currently in. */
+export function getDefaultAgentTierSelection(
+  settings: AgentTiersSettings = agentTiersSettings,
+): DefaultAgentTierSelection {
+  if (settings.defaultTier !== undefined) return { kind: "tier", tier: settings.defaultTier };
+  return settings.noDefaultTier === true ? { kind: "none" } : { kind: "unset" };
+}
+
+/**
+ * Set, clear, or withdraw the default tier.
  *
  * Always clears `blockedDefaultTier`: that tombstone describes the malformed
  * value this call is replacing, and keeping it would make the resolver refuse
@@ -296,25 +384,46 @@ export function offerableTierThinking(
  */
 export function setDefaultAgentTier(
   settings: AgentTiersSettings,
-  key: string | undefined,
+  selection: DefaultAgentTierSelection,
 ): AgentTiersSettings {
-  return compactTierSettings({ ...settings, defaultTier: key, blockedDefaultTier: false });
+  return compactTierSettings({
+    ...settings,
+    defaultTier: selection.kind === "tier" ? selection.tier : undefined,
+    noDefaultTier: selection.kind === "none",
+    blockedDefaultTier: false,
+  });
 }
 
 /**
  * Which tier applies, and where it came from.
  *
  * An explicitly requested tier that does not exist is an error rather than a
- * fallback: the host asked for a specific policy, and quietly running a
+ * fallback: the caller asked for a specific policy, and quietly running a
  * different model than the one it selected is worse than refusing.
+ *
+ * Precedence is `call > frontmatter > default`. A tier named per dispatch is
+ * current policy; an agent's own `tier:` is the older, weaker statement of the
+ * same thing. This holds for a workflow script exactly as it does for the host
+ * model — both are orchestrators routing one call.
+ *
+ * A `requireTier` spawn gets one extra step after the configured default: the
+ * shipped fallback. It is last because it is the only step the user did not
+ * write, and it is reachable only from a caller that has no parent model to
+ * fall back to.
+ *
+ * Exported because the managed-spawn path needs the tier *key* before the
+ * runner resolves — a tombstone and the lifecycle events carry it as a label.
+ * That caller asks this function rather than rebuilding the same three-step
+ * fallback beside it, for the reason given on {@link agentTierApplies}: a
+ * second copy of a precedence is only ever a way for the two to disagree.
  */
-function selectTier(
-  input: ResolveAgentTierInput,
-  settings: AgentTiersSettings,
+export function selectAgentTier(
+  input: TierSelectionInput,
+  settings: AgentTiersSettings = agentTiersSettings,
 ): { tier: string; source: AgentTierSource } | undefined {
   const requested = input.requestedTier;
   if (requested !== undefined) {
-    if (!isValidAgentTierKey(requested)) {
+    if (!isManagedAgentTier(requested)) {
       throw new AgentTierError(
         `Invalid agent tier key. Keys are non-empty, contain no whitespace, and are at most ` +
           `${MAX_AGENT_TIER_KEY_LENGTH} characters. Available tiers: ${tierKeyList(settings)}`,
@@ -330,7 +439,29 @@ function selectTier(
     throw new AgentTierError("agentTiers.defaultTier is blocked by malformed configuration");
   }
   if (settings.defaultTier !== undefined) return { tier: settings.defaultTier, source: "default" };
-  return undefined;
+  // Only a spawn that may not inherit the parent reaches the shipped fallback.
+  if (input.requireTier !== true) return undefined;
+  const fallback = managedDefaultAgentTier(settings);
+  return fallback === undefined ? undefined : { tier: fallback, source: "default" };
+}
+
+/**
+ * Whether `resolveAgentTier` will select a tier for this spawn.
+ *
+ * The callers that pre-compute a legacy model or thinking value need this
+ * before the runner resolves: a selected tier owns both outright, so
+ * pre-resolving one would hand the runner a value it is about to discard, and a
+ * scope check against a model that never runs. Implemented by asking
+ * `selectAgentTier` itself rather than restating its precedence, so the two cannot
+ * drift. A fail-closed condition counts as "applies": the tier path owns the
+ * refusal, and the legacy path must not quietly answer in its place.
+ */
+export function agentTierApplies(input: TierSelectionInput): boolean {
+  try {
+    return selectAgentTier(input, input.settings ?? agentTiersSettings) !== undefined;
+  } catch {
+    return true;
+  }
 }
 
 function describeSource(source: AgentTierSource, agentName: string | undefined): string {
@@ -349,12 +480,14 @@ function describeSource(source: AgentTierSource, agentName: string | undefined):
  *
  * Returns `undefined` fields and no snapshot when no tier applies at all, which
  * is how a workspace that has configured none keeps its previous behavior: the
- * caller then falls back to the agent's legacy `model:`/`thinking:` frontmatter
- * and finally to the parent session.
+ * caller then falls back to a programmatic model option, the configured
+ * `defaultModel`, and finally the parent session. A `requireTier` spawn cannot
+ * take that path, so it reaches the shipped fallback instead — and fails closed
+ * when the user has suppressed that too.
  */
 export function resolveAgentTier(input: ResolveAgentTierInput): AgentTierResolution {
   const settings = input.settings ?? agentTiersSettings;
-  const selected = selectTier(input, settings);
+  const selected = selectAgentTier(input, settings);
   if (!selected) return {};
 
   const { tier, source } = selected;
@@ -514,4 +647,37 @@ export function buildAgentTierParameterDescription(settings: AgentTiersSettings 
     `Model tier for this spawn, chosen by name. Available: ${available}.${fallback}` +
     " A tier overrides the agent's default. Unknown tiers are rejected rather than substituted."
   );
+}
+
+/**
+ * The catalogue as a managed peer needs to see it.
+ *
+ * Protocol-shaped on purpose: no settings-file details, no descriptions, no
+ * host paths — only what decides how a tier resolves, so a peer can tell
+ * whether a journaled call would still resolve the same way. `defaultTier` is
+ * the *managed* default, shipped fallback included: every consumer of this
+ * snapshot is a managed caller, and publishing the bare configured value would
+ * make its replay identity disagree with what the host actually selects.
+ *
+ * Both sorts use the default code-unit order rather than `localeCompare`.
+ * `blockedProfiles` is an array, so its order reaches the fingerprint, and a
+ * locale-dependent comparator would let the same catalogue hash differently on
+ * two machines — or on one machine after its locale changed. Object keys are
+ * canonicalized again by `canonicalizeRoutingPolicy`; sorting them here only
+ * keeps the wire payload readable.
+ */
+export function getRoutingPolicySnapshot(
+  settings: AgentTiersSettings = agentTiersSettings,
+): ManagedRoutingPolicySnapshot {
+  const policy: ManagedRoutingPolicy = {
+    defaultTier: managedDefaultAgentTier(settings) ?? null,
+    profiles: Object.fromEntries(
+      Object.entries(settings.profiles ?? {})
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, profile]) => [key, { model: profile.model, thinking: profile.thinking }]),
+    ),
+    blockedProfiles: [...(settings.blockedProfiles ?? [])].sort(),
+    blockedDefaultTier: settings.blockedDefaultTier === true,
+  };
+  return { policy, fingerprint: routingPolicyFingerprint(policy) };
 }

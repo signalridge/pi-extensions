@@ -1,7 +1,14 @@
 /** Pure wire types shared by managed Pi extension peers. */
 
-export type WorkflowTier = "small" | "medium" | "large";
-export type ManagedThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+/**
+ * Thinking policy an Agent-tier profile may declare.
+ *
+ * `inherit` keeps the parent session's level. `off` is deliberately absent: a
+ * profile that wants no thinking says so through the model it names, and the
+ * host's `clampThinkingLevel` handles a model that supports none.
+ */
+export type ManagedTierThinking = "inherit" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 export interface EventBus {
   on(event: string, handler: (data: unknown) => void): () => void;
   emit(event: string, data: unknown): void;
@@ -27,12 +34,17 @@ export interface ManagedSpawnRequest {
   type: string;
   prompt: string;
   description: string;
-  /** Semantic workflow profile; model and thinking are resolved by pi-subagents. */
-  tier?: WorkflowTier;
-  /** Optional exact provider/model reference, optionally suffixed with `:thinking`. */
-  model?: string;
-  /** Optional thinking override; `off` omits a thinking-level override. */
-  thinking?: ManagedThinking;
+  /**
+   * Agent-tier key. This is the host's own tier vocabulary, not a separate
+   * workflow one: the host resolves it with the same resolver, precedence, and
+   * fail-closed errors that an ordinary Agent spawn gets. Omitted means "use
+   * the agent's own tier, else `agentTiers.defaultTier`".
+   *
+   * Model and thinking are deliberately not on this request. A tier is the only
+   * model policy a managed caller can express, so there is no second selector
+   * that could silently win or be silently ignored.
+   */
+  tier?: string;
   /** Optional named toolset hint owned by pi-subagents/host configuration. */
   toolset?: string;
   /** Additional tool names to deny for this managed child. */
@@ -58,6 +70,8 @@ export interface ManagedTerminalSnapshot {
 
 export interface ManagedSpawnResponse {
   id: string;
+  /** Agent tier the host actually selected, including one it defaulted to. */
+  tier?: string;
   state?: ManagedSpawnState;
   created?: boolean;
   terminal?: ManagedTerminalSnapshot;
@@ -73,18 +87,42 @@ export interface ManagedProtocolCapabilities {
   managedSpawn: boolean;
   lifecycleOwner: boolean;
   ownedStop: boolean;
-  /** Optional in v3 for peers that do not expose the factory-time child marker. */
-  childContext?: boolean;
+  childContext: boolean;
   ownedQuiescence: boolean;
-  /** Optional in v3 for older peers; required before sending tiered requests. */
-  workflowTiers?: boolean;
-  /** True when managed model/tool/isolation overrides are accepted. */
-  managedPolicy?: boolean;
+  agentTiers: boolean;
+  managedPolicy: boolean;
+}
+
+export interface ManagedAgentTierProfile {
+  /** Profile model reference, including the provider-neutral "inherit" value. */
+  model: string;
+  /** Profile thinking policy before model-specific clamping. */
+  thinking: ManagedTierThinking;
+}
+
+/**
+ * The host's Agent-tier catalogue as a caller needs to see it.
+ *
+ * A managed caller does not resolve policy — it uses this to decide whether a
+ * previously journaled call would still resolve the same way, so a resume can
+ * replay it. Descriptions and other host-only UI fields are excluded.
+ */
+export interface ManagedRoutingPolicy {
+  defaultTier: string | null;
+  profiles: Record<string, ManagedAgentTierProfile>;
+  blockedProfiles: string[];
+  blockedDefaultTier: boolean;
+}
+
+export interface ManagedRoutingPolicySnapshot {
+  policy: ManagedRoutingPolicy;
+  fingerprint: string;
 }
 
 export interface ManagedProtocolPing {
   version: number;
   capabilities: ManagedProtocolCapabilities;
+  routingPolicy: ManagedRoutingPolicySnapshot;
 }
 
 export interface ChildContextReply {

@@ -8,7 +8,12 @@ import { BUILTIN_WORKFLOWS, validateBuiltinArgs } from "./builtins.js";
 import { type CommandResult, resolveCodeReviewScope } from "./code-review-scope.js";
 import { type ScriptStartOptions, type ScriptStartResult, WorkflowEngine, WorkflowWaitAbortedError } from "./engine.js";
 import { JOURNAL_ENTRY_TYPE, type SessionEntryLike } from "./journal.js";
-import { createManagedSpawnClient, PROTOCOL_DIAGNOSTIC, queryChildSessionContextImmediate } from "./rpc-client.js";
+import {
+  createManagedSpawnClient,
+  type ManagedProtocolCheck,
+  PROTOCOL_DIAGNOSTIC,
+  queryChildSessionContextImmediate,
+} from "./rpc-client.js";
 import { listSavedWorkflows, loadSavedWorkflow, saveWorkflow } from "./saved-workflows.js";
 import { liveWidgetLines, showWorkflowNavigator } from "./ui.js";
 import { loadWorkflowSettings, saveWorkflowSettings } from "./workflow-settings.js";
@@ -124,6 +129,7 @@ export function buildAdHocWorkflowScript(prompt: string): string {
 const originalPrompt = ${JSON.stringify(prompt)};
 const plan = await agent("Design a bounded execution plan for this user task. Return 1-8 independent or dependency-linked tasks. Use unique short ids, concise descriptions, exact worker prompts, and only dependencies that appear in the task list. Prefer independent tasks when possible. User task:\\n\\n" + originalPrompt, {
   label: "planner",
+  tier: "medium",
   schema: {
     type: "object",
     properties: {
@@ -152,7 +158,7 @@ const graph = await orchestrate(plan.tasks.map((task) => ({
   id: task.id,
   description: task.description,
   dependsOn: task.dependsOn || [],
-  run: ({ results, statuses }) => agent(task.prompt + "\\n\\nDependency results (null means unavailable):\\n" + JSON.stringify({ results, statuses }), { label: task.id }),
+  run: ({ results, statuses }) => agent(task.prompt + "\\n\\nDependency results (null means unavailable):\\n" + JSON.stringify({ results, statuses }), { label: task.id, tier: "low" }),
 })), { onError: "continue" });
 const SYNTHESIS_CONTEXT_LIMIT = 78000;
 function renderContextValue(value) {
@@ -226,21 +232,61 @@ while (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT && (valuePreviewBudget > 1
   synthesisJson = JSON.stringify(synthesisContext);
 }
 if (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT) throw new Error("Unable to fit the synthesis context within its managed prompt budget");
-return await agent("Synthesize the worker results into a direct answer to the original task. Mention incomplete or failed coverage explicitly.\\n\\nOriginal task, execution plan, and graph ledger:\\n" + synthesisJson, { label: "synthesizer" });`;
+return await agent("Synthesize the worker results into a direct answer to the original task. Mention incomplete or failed coverage explicitly.\\n\\nOriginal task, execution plan, and graph ledger:\\n" + synthesisJson, { label: "synthesizer", tier: "medium" });`;
 }
 
 export default function piWorkflows(pi: ExtensionAPI): void {
   let engine: WorkflowEngine | undefined;
   let protocolError: string | undefined;
-  let protocolCheck: Promise<void> = Promise.resolve();
+  let protocolCheck: Promise<ManagedProtocolCheck> | undefined;
+  let protocolProbe: (() => Promise<ManagedProtocolCheck>) | undefined;
+  let protocolInFlight: Promise<ManagedProtocolCheck> | undefined;
+  /**
+   * Track one in-flight probe so concurrent starts share it, and release it the
+   * moment it settles.
+   *
+   * Releasing matters: the catalogue is read live on the peer's side, so the
+   * next start or resume must issue a *new* ping. Holding a settled promise
+   * here would pin every later run to the routing policy as it stood at session
+   * start, and a tier defined since then would be rejected pre-dispatch as
+   * unknown.
+   */
+  const trackProbe = (check: Promise<ManagedProtocolCheck>): Promise<ManagedProtocolCheck> => {
+    protocolInFlight = check;
+    const release = () => {
+      if (protocolInFlight === check) protocolInFlight = undefined;
+    };
+    void check.then(release, release);
+    return check;
+  };
+  const awaitProtocol = async (): Promise<ManagedProtocolCheck> => {
+    let check = protocolInFlight;
+    if (!check) {
+      if (protocolProbe) protocolError = undefined;
+      check = protocolProbe?.() ?? protocolCheck;
+      if (!check) throw new Error(`${PROTOCOL_DIAGNOSTIC} Diagnostic: no active protocol probe`);
+      trackProbe(check);
+    }
+    try {
+      const result = await check;
+      protocolError = undefined;
+      return result;
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(protocolError ?? `${PROTOCOL_DIAGNOSTIC} Diagnostic: ${detail}`);
+    }
+  };
   let active = false;
-  let unsubscribeTreeSignal: (() => void) | undefined;
+  let surfaceRegistered = false;
+  const registeredWorkflowCommands = new Set<string>();
   let branchQuiesce: Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> | undefined;
   let lifecycleGeneration = 0;
   let protocolAbortController: AbortController | undefined;
   let sessionCwd = process.cwd();
   let workflowSettings = loadWorkflowSettings(sessionCwd);
   let effortLevel: "off" | "high" | "ultra" = workflowSettings.effort;
+  let triggerKeyword: string | undefined = workflowSettings.keywordTriggerWord;
+  let keywordTriggerEnabled = workflowSettings.keywordTriggerEnabled;
   /** Per-session delivery endpoint for background-run results (A10 fail-closed). */
   let deliverResult: ((text: string, details?: unknown) => void) | undefined;
   /** Pending deliveries for runs that settled before a session endpoint was bound (A10). */
@@ -252,9 +298,41 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let widgetTimer: ReturnType<typeof setInterval> | undefined;
 
   const currentEngine = (): WorkflowEngine => {
-    if (!engine) throw new Error("pi-workflows is not active in this session context");
+    if (!active || !engine || engine.isDisposed())
+      throw new Error("pi-workflows is not active in this session context");
     return engine;
   };
+
+  const clearWidget = (): void => {
+    const tui = (pi as unknown as { ui?: { setWidget?: (key: string, content: string[] | undefined) => void } }).ui;
+    tui?.setWidget?.("pi-workflows", undefined);
+  };
+  const refreshWidget = (): void => {
+    const tui = (pi as unknown as { ui?: { setWidget?: (key: string, content: string[] | undefined) => void } }).ui;
+    if (!tui?.setWidget) return;
+    const workflowEngine = engine;
+    if (!active || !workflowEngine || workflowEngine.isDisposed()) {
+      tui.setWidget("pi-workflows", undefined);
+      if (widgetTimer) {
+        clearInterval(widgetTimer);
+        widgetTimer = undefined;
+      }
+      return;
+    }
+    const runs = workflowEngine
+      .list()
+      .map((summary) => workflowEngine.getRun(String(summary.runId)))
+      .filter((run): run is NonNullable<typeof run> => run !== undefined);
+    const lines = liveWidgetLines(runs, workflowSettings.progressMode, workflowSettings.maxAgentsShown);
+    tui.setWidget("pi-workflows", lines.length > 0 ? lines : undefined);
+    if (lines.length > 0 && !widgetTimer) {
+      widgetTimer = setInterval(refreshWidget, 2_000);
+    } else if (lines.length === 0 && widgetTimer) {
+      clearInterval(widgetTimer);
+      widgetTimer = undefined;
+    }
+  };
+  const notifyRunChanged = (): void => refreshWidget();
 
   const branchEntries = (): SessionEntryLike[] => {
     const ctx = (pi as unknown as { currentSessionManager?: { getBranch?: () => unknown } }).currentSessionManager;
@@ -267,16 +345,38 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
   const DEFAULT_EXCLUDED_TOOLS = ["workflow", "workflow_control"] as const;
 
+  /**
+   * Resolve a nested `workflow(name)` reference, saying where the script came
+   * from.
+   *
+   * Shipped-ness has to be reported per script rather than inherited from the
+   * frame that called it: a user script may call a built-in by name, and a
+   * built-in's tier names are preferences against whatever catalogue the host
+   * defines, while a user script's are assertions about a catalogue the user
+   * owns. Inheriting the caller's flag would apply the wrong rule in both
+   * directions.
+   */
+  const resolveNestedWorkflow = (name: string): { script: string; shippedScript?: boolean } | undefined => {
+    // A saved file shadows a built-in of the same name; it is the user's own
+    // script and keeps the strict tier check.
+    const saved = loadSavedWorkflow(name, sessionCwd);
+    if (saved !== undefined) return { script: saved };
+    const builtin = BUILTIN_WORKFLOWS[name]?.script;
+    return builtin === undefined ? undefined : { script: builtin, shippedScript: true };
+  };
+
   const resolveScript = (
     script: string | undefined,
     name: string | undefined,
     args: unknown,
-  ): { script: string; source: string; toolset?: string } => {
+  ): { script: string; source: string; toolset?: string; shippedScript?: boolean } => {
     if (script !== undefined && name !== undefined) {
       throw new Error("Provide either `script` or `name`, not both.");
     }
     if (script !== undefined) return { script, source: "inline" };
     if (name !== undefined) {
+      // A saved workflow is the user's own file even when it shadows a built-in
+      // name, so it keeps the strict tier check.
       const saved = loadSavedWorkflow(name, sessionCwd);
       if (saved) return { script: saved, source: `saved:${name}` };
       const builtin = BUILTIN_WORKFLOWS[name];
@@ -284,7 +384,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         // Validate named invocations before starting a potentially expensive fleet.
         // Slash commands provide the same shape through their descriptor primaryArg.
         validateBuiltinArgs(name, args);
-        return { script: builtin.script, source: `builtin:${name}`, toolset: builtin.toolset };
+        return {
+          script: builtin.script,
+          source: `builtin:${name}`,
+          toolset: builtin.toolset,
+          shippedScript: true,
+        };
       }
       throw new Error(`Unknown workflow name "${name}". It is neither a saved workflow nor a built-in.`);
     }
@@ -295,6 +400,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     if (active) return;
     active = true;
     const workflowEngine = currentEngine();
+    workflowEngine.onRunSettled = notifyRunChanged;
+    // Command/tool registrations persist across session replacement, but the
+    // widget belongs to the newly restored engine and must be refreshed too.
+    refreshWidget();
+    if (surfaceRegistered) return;
+    surfaceRegistered = true;
 
     pi.registerTool(
       defineTool({
@@ -330,62 +441,67 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         },
         async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           try {
-            await protocolCheck;
+            const workflowEngine = currentEngine();
+            const resolved =
+              params.resumeFromRunId && params.script === undefined && params.name === undefined
+                ? (() => {
+                    const prior = workflowEngine.getRun(params.resumeFromRunId);
+                    if (!prior) throw new Error(`Workflow run not found: ${params.resumeFromRunId}`);
+                    // Resume reads the frozen flag off the restored run, so
+                    // this only has to satisfy the shared shape.
+                    return { script: prior.script, source: "resume", toolset: prior.toolset, shippedScript: undefined };
+                  })()
+                : resolveScript(params.script, params.name, params.args);
+            const { script, source, toolset, shippedScript } = resolved;
+            const options: ScriptStartOptions = {
+              args: params.args,
+              background: params.background ?? true,
+              maxAgents: params.maxAgents,
+              concurrency: params.concurrency,
+              agentRetries: params.agentRetries,
+              tokenBudget: params.tokenBudget,
+              agentTimeoutMs: params.agentTimeoutMs,
+              toolset,
+              ...(shippedScript === undefined ? {} : { shippedScript }),
+              excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
+              signal,
+              mainModel: ctx?.model?.id,
+              // Foreground checkpoint confirmation only when the run is not
+              // background — background runs are headless by contract.
+              confirm:
+                params.background === false && ctx?.hasUI && ctx.mode === "tui"
+                  ? async (promptText, checkpointOptions) => {
+                      if (checkpointOptions.kind === "input")
+                        return ctx.ui.input(promptText, String(checkpointOptions.default ?? ""));
+                      if (checkpointOptions.kind === "select")
+                        return ctx.ui.select(promptText, checkpointOptions.choices ?? []);
+                      return ctx.ui.confirm(promptText, promptText);
+                    }
+                  : undefined,
+              loadSavedWorkflow: resolveNestedWorkflow,
+            };
+            if (params.resumeFromRunId) {
+              const replacement = params.script !== undefined || params.name !== undefined ? script : undefined;
+              const resumed = await workflowEngine.resume(
+                params.resumeFromRunId,
+                branchEntries(),
+                options,
+                replacement,
+              );
+              if (!resumed) return textResult(`Workflow run not found: ${params.resumeFromRunId}`);
+              if (resumed.background) void deliverBackgroundResult(workflowEngine, resumed.runId);
+              return textResult(formatStart(resumed), resumed);
+            }
+            const result = await workflowEngine.start(script, options);
+            if (result.background) {
+              // The engine resolves the script's meta name for the delivery header.
+              void source;
+              void deliverBackgroundResult(workflowEngine, result.runId);
+            }
+            return textResult(formatStart(result), result);
           } catch (error: unknown) {
-            return textResult(
-              protocolError ??
-                `${PROTOCOL_DIAGNOSTIC} Diagnostic: ${error instanceof Error ? error.message : String(error)}`,
-            );
+            return textResult(error instanceof Error ? error.message : String(error));
           }
-          const resolved =
-            params.resumeFromRunId && params.script === undefined && params.name === undefined
-              ? (() => {
-                  const prior = workflowEngine.getRun(params.resumeFromRunId);
-                  if (!prior) throw new Error(`Workflow run not found: ${params.resumeFromRunId}`);
-                  return { script: prior.script, source: "resume", toolset: prior.toolset };
-                })()
-              : resolveScript(params.script, params.name, params.args);
-          const { script, source, toolset } = resolved;
-          const options: ScriptStartOptions = {
-            args: params.args,
-            background: params.background ?? true,
-            maxAgents: params.maxAgents,
-            concurrency: params.concurrency,
-            agentRetries: params.agentRetries,
-            tokenBudget: params.tokenBudget,
-            agentTimeoutMs: params.agentTimeoutMs,
-            toolset,
-            excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
-            signal,
-            mainModel: ctx?.model?.id,
-            // Foreground checkpoint confirmation only when the run is not
-            // background — background runs are headless by contract.
-            confirm:
-              params.background === false && ctx?.hasUI && ctx.mode === "tui"
-                ? async (promptText, checkpointOptions) => {
-                    if (checkpointOptions.kind === "input")
-                      return ctx.ui.input(promptText, String(checkpointOptions.default ?? ""));
-                    if (checkpointOptions.kind === "select")
-                      return ctx.ui.select(promptText, checkpointOptions.choices ?? []);
-                    return ctx.ui.confirm(promptText, promptText);
-                  }
-                : undefined,
-            loadSavedWorkflow: (name) => loadSavedWorkflow(name, sessionCwd) ?? BUILTIN_WORKFLOWS[name]?.script,
-          };
-          if (params.resumeFromRunId) {
-            const replacement = params.script !== undefined || params.name !== undefined ? script : undefined;
-            const resumed = await workflowEngine.resume(params.resumeFromRunId, branchEntries(), options, replacement);
-            if (!resumed) return textResult(`Workflow run not found: ${params.resumeFromRunId}`);
-            if (resumed.background) void deliverBackgroundResult(workflowEngine, resumed.runId);
-            return textResult(formatStart(resumed), resumed);
-          }
-          const result = await workflowEngine.start(script, options);
-          if (result.background) {
-            // The engine resolves the script's meta name for the delivery header.
-            void source;
-            void deliverBackgroundResult(workflowEngine, result.runId);
-          }
-          return textResult(formatStart(result), result);
         },
       }),
     );
@@ -405,20 +521,25 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           return new Text(theme.fg("dim", expanded ? text.slice(0, 8_000) : text.slice(0, 1_000)), 0, 0);
         },
         async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-          const rawAction = params.action as string;
-          const action = (rawAction === "status" ? "get" : rawAction) as
-            | "list"
-            | "get"
-            | "pause"
-            | "resume"
-            | "stop"
-            | "rm";
-          if (!["list", "get", "pause", "resume", "stop", "rm"].includes(action)) {
-            throw new Error(`unknown workflow_control action: ${params.action}`);
+          try {
+            const rawAction = params.action as string;
+            const action = (rawAction === "status" ? "get" : rawAction) as
+              | "list"
+              | "get"
+              | "pause"
+              | "resume"
+              | "stop"
+              | "rm";
+            if (!["list", "get", "pause", "resume", "stop", "rm"].includes(action)) {
+              throw new Error(`unknown workflow_control action: ${params.action}`);
+            }
+            const runId = normalizeControlRunId(params as unknown as Record<string, unknown>);
+            const workflowEngine = currentEngine();
+            const result = await workflowEngine.control(action, runId);
+            return textResult(JSON.stringify(result), result);
+          } catch (error: unknown) {
+            return textResult(error instanceof Error ? error.message : String(error));
           }
-          const runId = normalizeControlRunId(params as unknown as Record<string, unknown>);
-          const result = await workflowEngine.control(action, runId);
-          return textResult(JSON.stringify(result), result);
         },
       }),
     );
@@ -430,8 +551,16 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
         const [subcommand, ...rest] = tokens;
         const restArgs = rest.join(" ").trim();
+        const engineForCommand = (): WorkflowEngine | undefined => {
+          try {
+            return currentEngine();
+          } catch (error: unknown) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return undefined;
+          }
+        };
         if (!subcommand) {
-          await showWorkflowNavigator(ctx, workflowEngine);
+          await showWorkflowNavigator(ctx, currentEngine);
           return;
         }
         if (subcommand === "run") {
@@ -444,6 +573,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           return;
         }
         if (subcommand === "status") {
+          const workflowEngine = engineForCommand();
+          if (!workflowEngine) return;
           if (restArgs) {
             const run = workflowEngine.getRun(restArgs);
             if (!run) {
@@ -463,6 +594,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           return;
         }
         if (subcommand === "watch") {
+          const workflowEngine = engineForCommand();
+          if (!workflowEngine) return;
           const runId = restArgs || String(workflowEngine.list()[0]?.runId ?? "");
           if (!runId) {
             ctx.ui.notify("No workflow runs to watch.", "warning");
@@ -473,7 +606,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           return;
         }
         if (subcommand === "stop" || subcommand === "pause" || subcommand === "resume" || subcommand === "rm") {
-          const firstListed = workflowEngine.list()[0]?.runId;
+          const listedEngine = engineForCommand();
+          if (!listedEngine) return;
+          const firstListed = listedEngine.list()[0]?.runId;
           const runId = resolveControlTarget(
             subcommand,
             restArgs,
@@ -490,6 +625,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             return;
           }
           try {
+            const workflowEngine = engineForCommand();
+            if (!workflowEngine) return;
             await workflowEngine.control(subcommand, runId);
             if (subcommand === "resume") void deliverBackgroundResult(workflowEngine, runId);
             ctx.ui.notify(`Workflow ${subcommand} requested: ${runId}`, "info");
@@ -504,6 +641,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             ctx.ui.notify("/workflows save <name> [runId]", "warning");
             return;
           }
+          const workflowEngine = engineForCommand();
+          if (!workflowEngine) return;
           // Fallback to most recent run when runId omitted — matches upstream runs.find(r=>r.script)
           const runId = rest[1] ?? String(workflowEngine.list()[0]?.runId ?? "");
           if (!runId) {
@@ -582,8 +721,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // is annotated to say so. Arming AUTHORIZES the tool; it never forces a run,
     // and it never opens UI. A user asking a question about workflows still gets
     // an ordinary answer.
-    let triggerKeyword: string | undefined = workflowSettings.keywordTriggerWord;
-    let keywordTriggerEnabled = workflowSettings.keywordTriggerEnabled;
     const TRIGGER_WORD_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/u;
     const persistTriggerSettings = (): void => {
       workflowSettings = { ...workflowSettings, keywordTriggerWord: triggerKeyword, keywordTriggerEnabled };
@@ -708,7 +845,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // unregister or replace a command, so clobbering one is permanent.
     const claimedCommands = new Set((pi.getCommands?.() ?? []).map((command) => command.name));
     for (const name of Object.keys(BUILTIN_WORKFLOWS)) {
-      if (claimedCommands.has(name)) continue;
+      if (claimedCommands.has(name) || registeredWorkflowCommands.has(name)) continue;
       const descriptor = BUILTIN_WORKFLOWS[name];
       pi.registerCommand(name, {
         description: `Run the ${name} workflow`,
@@ -736,54 +873,33 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             args: scriptArgs,
             background: true,
             toolset: descriptor.toolset,
+            shippedScript: true,
             excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
-            loadSavedWorkflow: (savedName) =>
-              loadSavedWorkflow(savedName, sessionCwd) ?? BUILTIN_WORKFLOWS[savedName]?.script,
+            loadSavedWorkflow: resolveNestedWorkflow,
           };
-          const result = await workflowEngine.start(descriptor.script, options);
-          void deliverBackgroundResult(workflowEngine, result.runId);
-          ctx.ui.notify(`Workflow ${name} started in background: ${result.runId}`, "info");
+          try {
+            const workflowEngine = currentEngine();
+            const result = await workflowEngine.start(descriptor.script, options);
+            void deliverBackgroundResult(workflowEngine, result.runId);
+            ctx.ui.notify(`Workflow ${name} started in background: ${result.runId}`, "info");
+          } catch (error: unknown) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
         },
       });
+      registeredWorkflowCommands.add(name);
     }
 
-    // Live progress widget (A10): renders only while runs are active, then
-    // clears itself. The widget is TUI-only; headless sessions skip it.
-    const refreshWidget = () => {
-      const tui = (pi as unknown as { ui?: { setWidget?: (key: string, content: string[] | undefined) => void } }).ui;
-      if (!tui?.setWidget) return;
-      const runs = workflowEngine
-        .list()
-        .map((summary) => workflowEngine.getRun(String(summary.runId)))
-        .filter((run): run is NonNullable<typeof run> => run !== undefined);
-      const lines = liveWidgetLines(runs, workflowSettings.progressMode, workflowSettings.maxAgentsShown);
-      tui.setWidget("pi-workflows", lines.length > 0 ? lines : undefined);
-      if (lines.length > 0 && !widgetTimer) {
-        widgetTimer = setInterval(() => {
-          if (!tui?.setWidget) return;
-          const current = workflowEngine
-            .list()
-            .map((summary) => workflowEngine.getRun(String(summary.runId)))
-            .filter((run): run is NonNullable<typeof run> => run !== undefined);
-          const next = liveWidgetLines(current, workflowSettings.progressMode, workflowSettings.maxAgentsShown);
-          tui.setWidget("pi-workflows", next.length > 0 ? next : undefined);
-          if (next.length === 0 && widgetTimer) {
-            clearInterval(widgetTimer);
-            widgetTimer = undefined;
-          }
-        }, 2_000);
-      } else if (lines.length === 0 && widgetTimer) {
-        clearInterval(widgetTimer);
-        widgetTimer = undefined;
-      }
-    };
-    // Refresh after any control action and on run settlement.
-    const notifyRunChanged = () => refreshWidget();
-    workflowEngine.onRunSettled = notifyRunChanged;
-    void notifyRunChanged;
-
+    // Live progress widget refreshes through the current engine, so its timer
+    // and settlement callback remain safe across session replacement.
     const beginBranchQuiesce = (): Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> => {
       if (!branchQuiesce) {
+        let workflowEngine: WorkflowEngine;
+        try {
+          workflowEngine = currentEngine();
+        } catch {
+          return Promise.resolve({ settled: true, pending: [] });
+        }
         branchQuiesce = workflowEngine.quiesceForBranchChange().then((result) => {
           if (!result.settled) {
             console.warn(
@@ -796,7 +912,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       return branchQuiesce;
     };
 
-    unsubscribeTreeSignal = pi.events.on("subagents:session_before_tree", () => {
+    pi.events.on("subagents:session_before_tree", () => {
       void beginBranchQuiesce();
     });
 
@@ -807,6 +923,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       let entries: SessionEntryLike[];
       try {
         entries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
+      } catch {
+        return;
+      }
+      let workflowEngine: WorkflowEngine;
+      try {
+        workflowEngine = currentEngine();
       } catch {
         return;
       }
@@ -894,18 +1016,24 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // while the graph validates dependencies before dispatching any workers.
     const script = buildAdHocWorkflowScript(prompt);
     try {
-      await protocolCheck;
-      const result = await currentEngine().start(script, { background: true, mainModel: ctx.model?.id });
-      void deliverBackgroundResult(currentEngine(), result.runId);
+      const workflowEngine = currentEngine();
+      const result = await workflowEngine.start(script, {
+        background: true,
+        // We wrote this script, tiers included, so its tier names are a
+        // preference against whatever catalogue this host defines.
+        shippedScript: true,
+        mainModel: ctx.model?.id,
+      });
+      void deliverBackgroundResult(workflowEngine, result.runId);
       return result.runId;
     } catch (error: unknown) {
-      ctx.ui.notify(protocolError ?? (error instanceof Error ? error.message : String(error)), "error");
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       return undefined;
     }
   };
 
   const saveWorkflowFromRun = async (ctx: ExtensionCommandContext, name: string, runId?: string): Promise<void> => {
-    const state = engine?.getState(runId ?? "");
+    const state = currentEngine().getState(runId ?? "");
     if (!state) {
       throw new Error(`Workflow run not found: ${runId ?? "(none)"}`);
     }
@@ -919,6 +1047,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     sessionCwd = ctx.cwd ?? process.cwd();
     workflowSettings = loadWorkflowSettings(sessionCwd);
     effortLevel = workflowSettings.effort;
+    triggerKeyword = workflowSettings.keywordTriggerWord;
+    keywordTriggerEnabled = workflowSettings.keywordTriggerEnabled;
     let initialEntries: SessionEntryLike[];
     try {
       initialEntries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
@@ -936,6 +1066,15 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
     protocolAbortController = new AbortController();
     const client = createManagedSpawnClient(pi.events, protocolAbortController.signal, protocolAbortController.signal);
+    protocolError = undefined;
+    protocolProbe = () =>
+      client.checkProtocol?.() ?? Promise.reject(new Error("managed protocol check is unavailable"));
+    protocolCheck = trackProbe(protocolProbe());
+    void protocolCheck.catch((error: unknown) => {
+      if (generation !== lifecycleGeneration) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      protocolError = `${PROTOCOL_DIAGNOSTIC} Diagnostic: ${detail}`;
+    });
 
     let recoveredEngine: WorkflowEngine | undefined;
     let recoveryError: unknown;
@@ -955,6 +1094,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             return [];
           }
         },
+        awaitProtocol,
       );
       try {
         const entries =
@@ -1036,36 +1176,39 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // name clashes first — never overwrite another extension's command.
     const existingCommands = new Set((pi.getCommands?.() ?? []).map((command) => command.name));
     for (const savedName of listSavedWorkflows(sessionCwd)) {
-      if (existingCommands.has(savedName)) continue;
-      const script = loadSavedWorkflow(savedName, sessionCwd);
-      if (!script) continue;
+      if (existingCommands.has(savedName) || registeredWorkflowCommands.has(savedName)) continue;
+      if (!loadSavedWorkflow(savedName, sessionCwd)) continue;
       pi.registerCommand(savedName, {
         description: `Run the saved workflow ${savedName}`,
         handler: async (args: string, commandCtx: ExtensionCommandContext) => {
-          const options: ScriptStartOptions = {
-            args: args.trim() ? { prompt: args.trim() } : undefined,
-            background: true,
-            mainModel: commandCtx?.model?.id,
-            loadSavedWorkflow: (name) => loadSavedWorkflow(name, sessionCwd) ?? BUILTIN_WORKFLOWS[name]?.script,
-          };
-          const result = await recoveredEngine.start(script, options);
-          void deliverBackgroundResult(recoveredEngine, result.runId);
-          commandCtx.ui.notify(`Workflow ${savedName} started in background: ${result.runId}`, "info");
+          try {
+            const workflowEngine = currentEngine();
+            const script = loadSavedWorkflow(savedName, sessionCwd) ?? BUILTIN_WORKFLOWS[savedName]?.script;
+            if (!script) throw new Error(`Saved workflow "${savedName}" is no longer available.`);
+            const options: ScriptStartOptions = {
+              args: args.trim() ? { prompt: args.trim() } : undefined,
+              background: true,
+              mainModel: commandCtx?.model?.id,
+              loadSavedWorkflow: resolveNestedWorkflow,
+            };
+            const result = await workflowEngine.start(script, options);
+            void deliverBackgroundResult(workflowEngine, result.runId);
+            commandCtx.ui.notify(`Workflow ${savedName} started in background: ${result.runId}`, "info");
+          } catch (error: unknown) {
+            commandCtx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+          }
         },
       });
+      registeredWorkflowCommands.add(savedName);
     }
-
-    protocolError = undefined;
-    protocolCheck = client.checkProtocol?.() ?? Promise.reject(new Error("managed protocol check is unavailable"));
-    void protocolCheck.catch((error: unknown) => {
-      if (generation !== lifecycleGeneration) return;
-      const detail = error instanceof Error ? error.message : String(error);
-      protocolError = `${PROTOCOL_DIAGNOSTIC} Diagnostic: ${detail}`;
-    });
   });
 
   pi.on("session_shutdown", async () => {
     lifecycleGeneration += 1;
+    // Invalidate all long-lived command/tool/widget closures before awaiting
+    // engine quiescence; the old session must not accept another run.
+    active = false;
+    clearWidget();
     if (widgetTimer) {
       clearInterval(widgetTimer);
       widgetTimer = undefined;
@@ -1076,13 +1219,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     }
     protocolAbortController?.abort();
     protocolAbortController = undefined;
-    unsubscribeTreeSignal?.();
-    unsubscribeTreeSignal = undefined;
     closingEngine?.dispose();
     engine = undefined;
-    active = false;
     branchQuiesce = undefined;
-    protocolCheck = Promise.resolve();
+    protocolCheck = undefined;
+    protocolProbe = undefined;
+    protocolInFlight = undefined;
     protocolError = undefined;
     deliverResult = undefined;
   });

@@ -18,7 +18,6 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
 import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
@@ -29,10 +28,12 @@ import { detectEnv } from "./env.js";
 import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from "./gate.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
+  INTERNAL_PARENT_POLICY_SNAPSHOT,
   type InternalAgentConfigOverride,
+  type ParentPolicySnapshot,
 } from "./internal-run.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -40,8 +41,6 @@ import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createSupervisorTool } from "./supervisor.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
-import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
-import { resolveWorkflowTier } from "./workflow-tiers.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -507,14 +506,26 @@ export interface RunOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
-  /** Semantic workflow tier; resolved here rather than by workflow callers. */
-  tier?: WorkflowTier;
   /**
-   * User-named model tier for an ordinary spawn. Resolved here so the top-level
-   * Agent tool, nested delegation, the scheduler and cross-extension RPC all get
-   * the same precedence and the same fail-closed errors from one place.
+   * User-named model tier. Resolved here so the top-level Agent tool, nested
+   * delegation, the scheduler, cross-extension RPC and managed workflow calls
+   * all get the same precedence and the same fail-closed errors from one place.
    */
   agentTier?: string;
+  /**
+   * Refuse the implicit `defaultModel`-then-parent fallback when no tier
+   * applies, and reach the shipped fallback tier instead.
+   *
+   * Managed workflow calls set this so that every managed spawn carries a named
+   * policy with a durable resolution snapshot, rather than an unnamed model
+   * nobody chose for it. Note what this does *not* do: the shipped fallback is
+   * `medium`, whose profile inherits, so on an unconfigured host the model is
+   * still the parent session's. What the flag buys is that the choice has a
+   * name, a recorded thinking level, and a scope check — and that a user who
+   * sets `agentTiers.defaultTier` to "none" gets a hard refusal here instead of
+   * silent inheritance.
+   */
+  requireAgentTier?: boolean;
   /** Optional toolset hint forwarded by managed workflow callers. */
   toolset?: string;
   /** Additional tool names denied by the caller, merged with agent frontmatter. */
@@ -546,10 +557,15 @@ export interface RunOptions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
-  /** Called after pi-subagents resolves a semantic workflow tier. */
-  onTierResolved?: (snapshot: WorkflowTierResolutionSnapshot) => void;
-  /** Called after pi-subagents resolves a user-named agent tier. */
-  onAgentTierResolved?: (snapshot: AgentTierResolutionSnapshot) => void;
+  /**
+   * Called after pi-subagents resolves a user-named agent tier.
+   *
+   * `modelLabel` is the short display name of the model the tier pinned, and is
+   * absent when the profile inherits. It rides along rather than living on the
+   * snapshot because the snapshot is a durable policy record that a managed
+   * tombstone persists and revalidates; a cosmetic label does not belong in it.
+   */
+  onAgentTierResolved?: (snapshot: AgentTierResolutionSnapshot, modelLabel?: string) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -568,6 +584,8 @@ export interface RunOptions {
    * JSON/public spawn field; the generation wizard is the only issuer.
    */
   readonly [INTERNAL_AGENT_CONFIG_OVERRIDE]?: InternalAgentConfigOverride;
+  /** Parent model/thinking captured when a managed spawn was allocated. */
+  readonly [INTERNAL_PARENT_POLICY_SNAPSHOT]?: ParentPolicySnapshot;
   /**
    * Reopen an existing conversation from this session file instead of starting
    * a new one. Package-internal: the only issuer is the `@handle` mention
@@ -765,41 +783,49 @@ export async function runAgent(
         inheritContext: internalOverride.inheritContext,
       }
     : loadedAgentConfig;
-  const parentThinking = options.parentThinking ?? (() => {
-    const level = options.pi.getThinkingLevel?.();
-    return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
-      ? level
-      : undefined;
-  })();
-  // Resolve the semantic tier before the first await. Managed callers persist the
-  // immutable policy snapshot from onTierResolved before provider work begins.
-  const tierResolution = options.tier
-    ? resolveWorkflowTier({
-        tier: options.tier,
-        agentConfig,
-        directModel: options.model,
-        thinkingOverride: options.thinkingLevel,
-        parentModel: ctx.model,
-        parentThinking,
-        modelRegistry: ctx.modelRegistry,
-      })
-    : undefined;
-  if (tierResolution?.snapshot) options.onTierResolved?.(tierResolution.snapshot);
-
-  // Agent tiers resolve in the same place and before the same await, so every
-  // spawn path shares one precedence and one set of fail-closed errors. A tier
-  // that applies decides model and thinking outright: it is current policy,
-  // while an agent's legacy `model:`/`thinking:` frontmatter is the older, weaker
-  // statement of the same thing. Throwing here refuses the spawn rather than
-  // quietly running a model the caller did not choose.
+  const parentPolicySnapshot = options[INTERNAL_PARENT_POLICY_SNAPSHOT];
+  const parentModel = parentPolicySnapshot ? parentPolicySnapshot.model : ctx.model;
+  const parentThinking = parentPolicySnapshot
+    ? parentPolicySnapshot.thinking
+    : options.parentThinking ?? (() => {
+        const level = options.pi.getThinkingLevel?.();
+        return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
+          ? level
+          : undefined;
+      })();
+  // One resolver, one precedence, one set of fail-closed errors, for every
+  // spawn path. It runs before the first await so a managed caller can persist
+  // the immutable snapshot before any provider work begins.
   const agentTierResolution = resolveAgentTier({
     requestedTier: options.agentTier,
+    // The same flag that forbids the parent fallback below is what lets the
+    // resolver reach its shipped fallback, so the two can never disagree about
+    // whether this spawn has a tier.
+    requireTier: options.requireAgentTier === true,
     agentConfig,
-    parentModel: ctx.model,
+    parentModel,
     parentThinking,
     modelRegistry: ctx.modelRegistry,
   });
-  if (agentTierResolution.snapshot) options.onAgentTierResolved?.(agentTierResolution.snapshot);
+  const agentTierSnapshot = agentTierResolution.snapshot;
+  if (options.requireAgentTier === true && !agentTierSnapshot) {
+    throw new Error(
+      `No agent tier selected for "${type}". A managed workflow call must name a tier, ` +
+        "the agent must declare one, or agentTiers must offer a default; " +
+        "inheriting the parent session's model is not a policy this call can fall back to.",
+    );
+  }
+  if (agentTierSnapshot) {
+    // A tier owns model resolution, so it owns the label the UI shows for the
+    // spawn: no caller can compute one, because none of them resolved the
+    // model. A profile that inherits pinned nothing, so it gets no label — the
+    // agent is running the parent's model, which the UI shows by omission.
+    const tierModelLabel =
+      agentTierSnapshot.configuredModel === "inherit" || !agentTierResolution.model
+        ? undefined
+        : shortModelLabel(agentTierResolution.model);
+    options.onAgentTierResolved?.(agentTierSnapshot, tierModelLabel);
+  }
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -1021,41 +1047,25 @@ export async function runAgent(
     }
   }
 
-  // `options.model` stays highest: it is a resolved Model handed over by a
-  // programmatic caller, which is a more explicit act than naming a tier.
-  const model = options.model ?? agentTierResolution.model ?? tierResolution?.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
-  const thinkingLevel = agentTierResolution.snapshot
+  // A resolved tier owns both values. In particular, a pre-resolved parent or
+  // legacy model/thinking option from a caller cannot bypass it.
+  const model = agentTierSnapshot
+    ? agentTierResolution.model
+    : options.model ?? resolveDefaultModel(parentModel, ctx.modelRegistry, agentConfig?.model);
+  const thinkingLevel = agentTierSnapshot
     ? agentTierResolution.thinkingLevel
-    : options.tier !== undefined
-      ? tierResolution?.thinkingLevel
-      : options.thinkingLevel ?? agentConfig?.thinking;
+    : options.thinkingLevel ?? agentConfig?.thinking;
 
-  if (agentTierResolution.snapshot) {
-    const { configuredModel, source } = agentTierResolution.snapshot;
+  if (agentTierSnapshot) {
+    const { configuredModel, source } = agentTierSnapshot;
     const scopeVerdict = checkModelScope({
       model,
       cwd: ctx.cwd,
       modelRegistry: ctx.modelRegistry,
-      // A tier the caller named is a runtime choice by the model, which is what
-      // scopeModels exists to police; a tier that came from the agent file or
-      // the configured default is the user's own config and only warns.
+      // scopeModels polices a tier chosen per dispatch, by the host model or by
+      // a workflow script alike; a tier from the agent file or the configured
+      // default is standing config and only warns.
       callerSupplied: source === "call",
-      agentLabel: agentConfig?.displayName ?? type,
-      modelInput: configuredModel === "inherit" ? undefined : configuredModel,
-    });
-    if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
-    if (scopeVerdict.kind === "warn" && ctx.hasUI) ctx.ui.notify(scopeVerdict.message, "warning");
-  }
-
-  if (options.tier) {
-    const configuredModel = tierResolution?.snapshot?.configuredModel;
-    const scopeVerdict = checkModelScope({
-      model,
-      cwd: ctx.cwd,
-      modelRegistry: ctx.modelRegistry,
-      callerSupplied: false,
       agentLabel: agentConfig?.displayName ?? type,
       modelInput: configuredModel === "inherit" ? undefined : configuredModel,
     });
@@ -1373,7 +1383,11 @@ export async function runAgent(
       pendingToolTimeouts.delete(toolCallId);
       try {
         session.abort();
-      } catch {}
+      } catch {
+        // The session may already be torn down by the time this fires; the
+        // timeout's only job is to stop a hung tool, and there is nothing
+        // left to stop.
+      }
     }, defaultToolTimeoutMs);
     handle.unref?.();
     pendingToolTimeouts.set(toolCallId, handle);
@@ -1528,7 +1542,11 @@ export async function resumeAgent(
               resumePendingTimeouts.delete(id);
               try {
                 session.abort();
-              } catch {}
+              } catch {
+                // The session may already be torn down by the time this fires; the
+                // timeout's only job is to stop a hung tool, and there is nothing
+                // left to stop.
+              }
             }, defaultToolTimeoutMs);
             handle.unref?.();
             resumePendingTimeouts.set(id, handle);

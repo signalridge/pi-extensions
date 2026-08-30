@@ -1,7 +1,7 @@
 <!-- GENERATED from WORKFLOW_CAPABILITY_CONTRACT; do not edit by hand. -->
 # Workflow capability index
 
-Contract format: `1.0.0`<br>
+Contract format: `2.0.0`<br>
 Contract content / skill / extension: `1.4.0`
 
 This compact generated index covers supported runtime globals and workflow-tool inputs. For constraints, compatibility behavior, internal boundaries, and dynamic-reference ownership, follow the [exhaustive generated facts](capability-details.md).
@@ -11,7 +11,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional); default: derived from phase and call count<br>`phase`: string (optional); default: current phase<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional); default: pi-subagents model resolver<br>`tier`: small\|medium\|large (optional); default: pi-subagents workflow tier<br>`isolation`: "worktree" (optional); default: pi-subagents worktree policy<br>`thread`: string (optional); default: fresh session per call<br>`toolset`: string (optional); default: configured host/agent toolset hint<br>`excludeTools`: string[] (optional)<br>`agentType`: string (optional); default: general-purpose<br>`timeoutMs`: number \| null (optional); default: 300000 (5min); null disables<br>`retries`: number (optional); default: run retry count |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional); default: derived from phase and call count<br>`phase`: string (optional); default: current phase<br>`schema`: plain JSON Schema (optional)<br>`tier`: agent tier key (optional); default: the agent's own tier, else agentTiers.defaultTier<br>`isolation`: "worktree" (optional); default: pi-subagents worktree policy<br>`thread`: string (optional); default: fresh session per call<br>`toolset`: string (optional); default: configured host/agent toolset hint<br>`excludeTools`: string[] (optional)<br>`agentType`: string (optional); default: general-purpose<br>`timeoutMs`: number \| null (optional); default: 300000 (5min); null disables<br>`retries`: number (optional); default: run retry count |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | orchestrate | runtime-global | `orchestrate(tasks, options?) => Promise<{ results, tasks }>` | `onError`: "skip-dependents"\|"continue"\|"fail-fast" (optional); default: "skip-dependents" |

@@ -28,10 +28,13 @@ JavaScript.
 - Bound graph tasks, fan-out items, loops, retries, agents, concurrency, and
   evidence size. Invocation-level token and time caps are user constraints, not
   substitutes for algorithmic bounds.
-- Route an agent call with `tier: "small"`, `"medium"`, or `"large"`; omit
-  `tier` to use the pi-subagents workflow default. Never guess nonstandard model
-  routes, tiers, or agent types—use a name supplied by the current environment
-  and follow [registry ownership](references/registry-ownership.md).
+- Route an agent call with `tier: "<key>"`, naming a tier the destination host
+  defines. Omitting `tier` uses the agent's own tier, then the host's configured
+  default; a host whose default has been cleared rejects the call rather than
+  inheriting the parent model. There is no per-call `model`/`thinking`, and
+  neither may appear in workflow meta or phase profiles. Never guess a tier or
+  agent-type name—use names supplied by the current environment and follow
+  [registry ownership](references/registry-ownership.md).
 - Workflows have no imports, filesystem/network APIs, timers, or unrestricted
   Node APIs. Pass timestamps, randomness, and external decisions through `args`.
 
@@ -173,6 +176,8 @@ Before shipping a workflow change:
 - read [debugging](references/debugging.md) when reproducing a failure;
 - read [the review checklist](references/review.md) before accepting topology;
 - read [the generated capability index](references/capabilities.md) when a
-  signature, default, or support boundary is disputed;
+  signature, default, or support boundary is disputed; remember that a tier
+  names a key in the host catalogue while model/thinking resolution stays in
+  pi-subagents;
 - ensure every package-relative example/reference link remains inside the
   publishable package.

@@ -1,3 +1,4 @@
+import { PROTOCOL_VERSION } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import { type EventBus, registerRpcHandlers } from "../src/cross-extension-rpc.js";
 
@@ -46,7 +47,7 @@ describe("managed spawn RPC", () => {
     );
   });
 
-  it("advertises protocol v3 managed-policy capabilities through ping", async () => {
+  it("advertises every v4 capability and its routing policy through ping", async () => {
     const events = bus();
     registerRpcHandlers({ events, pi: {}, getCtx: () => ({}), manager: { spawn: vi.fn(), spawnManaged: vi.fn(), abort: vi.fn() } });
     const reply = vi.fn();
@@ -55,8 +56,22 @@ describe("managed spawn RPC", () => {
     await vi.waitFor(() => expect(reply).toHaveBeenCalledWith({
       success: true,
       data: {
-        version: 3,
-        capabilities: { managedSpawn: true, lifecycleOwner: true, ownedStop: true, childContext: true, ownedQuiescence: true, workflowTiers: true, managedPolicy: true },
+        version: PROTOCOL_VERSION,
+        capabilities: {
+          managedSpawn: true,
+          lifecycleOwner: true,
+          ownedStop: true,
+          childContext: true,
+          ownedQuiescence: true,
+          agentTiers: true,
+          managedPolicy: true,
+        },
+        // The peer needs the catalogue itself, not just an opaque id: it keys
+        // each cached call on the policy for that call's own tier.
+        routingPolicy: {
+          policy: expect.objectContaining({ profiles: expect.any(Object) }),
+          fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/),
+        },
       },
     }));
   });

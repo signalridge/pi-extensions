@@ -1,4 +1,5 @@
-import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
+import { agentTierApplies } from "./agent-tiers.js";
+import type { AgentTiersSettings } from "./settings.js";
 import type {
   AgentConfig,
   IsolationMode,
@@ -13,11 +14,10 @@ interface AgentInvocationParams {
    * are reachable only from programmatic callers and the legacy RPC.
    */
   tier?: string;
-  /**
-   * Workflow protocol tier (`small | medium | large`), set only by the managed
-   * spawn path. Kept apart from `tier` so the protocol's union stays closed.
-   */
-  workflowTier?: WorkflowTier;
+  /** Effective Agent-tier settings, used only to avoid pre-resolving legacy fields. */
+  agentTiers?: AgentTiersSettings;
+  /** Set by callers that cannot inherit the parent model; see `ResolveAgentTierInput`. */
+  requireTier?: boolean;
   model?: string;
   thinking?: string;
   max_turns?: number;
@@ -35,7 +35,8 @@ export function resolveAgentInvocationConfig(
   modelFromParams: boolean;
   /** Passed to `resolveAgentTier` as the requested tier; precedence lives there. */
   requestedAgentTier?: string;
-  workflowTier?: WorkflowTier;
+  /** True when a tier owns final model and thinking resolution. */
+  agentTierSelected: boolean;
   thinking?: ThinkingLevel;
   maxTurns?: number;
   inheritContext: boolean;
@@ -43,14 +44,24 @@ export function resolveAgentInvocationConfig(
   isolated: boolean;
   isolation?: IsolationMode;
 } {
+  // Asked, not restated: `agentTierApplies` runs the resolver's own selection.
+  // Whenever a tier applies it owns model and thinking outright, so pre-resolving
+  // a legacy field here would hand the runner a value the tier is about to
+  // discard, and a scope check against a model that never runs.
+  const agentTierSelected = agentTierApplies({
+    requestedTier: params.tier,
+    requireTier: params.requireTier,
+    agentConfig,
+    settings: params.agentTiers,
+  });
   return {
-    modelInput: agentConfig?.model ?? params.model,
+    modelInput: agentTierSelected ? undefined : agentConfig?.model ?? params.model,
     requestedAgentTier: params.tier,
-    workflowTier: params.workflowTier,
-    modelFromParams: agentConfig?.model == null && params.model != null,
-    thinking: (agentConfig?.thinking ?? params.thinking) as
-      | ThinkingLevel
-      | undefined,
+    agentTierSelected,
+    modelFromParams: !agentTierSelected && agentConfig?.model == null && params.model != null,
+    thinking: agentTierSelected
+      ? undefined
+      : (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext:
       agentConfig?.inheritContext ?? params.inherit_context ?? false,

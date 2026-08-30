@@ -12,20 +12,21 @@ import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { ManagedSpawnRequest as ProtocolManagedSpawnRequest, WorkflowTier } from "@signalridge/pi-subagents-protocol";
-import { isWorkflowTier, parseManagedSpawnRequest } from "@signalridge/pi-subagents-protocol";
+import type { ManagedSpawnRequest as ProtocolManagedSpawnRequest } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier, parseManagedSpawnRequest } from "@signalridge/pi-subagents-protocol";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentTierResolutionSnapshot } from "./agent-tiers.js";
+import { type AgentTierResolutionSnapshot, getAgentTiersSettings } from "./agent-tiers.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
+  INTERNAL_PARENT_POLICY_SNAPSHOT,
   type InternalAgentConfigOverride,
+  type ParentPolicySnapshot,
 } from "./internal-run.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
-import type { WorkflowThinking } from "./settings.js";
+import type { TierThinking } from "./settings.js";
 import type { AgentInvocation, AgentOwner, AgentRecord, AgentRecordSnapshot, IsolationMode, ResumableAgentEntry, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
-import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
 import {
   cleanupWorktree,
   cleanupWorktreeAsync,
@@ -241,7 +242,14 @@ interface SpawnArgs {
 export type ManagedSpawnRequest = ProtocolManagedSpawnRequest;
 
 export const MANAGED_SPAWN_ENTRY_TYPE = "subagents:managed-spawn";
-export const MANAGED_SPAWN_SCHEMA_VERSION = 1;
+/** Managed tombstone schema v2; schema-v1 facts are quarantined rather than reused. */
+export const MANAGED_SPAWN_SCHEMA_VERSION = 2;
+/**
+ * How many retired spawn keys to remember. Generous — a run rotates its attempt
+ * id on resume, so collisions need a key that was live across a branch
+ * replacement and is then re-requested verbatim.
+ */
+const MANAGED_RETIRED_KEY_LIMIT = 4_096;
 const MANAGED_TEXT_LIMIT = 8_000;
 const MANAGED_ERROR_LIMIT = 2_000;
 const MANAGED_PATH_LIMIT = 2_000;
@@ -276,14 +284,14 @@ export interface ManagedSpawnTombstone {
   type: string;
   description: string;
   owner: AgentOwner;
-  /** Semantic tier requested by the workflow; resolution remains internal. */
-  tier?: WorkflowTier;
+  /** Agent tier this spawn resolved to, including one the host defaulted to. */
+  tier?: string;
   /** Named managed thread, when this spawn re-enters a sequential session. */
   thread?: string;
   /** Effective policy fingerprint that makes thread reuse safe across calls/reloads. */
   threadPolicyFingerprint?: string;
-  /** Internal audit snapshot of the resolved model/thinking policy. */
-  tierSnapshot?: WorkflowTierResolutionSnapshot;
+  /** Internal audit snapshot of the resolved tier policy. */
+  tierSnapshot?: AgentTierResolutionSnapshot;
   state: ManagedSpawnState;
   createdAt: number;
   updatedAt: number;
@@ -294,6 +302,8 @@ export interface ManagedSpawnTombstone {
 /** Response returned by managed spawn, including an already-settled outcome. */
 export interface ManagedSpawnResult {
   id: string;
+  /** Agent tier the manager selected, echoed so the caller can journal it. */
+  tier?: string;
   state: ManagedSpawnState;
   /** True only when this call allocated a new tombstone/Agent record. */
   created: boolean;
@@ -352,19 +362,13 @@ function normalizeManagedOwner(raw: unknown, requireAttempt = false): AgentOwner
   };
 }
 
-function normalizeManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
-  return parseManagedSpawnRequest(raw);
-}
-
 function managedFingerprint(request: ManagedSpawnRequest, policyFingerprint?: string): string {
   return createHash("sha256")
     .update(JSON.stringify([
       request.type,
       request.prompt,
       request.description,
-      ...(request.tier === undefined ? [] : [request.tier]),
-      request.model,
-      request.thinking,
+      request.tier,
       request.toolset,
       request.excludeTools,
       request.isolation,
@@ -378,48 +382,71 @@ function managedFingerprint(request: ManagedSpawnRequest, policyFingerprint?: st
     .digest("hex");
 }
 
-/** Exact schema-v1 identity; do not add newer policy fields to this algorithm. */
-function managedLegacyFingerprintV1(request: ManagedSpawnRequest): string {
-  return createHash("sha256")
-    .update(JSON.stringify([
-      request.type,
-      request.prompt,
-      request.description,
-      ...(request.tier === undefined ? [] : [request.tier]),
-      request.owner.extension,
-      request.owner.runId,
-      request.owner.nodeId,
-      request.owner.attemptId,
-    ]))
-    .digest("hex");
+
+function currentParentThinkingLevel(pi: ExtensionAPI): ThinkingLevel | undefined {
+  const level = pi.getThinkingLevel?.();
+  return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
+    ? level
+    : undefined;
 }
 
 /**
  * Policy identity for a managed spawn. Prompts and owner attempt identities
  * intentionally do not participate: a thread is allowed to receive new work,
  * but its session cannot safely change model/tool/isolation policy.
+ *
+ * The tier's *resolved* model and thinking participate, not just its key: two
+ * calls naming the same tier are only the same policy while that tier still
+ * means the same thing. A profile that inherits folds in the parent identity
+ * for the same reason — it is the value that will actually run.
  */
-function managedThreadPolicyFingerprint(request: ManagedSpawnRequest, policy: ManagedSpawnPolicy): string {
-  const model = policy.model as { provider?: unknown; id?: unknown } | undefined;
+function managedThreadPolicyFingerprint(
+  request: ManagedSpawnRequest,
+  policy: ManagedSpawnPolicy,
+  parentModel: { provider?: unknown; id?: unknown } | undefined,
+  parentThinking: ThinkingLevel | undefined,
+): string {
+  const effectiveTier = request.tier ?? policy.invocation?.agentTier;
+  const profile = effectiveTier ? getAgentTiersSettings().profiles?.[effectiveTier] : undefined;
+  const inheritedModelIdentity =
+    profile?.model === "inherit" ? { provider: parentModel?.provider, id: parentModel?.id } : undefined;
+  const inheritedThinkingIdentity = profile?.thinking === "inherit" ? parentThinking : undefined;
   const excludeTools = [...new Set([...(request.excludeTools ?? []), ...(policy.excludeTools ?? [])])].sort();
   return createHash("sha256")
     .update(JSON.stringify([
       request.type,
-      request.tier,
-      request.model,
-      request.thinking === "off" ? undefined : request.thinking,
+      effectiveTier,
+      profile?.model,
+      profile?.thinking,
+      inheritedModelIdentity,
+      inheritedThinkingIdentity,
       request.toolset ?? policy.toolset,
       excludeTools,
       request.isolation ?? policy.isolation,
       policy.maxTurns,
       policy.isolated,
       policy.inheritContext,
-      policy.thinkingLevel,
       policy.policyFingerprint,
-      model?.provider,
-      model?.id,
     ]))
     .digest("hex");
+}
+
+/**
+ * Name what a caller can actually act on.
+ *
+ * The common cause is not a changed script: every shipped tier profile inherits
+ * its model, so switching the session's model changes what the thread's tier
+ * resolves to and invalidates the session it was reusing. A message that only
+ * says "policy changed" sends the reader looking in the wrong file.
+ */
+function threadPolicyConflictMessage(thread: string, tier: string | undefined): string {
+  const cause = tier
+    ? `Its tier "${tier}", the session model or thinking level that tier inherits, or its tool/isolation policy changed since the thread's last call.`
+    : "Its model, thinking, tool, or isolation policy changed since the thread's last call.";
+  return (
+    `Managed workflow thread policy conflict: "${thread}". ${cause} ` +
+    "A thread reuses one session, which cannot safely change policy mid-conversation; use a new thread name."
+  );
 }
 
 function isManagedState(value: unknown): value is ManagedSpawnState {
@@ -450,62 +477,50 @@ function cloneManagedTombstone(tombstone: ManagedSpawnTombstone): ManagedSpawnTo
   };
 }
 
-const WORKFLOW_THINKING_LEVELS = new Set<ThinkingLevel>(["minimal", "low", "medium", "high", "xhigh", "max"]);
-const WORKFLOW_CONFIGURED_THINKING = new Set<WorkflowThinking>([...WORKFLOW_THINKING_LEVELS, "inherit"]);
+const THINKING_LEVELS = new Set<ThinkingLevel>(["minimal", "low", "medium", "high", "xhigh", "max"]);
 const TIER_SNAPSHOT_KEYS = new Set([
   "tier",
+  "source",
   "model",
   "thinking",
   "configuredModel",
   "configuredThinking",
   "requestedThinking",
-  "modelSource",
-  "thinkingSource",
   "clamped",
   "diagnostic",
 ]);
 
-function parseTierSnapshot(raw: unknown, tier: WorkflowTier): WorkflowTierResolutionSnapshot | undefined {
-  if (!isRecord(raw) || raw.tier !== tier) return undefined;
+function parseTierSnapshot(raw: unknown, tier: string): AgentTierResolutionSnapshot | undefined {
+  if (!isRecord(raw) || raw.tier !== tier || !isManagedAgentTier(tier)) return undefined;
   try {
     rejectManagedKeys(raw, TIER_SNAPSHOT_KEYS, "tierSnapshot");
-    const source = raw.modelSource;
-    const thinkingSource = raw.thinkingSource;
-    if ((source !== "frontmatter" && source !== "tier" && source !== "parent") ||
-      (thinkingSource !== "frontmatter" && thinkingSource !== "tier" && thinkingSource !== "parent")) return undefined;
+    const source = raw.source;
+    if (source !== "call" && source !== "frontmatter" && source !== "default") return undefined;
     const optionalThinking = (value: unknown): ThinkingLevel | undefined => {
       if (value === undefined) return undefined;
-      return typeof value === "string" && WORKFLOW_THINKING_LEVELS.has(value as ThinkingLevel)
+      return typeof value === "string" && THINKING_LEVELS.has(value as ThinkingLevel)
         ? value as ThinkingLevel
         : undefined;
     };
     const thinking = optionalThinking(raw.thinking);
-    const configuredThinking = raw.configuredThinking === undefined
-      ? undefined
-      : typeof raw.configuredThinking === "string" && WORKFLOW_CONFIGURED_THINKING.has(raw.configuredThinking as WorkflowThinking)
-        ? raw.configuredThinking as WorkflowThinking
-        : undefined;
     const requestedThinking = optionalThinking(raw.requestedThinking);
-    for (const [label, value] of [["model", raw.model], ["configuredModel", raw.configuredModel]] as const) {
-      if (value !== undefined && (typeof value !== "string" || !value.trim() || value.length > MANAGED_PATH_LIMIT)) {
-        return undefined;
-      }
-      if (label === "model" && typeof value === "string" && !value.includes("/")) return undefined;
-    }
+    const configuredThinking = raw.configuredThinking;
+    if (typeof raw.configuredModel !== "string" || !raw.configuredModel.trim() || raw.configuredModel.length > MANAGED_PATH_LIMIT) return undefined;
+    if (typeof configuredThinking !== "string" || ![...THINKING_LEVELS, "inherit"].includes(configuredThinking)) return undefined;
+    if (raw.model !== undefined &&
+      (typeof raw.model !== "string" || !raw.model.trim() || raw.model.length > MANAGED_PATH_LIMIT || !raw.model.includes("/"))) return undefined;
     if (raw.thinking !== undefined && thinking === undefined) return undefined;
-    if (raw.configuredThinking !== undefined && configuredThinking === undefined) return undefined;
     if (raw.requestedThinking !== undefined && requestedThinking === undefined) return undefined;
     if (raw.clamped !== undefined && typeof raw.clamped !== "boolean") return undefined;
     if (raw.diagnostic !== undefined && (typeof raw.diagnostic !== "string" || raw.diagnostic.length > MANAGED_ERROR_LIMIT)) return undefined;
     return {
       tier,
+      source,
       ...(typeof raw.model === "string" ? { model: raw.model } : {}),
       ...(thinking ? { thinking } : {}),
-      ...(typeof raw.configuredModel === "string" ? { configuredModel: raw.configuredModel } : {}),
-      ...(configuredThinking ? { configuredThinking } : {}),
+      configuredModel: raw.configuredModel,
+      configuredThinking: configuredThinking as TierThinking,
       ...(requestedThinking ? { requestedThinking } : {}),
-      modelSource: source,
-      thinkingSource,
       ...(raw.clamped === true ? { clamped: true } : {}),
       ...(typeof raw.diagnostic === "string" ? { diagnostic: raw.diagnostic } : {}),
     };
@@ -521,6 +536,13 @@ function terminalStatusForRecord(status: ManagedRecordStatus): ManagedTerminalSn
   return undefined;
 }
 
+/** Recover only the key needed to prevent an unsupported tombstone from being replayed. */
+function managedSpawnKeyForQuarantine(raw: unknown): string | undefined {
+  if (!isRecord(raw) || typeof raw.spawnKey !== "string") return undefined;
+  const key = raw.spawnKey.trim();
+  return key.length > 0 && key.length <= 256 ? key : undefined;
+}
+
 function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined {
   if (!isRecord(raw) || raw.schemaVersion !== MANAGED_SPAWN_SCHEMA_VERSION) return undefined;
   try {
@@ -533,10 +555,11 @@ function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined 
       ? undefined
       : boundedManagedString(raw.threadPolicyFingerprint, "threadPolicyFingerprint", 128);
     if ((thread === undefined) !== (threadPolicyFingerprint === undefined)) return undefined;
-    const tier = raw.tier;
-    if (tier !== undefined && !isWorkflowTier(tier)) return undefined;
+    const rawTier = raw.tier;
+    if (rawTier !== undefined && !isManagedAgentTier(rawTier)) return undefined;
+    const tier = rawTier as string | undefined;
     const tierSnapshotValue = raw.tierSnapshot;
-    let tierSnapshot: WorkflowTierResolutionSnapshot | undefined;
+    let tierSnapshot: AgentTierResolutionSnapshot | undefined;
     if (tierSnapshotValue !== undefined) {
       if (tier === undefined) return undefined;
       tierSnapshot = parseTierSnapshot(tierSnapshotValue, tier);
@@ -608,10 +631,10 @@ export interface SpawnOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
-  /** Semantic workflow tier resolved by pi-subagents at session start. */
-  tier?: WorkflowTier;
   /** User-named model tier; resolved by pi-subagents at session start. */
   agentTier?: string;
+  /** Managed workflow runs must select a tier instead of inheriting the parent. */
+  requireAgentTier?: boolean;
   /** Optional toolset hint; concrete tool availability remains agent-configured. */
   toolset?: string;
   /** Additional tool names denied for this invocation. */
@@ -638,6 +661,8 @@ export interface SpawnOptions {
   cwd?: string;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
+  /** Parent model/thinking captured for a managed spawn before it enters the queue. */
+  readonly [INTERNAL_PARENT_POLICY_SNAPSHOT]?: ParentPolicySnapshot;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -646,10 +671,8 @@ export interface SpawnOptions {
   onTextDelta?: (delta: string, fullText: string) => void;
   /** Called when the agent session is created (for accessing session stats). */
   onSessionCreated?: (session: AgentSession) => void;
-  /** Called after pi-subagents resolves a semantic workflow tier. */
-  onTierResolved?: (snapshot: WorkflowTierResolutionSnapshot) => void;
-  /** Called after pi-subagents resolves a user-named agent tier. */
-  onAgentTierResolved?: (snapshot: AgentTierResolutionSnapshot) => void;
+  /** Called after pi-subagents resolves the tier for this spawn; see RunOptions. */
+  onAgentTierResolved?: (snapshot: AgentTierResolutionSnapshot, modelLabel?: string) => void;
   /** Called synchronously after a new record is allocated, before session creation. */
   onSpawned?: (id: string) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
@@ -684,10 +707,10 @@ export interface SpawnOptions {
   resumeSessionFile?: string;
 }
 
-/** Internal managed-spawn policy; model and thinking are finalized by runAgent when a tier is present. */
+/** Internal managed-spawn policy; model/thinking resolution is finalized by runAgent. */
 export type ManagedSpawnPolicy = Pick<
   SpawnOptions,
-  "model" | "maxTurns" | "isolated" | "inheritContext" | "thinkingLevel" | "isolation" | "invocation" | "rootSessionId" | "toolset" | "excludeTools"
+  "maxTurns" | "isolated" | "inheritContext" | "isolation" | "invocation" | "rootSessionId" | "toolset" | "excludeTools"
 > & {
   /** In-process identity of the resolved agent definition/tool allowlist for thread reuse. */
   policyFingerprint?: string;
@@ -699,6 +722,8 @@ interface ResumeTerminalSnapshot {
   completedAt?: number;
   result?: string;
   error?: string;
+  /** Policy metadata must survive a detached/resumed attempt unchanged. */
+  invocation?: AgentInvocation;
 }
 
 interface ResumeControl {
@@ -720,6 +745,16 @@ export class AgentManager {
   private onCompact?: OnAgentCompact;
   private managedSpawns = new Map<string, ManagedSpawnTombstone>();
   private managedKeysById = new Map<string, string>();
+  /** Spawn keys found in unsupported/corrupt persisted tombstones. */
+  private managedQuarantinedKeys = new Set<string>();
+  /**
+   * Spawn keys retired during a branch/session replacement before their
+   * provider work settled. A retired key must never be reallocated, but the set
+   * is bounded: a long session that replaces its branch repeatedly would
+   * otherwise grow it without limit. Oldest entries are evicted first — those
+   * are the ones whose sessions are least likely to still be alive.
+   */
+  private managedRetiredKeys = new Set<string>();
   /** Active workflow-thread name to the managed AgentSession it re-enters. */
   private managedThreads = new Map<string, string>();
   /** Policy identity captured with each thread; policy changes cannot bypass a denylist. */
@@ -1049,7 +1084,8 @@ export class AgentManager {
       : undefined;
     this.replaceManagedTombstone(key, {
       ...tombstone,
-      ...(record.invocation?.tierSnapshot ? { tierSnapshot: { ...record.invocation.tierSnapshot } } : {}),
+      ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } } : {}),
+      ...(record.invocation?.agentTier !== undefined ? { tier: record.invocation.agentTier } : {}),
       state,
       updatedAt: Date.now(),
       compactionCount,
@@ -1091,10 +1127,28 @@ export class AgentManager {
     }
     return {
       id: tombstone.id,
+      ...(tombstone.tier === undefined ? {} : { tier: tombstone.tier }),
       state: tombstone.state,
       created,
       ...(tombstone.terminal ? { terminal: cloneManagedTerminal(tombstone.terminal) } : {}),
     };
+  }
+
+  private retireLiveManagedKeys(): void {
+    for (const [key, tombstone] of this.managedSpawns) {
+      const record = this.agents.get(tombstone.id);
+      if (!isManagedTerminalState(tombstone.state) || (record !== undefined && !this.isFullyCleaned(record))) {
+        // Re-inserting moves an existing key to the end of iteration order, so
+        // the eviction below always drops the least recently retired key.
+        this.managedRetiredKeys.delete(key);
+        this.managedRetiredKeys.add(key);
+      }
+    }
+    while (this.managedRetiredKeys.size > MANAGED_RETIRED_KEY_LIMIT) {
+      const oldest = this.managedRetiredKeys.values().next();
+      if (oldest.done) break;
+      this.managedRetiredKeys.delete(oldest.value);
+    }
   }
 
   /** Restore session-scoped managed idempotency entries and settle orphaned work. */
@@ -1104,15 +1158,38 @@ export class AgentManager {
   ): ManagedSpawnTombstone[] {
     this.clearManagedPersistenceRetries();
     if (this.disposed) return [];
+    this.retireLiveManagedKeys();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedQuarantinedKeys.clear();
     this.managedThreads.clear();
     this.managedThreadPolicies.clear();
     this.managedThreadReservations.clear();
     for (const entry of entries) {
       if (entry.type !== "custom" || entry.customType !== MANAGED_SPAWN_ENTRY_TYPE) continue;
       const tombstone = parseManagedTombstone(entry.data);
-      if (!tombstone) continue;
+      if (!tombstone) {
+        const key = managedSpawnKeyForQuarantine(entry.data);
+        if (key) {
+          this.managedQuarantinedKeys.add(key);
+          const previous = this.managedSpawns.get(key);
+          if (previous && this.managedKeysById.get(previous.id) === key) {
+            this.managedKeysById.delete(previous.id);
+            for (const [threadKey, threadId] of this.managedThreads) {
+              if (threadId !== previous.id) continue;
+              this.managedThreads.delete(threadKey);
+              this.managedThreadPolicies.delete(threadKey);
+            }
+          }
+          // A later incompatible fact must invalidate an earlier current-schema
+          // fact for the same key. Otherwise restore order could resurrect a
+          // spawn that the clean-break quarantine is meant to reject.
+          this.managedSpawns.delete(key);
+          console.warn(`[pi-subagents] quarantined unsupported managed spawn tombstone for ${key}`);
+        }
+        continue;
+      }
+      if (this.managedQuarantinedKeys.has(tombstone.spawnKey) || this.managedRetiredKeys.has(tombstone.spawnKey)) continue;
       if (options.dropActive && !isManagedTerminalState(tombstone.state)) continue;
       this.managedSpawns.set(tombstone.spawnKey, tombstone);
       this.managedKeysById.set(tombstone.id, tombstone.spawnKey);
@@ -1387,42 +1464,68 @@ export class AgentManager {
     callbacks?: Pick<SpawnOptions, "onToolActivity" | "onTextDelta" | "onSessionCreated" | "onTurnEnd" | "onAssistantUsage" | "onCompaction" | "onSpawned">,
   ): ManagedSpawnResult {
     if (this.disposed) throw new Error("AgentManager is disposed");
-    const normalized = normalizeManagedSpawnRequest(request);
-    if (normalized.thread && (normalized.isolation === "worktree" || policy.isolation === "worktree")) {
+    const normalized = parseManagedSpawnRequest(request);
+    // The policy may already know the agent's own tier or the configured
+    // default before runAgent emits its authoritative resolution callback.
+    // Carry that key in managed identity, but keep it out of the runner options
+    // so source and snapshot semantics still resolve centrally in runAgent.
+    const identityTier = normalized.tier ?? policy.invocation?.agentTier;
+    // Narrowed once so every later use is a plain string rather than a
+    // non-null assertion on a field TypeScript cannot re-narrow across the
+    // intervening lookups.
+    const thread = normalized.thread;
+    if (thread && (normalized.isolation === "worktree" || policy.isolation === "worktree")) {
       throw new Error("Managed workflow threads cannot use worktree isolation; use separate calls instead.");
     }
     const scope = normalized.spawnKey;
-    const policyFingerprint = managedThreadPolicyFingerprint(normalized, policy);
+    if (this.managedQuarantinedKeys.has(scope) || this.managedRetiredKeys.has(scope)) {
+      throw new Error(`Managed spawn key is quarantined and cannot be reused: "${scope}"`);
+    }
+    const parentThinking = currentParentThinkingLevel(pi);
+    const parentPolicySnapshot: ParentPolicySnapshot = Object.freeze({
+      model: ctx.model,
+      thinking: parentThinking,
+    });
+    const policyFingerprint = managedThreadPolicyFingerprint(
+      normalized,
+      policy,
+      parentPolicySnapshot.model,
+      parentPolicySnapshot.thinking,
+    );
     const fingerprint = managedFingerprint(normalized, policyFingerprint);
-    const legacyFingerprint = managedLegacyFingerprintV1(normalized);
-    const threadPolicyFingerprint = normalized.thread ? policyFingerprint : undefined;
+    const threadPolicyFingerprint = thread ? policyFingerprint : undefined;
     const previous = this.managedSpawns.get(scope);
     if (previous) {
-      if (previous.fingerprint !== fingerprint && previous.fingerprint !== legacyFingerprint) {
+      if (previous.fingerprint !== fingerprint) {
         throw new Error(`Managed spawn key conflict: "${normalized.spawnKey}"`);
       }
-      if (normalized.thread && previous.threadPolicyFingerprint !== threadPolicyFingerprint) {
-        throw new Error(`Managed workflow thread policy conflict: "${normalized.thread}"; use a new thread name for changed model/tool policy.`);
+      if (thread && previous.threadPolicyFingerprint !== threadPolicyFingerprint) {
+        throw new Error(threadPolicyConflictMessage(thread, identityTier));
       }
       return this.managedResult(scope);
     }
 
-    const threadKey = normalized.thread ? `${normalized.owner.runId}\u0000${normalized.thread}` : undefined;
+    const threadKey = thread ? `${normalized.owner.runId}\u0000${thread}` : undefined;
     if (threadKey && this.managedThreadReservations.has(threadKey)) {
-      throw new Error(`Managed workflow thread "${normalized.thread}" is already running; calls must be sequential.`);
+      throw new Error(`Managed workflow thread "${thread}" is already running; calls must be sequential.`);
     }
     const threadedId = threadKey ? this.managedThreads.get(threadKey) : undefined;
-    if (threadedId) {
-      if (threadPolicyFingerprint !== undefined && this.managedThreadPolicies.get(threadKey!) !== threadPolicyFingerprint) {
-        throw new Error(`Managed workflow thread policy conflict: "${normalized.thread}"; use a new thread name for changed model/tool policy.`);
+    if (threadedId && threadKey && thread) {
+      if (threadPolicyFingerprint !== undefined && this.managedThreadPolicies.get(threadKey) !== threadPolicyFingerprint) {
+        throw new Error(threadPolicyConflictMessage(thread, identityTier));
       }
       const record = this.agents.get(threadedId);
       if (record?.session && record.status !== "running" && record.status !== "queued" && !record.detached) {
         const previousOwner = record.owner;
         const previousInvocation = record.invocation;
         const previousManagedKey = this.managedKeysById.get(threadedId);
+        const resumedTier = identityTier ?? previousInvocation?.agentTier;
         record.owner = Object.freeze({ ...normalized.owner });
-        record.invocation = policy.invocation;
+        record.invocation = {
+          ...(policy.invocation ?? {}),
+          ...(resumedTier === undefined ? {} : { agentTier: resumedTier }),
+          ...(previousInvocation?.agentTierSnapshot ? { agentTierSnapshot: previousInvocation.agentTierSnapshot } : {}),
+        };
         const now = Date.now();
         const tombstone: ManagedSpawnTombstone = {
           schemaVersion: MANAGED_SPAWN_SCHEMA_VERSION,
@@ -1433,12 +1536,13 @@ export class AgentManager {
           type: normalized.type,
           description: normalized.description,
           owner: { ...normalized.owner },
-          ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
-          ...(normalized.thread === undefined ? {} : { thread: normalized.thread, threadPolicyFingerprint }),
+          ...(resumedTier === undefined ? {} : { tier: resumedTier }),
+          ...(thread === undefined ? {} : { thread, threadPolicyFingerprint }),
           state: "queued",
           createdAt: now,
           updatedAt: now,
           compactionCount: record.compactionCount,
+          ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } } : {}),
         };
         this.clearManagedPersistenceRetry(scope);
         this.managedSpawns.set(scope, tombstone);
@@ -1461,10 +1565,15 @@ export class AgentManager {
         }).catch(() => {});
         this.syncManagedRecord(record, true);
         const resumedState = String(record.status);
-        return { id: threadedId, state: resumedState === "queued" ? "queued" : "running", created: true };
+        return {
+          id: threadedId,
+          ...(resumedTier === undefined ? {} : { tier: resumedTier }),
+          state: resumedState === "queued" ? "queued" : "running",
+          created: true,
+        };
       }
       if (record && !record.detached && (record.status === "running" || record.status === "queued")) {
-        throw new Error(`Managed workflow thread "${normalized.thread}" is already running; calls must be sequential.`);
+        throw new Error(`Managed workflow thread "${thread}" is already running; calls must be sequential.`);
       }
       if (!record || record.detached || !record.session) {
         this.managedThreads.delete(threadKey!);
@@ -1485,8 +1594,8 @@ export class AgentManager {
       type: normalized.type,
       description: normalized.description,
       owner: { ...normalized.owner },
-      ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
-      ...(normalized.thread === undefined ? {} : { thread: normalized.thread, threadPolicyFingerprint }),
+      ...(identityTier === undefined ? {} : { tier: identityTier }),
+      ...(thread === undefined ? {} : { thread, threadPolicyFingerprint }),
       state: "queued",
       createdAt: now,
       updatedAt: now,
@@ -1518,8 +1627,12 @@ export class AgentManager {
     try {
       this.spawnInternal(pi, ctx, normalized.type, normalized.prompt, {
         ...policy,
-        ...(normalized.tier === undefined ? {} : { tier: normalized.tier }),
-        ...(normalized.thread === undefined ? {} : { thread: normalized.thread }),
+        [INTERNAL_PARENT_POLICY_SNAPSHOT]: parentPolicySnapshot,
+        // A managed workflow must resolve a tier or fail closed; it may not
+        // silently inherit the parent session's model when nobody named one.
+        requireAgentTier: true,
+        ...(normalized.tier === undefined ? {} : { agentTier: normalized.tier }),
+        ...(thread === undefined ? {} : { thread }),
         description: normalized.description,
         isBackground: true,
         ...callbacks,
@@ -1553,11 +1666,16 @@ export class AgentManager {
     return this.managedResult(scope, true);
   }
 
-  /** Forget managed idempotency keys when a logical session is replaced. */
+  /** Forget settled managed idempotency state when a logical session is replaced; retire live keys. */
   resetManagedSpawns(): void {
     this.clearManagedPersistenceRetries();
+    // Keep identities whose provider/session may still be alive after a branch
+    // replacement. Clearing the in-memory tombstone without retaining its key
+    // would let a resumed run allocate the same spawn identity again.
+    this.retireLiveManagedKeys();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedQuarantinedKeys.clear();
     this.managedThreads.clear();
     this.managedThreadPolicies.clear();
     this.managedThreadReservations.clear();
@@ -1639,9 +1757,10 @@ export class AgentManager {
       isolated: internalOverride?.isolated ?? options.isolated,
       inheritContext: internalOverride?.inheritContext ?? options.inheritContext,
       ...(internalOverride ? { [INTERNAL_AGENT_CONFIG_OVERRIDE]: internalOverride } : {}),
+      [INTERNAL_PARENT_POLICY_SNAPSHOT]: options[INTERNAL_PARENT_POLICY_SNAPSHOT],
       thinkingLevel: options.thinkingLevel,
-      tier: options.tier,
       agentTier: options.agentTier,
+      requireAgentTier: options.requireAgentTier,
       // Worktree wins for the working dir (the agent must run in the copy —
       // which, with a custom cwd, was created from that target). Config stays
       // with the parent project when a caller-supplied cwd is in play; it must
@@ -1691,31 +1810,21 @@ export class AgentManager {
         depth: record.depth ?? 1,
         maxSubagentDepth: record.maxSubagentDepth,
       },
-      onTierResolved: (snapshot) => {
+      onAgentTierResolved: (snapshot, modelLabel) => {
         if (!record.detached) {
           record.invocation = {
             ...(record.invocation ?? {}),
-            ...(options.tier === undefined ? {} : { tier: options.tier }),
-            thinking: snapshot.thinking,
-            tierSnapshot: { ...snapshot },
-          };
-          this.syncManagedRecord(record, true);
-          options.onTierResolved?.(snapshot);
-        }
-      },
-      // Recorded on the same record as the workflow snapshot but under its own
-      // field, so a run can carry both without either overwriting the other's
-      // account of how its model was chosen.
-      onAgentTierResolved: (snapshot) => {
-        if (!record.detached) {
-          record.invocation = {
-            ...(record.invocation ?? {}),
+            // The tier owns model and thinking, so it owns their display too —
+            // including clearing a label a caller pre-computed before the tier
+            // resolved. Without this a tiered spawn shows its tier name and no
+            // model at all, even when the profile pins one.
+            modelName: modelLabel,
             agentTier: snapshot.tier,
             thinking: snapshot.thinking,
             agentTierSnapshot: { ...snapshot },
           };
           this.syncManagedRecord(record, true);
-          options.onAgentTierResolved?.(snapshot);
+          options.onAgentTierResolved?.(snapshot, modelLabel);
         }
       },
       onSessionCreated: (session) => {
@@ -2134,6 +2243,7 @@ export class AgentManager {
       ...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
       ...(record.result === undefined ? {} : { result: record.result }),
       ...(record.error === undefined ? {} : { error: record.error }),
+      ...(record.invocation ? { invocation: cloneFrozenData(record.invocation) as AgentInvocation } : {}),
     };
   }
 
@@ -2143,6 +2253,9 @@ export class AgentManager {
     record.completedAt = snapshot.completedAt;
     record.result = snapshot.result;
     record.error = snapshot.error;
+    record.invocation = snapshot.invocation
+      ? cloneFrozenData(snapshot.invocation) as AgentInvocation
+      : undefined;
   }
 
   private beginResumeControl(
@@ -3358,6 +3471,8 @@ export class AgentManager {
     this.agents.clear();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
+    this.managedQuarantinedKeys.clear();
+    this.managedRetiredKeys.clear();
     this.managedThreads.clear();
     this.managedThreadPolicies.clear();
     this.managedThreadReservations.clear();

@@ -574,7 +574,7 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       const rootManager = (globalThis as Record<symbol, unknown>)[managerKey] as Pick<AgentManager, "spawn"> & {
         getRecord: (id: string) => unknown;
       };
-      const rootId = rootManager.spawn(pi as never, ctx as never, "R", "root", {
+      const rootId = rootManager.spawn(pi as never, ctx as never, "general-purpose", "root", {
         description: "root",
         isBackground: true,
         isolation: "worktree",

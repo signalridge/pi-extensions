@@ -26,7 +26,7 @@ A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-
 - **Tool denylist** — block specific tools via `disallowed_tools` frontmatter
 - **Styled completion notifications** — background agent results render as themed, compact notification boxes (icon, stats, result preview) instead of raw XML. Expandable to show full output. Group completions render each agent individually
 - **Event bus** — lifecycle events (`subagents:created`, `started`, `completed`, `failed`, `steered`, `compacted`) emitted via `pi.events`, enabling other extensions to react to sub-agent activity
-- **Cross-extension RPC** — other Pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Protocol v3 adds managed spawning, optional model/thinking/toolset/denylist/thread/worktree hints, owner-scoped stop/quiescence, and standardized reply envelopes; pi-subagents remains the final policy owner. Emits `subagents:ready` on session start
+- **Cross-extension RPC** — other Pi extensions can spawn and stop subagents via the `pi.events` event bus (`subagents:rpc:ping`, `subagents:rpc:spawn`, `subagents:rpc:stop`). Protocol v4 adds managed spawning, a request-level Agent `tier`, toolset/denylist/thread/worktree hints, owner-scoped stop/quiescence, a published Agent-tier routing policy, and standardized reply envelopes; pi-subagents remains the final policy owner. Pre-schema-v2 managed tombstones are quarantined rather than replayed. Emits `subagents:ready` on session start
 - **Schedule subagents** — pass `schedule` to the `Agent` tool to fire on cron / interval / one-shot. Session-scoped jobs with PID-locked persistence; results land via the same `subagent-notification` followUp path as manual background completions; manage via `/agents → Scheduled jobs`
 - **Model tiers** — name a (model, thinking) pair once and let the orchestrator pick it by name; the `Agent` tool exposes `tier` and never `model`/`thinking`, so which model runs stays a config decision. Manage the catalogue in `/agents → Model tiers`, pick the default in `/agents → Settings → Default tier`, or set a plain `defaultModel` when one line beats a catalogue
 - **Model scope enforcement** — opt-in validation that subagent model choices stay within your pi `enabledModels` allowlist (sourced from `/scoped-models`, with both global and project-local pi settings honored). Caller-supplied out-of-scope → hard error to orchestrator; frontmatter-pinned out-of-scope → warning + runs anyway (frontmatter authoritative). Toggle via `/agents → Settings → Scope models`
@@ -414,12 +414,12 @@ When background agents complete, they notify the main agent. The **join mode** c
 
 ## Model tiers
 
-A **tier** is one name for a (model, thinking) pair. The host agent picks a tier
-by name and nothing else: the `Agent` tool exposes `tier` and does **not** expose
-`model` or `thinking`, so which model runs is decided by whoever writes
-`subagents.json`, not by the orchestrator improvising per call.
+An **Agent tier** is one name for a (model, thinking) pair. The host agent picks a
+tier by name and nothing else: the `Agent` tool exposes `tier` and does **not**
+expose `model` or `thinking`, so which model runs is decided by the Agent-tier
+catalogue rather than by the orchestrator improvising per call.
 
-Names are yours. `small`/`medium`/`large` below are only an example — `research`,
+Names are yours. The names below are only an example — `research`,
 `cheap`, `nightly` are equally valid keys. Replace the illustrative provider/model
 values with models available in your environment.
 
@@ -428,10 +428,10 @@ values with models available in your environment.
   "agentTiers": {
     "defaultTier": "medium",
     "profiles": {
-      "small":    { "description": "Fast, cheap exploration",        "model": "provider/fast-model", "thinking": "max" },
-      "medium":   { "description": "Ordinary planning and review",   "model": "provider/reasoning-model", "thinking": "max" },
-      "large":    { "description": "Architecture and risky review",  "model": "provider/architecture-model", "thinking": "xhigh" },
-      "research": { "description": "Long-context research",          "model": "provider/long-context-model",       "thinking": "max" }
+      "low":      { "description": "Fast, cheap exploration",       "model": "provider/fast-model", "thinking": "max" },
+      "medium":   { "description": "Ordinary planning and review",  "model": "provider/reasoning-model", "thinking": "max" },
+      "high":     { "description": "Architecture and risky review", "model": "provider/architecture-model", "thinking": "xhigh" },
+      "research": { "description": "Long-context research",         "model": "provider/long-context-model", "thinking": "max" }
     }
   }
 }
@@ -439,7 +439,56 @@ values with models available in your environment.
 
 A profile is all-or-nothing: both `model` and `thinking` are required, and either
 may be the literal `"inherit"` to keep the parent's. `description` is optional and
-defaults to the key; it is what the host reads when choosing between tiers.
+defaults to the key; it is what the host reads when choosing between Agent tiers.
+
+### One catalogue, including for workflows
+
+A managed `pi-workflows` call names a key from this same `agentTiers` catalogue.
+There is no second workflow-tier vocabulary and no mapping layer: a workflow that
+wants cheap work asks for the tier you defined for cheap work.
+
+```js
+// in a workflow script
+await agent("summarize this diff", { tier: "low" })
+await agent("design the migration", { tier: "high" })
+```
+
+The tier is resolved by the same `resolveAgentTier()` path an ordinary Agent
+spawn uses — same precedence, same model lookup, same thinking clamping, same
+availability checks, same immutable resolution snapshot. A tier the host does not
+define is rejected before dispatch, naming the tiers it does define.
+
+Model and thinking are deliberately absent from the managed request. A tier is
+the only model policy a workflow can express, so there is no second selector that
+could silently win or be silently ignored.
+
+Fresh installs ship an effort ladder: `low`, `medium`, `high`. Every shipped
+profile inherits its model, so a new machine gets a working vocabulary without
+this package ever choosing a vendor for you. A managed call that names no tier
+uses the agent's own tier, then `agentTiers.defaultTier`, and finally falls back
+to `medium` so a workflow runs on an unconfigured machine.
+
+`medium` inherits its model, so on an unconfigured machine that fallback runs on
+the parent session's model. What it buys is a call with a *named* policy, a
+durable resolution snapshot and a scope check — not cheaper work. If you want
+managed work to run somewhere cheaper, set a `defaultTier` whose profile pins a
+model.
+
+That last fallback is scoped to managed calls. It is deliberately **not** the
+catalogue's `defaultTier`: a shipped default that applied to every ordinary spawn
+would silence [`defaultModel`](#defaultmodel) and pin a thinking level on machines
+that configured neither.
+
+So `Default tier` has three settings, not two, and the menu offers all three:
+
+| Setting | Ordinary spawn | Managed workflow call |
+| --- | --- | --- |
+| a tier name | that tier | that tier |
+| `unset` | `defaultModel`, then the parent session | the shipped `medium` |
+| `none` | `defaultModel`, then the parent session | rejected |
+
+`none` is a policy statement, recorded as `noDefaultTier`; `unset` is the absence
+of one. Deleting the profiles has the same effect on managed calls as `none`.
 
 ### How the host discovers tiers
 
@@ -450,7 +499,7 @@ remember. It sees:
 ```
 Available agent tiers:
 
-- small: Fast, cheap exploration
+- low: Fast, cheap exploration
   model: provider/fast-model
   thinking: max
 ...
@@ -476,6 +525,11 @@ An agent cannot pin its own model at any step. `model:`/`thinking:` in
 frontmatter are read only to warn that they are stale, and the built-in agents
 pin nothing either. With nothing configured at all, a subagent runs on the
 parent session's model.
+
+A **managed workflow call** cannot take steps 4 and 5 — it has no parent session
+to inherit from — so it gets one extra step between 3 and the end: the shipped
+`medium` fallback. That step exists only for callers that would otherwise fail
+closed, which is why it does not displace `defaultModel` for everyone else.
 
 ### `defaultModel`
 
@@ -549,22 +603,13 @@ level nobody chose for that pair. A project profile that fails validation blocks
 its global namesake rather than reviving it, and `defaultTier` is a simple
 project-over-global override.
 
-### Not the same as `workflow.tiers`
-
-`pi-workflows` has its own tiers, and they stay fixed at `small | medium | large`.
-That vocabulary is part of the cross-package protocol: it lets a workflow
-definition be validated at parse time and stay portable between machines, neither
-of which survives arbitrary names. The two systems share no fields — a spawn
-records `agentTier`/`agentTierSnapshot` or `tier`/`tierSnapshot`, never one
-standing in for the other.
-
 ### Migrating from `model:`/`thinking:`
 
-Define the profiles once, then replace each agent's `model:`/`thinking:` with
-`tier: <name>`. Files that still carry the old fields load and run — the fields
-are ignored, with a warning naming the file — so the migration can be done one
-agent at a time. Until an agent names a tier it uses `defaultTier`, or the
-parent's model when none is set.
+Define the Agent-tier profiles once, then replace each agent's `model:`/`thinking:`
+with `tier: <name>`. Files that still carry the old fields load and run — the
+fields are ignored, with a warning naming the file — so the migration can be done
+one agent at a time. Until an agent names a tier it uses `agentTiers.defaultTier`,
+then `defaultModel`, or the parent's model when none is set.
 
 Programmatic callers and the legacy RPC may still pass `model`/`thinking`
 directly. That is the escape hatch for code, not a way to configure an agent.
@@ -579,11 +624,11 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 | Model source | Out-of-scope behavior |
 |---|---|
-| Caller-supplied via `Agent({ model: "..." })` | Hard error returned to the orchestrator, listing allowed models |
+| Caller-supplied programmatic `model` (only when no Agent tier applies) | Hard error returned to the orchestrator, listing allowed models |
 | Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
-**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).
+**Design:** `scopeModels` is a guardrail against unexpected runtime model choices, not a hard policy against user-level config. An applicable Agent tier is checked after its single final resolution; compatibility model inputs are checked only on the no-tier path and cannot override a tier.
 
 **Nested spawns** ([nested subagents](#nested-subagents)) apply the same table against the parent's config root. The hard-error case is identical; the warning cases proceed silently, since a subagent session has no UI to toast to.
 
@@ -600,26 +645,9 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `4`, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
-**Workflow tiers** (`workflow`) are semantic model-plus-thinking profiles used by `@signalridge/pi-workflows` managed spawns. The wire request carries only `"small"`, `"medium"`, or `"large"`; pi-subagents resolves the configured profile at spawn time and records the immutable resolution snapshot in its managed session journal.
+The `workflow` settings key is **retired**. Managed `pi-workflows` calls name an `agentTiers` key directly, so there is no separate workflow routing table; a file that still has one is ignored with a warning naming the key. `agentTiers.defaultTier` replaces what `workflow.defaultTier` used to do. See [One catalogue, including for workflows](#one-catalogue-including-for-workflows).
 
-```json
-{
-  "workflow": {
-    "defaultTier": "medium",
-    "tiers": {
-      "small": { "model": "inherit", "thinking": "low" },
-      "medium": { "model": "inherit", "thinking": "medium" },
-      "large": { "model": "provider/architecture-model", "thinking": "max" }
-    }
-  }
-}
-```
-
-Replace the illustrative `provider/architecture-model` value with a model available in your environment.
-
-Profiles are complete `model` + `thinking` tuples. Each field may use `inherit`; a project profile replaces the whole matching global tier entry. Malformed or incomplete entries are retained as durable blocked-tier tombstones and fail closed rather than falling back to a built-in profile or merging field-by-field. An explicit `defaultTier` applies when a workflow task omits its tier. Without a task tier or configured default, the parent model and thinking level are inherited. Agent frontmatter remains authoritative for its explicit `model` and `thinking`; thinking is clamped to the selected model's native supported levels.
-
-**Default model** (`defaultModel`, unset): the model a subagent runs when no tier picked one — see [`defaultModel`](#defaultmodel) for where it sits in precedence, why an unresolvable value falls back instead of failing, and how `"inherit"` lets a project cancel a global default. **Default tier** (`agentTiers.defaultTier`, unset) is the tier applied when neither the caller nor the agent names one; the profiles it selects from live under [`agentTiers`](#model-tiers).
+**Default model** (`defaultModel`, unset): the model a non-tiered ordinary subagent runs — see [`defaultModel`](#defaultmodel) for where it sits in precedence, why an unresolvable value falls back instead of failing, and how `"inherit"` lets a project cancel a global default. **Default tier** (`agentTiers.defaultTier`, unset) is the tier applied when neither the caller nor the agent names one; the profiles it selects from live under [`agentTiers`](#model-tiers). It has three settings — a tier name, `unset`, and `none` — which the menu offers separately because the last two behave differently for managed workflow calls; see [Model tiers](#model-tiers) for the table.
 
 **Strict agent files** (`strictAgentFiles`, default `false`): normal startup skips unreadable or malformed agent definitions with a warning that includes the file path. Enable it to fail closed during the first `session_start`, using that session's `ctx.cwd`, with the path in the error instead of silently running a surviving lower-priority override. A failed validation leaves no root manager or RPC responder behind. Reloads after startup remain lenient, so an accidental edit cannot terminate an active session; the setting applies on the next pi session.
 
@@ -676,7 +704,7 @@ Agent lifecycle events are emitted via `pi.events.emit()` so other extensions ca
 | `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount`, optional `owner` |
 | `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
 | `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
-| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `version: 3`, `capabilities` (`managedSpawn`, `lifecycleOwner`, `ownedStop`, `ownedQuiescence`, `childContext`, `workflowTiers`) |
+| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `version: 4`, `capabilities` (`managedSpawn`, `lifecycleOwner`, `ownedStop`, `ownedQuiescence`, `childContext`, `agentTiers`, `managedPolicy` — all required), `routingPolicy` (Agent-tier catalogue + fingerprint) |
 | `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
 | `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
 
@@ -702,20 +730,20 @@ pi.events.on("subagents:ready", () => {
 
 ### Ping
 
-Check if the subagents extension is loaded and get the protocol version:
+Check if the subagents extension is loaded and get the protocol version and current routing-policy fingerprint:
 
 ```typescript
 const requestId = crypto.randomUUID();
 const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (reply) => {
   unsub();
-  if (reply.success) console.log("Protocol version:", reply.data.version);
+  if (reply.success) console.log("Protocol version:", reply.data.version, "routing policy:", reply.data.routingPolicy.fingerprint);
 });
 pi.events.emit("subagents:rpc:ping", { requestId });
 ```
 
-### Managed spawn (protocol v3)
+### Managed spawn (protocol v4)
 
-Workflow-owned orchestration uses the additive `subagents:rpc:spawn-managed` channel. Its request may include the core identity fields plus optional `tier`, exact `model`, `thinking`, `toolset`, `excludeTools`, `thread`, and `isolation: "worktree"` hints:
+Workflow-owned orchestration uses the `subagents:rpc:spawn-managed` channel. Its request may include the core identity fields plus an optional Agent `tier`, `toolset`, `excludeTools`, `thread`, and `isolation: "worktree"`. There is no per-call `model` or `thinking` — the wire validator rejects them:
 
 ```json
 {
@@ -724,15 +752,14 @@ Workflow-owned orchestration uses the additive `subagents:rpc:spawn-managed` cha
   "type": "Explore",
   "prompt": "Find the relevant files",
   "description": "Find relevant files",
-  "tier": "small",
-  "model": "provider/model:medium",
+  "tier": "low",
   "excludeTools": ["workflow", "workflow_control"],
   "isolation": "worktree",
   "owner": { "extension": "pi-workflows", "runId": "run-id", "nodeId": "node-id", "attemptId": "run-id/node-id/attempt-1" }
 }
 ```
 
-The manager validates and resolves every hint against its own model scope, agent configuration, queue, tool, session, and worktree policy. `spawnKey` is idempotent within a root manager; the same normalized request returns the existing agent id and a conflicting request is rejected. A named managed `thread` re-enters one sequential session only while its effective model, thinking, toolset, denylist, isolation, and agent policy fingerprint remain unchanged; a policy change or concurrent call is rejected rather than silently reusing the old session. Managed agents use the normal Agent execution path, queue, FleetView, activity, transcript, compaction, and lifecycle events. Only the automatic main-session completion nudge is suppressed for an owner-scoped record. Managed requests must carry an attempt-scoped owner, and `stop-owned`/`quiesce-owned` fail closed when exact node/generation metadata is missing. During branch replacement, timed-out records are detached and late callbacks are suppressed.
+The manager validates and resolves the tier, agent configuration, queue, tool, session, and worktree policy against its own Agent-tier catalogue and model scope. The resolved tier and its snapshot are retained on the managed invocation/tombstone. `spawnKey` is idempotent within a root manager; the same normalized request returns the existing agent id and a conflicting request is rejected. A named managed `thread` re-enters one sequential session only while its effective model, thinking, toolset, denylist, isolation, and agent policy fingerprint remain unchanged — including the model and thinking its tier currently resolves to, so switching the session model interrupts a thread whose tier inherits it; a policy change or concurrent call is rejected rather than silently reusing the old session. Managed agents use the normal Agent execution path, queue, FleetView, activity, transcript, compaction, and lifecycle events. Only the automatic main-session completion nudge is suppressed for an owner-scoped record. Managed requests must carry an attempt-scoped owner, and `stop-owned`/`quiesce-owned` fail closed when exact node/generation metadata is missing. During branch replacement, timed-out records are detached and late callbacks are suppressed.
 
 ### Spawn
 

@@ -1,5 +1,5 @@
 /**
- * journal.ts — durable journal for script-based workflow runs (schema v3).
+ * journal.ts — durable journal for script-based workflow runs (schema v4).
  *
  * A script run is journaled as an ordered event stream in the session entry
  * store. `run_created` carries the raw script, its hash, and its parsed meta
@@ -17,13 +17,14 @@
  * preserved from the declarative journal and re-keyed to call indexes, because
  * interrupted managed spawns still need generation rotation on restore.
  *
- * Schema v2 runs (declarative DAG journals) are quarantined rather than
- * replayed — the event shapes are incompatible and a script run must not
- * inherit DAG bookkeeping.
+ * Schema-v3 and older runs are quarantined rather than replayed — the call
+ * hash and metadata contracts changed, and a script run must not silently
+ * inherit incompatible bookkeeping.
  */
 
 import { createHash } from "node:crypto";
 import type { ManagedOwner } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import {
   MAX_CALLS_PER_WORKFLOW,
   normalizeAgentRetries,
@@ -35,16 +36,15 @@ import {
 } from "./runtime.js";
 
 export const JOURNAL_ENTRY_TYPE = "pi-workflows:journal";
-export const JOURNAL_SCHEMA_VERSION = 3;
-/** Schema v2 (declarative DAG) and v1 are quarantined on replay, not migrated. */
-export const JOURNAL_LEGACY_SCHEMA_VERSION = 2;
-export type JournalSchemaVersion = 2 | 3;
+/** Breaking journal contract: v3 facts are quarantined, never replayed. */
+export const JOURNAL_SCHEMA_VERSION = 4;
+export type JournalSchemaVersion = 4;
 export const JOURNAL_TEXT_LIMIT = 8_000;
 export const JOURNAL_SCRIPT_LIMIT = 200_000;
 export const JOURNAL_ERROR_LIMIT = 2_000;
 export const JOURNAL_ID_LIMIT = 256;
 export const JOURNAL_TIMESTAMP_LIMIT = 8_640_000_000_000_000;
-export const JOURNAL_RECOVERY_ID_PREFIX = "r3-";
+export const JOURNAL_RECOVERY_ID_PREFIX = "r4-";
 export const JOURNAL_RECOVERY_ID_LIMIT = JOURNAL_RECOVERY_ID_PREFIX.length + 64;
 /** Maximum number of distinct atomic recoveries retained while replaying one run. */
 export const JOURNAL_RECOVERY_SEEN_LIMIT = 4_096;
@@ -52,7 +52,7 @@ export const JOURNAL_RECOVERY_SEEN_LIMIT = 4_096;
 export const JOURNAL_CALL_LIMIT = MAX_CALLS_PER_WORKFLOW;
 /** One atomic recovery event may rotate every active call in a run. */
 export const JOURNAL_RECOVERY_NODE_LIMIT = JOURNAL_CALL_LIMIT;
-const RECOVERY_ID_PATTERN = /^r3-[0-9a-f]{64}$/;
+const RECOVERY_ID_PATTERN = /^r4-[0-9a-f]{64}$/;
 
 export class StaleJournalGenerationError extends Error {
   constructor(message: string) {
@@ -88,7 +88,6 @@ const WORKFLOW_STATUS_VALUES = new Set<WorkflowStatus>([
 const CALL_STATUS_VALUES = new Set<CallStatus>(["running", "completed", "failed", "stopped"]);
 const JOURNAL_KINDS = new Set([
   "run_created",
-  "run_args",
   "run_revision",
   "run_removed",
   "workflow_transition",
@@ -103,8 +102,13 @@ const JOURNAL_KINDS = new Set([
 
 export type WorkflowOwner = ManagedOwner;
 
+/** The Agent tier one journaled call resolved to. */
+export interface CallTierIdentity {
+  tier?: string;
+}
+
 /** A completed agent()/checkpoint() call, journaled for resume replay. */
-export interface CallResult {
+export interface CallResult extends CallTierIdentity {
   status: "completed" | "failed" | "stopped";
   agentId?: string;
   attemptId?: string;
@@ -125,10 +129,16 @@ export interface ScriptRun {
   meta: WorkflowMeta;
   /** Frozen invocation input reused by automatic and manual resume. */
   args?: unknown;
-  /** Explicit on current runs; absent only for legacy schema-v3 run_created facts. */
-  frozenArgsPresent?: boolean;
+  /** Explicit marker recording whether the current run was given args. */
+  frozenArgsPresent: boolean;
   /** Number of the latest edited-script revision. */
   revision?: number;
+  /**
+   * This run's script ships with the package. Frozen for the same reason
+   * `toolset` is: a resume must keep treating a shipped script's tier names as
+   * preferences, not as assertions about the user's catalogue.
+   */
+  shippedScript?: boolean;
   /** Toolset marker persisted across resume (e.g. "web-research" for deep-research). */
   toolset?: string;
   /** Frozen run params — persisted so resume after restore keeps original budget/scale. */
@@ -148,6 +158,8 @@ export interface ScriptRun {
   attemptTracking?: boolean;
   /** Call index → journaled result (the resume journal source). */
   callResults: Record<string, CallResult>;
+  /** Call index → resolved tier identity for live and stopped calls. */
+  callTiers: Record<string, CallTierIdentity>;
   /** Call index → latest accepted nested workflow result generation. */
   workflowResultGenerations: Record<string, number>;
   compactions: Record<string, number>;
@@ -170,7 +182,7 @@ interface JournalBase {
 /** State observed immediately before an atomic recovery rotation. */
 export type RecoverySourceStatus = CallStatus | "running";
 
-export interface RecoveryRotation {
+export interface RecoveryRotation extends CallTierIdentity {
   nodeId: string;
   sourceAttemptId: string;
   sourceGeneration: number;
@@ -195,8 +207,6 @@ export interface RunRecoveryEvent extends JournalBase {
   rotations: RecoveryRotation[];
   terminalResults?: RecoveryTerminalResult[];
   recoveryId: string;
-  /** Set only when reading a schema-v2 atomic event written before recoveryId existed. */
-  legacyMigration?: true;
   timestamp: number;
 }
 
@@ -217,8 +227,6 @@ export interface AttemptRecoveryEvent extends JournalBase {
   nodeId: string;
   branchGeneration: number;
   rotation: RecoveryRotation;
-  /** Only used to migrate a legacy prefix ending after workflow_transition. */
-  legacyMigration?: true;
 }
 
 export type JournalEvent =
@@ -228,8 +236,9 @@ export type JournalEvent =
       scriptHash: string;
       meta: WorkflowMeta;
       args?: unknown;
-      /** Explicit args presence marker; absent only on legacy schema-v3 facts. */
-      frozenArgsPresent?: boolean;
+      /** Explicit args presence marker for deterministic resume. */
+      frozenArgsPresent: boolean;
+      shippedScript?: boolean;
       toolset?: string;
       frozenMaxAgents?: number;
       frozenConcurrency?: number;
@@ -239,11 +248,6 @@ export type JournalEvent =
       frozenExcludeTools?: string[];
       attempts?: Record<string, number>;
       attemptIds?: Record<string, string>;
-    })
-  | (JournalBase & {
-      /** Canonical invocation args backfilled when resuming an older schema-v3 run. */
-      kind: "run_args";
-      args: unknown;
     })
   | (JournalBase & {
       kind: "run_revision";
@@ -269,6 +273,7 @@ export type JournalEvent =
       kind: "call_transition";
       nodeId: string;
       status: CallStatus;
+      tier?: string;
       agentId?: string;
       attemptId?: string;
       owner?: WorkflowOwner;
@@ -278,6 +283,7 @@ export type JournalEvent =
       nodeId: string;
       attemptId: string;
       generation: number;
+      tier?: string;
       owner?: WorkflowOwner;
     })
   | (JournalBase & {
@@ -318,6 +324,8 @@ export interface SessionEntryLike {
 
 export interface ReplayJournalOptions {
   onInvalid?: (diagnostic: string) => void;
+  /** Internal observer for events that passed replay validation and were applied. */
+  onAccepted?: (event: JournalEvent) => void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -362,21 +370,31 @@ function parseMeta(raw: unknown): WorkflowMeta {
   if (!isRecord(raw)) throw new Error("meta is invalid");
   const name = boundedString(raw.name, "meta.name", 512);
   const description = boundedString(raw.description, "meta.description", 100_000);
+  if (Object.hasOwn(raw, "model") || Object.hasOwn(raw, "thinking")) {
+    throw new Error("workflow journal meta model/thinking fields are unsupported");
+  }
   const meta: WorkflowMeta = { name, description };
-  if (raw.model !== undefined) meta.model = boundedString(raw.model, "meta.model", 512);
   if (raw.phases !== undefined) {
     if (!Array.isArray(raw.phases)) throw new Error("meta.phases must be an array");
     meta.phases = raw.phases.map((phase, i) => {
       if (!isRecord(phase) || typeof phase.title !== "string" || phase.title.length === 0) {
         throw new Error(`meta.phases[${i}].title is invalid`);
       }
+      if (Object.hasOwn(phase, "model") || Object.hasOwn(phase, "thinking")) {
+        throw new Error(`workflow journal phase ${i} model/thinking fields are unsupported`);
+      }
       const out: NonNullable<WorkflowMeta["phases"]>[number] = { title: phase.title.slice(0, 512) };
       if (phase.detail !== undefined) out.detail = String(phase.detail).slice(0, 2_000);
-      if (phase.model !== undefined) out.model = String(phase.model).slice(0, 512);
       return out;
     });
   }
   return meta;
+}
+
+function parseCallTierIdentity(raw: Record<string, unknown>, label: string): CallTierIdentity {
+  if (raw.tier === undefined) return {};
+  if (!isManagedAgentTier(raw.tier)) throw new Error(`${label}.tier is invalid`);
+  return { tier: raw.tier };
 }
 
 function parseResult(raw: unknown, label: string): CallResult {
@@ -390,10 +408,12 @@ function parseResult(raw: unknown, label: string): CallResult {
     throw new Error(`${label} compactionCount is invalid`);
   }
   const updatedAt = validTimestamp(raw.updatedAt, label);
+  const tierIdentity = parseCallTierIdentity(raw, label);
   const result: CallResult = {
     status,
     compactionCount,
     updatedAt,
+    ...tierIdentity,
     ...(raw.agentId === undefined ? {} : { agentId: boundedString(raw.agentId, `${label}.agentId`, JOURNAL_ID_LIMIT) }),
     ...(raw.attemptId === undefined
       ? {}
@@ -415,6 +435,17 @@ function parseResult(raw: unknown, label: string): CallResult {
         }),
   };
   return result;
+}
+
+function mergeCallResultTierIdentity(previous: CallTierIdentity | undefined, result: CallResult): CallResult {
+  return result.tier === undefined && previous?.tier !== undefined ? { ...result, tier: previous.tier } : result;
+}
+
+function priorCallTierIdentity(run: ScriptRun, nodeId: string): CallTierIdentity {
+  return {
+    ...(run.callTiers[nodeId] ?? {}),
+    ...(run.callResults[nodeId]?.tier === undefined ? {} : { tier: run.callResults[nodeId].tier }),
+  };
 }
 
 function parseOwner(raw: unknown, runId: string, nodeId: string): WorkflowOwner {
@@ -486,6 +517,7 @@ function parseRotation(raw: unknown, runId: string): RecoveryRotation {
   if (generation <= sourceGeneration) throw new Error("rotation generation must exceed its source");
   const owner = parseOwner(raw.owner, runId, nodeId);
   if (owner.attemptId !== attemptId) throw new Error("rotation owner does not match its attempt");
+  const tierIdentity = parseCallTierIdentity(raw, "rotation");
   return {
     nodeId,
     sourceAttemptId,
@@ -494,6 +526,7 @@ function parseRotation(raw: unknown, runId: string): RecoveryRotation {
     attemptId,
     generation,
     owner,
+    ...tierIdentity,
     ...(raw.supersededAgentId === undefined
       ? {}
       : { supersededAgentId: boundedString(raw.supersededAgentId, "rotation.supersededAgentId", JOURNAL_ID_LIMIT) }),
@@ -523,7 +556,9 @@ function parseRunRecovery(raw: Record<string, unknown>, run: ScriptRun, timestam
     raw.terminalResults === undefined
       ? undefined
       : (() => {
-          if (!Array.isArray(raw.terminalResults)) throw new Error("run recovery terminalResults is invalid");
+          if (!Array.isArray(raw.terminalResults) || raw.terminalResults.length > JOURNAL_RECOVERY_NODE_LIMIT) {
+            throw new Error("run recovery terminalResults are invalid");
+          }
           return raw.terminalResults.map((terminal) => parseTerminalResult(terminal, run.runId));
         })();
   const recoveryId = boundedString(raw.recoveryId, "recoveryId", JOURNAL_RECOVERY_ID_LIMIT);
@@ -588,7 +623,6 @@ function parseAttemptRecovery(raw: Record<string, unknown>, run: ScriptRun, time
     nodeId: rotation.nodeId,
     branchGeneration: raw.branchGeneration,
     rotation,
-    ...(raw.legacyMigration === true ? { legacyMigration: true } : {}),
     timestamp,
   };
 }
@@ -600,53 +634,20 @@ export function recoverySemanticFingerprint(event: RunRecoveryEvent | TerminalRe
 }
 
 function parseDuplicateRunRecovery(raw: Record<string, unknown>, run: ScriptRun): RunRecoveryEvent {
-  if (raw.status !== "interrupted") throw new Error("run recovery status is invalid");
-  if (!Array.isArray(raw.rotations) || raw.rotations.length > JOURNAL_RECOVERY_NODE_LIMIT) {
-    throw new Error("run recovery rotations are invalid");
-  }
-  const rotations = raw.rotations.map((rotation) => parseRotation(rotation, run.runId));
-  const terminalResults =
-    raw.terminalResults === undefined
-      ? undefined
-      : (() => {
-          if (!Array.isArray(raw.terminalResults)) throw new Error("run recovery terminalResults is invalid");
-          return raw.terminalResults.map((terminal) => parseTerminalResult(terminal, run.runId));
-        })();
-  return {
-    kind: "run_recovery",
-    schemaVersion: JOURNAL_SCHEMA_VERSION,
-    runId: run.runId,
-    status: "interrupted",
-    branchGeneration: run.updatedAt, // not meaningful for duplicates; fingerprint covers content
-    rotations,
-    ...(terminalResults === undefined || terminalResults.length === 0 ? {} : { terminalResults }),
-    recoveryId: boundedString(raw.recoveryId, "recoveryId", JOURNAL_RECOVERY_ID_LIMIT),
-    timestamp: run.updatedAt,
-  };
+  // Duplicate detection must fingerprint the same semantic event as the normal
+  // parser. In particular, preserve branchGeneration and timestamp; replacing
+  // either with current run state turns an idempotent retry into a conflict.
+  return parseRunRecovery(raw, run, validTimestamp(raw.timestamp, "timestamp"));
 }
 
 function parseDuplicateTerminalRecovery(raw: Record<string, unknown>, run: ScriptRun): TerminalRecoveryEvent {
-  if (raw.status !== "failed" && raw.status !== "stopped") throw new Error("terminal recovery status is invalid");
-  if (!Array.isArray(raw.terminalResults) || raw.terminalResults.length > JOURNAL_RECOVERY_NODE_LIMIT) {
-    throw new Error("terminal recovery terminalResults are invalid");
-  }
-  const terminalResults = raw.terminalResults.map((terminal) => parseTerminalResult(terminal, run.runId));
-  return {
-    kind: "terminal_recovery",
-    schemaVersion: JOURNAL_SCHEMA_VERSION,
-    runId: run.runId,
-    status: raw.status,
-    terminalIntent: raw.terminalIntent === "failure" ? "failure" : "stop",
-    branchGeneration: run.updatedAt,
-    terminalResults,
-    blockedNodeIds: [],
-    recoveryId: boundedString(raw.recoveryId, "recoveryId", JOURNAL_RECOVERY_ID_LIMIT),
-    timestamp: run.updatedAt,
-  };
+  // Preserve every semantic field, including blocked nodes, error, branch
+  // generation, and timestamp, so an at-least-once append is truly idempotent.
+  return parseTerminalRecovery(raw, run, validTimestamp(raw.timestamp, "timestamp"));
 }
 
-function parseFrozenArgsPresence(raw: Record<string, unknown>): boolean | undefined {
-  if (raw.frozenArgsPresent === undefined) return undefined;
+function parseFrozenArgsPresence(raw: Record<string, unknown>): boolean {
+  if (raw.frozenArgsPresent === undefined) throw new Error("frozen args presence marker is required");
   if (typeof raw.frozenArgsPresent !== "boolean") throw new Error("frozen args presence marker must be boolean");
   const hasArgs = Object.hasOwn(raw, "args");
   if (raw.frozenArgsPresent && (!hasArgs || raw.args === undefined)) {
@@ -658,15 +659,13 @@ function parseFrozenArgsPresence(raw: Record<string, unknown>): boolean | undefi
   return raw.frozenArgsPresent;
 }
 
-function parseEvent(
-  raw: unknown,
-  runs: Map<string, ScriptRun>,
-  legacyArgsBackfilled: ReadonlySet<string>,
-): JournalEvent {
+function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
   if (!isRecord(raw)) throw new Error("journal event is not an object");
   if (typeof raw.kind !== "string" || !JOURNAL_KINDS.has(raw.kind)) throw new Error("journal event kind is unknown");
-  if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION && raw.schemaVersion !== JOURNAL_LEGACY_SCHEMA_VERSION) {
-    throw new Error("journal schema version is unsupported");
+  if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) {
+    throw new Error(
+      `journal schema version ${String(raw.schemaVersion)} is unsupported; expected ${JOURNAL_SCHEMA_VERSION}`,
+    );
   }
   const runId = boundedString(raw.runId, "runId", JOURNAL_ID_LIMIT);
   const timestamp = validTimestamp(raw.timestamp, "timestamp");
@@ -678,46 +677,72 @@ function parseEvent(
     const meta = parseMeta(raw.meta);
     const frozenArgsPresent = parseFrozenArgsPresence(raw);
     const args = raw.args === undefined ? undefined : parsePersistedValue(raw.args, "workflow args");
-    const toolset =
-      raw.toolset === undefined
-        ? undefined
-        : typeof raw.toolset === "string" && raw.toolset.length > 0 && raw.toolset.length <= 64
-          ? raw.toolset
-          : undefined;
-    const frozenMaxAgents =
-      typeof raw.frozenMaxAgents === "number" && Number.isFinite(raw.frozenMaxAgents) && raw.frozenMaxAgents >= 1
-        ? normalizeMaxAgents(raw.frozenMaxAgents)
-        : undefined;
-    const frozenConcurrency =
-      typeof raw.frozenConcurrency === "number" && Number.isFinite(raw.frozenConcurrency) && raw.frozenConcurrency >= 1
-        ? normalizeConcurrency(raw.frozenConcurrency)
-        : undefined;
-    const frozenAgentRetries =
-      typeof raw.frozenAgentRetries === "number" &&
-      Number.isFinite(raw.frozenAgentRetries) &&
-      raw.frozenAgentRetries >= 0
-        ? normalizeAgentRetries(raw.frozenAgentRetries)
-        : undefined;
-    const frozenTokenBudget =
-      raw.frozenTokenBudget === null
-        ? null
-        : typeof raw.frozenTokenBudget === "number" &&
-            Number.isFinite(raw.frozenTokenBudget) &&
-            raw.frozenTokenBudget >= 1
-          ? normalizeTokenBudget(raw.frozenTokenBudget)
-          : undefined;
-    const frozenAgentTimeoutMs =
-      raw.frozenAgentTimeoutMs === null
-        ? null
-        : typeof raw.frozenAgentTimeoutMs === "number" &&
-            Number.isFinite(raw.frozenAgentTimeoutMs) &&
-            raw.frozenAgentTimeoutMs >= 1
-          ? normalizeAgentTimeout(raw.frozenAgentTimeoutMs)
-          : undefined;
-    const frozenExcludeTools =
-      Array.isArray(raw.frozenExcludeTools) && raw.frozenExcludeTools.every((v) => typeof v === "string")
-        ? (raw.frozenExcludeTools as string[])
-        : undefined;
+    const toolset = Object.hasOwn(raw, "toolset") ? boundedString(raw.toolset, "toolset", 64) : undefined;
+    const shippedScript = (() => {
+      if (!Object.hasOwn(raw, "shippedScript")) return undefined;
+      if (typeof raw.shippedScript !== "boolean") throw new Error("shippedScript is invalid");
+      return raw.shippedScript;
+    })();
+    const frozenMaxAgents = (() => {
+      if (!Object.hasOwn(raw, "frozenMaxAgents")) return undefined;
+      if (typeof raw.frozenMaxAgents !== "number" || !Number.isFinite(raw.frozenMaxAgents) || raw.frozenMaxAgents < 1) {
+        throw new Error("frozenMaxAgents is invalid");
+      }
+      return normalizeMaxAgents(raw.frozenMaxAgents);
+    })();
+    const frozenConcurrency = (() => {
+      if (!Object.hasOwn(raw, "frozenConcurrency")) return undefined;
+      if (
+        typeof raw.frozenConcurrency !== "number" ||
+        !Number.isFinite(raw.frozenConcurrency) ||
+        raw.frozenConcurrency < 1
+      ) {
+        throw new Error("frozenConcurrency is invalid");
+      }
+      return normalizeConcurrency(raw.frozenConcurrency);
+    })();
+    const frozenAgentRetries = (() => {
+      if (!Object.hasOwn(raw, "frozenAgentRetries")) return undefined;
+      if (
+        typeof raw.frozenAgentRetries !== "number" ||
+        !Number.isFinite(raw.frozenAgentRetries) ||
+        raw.frozenAgentRetries < 0
+      ) {
+        throw new Error("frozenAgentRetries is invalid");
+      }
+      return normalizeAgentRetries(raw.frozenAgentRetries);
+    })();
+    const frozenTokenBudget = (() => {
+      if (!Object.hasOwn(raw, "frozenTokenBudget")) return undefined;
+      if (raw.frozenTokenBudget === null) return null;
+      if (
+        typeof raw.frozenTokenBudget !== "number" ||
+        !Number.isFinite(raw.frozenTokenBudget) ||
+        raw.frozenTokenBudget < 1
+      ) {
+        throw new Error("frozenTokenBudget is invalid");
+      }
+      return normalizeTokenBudget(raw.frozenTokenBudget);
+    })();
+    const frozenAgentTimeoutMs = (() => {
+      if (!Object.hasOwn(raw, "frozenAgentTimeoutMs")) return undefined;
+      if (raw.frozenAgentTimeoutMs === null) return null;
+      if (
+        typeof raw.frozenAgentTimeoutMs !== "number" ||
+        !Number.isFinite(raw.frozenAgentTimeoutMs) ||
+        raw.frozenAgentTimeoutMs < 1
+      ) {
+        throw new Error("frozenAgentTimeoutMs is invalid");
+      }
+      return normalizeAgentTimeout(raw.frozenAgentTimeoutMs);
+    })();
+    const frozenExcludeTools = (() => {
+      if (!Object.hasOwn(raw, "frozenExcludeTools")) return undefined;
+      if (!Array.isArray(raw.frozenExcludeTools) || !raw.frozenExcludeTools.every((v) => typeof v === "string")) {
+        throw new Error("frozenExcludeTools is invalid");
+      }
+      return [...raw.frozenExcludeTools] as string[];
+    })();
     return {
       kind: "run_created",
       schemaVersion: raw.schemaVersion as JournalSchemaVersion,
@@ -726,7 +751,8 @@ function parseEvent(
       scriptHash,
       meta,
       ...(args === undefined ? {} : { args }),
-      ...(frozenArgsPresent === undefined ? {} : { frozenArgsPresent }),
+      frozenArgsPresent,
+      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -742,21 +768,6 @@ function parseEvent(
 
   const run = runs.get(runId);
   if (!run) throw new Error("journal event references an unknown run");
-  if (raw.kind === "run_args") {
-    if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) throw new Error("run args schema version is unsupported");
-    if (!Object.hasOwn(raw, "args") || raw.args === undefined) throw new Error("run args fact is missing args");
-    if (run.schemaVersion !== JOURNAL_SCHEMA_VERSION || run.frozenArgsPresent !== undefined) {
-      throw new Error("run args fact cannot override frozen workflow args presence");
-    }
-    const args = parsePersistedValue(raw.args, "run args");
-    if (
-      run.args !== undefined &&
-      (!legacyArgsBackfilled.has(runId) || JSON.stringify(run.args) !== JSON.stringify(args))
-    ) {
-      throw new Error("conflicting workflow run args");
-    }
-    return { kind: "run_args", schemaVersion: JOURNAL_SCHEMA_VERSION, runId, args, timestamp };
-  }
   if (raw.kind === "run_revision") {
     const revision = raw.revision;
     if (typeof revision !== "number" || !Number.isInteger(revision) || revision <= (run.revision ?? 0))
@@ -819,7 +830,10 @@ function parseEvent(
     if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) throw new Error("workflow result schema version is unsupported");
     if (raw.owner !== undefined || raw.attemptId !== undefined)
       throw new Error("workflow result cannot carry a managed attempt");
-    const result = parseResult(raw.result, "workflow result");
+    const result = mergeCallResultTierIdentity(
+      priorCallTierIdentity(run, nodeId),
+      parseResult(raw.result, "workflow result"),
+    );
     if (result.status !== "completed") throw new Error("workflow result must be completed");
     if (result.attemptId !== undefined) throw new Error("workflow result payload cannot carry a managed attempt");
     const generation = raw.generation;
@@ -895,6 +909,7 @@ function parseEvent(
     if (attemptId !== expectedAttemptId || owner?.attemptId !== attemptId) {
       throw new Error("call attempt does not identify its next generation");
     }
+    const tierIdentity = parseCallTierIdentity(raw, "call attempt");
     return {
       kind: "call_attempt",
       schemaVersion: JOURNAL_SCHEMA_VERSION,
@@ -902,6 +917,7 @@ function parseEvent(
       nodeId,
       attemptId,
       generation,
+      ...tierIdentity,
       timestamp,
       ...(owner ? { owner } : {}),
     };
@@ -910,12 +926,14 @@ function parseEvent(
   if (raw.kind === "call_transition") {
     if (!CALL_STATUS_VALUES.has(raw.status as CallStatus)) throw new Error("call status is unknown");
     const agentId = raw.agentId === undefined ? undefined : boundedString(raw.agentId, "agentId", JOURNAL_ID_LIMIT);
+    const tierIdentity = parseCallTierIdentity(raw, "call transition");
     return {
       kind: "call_transition",
       schemaVersion: JOURNAL_SCHEMA_VERSION,
       runId,
       nodeId,
       status: raw.status as CallStatus,
+      ...tierIdentity,
       timestamp,
       ...(agentId ? { agentId } : {}),
       ...(attemptId ? { attemptId } : {}),
@@ -930,12 +948,14 @@ function parseEvent(
   if (result.attemptId && attemptId && result.attemptId !== attemptId) {
     throw new StaleJournalGenerationError("call result payload references a superseded attempt");
   }
+  const normalizedResult = result.attemptId === undefined && attemptId ? { ...result, attemptId } : result;
+  const resultWithTierIdentity = mergeCallResultTierIdentity(priorCallTierIdentity(run, nodeId), normalizedResult);
   return {
     kind: "call_result",
     schemaVersion: JOURNAL_SCHEMA_VERSION,
     runId,
     nodeId,
-    result: result.attemptId === undefined && attemptId ? { ...result, attemptId } : result,
+    result: resultWithTierIdentity,
     ...(raw.callHash === undefined ? {} : { callHash: boundedString(raw.callHash, "callHash", 128) }),
     ...(raw.storeDelta === undefined
       ? {}
@@ -969,7 +989,8 @@ export function replayJournal(
   const runs = new Map<string, ScriptRun>();
   const quarantined = new Set<string>();
   const removed = new Set<string>();
-  const legacyArgsBackfilled = new Set<string>();
+  /** Parsed creation facts are retained separately from mutable run state for duplicate checks. */
+  const creationFingerprints = new Map<string, string>();
   /** Recovery identities are scoped to one replayed run and bounded explicitly. */
   const seenRecoveries = new Map<string, Map<string, string>>();
   let reported = false;
@@ -984,18 +1005,28 @@ export function replayJournal(
     const rawRunId = isRecord(raw) && typeof raw.runId === "string" ? raw.runId : undefined;
     if (rawRunId && quarantined.has(rawRunId)) continue;
     if (rawRunId && removed.has(rawRunId)) continue;
+    // Set inside the guarded region, delivered outside it. An observer that
+    // throws is reporting that the accepted facts contradict each other, which
+    // is exactly the condition the caller needs to see — running it inside the
+    // `try` would quarantine the run and swallow the diagnostic, turning a real
+    // conflict into a silently missing cache entry. `finally` also delivers on
+    // the `continue` paths, which a trailing statement would skip.
+    let accepted: JournalEvent | undefined;
     try {
-      if (isRecord(raw) && raw.kind === "run_created" && rawRunId && runs.has(rawRunId)) {
-        const existing = runs.get(rawRunId);
-        if (
-          existing &&
-          existing.script === raw.script &&
-          existing.scriptHash === raw.scriptHash &&
-          JSON.stringify(existing.meta) === JSON.stringify(raw.meta) &&
-          existing.frozenArgsPresent === parseFrozenArgsPresence(raw) &&
-          JSON.stringify(existing.args) === JSON.stringify(raw.args)
-        )
-          continue;
+      if (
+        isRecord(raw) &&
+        raw.schemaVersion === JOURNAL_SCHEMA_VERSION &&
+        raw.kind === "run_created" &&
+        rawRunId &&
+        runs.has(rawRunId)
+      ) {
+        // Parse against an empty run map so every creation field participates in
+        // the comparison, including frozen limits and attempt seeds. Comparing
+        // against mutable run state would make a harmless retry conflict after
+        // later call/recovery events have changed that state.
+        const candidate = parseEvent(raw, new Map());
+        const candidateFingerprint = JSON.stringify(candidate);
+        if (creationFingerprints.get(rawRunId) === candidateFingerprint) continue;
         throw new Error("conflicting duplicate workflow run_created event");
       }
       if (
@@ -1008,7 +1039,12 @@ export function replayJournal(
           throw new Error(`recoveryId ${raw.recoveryId} is already owned by workflow run ${seenRunId}`);
         }
       }
-      if (isRecord(raw) && (raw.kind === "run_recovery" || raw.kind === "terminal_recovery") && rawRunId) {
+      if (
+        isRecord(raw) &&
+        raw.schemaVersion === JOURNAL_SCHEMA_VERSION &&
+        (raw.kind === "run_recovery" || raw.kind === "terminal_recovery") &&
+        rawRunId
+      ) {
         const run = runs.get(rawRunId);
         const seen = seenRecoveries.get(rawRunId);
         if (run && seen) {
@@ -1027,11 +1063,13 @@ export function replayJournal(
         }
       }
 
-      const event = parseEvent(raw, runs, legacyArgsBackfilled);
+      const event = parseEvent(raw, runs);
       if (quarantined.has(event.runId)) continue;
       if (event.kind === "run_created") {
         applyJournalEvent(runs, event);
+        creationFingerprints.set(event.runId, JSON.stringify(event));
         seenRecoveries.set(event.runId, new Map());
+        accepted = event;
         continue;
       }
       if (event.kind === "run_recovery" || event.kind === "terminal_recovery") {
@@ -1050,23 +1088,25 @@ export function replayJournal(
         applyJournalEvent(runs, event);
         seen.set(event.recoveryId, recoverySemanticFingerprint(event));
         seenRecoveries.set(event.runId, seen);
+        accepted = event;
         continue;
       }
       applyJournalEvent(runs, event);
-      if (event.kind === "run_args") legacyArgsBackfilled.add(event.runId);
+      accepted = event;
       if (event.kind === "run_removed") {
         removed.add(event.runId);
-        legacyArgsBackfilled.delete(event.runId);
       }
     } catch (error: unknown) {
       if (error instanceof StaleJournalGenerationError) continue;
       if (rawRunId) {
         quarantined.add(rawRunId);
         runs.delete(rawRunId);
+        creationFingerprints.delete(rawRunId);
         seenRecoveries.delete(rawRunId);
-        legacyArgsBackfilled.delete(rawRunId);
       }
       report(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (accepted) options.onAccepted?.(accepted);
     }
   }
   for (const [runId, run] of runs) {
@@ -1075,6 +1115,7 @@ export function replayJournal(
     } catch (error: unknown) {
       runs.delete(runId);
       quarantined.add(runId);
+      creationFingerprints.delete(runId);
       seenRecoveries.delete(runId);
       report(`${runId}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1088,15 +1129,19 @@ function applyRecoveryRotation(run: ScriptRun, rotation: RecoveryRotation): void
   run.attemptIds[rotation.nodeId] = rotation.attemptId;
   delete run.agentIds[rotation.nodeId];
   delete run.callResults[rotation.nodeId];
+  const rotationTier = rotation.tier ?? run.callTiers[rotation.nodeId]?.tier;
+  if (rotationTier !== undefined) run.callTiers[rotation.nodeId] = { tier: rotationTier };
   run.compactions[rotation.nodeId] = 0;
   run.callStatus[rotation.nodeId] = "running";
 }
 
 function applyRecoveryTerminalResult(run: ScriptRun, terminal: RecoveryTerminalResult): void {
   run.compactions[terminal.nodeId] = Math.max(run.compactions[terminal.nodeId] ?? 0, terminal.result.compactionCount);
-  run.callResults[terminal.nodeId] = terminal.result;
-  run.callStatus[terminal.nodeId] = terminal.result.status;
-  if (terminal.result.agentId) run.agentIds[terminal.nodeId] = terminal.result.agentId;
+  const result = mergeCallResultTierIdentity(priorCallTierIdentity(run, terminal.nodeId), terminal.result);
+  run.callResults[terminal.nodeId] = result;
+  run.callTiers[terminal.nodeId] = result.tier === undefined ? {} : { tier: result.tier };
+  run.callStatus[terminal.nodeId] = result.status;
+  if (result.agentId) run.agentIds[terminal.nodeId] = result.agentId;
 }
 
 export function applyRecoveryTerminalResults(run: ScriptRun, terminalResults: readonly RecoveryTerminalResult[]): void {
@@ -1145,8 +1190,9 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       scriptHash: event.scriptHash,
       meta: event.meta,
       ...(event.args === undefined ? {} : { args: structuredClone(event.args) }),
-      ...(event.frozenArgsPresent === undefined ? {} : { frozenArgsPresent: event.frozenArgsPresent }),
+      frozenArgsPresent: event.frozenArgsPresent,
       revision: 0,
+      ...(event.shippedScript === undefined ? {} : { shippedScript: event.shippedScript }),
       ...(event.toolset ? { toolset: event.toolset } : {}),
       ...(event.frozenMaxAgents !== undefined ? { frozenMaxAgents: event.frozenMaxAgents } : {}),
       ...(event.frozenConcurrency !== undefined ? { frozenConcurrency: event.frozenConcurrency } : {}),
@@ -1161,6 +1207,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       attemptIds,
       attemptTracking: event.attemptIds !== undefined,
       callResults: {},
+      callTiers: {},
       workflowResultGenerations: {},
       compactions: {},
       startedAt: event.timestamp,
@@ -1177,9 +1224,6 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
   }
   run.updatedAt = event.timestamp;
   switch (event.kind) {
-    case "run_args":
-      run.args = structuredClone(event.args);
-      break;
     case "run_revision":
       run.revision = event.revision;
       run.script = event.script;
@@ -1205,6 +1249,7 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       run.attemptIds[event.nodeId] = event.attemptId;
       delete run.agentIds[event.nodeId];
       delete run.callResults[event.nodeId];
+      if (event.tier !== undefined) run.callTiers[event.nodeId] = { tier: event.tier };
       run.callStatus[event.nodeId] = "running";
       run.compactions[event.nodeId] = 0;
       break;
@@ -1212,30 +1257,42 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       if (event.attemptId && event.attemptId !== run.attemptIds[event.nodeId]) {
         throw new Error("call transition references a superseded attempt");
       }
-      run.callStatus[event.nodeId] = event.status;
+      if (event.tier !== undefined) run.callTiers[event.nodeId] = { tier: event.tier };
+      // Identity-only transitions use status "running". A delayed retry must
+      // not regress a terminal call result that was already replayed.
+      if (
+        event.status !== "running" ||
+        run.callStatus[event.nodeId] === undefined ||
+        run.callStatus[event.nodeId] === "running"
+      ) {
+        run.callStatus[event.nodeId] = event.status;
+      }
       if (event.agentId) run.agentIds[event.nodeId] = event.agentId;
       break;
-    case "workflow_result":
+    case "workflow_result": {
       run.workflowResultGenerations[event.nodeId] = event.generation;
-      run.callResults[event.nodeId] = event.result;
-      run.callStatus[event.nodeId] = event.result.status;
-      run.compactions[event.nodeId] = event.result.compactionCount;
+      const result = mergeCallResultTierIdentity(priorCallTierIdentity(run, event.nodeId), event.result);
+      run.callResults[event.nodeId] = result;
+      run.callTiers[event.nodeId] = result.tier === undefined ? {} : { tier: result.tier };
+      run.callStatus[event.nodeId] = result.status;
+      run.compactions[event.nodeId] = result.compactionCount;
       break;
-    case "call_result":
+    }
+    case "call_result": {
       if (event.attemptId && event.attemptId !== run.attemptIds[event.nodeId]) {
         throw new Error("call result references a superseded attempt");
       }
-      if (
-        run.callResults[event.nodeId] &&
-        JSON.stringify(run.callResults[event.nodeId]) !== JSON.stringify(event.result)
-      ) {
+      const result = mergeCallResultTierIdentity(priorCallTierIdentity(run, event.nodeId), event.result);
+      if (run.callResults[event.nodeId] && JSON.stringify(run.callResults[event.nodeId]) !== JSON.stringify(result)) {
         throw new Error("contradictory terminal call result");
       }
-      run.callResults[event.nodeId] = event.result;
-      run.callStatus[event.nodeId] = event.result.status;
-      run.compactions[event.nodeId] = Math.max(run.compactions[event.nodeId] ?? 0, event.result.compactionCount);
-      if (event.result.agentId) run.agentIds[event.nodeId] = event.result.agentId;
+      run.callResults[event.nodeId] = result;
+      run.callTiers[event.nodeId] = result.tier === undefined ? {} : { tier: result.tier };
+      run.callStatus[event.nodeId] = result.status;
+      run.compactions[event.nodeId] = Math.max(run.compactions[event.nodeId] ?? 0, result.compactionCount);
+      if (result.agentId) run.agentIds[event.nodeId] = result.agentId;
       break;
+    }
   }
 }
 
@@ -1310,9 +1367,9 @@ export function snapshotRun(run: ScriptRun): ScriptRun {
  * The runtime keys its cache by `${runId}:${callIndex}` (the same namespacing
  * the store deltas use), so a nested workflow() call with its own runId can
  * never replay the parent's entry. Every `call_result` or `workflow_result`
- * event that carries a `callHash` is a replayable fact; entries without a hash
- * (legacy or malformed) are skipped rather than quarantined — a resume must
- * tolerate a foreign or partial journal and simply re-run the misses live.
+ * event that carries a `callHash` is a replayable fact. Entries from another
+ * schema or without a hash are not replayable; they are ignored here even when
+ * `replayJournal` retains them as non-replayable lifecycle history.
  */
 export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
   string,
@@ -1321,88 +1378,70 @@ export function buildResumeJournal(entries: readonly SessionEntryLike[]): Map<
     runId?: string;
     hash: string;
     result: unknown;
+    tier?: string;
     storeDelta?: Record<string, unknown>;
     generation?: number;
     agentCount?: number;
   }
 > {
-  const journal = new Map<
-    string,
-    {
-      index: number;
-      runId?: string;
-      hash: string;
-      result: unknown;
-      storeDelta?: Record<string, unknown>;
-      generation?: number;
-      agentCount?: number;
-    }
-  >();
-  for (const entry of entries) {
-    if (entry.type !== "custom" || entry.customType !== JOURNAL_ENTRY_TYPE) continue;
-    const raw = entry.data;
-    if (
-      !isRecord(raw) ||
-      (raw.kind !== "call_result" && raw.kind !== "workflow_result") ||
-      typeof raw.callHash !== "string"
-    )
-      continue;
-    if (raw.schemaVersion !== JOURNAL_SCHEMA_VERSION) continue;
-    const runId = boundedString(raw.runId, "runId", JOURNAL_ID_LIMIT);
-    let nodeId: string;
-    try {
-      nodeId = parseCallIndex(raw.nodeId, "nodeId");
-    } catch {
-      continue;
-    }
-    const result = isRecord(raw.result) ? raw.result : undefined;
-    // Failed/stopped lifecycle facts are diagnostic history, not successful
-    // replay values. Replaying them as `undefined` would silently skip a call
-    // and bypass the runtime's retry/error policy.
-    if (result?.status !== "completed" || !Object.hasOwn(result, "result")) continue;
-    const generation =
-      raw.kind === "workflow_result" && raw.generation !== undefined
-        ? typeof raw.generation === "number" &&
-          Number.isInteger(raw.generation) &&
-          raw.generation >= 1 &&
-          raw.generation <= 1_000_000
-          ? raw.generation
-          : undefined
-        : undefined;
-    if (raw.kind === "workflow_result" && generation === undefined) continue;
-    const agentCount =
-      raw.kind === "workflow_result" && raw.agentCount !== undefined
-        ? typeof raw.agentCount === "number" &&
-          Number.isInteger(raw.agentCount) &&
-          raw.agentCount >= 0 &&
-          raw.agentCount <= JOURNAL_CALL_LIMIT
-          ? raw.agentCount
-          : undefined
-        : undefined;
-    if (raw.kind === "workflow_result" && raw.agentCount !== undefined && agentCount === undefined) continue;
-    const candidate = {
-      index: Number(nodeId),
-      runId,
-      hash: raw.callHash,
-      result: result.result,
-      ...(generation === undefined ? {} : { generation }),
-      ...(agentCount === undefined ? {} : { agentCount }),
-      ...(isRecord(raw.storeDelta) && Object.keys(raw.storeDelta).length > 0
-        ? { storeDelta: raw.storeDelta as Record<string, unknown> }
-        : {}),
-    };
-    const key = `${runId}:${nodeId}`;
-    const existing = journal.get(key);
-    if (generation !== undefined && existing?.generation !== undefined) {
-      if (generation < existing.generation) continue;
-      if (generation === existing.generation) {
-        if (JSON.stringify(existing) !== JSON.stringify(candidate)) {
-          throw new Error("contradictory nested workflow result");
+  type ResumeEntry = {
+    index: number;
+    runId?: string;
+    hash: string;
+    result: unknown;
+    tier?: string;
+    storeDelta?: Record<string, unknown>;
+    generation?: number;
+    agentCount?: number;
+  };
+  const journal = new Map<string, ResumeEntry>();
+  const journalRunIds = new Map<string, string>();
+
+  // Reuse the authoritative replay validator so stale call results from an
+  // older attempt, terminal-after-lifecycle facts, and quarantined runs never
+  // enter the cache merely because they appear later in the session branch.
+  const replayedRuns = replayJournal(entries, {
+    onAccepted: (event) => {
+      if ((event.kind !== "call_result" && event.kind !== "workflow_result") || event.callHash === undefined) return;
+      if (event.result.status !== "completed" || !Object.hasOwn(event.result, "result")) return;
+
+      const candidate: ResumeEntry = {
+        index: Number(event.nodeId),
+        runId: event.runId,
+        hash: event.callHash,
+        result: event.result.result,
+        ...(event.result.tier === undefined ? {} : { tier: event.result.tier }),
+        ...(event.kind === "workflow_result" ? { generation: event.generation } : {}),
+        ...(event.kind === "workflow_result" && event.agentCount !== undefined ? { agentCount: event.agentCount } : {}),
+        ...(event.storeDelta !== undefined && Object.keys(event.storeDelta).length > 0
+          ? { storeDelta: event.storeDelta }
+          : {}),
+      };
+      const key = `${event.runId}:${event.nodeId}`;
+      const existing = journal.get(key);
+      if (candidate.generation !== undefined && existing?.generation !== undefined) {
+        if (candidate.generation < existing.generation) return;
+        // Same generation, same content is an at-least-once retry. Same
+        // generation, different content is a contradiction `replayJournal` has
+        // already rejected before accepting the second fact — reaching here
+        // would mean the two validators disagree, so surface it rather than
+        // quietly keeping whichever arrived first.
+        if (candidate.generation === existing.generation) {
+          if (JSON.stringify(existing) !== JSON.stringify(candidate))
+            throw new Error("contradictory nested workflow result");
+          return;
         }
-        continue;
       }
-    }
-    journal.set(key, candidate);
+      journal.set(key, candidate);
+      journalRunIds.set(key, event.runId);
+    },
+  });
+
+  // replayJournal may quarantine a run after an accepted fact (for example,
+  // when a later contradictory event invalidates the aggregate). Do not retain
+  // cache entries belonging to that run.
+  for (const [key, runId] of journalRunIds) {
+    if (!replayedRuns.has(runId)) journal.delete(key);
   }
   return journal;
 }

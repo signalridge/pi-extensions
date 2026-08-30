@@ -221,14 +221,19 @@ function collectExtensionNames(cwd: string): string[] {
         const bare = (spec.startsWith("@") ? (spec.split("/")[1] ?? spec) : basename(spec)).replace(/@.*$/u, "");
         names.push(bare.replace(/^pi-/u, ""));
       }
-    } catch {}
+    } catch {
+      // Discovery is best-effort: a malformed manifest contributes no names
+      // rather than blanking the whole card.
+    }
   }
   for (const directory of [join(getAgentDir(), "extensions"), join(cwd, ".pi", "extensions")]) {
     try {
       for (const entry of readdirSync(directory)) {
         names.push(entry.replace(/\.[cm]?[jt]s$/u, "").replace(/^pi-/u, ""));
       }
-    } catch {}
+    } catch {
+      // An extensions directory that does not exist is the normal case.
+    }
   }
   return tidy(names);
 }
@@ -271,7 +276,9 @@ export function collectResources(pi: ExtensionAPI, cwd: string): [string, string
     // Several scopes can contribute the same filename (a project AGENTS.md and
     // a global one); the card names kinds of context, not paths.
     push("Context", nameList(tidy(files.map((file) => basename(file.path)))));
-  } catch {}
+  } catch {
+    // One unreadable source drops its row; the card still renders the rest.
+  }
 
   try {
     const commands = pi.getCommands?.() ?? [];
@@ -279,7 +286,9 @@ export function collectResources(pi: ExtensionAPI, cwd: string): [string, string
       tidy(commands.filter((command) => command.source === source).map((command) => `${prefix}${command.name}`));
     push("Skills", nameList(named("skill")));
     push("Prompts", nameList(named("prompt", "/")));
-  } catch {}
+  } catch {
+    // A host without these accessors simply contributes no rows.
+  }
 
   push("Extensions", nameList(collectExtensionNames(cwd)));
   push("Themes", nameList(collectThemeNames()));
@@ -288,7 +297,9 @@ export function collectResources(pi: ExtensionAPI, cwd: string): [string, string
     const all = pi.getAllTools?.() ?? [];
     const active = pi.getActiveTools?.() ?? [];
     if (all.length) push("Tools", `${active.length} active of ${all.length}`);
-  } catch {}
+  } catch {
+    // A host without these accessors simply contributes no rows.
+  }
 
   return rows;
 }
@@ -501,7 +512,10 @@ export default function (pi: ExtensionAPI) {
           return;
         }
       }
-    } catch {}
+    } catch {
+      // Unreadable entries mean we cannot prove the card was already written.
+      // Falling through re-appends it, which beats never showing it at all.
+    }
 
     try {
       pi.appendEntry<WelcomeData>(ENTRY_TYPE, collect(pi, ctx));

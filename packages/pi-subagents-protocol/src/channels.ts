@@ -1,6 +1,14 @@
 /** Stable event-bus channel names for the managed subagent protocol. */
 
-export const PROTOCOL_VERSION = 3;
+/**
+ * Protocol v4.
+ *
+ * v4 removed the `small | medium | large` workflow-tier vocabulary and its
+ * mapping layer: a managed request now names an Agent tier directly and
+ * `resolveAgentTier` in pi-subagents is the only resolver. Every capability is
+ * required — a peer that cannot answer one is not a v4 peer.
+ */
+export const PROTOCOL_VERSION = 4;
 
 export const PROTOCOL_CAPABILITIES = {
   managedSpawn: true,
@@ -8,7 +16,8 @@ export const PROTOCOL_CAPABILITIES = {
   ownedStop: true,
   childContext: true,
   ownedQuiescence: true,
-  workflowTiers: true,
+  /** The peer accepts a request-level Agent tier and publishes its tier policy. */
+  agentTiers: true,
   managedPolicy: true,
 } as const;
 
