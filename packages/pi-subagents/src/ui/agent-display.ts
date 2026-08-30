@@ -174,7 +174,7 @@ export function buildInvocationTags(
 ): { modelName?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
-  if (invocation.tier) tags.push(`tier: ${invocation.tier}`);
+  if (invocation.agentTier) tags.push(`tier: ${invocation.agentTier}`);
   if (invocation.thinking) tags.push(`thinking: ${invocation.thinking}`);
   if (invocation.isolated) tags.push("isolated");
   if (invocation.isolation === "worktree") tags.push("worktree");

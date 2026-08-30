@@ -1,5 +1,30 @@
+import {
+  type ManagedRoutingPolicy,
+  PROTOCOL_CAPABILITIES,
+  PROTOCOL_VERSION,
+  routingPolicyFingerprint,
+} from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it } from "vitest";
 import { checkManagedSpawnProtocol, createManagedSpawnClient, queryChildSessionContext } from "../src/rpc-client.js";
+
+const ROUTING_POLICY: ManagedRoutingPolicy = {
+  defaultTier: "medium",
+  profiles: {
+    low: { model: "inherit", thinking: "low" },
+    medium: { model: "inherit", thinking: "medium" },
+  },
+  blockedProfiles: [],
+  blockedDefaultTier: false,
+};
+const ROUTING_POLICY_SNAPSHOT = {
+  policy: ROUTING_POLICY,
+  fingerprint: routingPolicyFingerprint(ROUTING_POLICY),
+};
+const CAPABILITIES = { ...PROTOCOL_CAPABILITIES };
+const EXPECTED_CHECK = {
+  routingPolicy: ROUTING_POLICY,
+  routingPolicyFingerprint: ROUTING_POLICY_SNAPSHOT.fingerprint,
+};
 
 class Bus {
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -33,27 +58,45 @@ describe("pi-subagents protocol capability check", () => {
     await expect(queryChildSessionContext(new Bus(), 1)).resolves.toBeUndefined();
   });
 
-  it("accepts protocol v3 managed-spawn capabilities", async () => {
+  it("accepts a complete peer and returns the catalogue, not just its fingerprint", async () => {
     const bus = new Bus();
     bus.on("subagents:rpc:ping", (raw) => {
       const request = raw as { requestId: string };
       bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
         success: true,
-        data: {
-          version: 3,
-          capabilities: {
-            managedSpawn: true,
-            lifecycleOwner: true,
-            ownedStop: true,
-            childContext: true,
-            ownedQuiescence: true,
-            workflowTiers: true,
-            managedPolicy: true,
-          },
-        },
+        data: { version: PROTOCOL_VERSION, capabilities: CAPABILITIES, routingPolicy: ROUTING_POLICY_SNAPSHOT },
       });
     });
-    await expect(checkManagedSpawnProtocol(bus)).resolves.toBeUndefined();
+    // The policy itself is what a resume needs: each cached call keys on the
+    // profile for its own tier, which a fingerprint alone cannot supply.
+    await expect(checkManagedSpawnProtocol(bus)).resolves.toEqual(EXPECTED_CHECK);
+  });
+
+  it("rejects a peer missing any single capability", async () => {
+    for (const key of Object.keys(CAPABILITIES)) {
+      const { [key]: _dropped, ...partial } = CAPABILITIES as Record<string, boolean>;
+      const bus = new Bus();
+      bus.on("subagents:rpc:ping", (raw) => {
+        const request = raw as { requestId: string };
+        bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
+          success: true,
+          data: { version: PROTOCOL_VERSION, capabilities: partial, routingPolicy: ROUTING_POLICY_SNAPSHOT },
+        });
+      });
+      await expect(checkManagedSpawnProtocol(bus)).rejects.toThrow(new RegExp(`protocol v${PROTOCOL_VERSION}`));
+    }
+  });
+
+  it("rejects an otherwise capable peer that omits routing-policy metadata", async () => {
+    const bus = new Bus();
+    bus.on("subagents:rpc:ping", (raw) => {
+      const request = raw as { requestId: string };
+      bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
+        success: true,
+        data: { version: PROTOCOL_VERSION, capabilities: CAPABILITIES },
+      });
+    });
+    await expect(checkManagedSpawnProtocol(bus)).rejects.toThrow(new RegExp(`protocol v${PROTOCOL_VERSION}`));
   });
 
   it("accepts readiness when pi-subagents registers after the initial ping", async () => {
@@ -61,30 +104,12 @@ describe("pi-subagents protocol capability check", () => {
     const check = checkManagedSpawnProtocol(bus);
     setTimeout(() => {
       bus.emit("subagents:ready", {
-        version: 3,
-        capabilities: {
-          managedSpawn: true,
-          lifecycleOwner: true,
-          ownedStop: true,
-          ownedQuiescence: true,
-          workflowTiers: true,
-          managedPolicy: true,
-        },
+        version: PROTOCOL_VERSION,
+        capabilities: CAPABILITIES,
+        routingPolicy: ROUTING_POLICY_SNAPSHOT,
       });
     }, 10);
-    await expect(check).resolves.toBeUndefined();
-  });
-
-  it("rejects a v3 peer that lacks owner-scoped stop", async () => {
-    const bus = new Bus();
-    bus.on("subagents:rpc:ping", (raw) => {
-      const request = raw as { requestId: string };
-      bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
-        success: true,
-        data: { version: 3, capabilities: { managedSpawn: true, lifecycleOwner: true } },
-      });
-    });
-    await expect(checkManagedSpawnProtocol(bus)).rejects.toThrow(/owned stop/);
+    await expect(check).resolves.toEqual(EXPECTED_CHECK);
   });
 
   it("rejects an old or incomplete subagents protocol", async () => {
@@ -96,7 +121,7 @@ describe("pi-subagents protocol capability check", () => {
         data: { version: 2, capabilities: {} },
       });
     });
-    await expect(checkManagedSpawnProtocol(bus)).rejects.toThrow(/protocol v3/);
+    await expect(checkManagedSpawnProtocol(bus)).rejects.toThrow(new RegExp(`protocol v${PROTOCOL_VERSION}`));
   });
 
   it("cancels the RPC wait with the session signal without exposing a foreground signal", async () => {
@@ -134,7 +159,7 @@ describe("pi-subagents protocol capability check", () => {
       });
     });
     const client = createManagedSpawnClient(bus);
-    await expect(client.spawn({} as never, "run-1", "a", {} as never)).resolves.toEqual({
+    await expect(client.spawn({} as never, "run-1", "a", undefined)).resolves.toEqual({
       id: "agent-terminal",
       state: "completed",
       terminal: {

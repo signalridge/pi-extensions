@@ -26,6 +26,20 @@ import {
 } from "../src/runtime.js";
 import { SharedStore } from "../src/shared-store.js";
 
+/**
+ * Adapt a test's name → script map to the nested-workflow resolver contract.
+ *
+ * The resolver reports where each script came from, because shipped-ness
+ * travels with the script rather than with the frame that called it. Test
+ * scripts are never shipped, so this only has to supply the script itself.
+ */
+function savedScript(resolve: (name: string) => string | undefined): (name: string) => { script: string } | undefined {
+  return (name) => {
+    const script = resolve(name);
+    return script === undefined ? undefined : { script };
+  };
+}
+
 // ── meta parsing gate ────────────────────────────────────────────────────────
 
 describe("parseWorkflowScript meta gate", () => {
@@ -89,6 +103,17 @@ const x = 1;`,
     expect(() => parseWorkflowScript(`export const meta = { name: "a", description: "" };`)).toThrow(
       /description must be a non-empty/,
     );
+  });
+
+  it("rejects legacy workflow meta model/thinking policy explicitly", () => {
+    expect(() =>
+      parseWorkflowScript(`export const meta = { name: "a", description: "b", model: "provider/model" };`),
+    ).toThrow(/workflow meta model\/thinking fields are unsupported/);
+    expect(() =>
+      parseWorkflowScript(
+        `export const meta = { name: "a", description: "b", phases: [{ title: "p", thinking: "high" }] };`,
+      ),
+    ).toThrow(/workflow phase model\/thinking fields are unsupported/);
   });
 
   it("rejects direct nondeterminism before execution", () => {
@@ -203,7 +228,7 @@ describe("agent() dispatch contract", () => {
     let seen: { prompt: string; options?: AgentRunOptions } | undefined;
     await runWorkflow(
       `export const meta = { name: "dispatch", description: "d" };
-const r = await agent("do the thing", { tier: "small", agentType: "Explore", label: "mine", phase: "scan", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
+const r = await agent("do the thing", { tier: "low", agentType: "Explore", label: "mine", phase: "scan", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
 return r;`,
       {
         agent: {
@@ -216,7 +241,7 @@ return r;`,
     );
     expect(seen?.prompt).toContain("do the thing");
     expect(seen?.prompt).toContain('"ok"'); // schema instruction embedded
-    expect(seen?.options?.tier).toBe("small");
+    expect(seen?.options?.tier).toBe("low");
     expect(seen?.options?.label).toBe("mine");
     expect(seen?.options?.instructions).toContain("Act as workflow subagent type: Explore");
     expect(seen?.options?.instructions).toContain("Workflow phase: scan");
@@ -299,22 +324,124 @@ return await agent("say nothing");`,
     expect(result).toBeNull();
   });
 
-  it("forwards an explicit per-call model for managed resolution", async () => {
-    let selected: string | undefined;
-    const { result } = await runWorkflow(
-      `export const meta = { name: "model", description: "m" };
-return await agent("x", { model: "anthropic/claude-sonnet" });`,
-      {
-        agent: {
-          run: async (_prompt, options) => {
-            selected = options?.model;
-            return "ok";
+  it("rejects a tier the host does not define, before any dispatch", async () => {
+    let dispatched = 0;
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "unknown-tier", description: "u" };
+return await agent("x", { tier: "nope" });`,
+        {
+          routingPolicy: {
+            defaultTier: "medium",
+            profiles: { low: { model: "inherit", thinking: "low" }, medium: { model: "inherit", thinking: "medium" } },
+            blockedProfiles: [],
+            blockedDefaultTier: false,
+          },
+          agent: {
+            run: async () => {
+              dispatched++;
+              return "ok";
+            },
           },
         },
+      ),
+    ).rejects.toThrow(/unknown agent tier "nope"; this host defines: low, medium/);
+    expect(dispatched).toBe(0);
+  });
+
+  it("treats a shipped script's tier as a preference against the host catalogue", async () => {
+    // The tier catalogue is the user's, names included. A script we ship cannot
+    // assert that "low" exists on a machine whose tiers are called cheap/deep —
+    // so it falls back to the host default instead of refusing to run.
+    const seen: Array<string | undefined> = [];
+    const logs: string[] = [];
+    const routingPolicy = {
+      defaultTier: "standard",
+      profiles: {
+        cheap: { model: "inherit", thinking: "low" },
+        standard: { model: "inherit", thinking: "medium" },
       },
-    );
+      blockedProfiles: [],
+      blockedDefaultTier: false,
+    };
+    const script = `export const meta = { name: "shipped", description: "s" };
+return await agent("x", { tier: "low" });`;
+
+    const { result } = await runWorkflow(script, {
+      shippedScript: true,
+      routingPolicy: routingPolicy as never,
+      onLog: (message: string) => logs.push(message),
+      agent: {
+        run: async (_prompt, options) => {
+          seen.push(options?.tier);
+          return "ok";
+        },
+      },
+    });
     expect(result).toBe("ok");
-    expect(selected).toBe("anthropic/claude-sonnet");
+    // Dropped, not substituted: the host's own default decides.
+    expect(seen).toEqual([undefined]);
+    expect(logs.join("\n")).toContain('agent tier "low" is not defined here');
+
+    // The same script written by the user is a typo, and the catalogue is
+    // theirs to fix, so it still fails closed.
+    await expect(
+      runWorkflow(script, { routingPolicy: routingPolicy as never, agent: { run: async () => "ok" } }),
+    ).rejects.toThrow(/unknown agent tier "low"/);
+  });
+
+  it("takes shipped-ness from the nested script, not from the frame that called it", async () => {
+    // A user's script may call a built-in by name. The built-in's tier names are
+    // preferences against whatever catalogue this host defines, so inheriting
+    // the caller's strict rule would fail a run over a tier the built-in never
+    // claimed existed here — and the reverse would silently reroute a user
+    // script's typo.
+    const routingPolicy = {
+      defaultTier: "standard",
+      profiles: { standard: { model: "inherit", thinking: "medium" } },
+      blockedProfiles: [],
+      blockedDefaultTier: false,
+    };
+    const parent = `export const meta = { name: "parent", description: "p" };
+return await workflow("shipped-child");`;
+    const shippedChild = `export const meta = { name: "shipped-child", description: "c" };
+return await agent("x", { tier: "low" });`;
+
+    const seen: Array<string | undefined> = [];
+    const { result } = await runWorkflow(parent, {
+      // The parent is the user's own script: strict for its own tiers.
+      routingPolicy: routingPolicy as never,
+      loadSavedWorkflow: (name) =>
+        name === "shipped-child" ? { script: shippedChild, shippedScript: true } : undefined,
+      agent: {
+        run: async (_prompt, options) => {
+          seen.push(options?.tier);
+          return "ok";
+        },
+      },
+    });
+    expect(result).toBe("ok");
+    // Dropped for the child because the child ships, even though the caller does not.
+    expect(seen).toEqual([undefined]);
+
+    // The same child resolved as a user's saved workflow keeps the strict rule.
+    await expect(
+      runWorkflow(parent, {
+        routingPolicy: routingPolicy as never,
+        loadSavedWorkflow: (name) => (name === "shipped-child" ? { script: shippedChild } : undefined),
+        agent: { run: async () => "ok" },
+      }),
+    ).rejects.toThrow(/unknown agent tier "low"/);
+  });
+
+  it("rejects a malformed tier key without needing the host catalogue", async () => {
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "bad-tier", description: "b" };
+return await agent("x", { tier: "two words" });`,
+        { agent: { run: async () => "ok" } },
+      ),
+    ).rejects.toThrow(/whitespace-free key/);
   });
 });
 
@@ -870,10 +997,11 @@ return await workflow("empty-child");`;
       runWorkflow(script, {
         maxAgents: 1_000,
         agent: nullRunner(),
-        loadSavedWorkflow: (name) =>
+        loadSavedWorkflow: savedScript((name) =>
           name === "empty-child"
             ? `export const meta = { name: "empty-child", description: "e" };\nreturn "ok";`
             : undefined,
+        ),
         onAgentJournal: () => {
           checkpointFacts += 1;
         },
@@ -932,12 +1060,13 @@ return 0;`,
       {
         maxAgents: 9,
         concurrency: 4,
-        loadSavedWorkflow: (name) =>
+        loadSavedWorkflow: savedScript((name) =>
           name === "child-script"
             ? `export const meta = { name: "child", description: "c" };
 await parallel(Array.from({ length: args.n }, (_, i) => () => agent("c" + i)));
 return 1;`
             : undefined,
+        ),
         agent: {
           run: async () => {
             active++;
@@ -961,10 +1090,11 @@ return await parallel([
   () => workflow("child", { tag: "two" }),
 ]);`,
       {
-        loadSavedWorkflow: (name) =>
+        loadSavedWorkflow: savedScript((name) =>
           name === "child"
             ? `export const meta = { name: "child", description: "c" };\nawait agent("child-work");\nreturn args.tag;`
             : undefined,
+        ),
         agent: { run: async () => "x" },
       },
     );
@@ -987,7 +1117,7 @@ agent("slow child", { label: "slow-child" });
 return { child: "done" };`;
     const firstRun = runWorkflow(parentScript, {
       runId: "nested-frame-drain",
-      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      loadSavedWorkflow: savedScript((name) => (name === "child" ? childScript : undefined)),
       agent: {
         run: async () => {
           dispatches += 1;
@@ -1022,7 +1152,7 @@ return { child: "done" };`;
     const replayed = await runWorkflow(parentScript, {
       runId: "nested-frame-drain",
       resumeJournal: journal,
-      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      loadSavedWorkflow: savedScript((name) => (name === "child" ? childScript : undefined)),
       agent: {
         run: async () => {
           dispatches += 1;
@@ -1041,7 +1171,7 @@ return { child: "done" };`;
 await workflow("child");
 return 0;`,
         {
-          loadSavedWorkflow: (name) =>
+          loadSavedWorkflow: savedScript((name) =>
             name === "child"
               ? `export const meta = { name: "child", description: "c" };
 await workflow("grandchild");
@@ -1050,6 +1180,7 @@ return 0;`
                 ? `export const meta = { name: "grandchild", description: "g" };
 return 0;`
                 : undefined,
+          ),
           agent: nullRunner(),
         },
       ),
@@ -1065,12 +1196,13 @@ await workflow("child", { tag: "one" });
 await workflow("child", { tag: "two" });
 return 0;`,
       {
-        loadSavedWorkflow: (name) =>
+        loadSavedWorkflow: savedScript((name) =>
           name === "child"
             ? `export const meta = { name: "child", description: "c" };
 await agent("child-work");
 return args.tag;`
             : undefined,
+        ),
         agent: { run: async () => "x" },
         onAgentJournal: (entry) => {
           runIds.push(entry.runId ?? "");
@@ -1090,7 +1222,7 @@ return args.tag;`
     const options = {
       runId: "nested-arg-presence",
       agent: nullRunner(),
-      loadSavedWorkflow: (name: string) => (name === "child" ? childScript : undefined),
+      loadSavedWorkflow: savedScript((name: string) => (name === "child" ? childScript : undefined)),
       onWorkflowJournal: (entry: {
         index: number;
         runId?: string;
@@ -1116,10 +1248,11 @@ return args.tag;`
     const script = `export const meta = { name: "undefined-parent", description: "u" };\nreturn await workflow("child");`;
     const options = {
       runId: "undefined-child-parent",
-      loadSavedWorkflow: (name: string) =>
+      loadSavedWorkflow: savedScript((name: string) =>
         name === "child"
           ? `export const meta = { name: "undefined-child", description: "u" };\nawait agent("side effect");`
           : undefined,
+      ),
       agent: {
         run: async () => {
           childCalls += 1;
@@ -1154,12 +1287,13 @@ const child = await workflow("child", { tag: "stable" });
 return child;`;
     const options = {
       runId: "nested-parent",
-      loadSavedWorkflow: (name: string) =>
+      loadSavedWorkflow: savedScript((name: string) =>
         name === "child"
           ? `export const meta = { name: "child", description: "c" };
 const value = await agent("child-work");
 return args.tag + ":" + value;`
           : undefined,
+      ),
       agent: {
         run: async () => {
           childCalls += 1;
@@ -1228,6 +1362,132 @@ return [a, b, c];`;
       onAgentJournal: () => {},
     });
     expect(calls2).toEqual(["second EDITED", "third"]);
+  });
+
+  it("invalidates agent replay only when the tier that call used changed", async () => {
+    const journal = new Map<string, { index: number; runId: string; hash: string; result: unknown }>();
+    const calls: string[] = [];
+    const script = `export const meta = { name: "routing-policy", description: "r" };
+return await agent("stable", { tier: "low" });`;
+    const policy = (lowThinking: "low" | "high", extra?: Record<string, unknown>) => ({
+      defaultTier: "medium",
+      profiles: {
+        low: { model: "inherit", thinking: lowThinking },
+        medium: { model: "inherit", thinking: "medium" },
+        ...(extra ?? {}),
+      },
+      blockedProfiles: [],
+      blockedDefaultTier: false,
+    });
+    const run = (routingPolicy: ReturnType<typeof policy>, resumeJournal?: typeof journal) =>
+      runWorkflow(script, {
+        runId: "routing-policy-run",
+        routingPolicy: routingPolicy as never,
+        resumeJournal,
+        agent: {
+          run: async (prompt: string) => {
+            calls.push(prompt);
+            return "answer";
+          },
+        },
+        onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry as never),
+      });
+
+    await run(policy("low"));
+    await run(policy("low"), journal);
+    expect(calls).toEqual(["stable"]);
+
+    // A tier this call never used changed. Re-running the whole workflow for
+    // that would charge a full re-execution for a change that cannot have
+    // affected any of it.
+    await run(policy("low", { unrelated: { model: "provider/other", thinking: "max" } }), journal);
+    expect(calls).toEqual(["stable"]);
+
+    // The call's own tier now resolves differently, so its cached answer is
+    // no longer an answer to the same question.
+    await run(policy("high"), journal);
+    expect(calls).toEqual(["stable", "stable"]);
+  });
+
+  it("keys an untiered agent call on the whole catalogue, because its real tier may be the agent's", async () => {
+    // A call that names no tier is resolved by the host as
+    // `call > agent frontmatter > defaultTier`, and frontmatter is invisible
+    // from this side. Keyed on `defaultTier` it would replay stale work after
+    // an edit to the tier the agent actually declares, so it keys on the
+    // catalogue instead — coarse, but never wrong. A call that DOES name its
+    // tier keeps the precise key and ignores the same change.
+    const journal = new Map<string, { index: number; runId: string; hash: string; result: unknown }>();
+    const untiered: string[] = [];
+    const tiered: string[] = [];
+    const policy = {
+      defaultTier: "medium",
+      profiles: { low: { model: "inherit", thinking: "low" }, medium: { model: "inherit", thinking: "medium" } },
+      blockedProfiles: [],
+      blockedDefaultTier: false,
+    };
+    const script = `export const meta = { name: "untiered-policy", description: "r" };
+const a = await agent("explore", { agentType: "Explore" });
+const b = await agent("named", { tier: "low" });
+return a + b;`;
+    const run = (fingerprint: string, resumeJournal?: typeof journal) =>
+      runWorkflow(script, {
+        runId: "untiered-policy-run",
+        routingPolicy: policy as never,
+        routingPolicyFingerprint: fingerprint,
+        resumeJournal,
+        agent: {
+          run: async (prompt: string) => {
+            (prompt === "explore" ? untiered : tiered).push(prompt);
+            return "answer";
+          },
+        },
+        onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry as never),
+      });
+
+    await run("catalogue-a");
+    await run("catalogue-a", journal);
+    expect(untiered).toEqual(["explore"]);
+    expect(tiered).toEqual(["named"]);
+
+    // Some tier somewhere changed. The untiered call cannot prove it was not
+    // its own, so it re-executes; the tiered one can, so it replays. The
+    // untiered miss ends the replayable prefix, which is why `tiered` grows
+    // too — but on its own hash it would still have matched.
+    await run("catalogue-b", journal);
+    expect(untiered).toEqual(["explore", "explore"]);
+
+    const beforeTieredHash = journal.get("untiered-policy-run:1")?.hash;
+    await run("catalogue-c", journal);
+    expect(journal.get("untiered-policy-run:1")?.hash).toBe(beforeTieredHash);
+  });
+
+  it("invalidates nested workflow replay when the host routing policy changes", async () => {
+    const journal = new Map<string, { index: number; runId: string; hash: string; result: unknown }>();
+    let childCalls = 0;
+    const parent = `export const meta = { name: "routing-parent", description: "r" };
+return await workflow("child");`;
+    const child = `export const meta = { name: "routing-child", description: "r" };
+return await agent("stable");`;
+    const run = (fingerprint: string, resumeJournal?: typeof journal) =>
+      runWorkflow(parent, {
+        runId: "routing-parent-run",
+        routingPolicyFingerprint: fingerprint,
+        resumeJournal,
+        loadSavedWorkflow: savedScript((name: string) => (name === "child" ? child : undefined)),
+        agent: {
+          run: async () => {
+            childCalls += 1;
+            return "answer";
+          },
+        },
+        onWorkflowJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry as never),
+      });
+
+    await run("policy-a");
+    await run("policy-a", journal);
+    expect(childCalls).toBe(1);
+    await run("policy-b", journal);
+    expect(childCalls).toBe(2);
   });
 
   it("replayed calls do not consume the real-dispatch maxAgents cap", async () => {

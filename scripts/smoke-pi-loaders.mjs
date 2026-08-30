@@ -59,8 +59,28 @@ function pack(directory, destination) {
   return tarball;
 }
 
+/**
+ * Where a dependency's code actually lives for the smoke run.
+ *
+ * The workspace checkout is a candidate, not just the two `node_modules` trees,
+ * because a sibling package is not always installed into them. A package may
+ * declare a peer range that the workspace does not satisfy *yet* — `pi-workflows`
+ * requires `pi-subagents` `>=1.9.0` while the checkout still reads 1.8.1, which
+ * is exactly what the pending release fixes — and an unsatisfiable peer is
+ * skipped rather than linked. That window is one release long and says nothing
+ * about whether the extension loads, which is all this smoke test measures.
+ * Declared ranges are checked by check-shared-dep-ranges and check-versions.
+ *
+ * Note this cannot mask a genuinely missing dependency: only a package that
+ * exists in `packages/` is resolved here, and an external one still throws.
+ */
 function linkDependency(consumerNodeModules, dependency, fallbackRoot) {
-  const candidates = [join(root, "node_modules", dependency), join(fallbackRoot, "node_modules", dependency)];
+  const workspaceDirectory = localPackageDirectories().get(dependency);
+  const candidates = [
+    join(root, "node_modules", dependency),
+    join(fallbackRoot, "node_modules", dependency),
+    ...(workspaceDirectory ? [join(packagesRoot, workspaceDirectory)] : []),
+  ];
   const source = candidates.find((candidate) => existsSync(candidate));
   if (!source) throw new Error(`smoke dependency is not installed: ${dependency}`);
   const target = join(consumerNodeModules, dependency);
@@ -274,19 +294,20 @@ return recovered;`;
   const append = (event) => session.sessionManager.appendCustomEntry("pi-workflows:journal", event);
   append({
     kind: "run_created",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     script,
     scriptHash: "smoke-recovery-script-hash",
     meta: { name: "recovery smoke", description: "Recover one call" },
+    frozenArgsPresent: false,
     attempts: { [nodeId]: 1 },
     attemptIds: { [nodeId]: attemptId },
     timestamp: timestamp++,
   });
-  append({ kind: "workflow_transition", schemaVersion: 3, runId, status: "running", timestamp: timestamp++ });
+  append({ kind: "workflow_transition", schemaVersion: 4, runId, status: "running", timestamp: timestamp++ });
   append({
     kind: "call_attempt",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     nodeId,
     attemptId,
@@ -296,7 +317,7 @@ return recovered;`;
   });
   append({
     kind: "call_transition",
-    schemaVersion: 3,
+    schemaVersion: 4,
     runId,
     nodeId,
     status: "running",
@@ -591,7 +612,18 @@ try {
     mkdirSync(join(consumer, ".pi"), { recursive: true });
     writeFileSync(
       join(consumer, ".pi", "subagents.json"),
-      JSON.stringify({ maxConcurrent: 2, schedulingEnabled: false }),
+      JSON.stringify({
+        maxConcurrent: 2,
+        schedulingEnabled: false,
+        agentTiers: {
+          defaultTier: "medium",
+          profiles: {
+            low: { model: "inherit", thinking: "inherit" },
+            medium: { model: "inherit", thinking: "inherit" },
+            high: { model: "inherit", thinking: "inherit" },
+          },
+        },
+      }),
     );
     mkdirSync(join(consumer, ".pi", "agents"), { recursive: true });
     writeFileSync(

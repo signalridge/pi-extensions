@@ -12,8 +12,8 @@ isolation, retry, and session policy.
 
 ## Install
 
-`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.5.0`
-with protocol v3 managed-spawn, workflow-tier, and managed-policy support. They are separate Pi packages: the peer
+`@signalridge/pi-workflows` requires `@signalridge/pi-subagents` `>=1.9.0`
+with protocol v4 managed-spawn, Agent-tier, and managed-policy support. They are separate Pi packages: the peer
 dependency documents the requirement but intentionally does not auto-load or
 duplicate the subagent extension.
 
@@ -54,9 +54,9 @@ export const meta = {
 
 phase("scan");
 const findings = await parallel([
-  () => agent("Check for cross-package imports", { label: "imports", tier: "small" }),
-  () => agent("Check for secrets", { label: "secrets", tier: "small" }),
-  () => agent("Check for dead code", { label: "dead-code", tier: "small" }),
+  () => agent("Check for cross-package imports", { label: "imports", tier: "low" }),
+  () => agent("Check for secrets", { label: "secrets", tier: "low" }),
+  () => agent("Check for dead code", { label: "dead-code", tier: "low" }),
 ]);
 
 phase("synthesize");
@@ -77,15 +77,17 @@ user's own LLM and run on the user's own machine.
 
 ### Runtime globals
 
-- `agent(prompt, { label, phase, schema, model, tier, isolation, thread, agentType, toolset, excludeTools, timeoutMs, retries })`
+- `agent(prompt, { label, phase, schema, tier, isolation, thread, agentType, toolset, excludeTools, timeoutMs, retries })`
   — dispatch one subagent through the managed spawn protocol. Returns text, a
   schema-validated value, or recoverable `null` after retries. Replayed journal
   calls consume no real-dispatch cap or token/phase budget. `schema` is a
   plain JSON Schema; the reply is parsed and validated client-side with bounded
   repair across attempts, and exhaustion throws `SCHEMA_NONCOMPLIANCE`.
-  Explicit `model` and `isolation: "worktree"` are resolved and enforced by pi-subagents; `tier` remains the provider-neutral route.
-  `tier`; see "Model routing"). `thread` chains sequential turns within a named
-  conversation thread.
+  `tier` is the provider-neutral workflow route; `thread` chains sequential turns
+  within a named conversation thread. A legacy programmatic `model` option may
+  still be accepted by non-managed callers, but workflow meta/phase model or
+  thinking fields are rejected and are never a workflow policy source. Pre-schema-v4
+  journal runs are quarantined and cannot be resumed.
 - `parallel(thunks)` — run thunks concurrently, preserve input order. Recoverable
   thunk failures become `null`; non-recoverable failures (token budget, agent
   limit) halt the run after the batch barrier settles. Fan-out that breaches
@@ -184,12 +186,52 @@ written atomically with a backup.
 
 ## Model routing
 
-The managed protocol carries semantic tiers plus optional exact model/thinking, toolset, denylist, thread, and worktree requests. pi-subagents resolves model references, validates scope, creates/cleans worktrees, and owns tool/session policy. Workflows fail closed with a diagnostic when the peer does not advertise managed-policy support; explicit selectors otherwise fail closed when unavailable, and workflows never bypass the companion's policy.
+`tier` names a key in the host's own `agentTiers` catalogue — the same catalogue an
+ordinary `Agent` call uses. There is no separate workflow-tier vocabulary and no
+mapping layer: a workflow that wants cheap work asks for the tier the user defined
+for cheap work.
+
+```js
+await agent("summarize this diff", { tier: "low" })
+await agent("design the migration", { tier: "high" })
+```
+
+The host's catalogue arrives with the protocol handshake, so a tier this host does
+not define is rejected before any dispatch, naming the ones it does. Resolution
+itself is entirely pi-subagents' `resolveAgentTier()`: it owns the final model,
+thinking level, clamping, availability checks, and the immutable resolution
+snapshot.
+
+The catalogue belongs to whoever runs the workflow — the names included. The
+built-in workflows and the ad-hoc script ship with this package, so they cannot
+assert that `low` exists on a machine whose tiers are called `cheap` and `deep`:
+a name they use that the host does not define is dropped, with a log line, and
+the host's own default applies. A script you wrote names tiers from your own
+catalogue, so an undefined one there is a typo and fails closed instead.
+
+There is no per-call `model` or `thinking`, and `meta`/phase metadata may not carry
+them either — both are rejected explicitly rather than accepted and ignored. A tier
+is the only model policy a workflow can express, which is what keeps a script from
+pinning a vendor the host did not choose.
+
+Omitting `tier` uses the agent's own tier, then `agentTiers.defaultTier`. Fresh
+installs ship `low`/`medium`/`high` profiles, all inheriting their model, and a
+managed call that still names no tier falls back to `medium` — so the built-ins run
+on a new machine without any configuration. That fallback is scoped to managed
+calls: it is not the catalogue's `defaultTier`, so an ordinary `Agent` spawn on the
+same machine keeps falling through to `defaultModel` and the parent session. A host
+whose default has been cleared (`noDefaultTier`) rejects an untiered managed call
+rather than quietly inheriting the parent session's model.
+
+The managed wire, invocation record, journal, tombstone, and resume state all carry
+the one resolved tier — including one the host defaulted to, so a run's record says
+what actually ran. Resume keys each cached call on the policy for *that call's*
+tier: editing an unrelated tier does not invalidate work that never used it.
 
 ## Intentional adaptations from upstream
 
 - **No host-side web tools.** Agents reach the web through configured pi-web-access/MCP tools or an agent type's tool policy.
-- **Agent registry and tier catalogue ownership.** `agentType` and `small|medium|large` profiles resolve in pi-subagents, avoiding a second registry/config schema.
+- **Agent registry and tier catalogue ownership.** `agentType` and the tier catalogue resolve in pi-subagents; the workflow package supplies only a tier key, avoiding a second model/thinking policy.
 - **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
-State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v3), including frozen invocation args, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; schema-v2 declarative journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters.
+State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters.

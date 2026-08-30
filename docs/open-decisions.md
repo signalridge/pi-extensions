@@ -1,38 +1,36 @@
 # Open decisions
 
-Three questions this repository cannot answer for itself are followed by one
-completed reference review. The questions are written up rather than acted on,
-because each is a policy or ownership choice rather than a defect: implementing
-any of them unilaterally would decide something the maintainer has not decided.
+Two questions this repository cannot answer for itself are followed by one
+completed reference review and one decision that has since been settled. The
+questions are written up rather than acted on, because each is a policy or
+ownership choice rather than a defect: implementing any of them unilaterally
+would decide something the maintainer has not decided.
 
-Each section states the current state, the options, and a recommendation. None
-is blocking; the code is coherent as it stands under every option below.
+Each open section states the current state, the options, and a recommendation.
+None is blocking; the code is coherent as it stands under every option below.
 
 ---
 
-## 1. Per-call worktree isolation (protocol change)
+## 1. Per-call worktree isolation — **settled in protocol v3**
 
-**Current state.** Worktree isolation exists and is thorough —
-`pi-subagents/src/worktree.ts` handles creation, cleanup, and cleanup forensics.
-It can only be triggered by an agent's own frontmatter (`isolation: worktree`),
-because `ManagedSpawnPolicy` carries no `cwd` and the wire request has no
-isolation field. A workflow that wants an isolated agent must therefore point at
-an agentType that declares isolation, rather than asking for it per call.
+Kept as a record of what was decided and what the decision costs to maintain;
+there is nothing left to choose here.
 
-This is a real divergence from the upstream orchestrator, which isolates
-per call. It is documented as intentional in `pi-workflows/README.md`.
+**What shipped.** Worktree isolation is owned by
+`pi-subagents/src/worktree.ts`, which handles creation, cleanup, and cleanup
+forensics. It is triggered either by an agent's own frontmatter
+(`isolation: worktree`) or by the per-call managed-spawn `isolation` request —
+the latter added in protocol **v3**, alongside the `managedPolicy` capability
+that gates policy-bearing requests. Protocol v4 changed model routing, not
+isolation; the field and its capability are unchanged.
 
-**The options.**
+That seam follows the upstream per-call behavior while keeping creation,
+cleanup, and failure handling in the existing worktree implementation, and it
+keeps the ownership boundary explicit: one agentType can still answer
+differently per call.
 
-- **Leave it (status quo).** Isolation stays agent-owned. A workflow expresses
-  "isolated" by choosing an agent, which is a coarser but perfectly usable
-  handle, and no protocol version moves.
-- **Add it.** The managed-spawn request gains an optional `isolation` field,
-  gated behind a new capability flag. That is `PROTOCOL_VERSION` 3 → 4, and a
-  **major** release of both `pi-subagents-protocol` and `pi-subagents`.
-
-**What it would cost beyond the version bump.** Two things that are easy to get
-wrong and worth writing down before anyone starts:
+**Constraints the implementation must keep honoring.** Each is easy to
+regress and none is enforced by a type:
 
 - worktree names must be `${runId}-${callIndex}-${label}` — **deterministic, no
   wall clock**. A name containing a timestamp changes between a run and its
@@ -43,11 +41,7 @@ wrong and worth writing down before anyone starts:
 - it must route into the existing `worktree.ts`. A fourth worktree
   implementation in this repository would be one too many.
 
-**Recommendation: leave it for now.** The status quo is not a gap so much as a
-different place to put the same switch, and a double major on the protocol is a
-large price for moving it. Revisit if a concrete workflow turns out to need two
-different isolation answers from the *same* agentType — that is the case the
-current design genuinely cannot express.
+Revisit only if per-call isolation turns out never to be used.
 
 ---
 

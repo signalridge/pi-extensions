@@ -24,8 +24,9 @@
  * toggle on every apply.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -86,6 +87,13 @@ function readEnabled(): boolean {
  * Read-modify-write the whole settings file. pi rewrites this file too, so the
  * read happens at write time rather than from a cached copy — a stale snapshot
  * here would silently revert whatever pi changed in between.
+ *
+ * The write is atomic for the same reason. This is pi's own settings file,
+ * shared with pi and every other extension, and it is rewritten on every toggle
+ * of this feature. A torn write — crash, kill, disk full between truncate and
+ * flush — would leave the user with no pi configuration at all, not just no
+ * gpt-fast setting. Write a unique temp file in the same directory, then rename
+ * over the target; rename is atomic on POSIX and Windows.
  */
 function writeEnabled(enabled: boolean): void {
   const path = settingsPath();
@@ -99,7 +107,19 @@ function writeEnabled(enabled: boolean): void {
   const settings = isRecord(raw) ? raw : {};
   const block = isRecord(settings[SETTINGS_KEY]) ? settings[SETTINGS_KEY] : {};
   settings[SETTINGS_KEY] = { ...block, enabled };
-  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+  const document = `${JSON.stringify(settings, null, 2)}\n`;
+  const temporaryPath = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temporaryPath, document, { encoding: "utf8", flag: "wx" });
+    renameSync(temporaryPath, path);
+  } finally {
+    try {
+      rmSync(temporaryPath, { force: true });
+    } catch {
+      // Best-effort cleanup must not replace the write result.
+    }
+  }
 }
 
 export default function (pi: ExtensionAPI) {

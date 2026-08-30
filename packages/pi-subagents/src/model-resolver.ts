@@ -98,3 +98,15 @@ export function resolveModel<TModel extends ModelEntry>(
     .join("\n");
   return `Model not found: "${input}".\n\nAvailable models:\n${modelList}`;
 }
+
+/**
+ * The short model label the agent UI shows, e.g. `haiku 4.5`.
+ *
+ * Lives here rather than at either call site because two paths now produce it:
+ * the Agent tool, from the model it pre-resolves for an untiered spawn, and the
+ * runner, from the model a tier's profile pinned. The label must read the same
+ * either way, so it is derived once.
+ */
+export function shortModelLabel(model: Pick<ModelEntry, "id" | "name">): string {
+  return (model.name || model.id).replace(/^Claude\s+/iu, "").toLowerCase();
+}

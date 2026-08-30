@@ -42,11 +42,16 @@ function context(cwd: string) {
 
 describe("managed spawn fallback and reload wiring", () => {
   let cwd = "";
+  let globalDir = "";
   let originalCwd = "";
+  let originalAgentDir: string | undefined;
 
   beforeEach(() => {
     originalCwd = process.cwd();
+    originalAgentDir = process.env.PI_CODING_AGENT_DIR;
     cwd = mkdtempSync(join(tmpdir(), "managed-fallback-"));
+    globalDir = mkdtempSync(join(tmpdir(), "managed-fallback-global-"));
+    process.env.PI_CODING_AGENT_DIR = globalDir;
     mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
     writeFileSync(
       join(cwd, ".pi", "agents", "retired.md"),
@@ -62,7 +67,10 @@ describe("managed spawn fallback and reload wiring", () => {
     delete (globalThis as Record<symbol, unknown>)[Symbol.for("pi-subagents:manager")];
     registerAgents(new Map());
     process.chdir(originalCwd);
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     rmSync(cwd, { recursive: true, force: true });
+    rmSync(globalDir, { recursive: true, force: true });
   });
 
   it("reloads disabled custom agents and applies fail-closed/fallback policy", async () => {

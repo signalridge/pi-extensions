@@ -60,7 +60,7 @@ return names;`;
   });
 
   it("the contract version is stable and the declaration is non-empty", () => {
-    expect(WORKFLOW_CAPABILITY_CONTRACT_VERSION).toBe("1.0.0");
+    expect(WORKFLOW_CAPABILITY_CONTRACT_VERSION).toBe("2.0.0");
     expect(WORKFLOW_CAPABILITIES.length).toBeGreaterThan(20);
   });
 

@@ -1,15 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type {
+  ManagedRoutingPolicy,
   ManagedSpawnResponse as ProtocolManagedSpawnResponse,
   ManagedTerminalSnapshot as ProtocolManagedTerminalSnapshot,
-  WorkflowTier,
 } from "@signalridge/pi-subagents-protocol";
 import {
   PROTOCOL_VERSION,
   parseManagedSpawnResponse,
   parseProtocolPing,
   requiredCapabilitiesMatch,
-  workflowTierCapabilityMatch,
 } from "@signalridge/pi-subagents-protocol";
 import type { WorkflowOwner } from "./journal.js";
 
@@ -18,11 +17,8 @@ export interface DispatchTask {
   subagent_type: string;
   prompt: string;
   description: string;
-  tier?: WorkflowTier;
-  /** Exact provider/model reference; resolution remains inside pi-subagents. */
-  model?: string;
-  /** Optional thinking suffix/override resolved by pi-subagents. */
-  thinking?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "off";
+  /** Agent-tier key, from the host's own catalogue. The only model policy here. */
+  tier?: string;
   /** Per-call worktree request owned by pi-subagents. */
   isolation?: "worktree";
   /** Forwarded toolset hint (e.g. "web-research") for pi-subagents to augment tools. */
@@ -105,8 +101,10 @@ function callRpc<T>(
 
 export const REQUIRED_SUBAGENTS_PROTOCOL = PROTOCOL_VERSION;
 export const PROTOCOL_DIAGNOSTIC =
-  "@signalridge/pi-workflows requires @signalridge/pi-subagents protocol v3 with managedSpawn, lifecycleOwner, ownedStop, ownedQuiescence, workflowTiers, and managedPolicy capabilities. " +
+  `@signalridge/pi-workflows requires @signalridge/pi-subagents protocol v${PROTOCOL_VERSION} with managedSpawn, lifecycleOwner, ownedStop, childContext, ownedQuiescence, agentTiers, and managedPolicy, plus its Agent-tier routing policy. ` +
   "Install @signalridge/pi-subagents and @signalridge/pi-workflows exactly once; Pi loads both from their configured pi.extensions manifests.";
+
+const CAPABILITY_DIAGNOSTIC = `subagents protocol v${PROTOCOL_VERSION} is required, with every capability and an Agent-tier routing policy`;
 
 export const CHILD_CONTEXT_QUERY_TIMEOUT_MS = 250;
 
@@ -169,7 +167,17 @@ export function queryChildSessionContextImmediate(events: WorkflowEventBus): boo
 }
 
 /** Verify the separately configured pi-subagents package before workflow execution. */
-export async function checkManagedSpawnProtocol(events: WorkflowEventBus, signal?: AbortSignal): Promise<void> {
+export interface ManagedProtocolCheck {
+  /** The host's Agent-tier catalogue, as of this check. */
+  routingPolicy: ManagedRoutingPolicy;
+  /** Whole-catalogue identity; used only where a per-tier identity cannot be. */
+  routingPolicyFingerprint: string;
+}
+
+export async function checkManagedSpawnProtocol(
+  events: WorkflowEventBus,
+  signal?: AbortSignal,
+): Promise<ManagedProtocolCheck> {
   const id = requestId();
   const reply = await new Promise<unknown>((resolve, reject) => {
     const replyChannel = `subagents:rpc:ping:reply:${id}`;
@@ -228,57 +236,40 @@ export async function checkManagedSpawnProtocol(events: WorkflowEventBus, signal
   let ping: ReturnType<typeof parseProtocolPing>;
   try {
     ping = parseProtocolPing(reply);
-  } catch {
-    if (
-      !isRecord(reply) ||
-      typeof reply.version !== "number" ||
-      !isRecord(reply.capabilities) ||
-      reply.version < REQUIRED_SUBAGENTS_PROTOCOL ||
-      reply.capabilities.managedSpawn !== true ||
-      reply.capabilities.lifecycleOwner !== true ||
-      reply.capabilities.ownedStop !== true ||
-      reply.capabilities.ownedQuiescence !== true ||
-      reply.capabilities.managedPolicy !== true
-    ) {
-      throw new Error(
-        `subagents protocol v${REQUIRED_SUBAGENTS_PROTOCOL} with managed spawning, owned stop, owned quiescence, and managed policy capabilities is required`,
-      );
+  } catch (error: unknown) {
+    // Anything shaped like a ping is a peer that is present but not v4-complete,
+    // and the actionable answer is the same in every such case: install a
+    // matching pair. A reply that is not a ping at all gets its own message,
+    // because "upgrade the peer" would be the wrong thing to go do.
+    if (!isRecord(reply) || typeof reply.version !== "number") {
+      throw new Error("subagents protocol ping did not return a valid version/capability envelope");
     }
-    throw new Error("subagents protocol ping did not return a valid version/capability envelope");
+    throw new Error(`${CAPABILITY_DIAGNOSTIC} (${error instanceof Error ? error.message : String(error)})`);
   }
+  // Every v4 capability is required, so one check covers them all. The parser
+  // has already rejected a ping without a well-formed routing policy.
   if (ping.version < REQUIRED_SUBAGENTS_PROTOCOL || !requiredCapabilitiesMatch(ping.capabilities)) {
-    throw new Error(
-      `subagents protocol v${REQUIRED_SUBAGENTS_PROTOCOL} with managed spawning, owned stop, and owned quiescence capability is required`,
-    );
+    throw new Error(CAPABILITY_DIAGNOSTIC);
   }
-  if (!workflowTierCapabilityMatch(ping.capabilities)) {
-    throw new Error("subagents workflow tier capability is required before tiered managed spawning");
-  }
-  if (ping.capabilities.managedPolicy !== true) {
-    throw new Error("subagents managed policy capability is required before policy-bearing managed spawning");
-  }
+  return {
+    routingPolicy: ping.routingPolicy.policy,
+    routingPolicyFingerprint: ping.routingPolicy.fingerprint,
+  };
 }
 
 export type ManagedTerminalSnapshot = ProtocolManagedTerminalSnapshot;
 export type ManagedSpawnResponse = ProtocolManagedSpawnResponse;
 
 export interface ManagedSpawnClient {
-  /** String remains accepted for deterministic legacy fixtures; protocol v3 returns ManagedSpawnResponse. */
-  /**
-   * The fourth argument is the current attempt for protocol-v3 clients. The
-   * optional fifth argument is retained only for old in-process test/fixture
-   * clients that used the former context, attemptId shape; it is never a
-   * runtime context and is not sent over RPC.
-   */
+  /** Managed spawn returns a structured response. */
   spawn(
     task: DispatchTask,
     runId: string,
     nodeId: string,
     attemptId?: string,
-    legacyAttemptId?: string,
     signal?: AbortSignal,
   ): Promise<ManagedSpawnResponse | string>;
-  /** Unscoped v2 stop, retained for existing callers. */
+  /** Unscoped stop for non-managed callers. */
   stop(agentId: string): Promise<void>;
   /** Owner-scoped v3 stop used by workflow lifecycle operations. */
   stopOwned?(agentId: string, owner: WorkflowOwner): Promise<void>;
@@ -290,8 +281,8 @@ export interface ManagedSpawnClient {
     timeoutMs?: number,
     owners?: WorkflowOwner[],
   ): Promise<{ settled: boolean; pending: string[] }>;
-  /** Optional startup capability check; workflow execution remains event-bus-only. */
-  checkProtocol?: () => Promise<void>;
+  /** Fresh capability and routing-policy check; workflow execution remains event-bus-only. */
+  checkProtocol?: () => Promise<ManagedProtocolCheck>;
 }
 
 /** Event-bus-only client for the additive pi-subagents managed protocol. */
@@ -320,7 +311,7 @@ export function createManagedSpawnClient(
      * error for the same key with a different fingerprint. Same key + same
      * fingerprint still reuses the persisted tombstone (per-call cache).
      */
-    async spawn(task, runId, nodeId, attemptId, _legacyAttemptId, signal) {
+    async spawn(task, runId, nodeId, attemptId, signal) {
       const effectiveAttemptId = attemptId ?? `attempt-1`;
       const spawnKey = `${runId}/${nodeId}/${effectiveAttemptId}`;
       const requestSignal =
@@ -339,8 +330,6 @@ export function createManagedSpawnClient(
             ...(task.toolset === undefined ? {} : { toolset: task.toolset }),
             ...(task.thread === undefined ? {} : { thread: task.thread }),
             ...(task.excludeTools === undefined ? {} : { excludeTools: task.excludeTools }),
-            ...(task.model === undefined ? {} : { model: task.model }),
-            ...(task.thinking === undefined ? {} : { thinking: task.thinking }),
             ...(task.isolation === undefined ? {} : { isolation: task.isolation }),
             owner: { extension: "pi-workflows", runId, nodeId, attemptId: effectiveAttemptId },
           },

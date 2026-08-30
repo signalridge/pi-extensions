@@ -1,7 +1,7 @@
 <!-- GENERATED from WORKFLOW_CAPABILITY_CONTRACT; do not edit by hand. -->
 # Exhaustive workflow capability facts
 
-Contract format: `1.0.0`<br>
+Contract format: `2.0.0`<br>
 Contract content / skill / extension: `1.4.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
@@ -16,8 +16,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `label`: string (optional); default: derived from phase and call count
 - `phase`: string (optional); default: current phase
 - `schema`: plain JSON Schema (optional)
-- `model`: string (optional); default: pi-subagents model resolver
-- `tier`: small\|medium\|large (optional); default: pi-subagents workflow tier
+- `tier`: agent tier key (optional); default: the agent's own tier, else agentTiers.defaultTier
 - `isolation`: "worktree" (optional); default: pi-subagents worktree policy
 - `thread`: string (optional); default: fresh session per call
 - `toolset`: string (optional); default: configured host/agent toolset hint
@@ -30,7 +29,9 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
 - Constraint: replayed calls do not consume the real-dispatch maxAgents or token/phase budgets
 - Constraint: spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict
-- Constraint: explicit model is resolved and scope-checked by pi-subagents; unavailable selectors fail closed
+- Constraint: tier names a key in the host's agentTiers catalogue; a key it does not define is rejected before dispatch
+- Constraint: resolveAgentTier in pi-subagents owns model, thinking, clamping, availability, and the resolution snapshot
+- Constraint: there is no per-call model or thinking: a tier is the only model policy a workflow can express
 - Constraint: same-thread calls must be sequential and preserve a stable workflow thread name
 - Constraint: threads cannot be combined with worktree isolation
 
@@ -299,6 +300,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `export const meta = { name, description, phases? }`
 - Constraint: must be the first statement
 - Constraint: name and description must be nonblank literals
+- Constraint: workflow meta and phase metadata cannot contain model or thinking fields
 - Constraint: spread, computed keys, methods, template interpolation, and __proto__/constructor/prototype are rejected
 
 <a id="script-contract-determinism"></a>

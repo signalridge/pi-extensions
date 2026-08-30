@@ -103,6 +103,65 @@ export default function (pi: ExtensionAPI) {
     return path.join(dir, `${sanitize(name)}${ext}`);
   }
 
+  /**
+   * Canonicalize as much of `target` as exists on disk.
+   *
+   * A containment check that compares lexical paths is defeated by a symlink:
+   * `.ralph/notes.md -> ../../../etc/notes.md` reads as inside the workspace
+   * and is not. `realpathSync` answers that, but it throws on a path that does
+   * not exist yet — which is the ordinary case here, since `/ralph start` is
+   * usually creating the file. So resolve the deepest existing ancestor and
+   * re-attach the not-yet-created suffix, which cannot itself be a link.
+   *
+   * Applied to both sides of the comparison, so a workspace that is itself
+   * reached through a link (`/tmp` on macOS) still matches its own contents.
+   */
+  function realpathOfNearestExisting(target: string): string {
+    let current = target;
+    for (;;) {
+      try {
+        return path.resolve(fs.realpathSync(current), path.relative(current, target));
+      } catch {
+        const parent = path.dirname(current);
+        // Filesystem root: nothing above it to canonicalize against.
+        if (parent === current) return target;
+        current = parent;
+      }
+    }
+  }
+
+  /**
+   * Resolve a task-file path against the session cwd, refusing anything that
+   * lands outside it.
+   *
+   * `/ralph start <name|path>` takes a raw path, and this extension drives long
+   * unattended loops — the command is as likely to be issued by a model as
+   * typed. Without this, `../../notes.md` silently `mkdir -p`s and creates a
+   * file outside the project the user opened. Everything this extension owns
+   * lives under the workspace, so anything else is a mistake, not a feature.
+   */
+  function resolveInWorkspace(ctx: ExtensionContext, taskFile: string): string | undefined {
+    const root = realpathOfNearestExisting(path.resolve(ctx.cwd));
+    const full = realpathOfNearestExisting(path.resolve(path.resolve(ctx.cwd), taskFile));
+    const relative = path.relative(root, full);
+    // "" is the root directory itself, which is not a task file. An escape
+    // produces a `..` segment: match `..` exactly or followed by a separator,
+    // never a bare `startsWith("..")` — that would also reject `..notes.md`,
+    // an ordinary filename inside the workspace. `isAbsolute` catches the
+    // Windows case where the two paths are on different drives and `relative`
+    // cannot express a traversal at all.
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      return undefined;
+    }
+    return full;
+  }
+
+  /** Read a persisted task file, or null when it is missing or escapes the workspace. */
+  function readTaskFile(ctx: ExtensionContext, taskFile: string): string | null {
+    const full = resolveInWorkspace(ctx, taskFile);
+    return full ? tryRead(full) : null;
+  }
+
   function ensureDir(filePath: string): void {
     const dir = path.dirname(filePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -359,7 +418,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const fullPath = path.resolve(ctx.cwd, taskFile);
+      const fullPath = resolveInWorkspace(ctx, taskFile);
+      if (!fullPath) {
+        ctx.ui.notify(`Task file must be inside the workspace: ${taskFile}`, "error");
+        return;
+      }
       if (!fs.existsSync(fullPath)) {
         ensureDir(fullPath);
         fs.writeFileSync(fullPath, DEFAULT_TEMPLATE, "utf-8");
@@ -437,7 +500,7 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
 
-      const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
+      const content = readTaskFile(ctx, state.taskFile);
       if (!content) {
         ctx.ui.notify(`Could not read task file: ${state.taskFile}`, "error");
         return;
@@ -496,8 +559,8 @@ export default function (pi: ExtensionAPI) {
       ensureDir(dstState);
       if (fs.existsSync(srcState)) fs.renameSync(srcState, dstState);
 
-      const srcTask = path.resolve(ctx.cwd, state.taskFile);
-      if (srcTask.startsWith(ralphDir(ctx)) && !srcTask.startsWith(archiveDir(ctx))) {
+      const srcTask = resolveInWorkspace(ctx, state.taskFile);
+      if (srcTask?.startsWith(ralphDir(ctx)) && !srcTask.startsWith(archiveDir(ctx))) {
         const dstTask = getPath(ctx, loopName, ".md", true);
         if (fs.existsSync(srcTask)) fs.renameSync(srcTask, dstTask);
       }
@@ -665,7 +728,13 @@ Examples:
         return { content: [{ type: "text", text: `Loop "${loopName}" already active.` }], details: {} };
       }
 
-      const fullPath = path.resolve(ctx.cwd, taskFile);
+      const fullPath = resolveInWorkspace(ctx, taskFile);
+      if (!fullPath) {
+        return {
+          content: [{ type: "text", text: `Error: task file escapes the workspace: ${taskFile}` }],
+          details: {},
+        };
+      }
       ensureDir(fullPath);
       fs.writeFileSync(fullPath, params.taskContent, "utf-8");
 
@@ -744,7 +813,7 @@ Examples:
       saveState(ctx, state);
       updateUI(ctx);
 
-      const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
+      const content = readTaskFile(ctx, state.taskFile);
       if (!content) {
         pauseLoop(ctx, state);
         return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };

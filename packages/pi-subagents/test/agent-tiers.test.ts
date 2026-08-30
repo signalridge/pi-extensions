@@ -11,21 +11,25 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentTierError,
+  agentTierApplies,
   buildAgentTierListText,
   buildAgentTierParameterDescription,
   buildCompactAgentTierListText,
   getAgentTiersConfiguredSettings,
   getAgentTiersSettings,
+  getRoutingPolicySnapshot,
   isValidAgentTierKey,
   MAX_AGENT_TIER_KEY_LENGTH,
   offerableTierThinking,
   removeAgentTierProfile,
   resolveAgentTier,
+  selectAgentTier,
   setAgentTiersSettings,
   setDefaultAgentTier,
+  shippedFallbackAgentTier,
   upsertAgentTierProfile,
 } from "../src/agent-tiers.js";
 import type { ModelRegistry } from "../src/model-resolver.js";
@@ -193,30 +197,179 @@ describe("agent tier resolution", () => {
   });
 });
 
-describe("setAgentTiersSettings shipped fast tier", () => {
+describe("shipped fallback tier for managed calls", () => {
   beforeEach(() => {
     setAgentTiersSettings({});
   });
 
-  it("ships the `fast` tier on a fresh install", () => {
+  const resolveWithNoTier = (settings = getAgentTiersSettings()) =>
+    resolveAgentTier({ settings, parentModel: parent, parentThinking: "high", modelRegistry: registry });
+
+  const resolveRequiringTier = (settings = getAgentTiersSettings()) =>
+    resolveAgentTier({
+      settings,
+      requireTier: true,
+      parentModel: parent,
+      parentThinking: "high",
+      modelRegistry: registry,
+    });
+
+  it("applies `medium` to a managed call on a fresh install", () => {
+    const resolved = resolveRequiringTier();
+    expect(resolved.snapshot).toMatchObject({ tier: "medium", source: "default", configuredModel: "inherit" });
+    // Provider-neutral: the profile inherits, so this commits to an effort
+    // level and the parent model is what actually runs.
+    expect(resolved.model).toBe(parent);
+  });
+
+  it("leaves an ordinary spawn untiered so defaultModel and the parent still apply", () => {
+    // The reason the fallback is scoped rather than a catalogue default: an
+    // ordinary spawn that reaches it would silence `defaultModel` and pin a
+    // thinking level on a machine that configured neither.
+    expect(getAgentTiersSettings().defaultTier).toBeUndefined();
+    expect(resolveWithNoTier().snapshot).toBeUndefined();
+    expect(agentTierApplies({})).toBe(false);
+    expect(agentTierApplies({ requireTier: true })).toBe(true);
+  });
+
+  it("is not written back into the settings file", () => {
+    expect(getAgentTiersConfiguredSettings().defaultTier).toBeUndefined();
+    // The UI edits the effective view and hands it back; that round trip must
+    // not pin a default the user never chose.
+    setAgentTiersSettings(upsertAgentTierProfile(getAgentTiersSettings(), "mine", { model: "test/fast", thinking: "low" }));
+    expect(getAgentTiersConfiguredSettings().defaultTier).toBeUndefined();
+  });
+
+  it("yields to a configured default, which also applies to ordinary spawns", () => {
+    setAgentTiersSettings({ defaultTier: "low" });
+    expect(resolveRequiringTier().snapshot?.tier).toBe("low");
+    expect(resolveWithNoTier().snapshot?.tier).toBe("low");
+  });
+
+  it("stays cleared when the user explicitly chose no default", () => {
+    setAgentTiersSettings(setDefaultAgentTier(getAgentTiersSettings(), { kind: "none" }));
+    expect(getAgentTiersSettings().defaultTier).toBeUndefined();
+    expect(getAgentTiersConfiguredSettings().noDefaultTier).toBe(true);
+    // `noDefaultTier` is the one way to make a managed call fail closed too.
+    expect(resolveWithNoTier().snapshot).toBeUndefined();
+    expect(resolveRequiringTier().snapshot).toBeUndefined();
+  });
+
+  it("disappears with the profile it names", () => {
+    setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), "medium"));
+    expect(resolveRequiringTier().snapshot).toBeUndefined();
+  });
+
+  it("does not apply when the configured default is a tombstone", () => {
+    setAgentTiersSettings({ blockedDefaultTier: true });
+    expect(getAgentTiersSettings().defaultTier).toBeUndefined();
+    expect(() => resolveRequiringTier()).toThrow(/blocked by malformed configuration/);
+    // The refusal belongs to the tier path, so the legacy path must not answer
+    // in its place.
+    expect(agentTierApplies({ requireTier: true })).toBe(true);
+  });
+
+  it("reports what `unset` would reach, so the Settings menu cannot promise a tier that is gone", () => {
+    // The menu offers `unset` and `none` as different choices, and the only
+    // difference between them is this value. On a catalogue that removed the
+    // shipped profile they behave identically, and the row has to say so
+    // instead of naming a fallback that no longer resolves.
+    expect(shippedFallbackAgentTier()).toBe("medium");
+    // A current choice is not the question: `unset` means "if I cleared this".
+    setAgentTiersSettings(setDefaultAgentTier(getAgentTiersSettings(), { kind: "none" }));
+    expect(shippedFallbackAgentTier()).toBe("medium");
+    setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), "medium"));
+    expect(shippedFallbackAgentTier()).toBeUndefined();
+  });
+
+  it("selects the same tier for a managed label as the runner will resolve", () => {
+    // The managed-spawn path needs the tier KEY before the runner resolves, to
+    // label a tombstone and the lifecycle events. It asks this function rather
+    // than rebuilding the fallback beside it, so the label can never name a
+    // tier other than the one that runs.
+    const explore = { name: "Explore", agentTier: "low" } as AgentConfig;
+    expect(selectAgentTier({ requireTier: true })).toEqual({ tier: "medium", source: "default" });
+    expect(selectAgentTier({ requireTier: true, agentConfig: explore })).toEqual({
+      tier: "low",
+      source: "frontmatter",
+    });
+    expect(selectAgentTier({ requireTier: true, requestedTier: "high", agentConfig: explore })).toEqual({
+      tier: "high",
+      source: "call",
+    });
+    // A fail-closed catalogue produces no label; the runner owns the refusal.
+    setAgentTiersSettings(setDefaultAgentTier(getAgentTiersSettings(), { kind: "none" }));
+    expect(selectAgentTier({ requireTier: true })).toBeUndefined();
+  });
+
+  it("is what the managed routing policy publishes, so a peer cannot disagree", () => {
+    expect(getRoutingPolicySnapshot().policy.defaultTier).toBe("medium");
+    setAgentTiersSettings(setDefaultAgentTier(getAgentTiersSettings(), { kind: "none" }));
+    expect(getRoutingPolicySnapshot().policy.defaultTier).toBeNull();
+  });
+});
+
+describe("routing policy snapshot", () => {
+  beforeEach(() => {
+    setAgentTiersSettings({});
+  });
+
+  it("publishes only what decides how a tier resolves", () => {
+    setAgentTiersSettings({
+      profiles: { mine: { model: "test/fast", thinking: "medium", description: "prose for the host model" } },
+      blockedProfiles: ["broken"],
+    });
+    const { policy, fingerprint } = getRoutingPolicySnapshot();
+    expect(policy.profiles.mine).toEqual({ model: "test/fast", thinking: "medium" });
+    expect(policy.blockedProfiles).toEqual(["broken"]);
+    expect(policy.defaultTier).toBe("medium");
+    expect(fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    // Descriptions are host-side UI prose; a peer keying a replay cache on this
+    // must not re-run work because someone reworded one.
+    expect(JSON.stringify(policy)).not.toContain("prose for the host model");
+  });
+
+  it("is stable across key order and changes with policy", () => {
+    const before = getRoutingPolicySnapshot().fingerprint;
+    setAgentTiersSettings({ profiles: { b: { model: "test/fast", thinking: "low" }, a: { model: "test/fast", thinking: "low" } } });
+    const reordered = getRoutingPolicySnapshot().fingerprint;
+    setAgentTiersSettings({ profiles: { a: { model: "test/fast", thinking: "low" }, b: { model: "test/fast", thinking: "low" } } });
+    expect(getRoutingPolicySnapshot().fingerprint).toBe(reordered);
+    expect(reordered).not.toBe(before);
+  });
+});
+
+describe("setAgentTiersSettings shipped profiles", () => {
+  beforeEach(() => {
+    setAgentTiersSettings({});
+  });
+
+  it("ships exactly the low/medium/high ladder on a fresh install", () => {
+    setAgentTiersSettings({});
+    // One name per effort level. A second shipped name for an effort level
+    // already covered would be a synonym the user has to learn and maintain.
+    expect(Object.keys(getAgentTiersSettings().profiles ?? {}).sort()).toEqual(["high", "low", "medium"]);
+  });
+
+  it("ships the `low` tier Explore names in its frontmatter", () => {
     setAgentTiersSettings({});
     const result = resolveAgentTier({
-      requestedTier: "fast",
+      requestedTier: "low",
       settings: getAgentTiersSettings(),
       parentModel: parent,
       parentThinking: "high",
       modelRegistry: registry,
     });
-    expect(result.snapshot?.tier).toBe("fast");
+    expect(result.snapshot?.tier).toBe("low");
     expect(result.snapshot?.source).toBe("call");
   });
 
-  it("a user-defined `fast` profile wins over the shipped one", () => {
+  it("a user-defined `low` profile wins over the shipped one", () => {
     setAgentTiersSettings({
-      profiles: { fast: { model: "test/parent", thinking: "high", description: "mine" } },
+      profiles: { low: { model: "test/parent", thinking: "high", description: "mine" } },
     });
     const resolved = resolveAgentTier({
-      requestedTier: "fast",
+      requestedTier: "low",
       settings: getAgentTiersSettings(),
       parentModel: parent,
       parentThinking: "high",
@@ -225,37 +378,38 @@ describe("setAgentTiersSettings shipped fast tier", () => {
     expect(resolved.model?.id).toBe("parent");
   });
 
-  it("a blocked `fast` is not resurrected by the shipped merge", () => {
-    setAgentTiersSettings({ blockedProfiles: ["fast"] });
-    expect(getAgentTiersSettings().profiles?.fast).toBeUndefined();
+  it("a blocked `low` is not resurrected by the shipped merge", () => {
+    setAgentTiersSettings({ blockedProfiles: ["low"] });
+    expect(getAgentTiersSettings().profiles?.low).toBeUndefined();
   });
 
-  it("deleting the shipped `fast` tombstones it so it does not come back", () => {
+  it("deleting the shipped `low` tombstones it so it does not come back", () => {
     setAgentTiersSettings({});
-    const afterDelete = removeAgentTierProfile(getAgentTiersSettings(), "fast");
+    const afterDelete = removeAgentTierProfile(getAgentTiersSettings(), "low");
     setAgentTiersSettings(afterDelete);
-    expect(getAgentTiersSettings().profiles?.fast).toBeUndefined();
-    expect(getAgentTiersSettings().blockedProfiles).toContain("fast");
+    expect(getAgentTiersSettings().profiles?.low).toBeUndefined();
+    expect(getAgentTiersSettings().blockedProfiles).toContain("low");
   });
 
   it("redefining a deleted shipped tier retires the tombstone", () => {
     setAgentTiersSettings({});
-    setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), "fast"));
-    setAgentTiersSettings(upsertAgentTierProfile(getAgentTiersSettings(), "fast", { model: "test/parent", thinking: "medium" }));
+    setAgentTiersSettings(removeAgentTierProfile(getAgentTiersSettings(), "low"));
+    setAgentTiersSettings(upsertAgentTierProfile(getAgentTiersSettings(), "low", { model: "test/parent", thinking: "medium" }));
     setAgentTiersSettings(getAgentTiersSettings());
-    expect(getAgentTiersSettings().profiles?.fast).toBeDefined();
-    expect(getAgentTiersSettings().blockedProfiles ?? []).not.toContain("fast");
+    expect(getAgentTiersSettings().profiles?.low).toBeDefined();
+    expect(getAgentTiersSettings().blockedProfiles ?? []).not.toContain("low");
   });
 
   it("shows the shipped tier in the rendered catalogue when nothing else is configured", () => {
     setAgentTiersSettings({});
-    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("fast");
-    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("shipped default");
+    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("low");
+    // "(shipped)", not "(shipped default)": none of these is the catalogue default.
+    expect(buildAgentTierListText(getAgentTiersSettings())).toContain("(shipped)");
   });
 
   it("the configured view stays empty so persistence never writes shipped tiers", () => {
     setAgentTiersSettings({});
-    expect(getAgentTiersSettings().profiles?.fast).toBeDefined();
+    expect(getAgentTiersSettings().profiles?.low).toBeDefined();
     expect(getAgentTiersConfiguredSettings().profiles).toBeUndefined();
     expect(getAgentTiersConfiguredSettings().defaultTier).toBeUndefined();
   });
@@ -508,22 +662,20 @@ describe("agentTiers settings merge", () => {
     ]);
   });
 
-  it("keeps workflow tiers working alongside an agent tier catalogue", () => {
-    writeGlobal({
-      workflow: {
-        defaultTier: "small",
-        tiers: { small: { model: "test/fast", thinking: "max" } },
-      },
-      agentTiers: { defaultTier: "everyday", profiles: settings.profiles },
-    });
+  it("keeps the catalogue when a retired workflow key is present alongside it", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      writeGlobal({
+        workflow: { defaultTier: "small", tiers: { small: { agentTier: "low" } } },
+        agentTiers: { defaultTier: "everyday", profiles: settings.profiles },
+      });
 
-    const loaded = loadSettings(projectDir);
-    expect(loaded.workflow?.defaultTier).toBe("small");
-    expect(loaded.workflow?.tiers?.small).toEqual({
-      model: "test/fast",
-      thinking: "max",
-    });
-    expect(loaded.agentTiers?.defaultTier).toBe("everyday");
+      const loaded = loadSettings(projectDir);
+      expect(loaded).not.toHaveProperty("workflow");
+      expect(loaded.agentTiers?.defaultTier).toBe("everyday");
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("round-trips a catalogue built by the tier editor", () => {
@@ -535,7 +687,7 @@ describe("agentTiers settings merge", () => {
         thinking: "medium",
         description: "ordinary work",
       }),
-      "everyday",
+      { kind: "tier", tier: "everyday" },
     );
     saveSettings({ agentTiers: edited }, projectDir);
     expect(loadSettings(projectDir).agentTiers).toEqual(edited);
@@ -608,12 +760,27 @@ describe("tier catalogue edits", () => {
     // The tombstone describes the value this call replaces; keeping it would
     // make the resolver refuse the choice the user just made explicitly.
     expect(
-      setDefaultAgentTier({ profiles: { everyday }, blockedDefaultTier: true }, "everyday"),
+      setDefaultAgentTier({ profiles: { everyday }, blockedDefaultTier: true }, { kind: "tier", tier: "everyday" }),
     ).toEqual({ defaultTier: "everyday", profiles: { everyday } });
   });
 
-  it("clears the default tier", () => {
-    expect(setDefaultAgentTier({ defaultTier: "everyday", profiles: { everyday } }, undefined)).toEqual({
+  it("clears the default tier as an explicit choice, not an absent field", () => {
+    // A shipped default exists, so an absent `defaultTier` means "no opinion"
+    // and would be filled back in. Clearing has to say "none" out loud.
+    expect(
+      setDefaultAgentTier({ defaultTier: "everyday", profiles: { everyday } }, { kind: "none" }),
+    ).toEqual({
+      noDefaultTier: true,
+      profiles: { everyday },
+    });
+    expect(setDefaultAgentTier({ noDefaultTier: true, profiles: { everyday } }, { kind: "tier", tier: "everyday" })).toEqual({
+      defaultTier: "everyday",
+      profiles: { everyday },
+    });
+    // "unset" is the third state: no default, and the shipped managed fallback
+    // is reachable again. A single `undefined` could not say which of the two
+    // the user meant.
+    expect(setDefaultAgentTier({ noDefaultTier: true, profiles: { everyday } }, { kind: "unset" })).toEqual({
       profiles: { everyday },
     });
   });

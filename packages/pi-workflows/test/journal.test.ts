@@ -1,10 +1,10 @@
 /**
- * journal.test.ts — schema-v3 script-run journal replay.
+ * journal.test.ts — schema-v4 script-run journal replay.
  *
  * Acceptance coverage from the optimization spec (A3):
  *  - run_created carries script text + hash + meta
  *  - node identity is the call index
- *  - schema v2 runs are quarantined rather than replayed
+ *  - pre-schema-v4 runs are quarantined rather than replayed
  *  - recovery events rotate call generations
  *  - buildResumeJournal reconstructs the runtime's cache map
  */
@@ -35,19 +35,8 @@ const runCreated = (runId: string, overrides: Record<string, unknown> = {}) => (
     scriptHash: "h".repeat(64),
     meta: { name: "demo", description: "d" },
     timestamp: 1,
+    frozenArgsPresent: false,
     ...overrides,
-  },
-});
-
-const runArgs = (runId: string, args: unknown, timestamp: number) => ({
-  type: "custom" as const,
-  customType: "pi-workflows:journal",
-  data: {
-    kind: "run_args",
-    schemaVersion: JOURNAL_SCHEMA_VERSION,
-    runId,
-    args,
-    timestamp,
   },
 });
 
@@ -79,6 +68,27 @@ const callResult = (runId: string, nodeId: string, timestamp: number, overrides:
   },
 });
 
+const callAttempt = (runId: string, nodeId: string, timestamp: number) => ({
+  type: "custom" as const,
+  customType: "pi-workflows:journal",
+  data: {
+    kind: "call_attempt",
+    schemaVersion: JOURNAL_SCHEMA_VERSION,
+    runId,
+    nodeId,
+    attemptId: `${runId}/${nodeId}/attempt-1`,
+    generation: 1,
+    tier: "low",
+    owner: {
+      extension: "pi-workflows",
+      runId,
+      nodeId,
+      attemptId: `${runId}/${nodeId}/attempt-1`,
+    },
+    timestamp,
+  },
+});
+
 const workflowResult = (runId: string, nodeId: string, timestamp: number, overrides: Record<string, unknown> = {}) => ({
   type: "custom" as const,
   customType: "pi-workflows:journal",
@@ -95,7 +105,7 @@ const workflowResult = (runId: string, nodeId: string, timestamp: number, overri
   },
 });
 
-describe("workflow journal replay (schema v3)", () => {
+describe("workflow journal replay (schema v4)", () => {
   it("replays a run_created with script text, hash, meta, and frozen args", () => {
     const runs = replayJournal([runCreated("r1", { args: { target: "x" }, frozenArgsPresent: true })]);
     const run = runs.get("r1");
@@ -108,44 +118,93 @@ describe("workflow journal replay (schema v3)", () => {
     expect(run?.status).toBe("pending");
   });
 
-  it("deduplicates matching args facts and quarantines conflicting facts", () => {
-    const matching = replayJournal([
-      runCreated("args-fact"),
-      runArgs("args-fact", { target: "stable" }, 2),
-      runArgs("args-fact", { target: "stable" }, 3),
-    ]);
-    expect(matching.get("args-fact")?.args).toEqual({ target: "stable" });
+  it("deduplicates identical recovery events without quarantining the run", () => {
+    const recovery = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind: "run_recovery",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId: "recovery-duplicate",
+        status: "interrupted",
+        branchGeneration: 7,
+        rotations: [],
+        recoveryId: `r4-${"a".repeat(64)}`,
+        timestamp: 2,
+      },
+    };
+    const terminal = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind: "terminal_recovery",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId: "terminal-duplicate",
+        status: "stopped",
+        terminalIntent: "stop",
+        branchGeneration: 9,
+        terminalResults: [],
+        blockedNodeIds: [],
+        error: "stopped",
+        recoveryId: `r4-${"b".repeat(64)}`,
+        timestamp: 2,
+      },
+    };
 
-    const diagnostics: string[] = [];
-    const conflicting = replayJournal(
-      [
-        runCreated("args-conflict"),
-        runArgs("args-conflict", { target: "one" }, 2),
-        runArgs("args-conflict", { target: "two" }, 3),
-      ],
-      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
-    );
-    expect(conflicting.has("args-conflict")).toBe(false);
-    expect(diagnostics.some((diagnostic) => diagnostic.includes("conflicting workflow run args"))).toBe(true);
+    const runs = replayJournal([
+      runCreated("recovery-duplicate"),
+      recovery,
+      recovery,
+      runCreated("terminal-duplicate"),
+      terminal,
+      terminal,
+    ]);
+
+    expect(runs.get("recovery-duplicate")?.status).toBe("interrupted");
+    expect(runs.get("terminal-duplicate")?.status).toBe("stopped");
   });
 
-  it("freezes current omitted args and rejects run_args fallback for marked runs", () => {
-    const current = replayJournal([runCreated("current-omitted", { frozenArgsPresent: false })]).get("current-omitted");
-    expect(current).toMatchObject({ frozenArgsPresent: false });
-    expect(current?.args).toBeUndefined();
+  it("compares duplicate creation facts against immutable creation state", () => {
+    const created = runCreated("creation-fact");
+    const duplicate = runCreated("creation-fact");
+    const replayed = replayJournal([created, callAttempt("creation-fact", "0", 2), duplicate]);
+    expect(replayed.get("creation-fact")?.callStatus["0"]).toBe("running");
 
+    const conflicting = replayJournal([
+      runCreated("creation-conflict", { frozenMaxAgents: 1 }),
+      runCreated("creation-conflict", { frozenMaxAgents: 2 }),
+    ]);
+    expect(conflicting.has("creation-conflict")).toBe(false);
+  });
+
+  it("quarantines legacy journal meta policy fields instead of ignoring them", () => {
     const diagnostics: string[] = [];
-    const rejected = replayJournal(
+    const run = replayJournal(
       [
-        runCreated("current-fallback", { frozenArgsPresent: false }),
-        runArgs("current-fallback", { target: "must-not-apply" }, 2),
+        runCreated("legacy-meta", {
+          meta: {
+            name: "legacy",
+            description: "old policy",
+            model: "provider/old",
+            thinking: "high",
+            phases: [{ title: "phase", model: "provider/phase", thinking: "low" }],
+          },
+        }),
       ],
       { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
-    );
-    expect(rejected.has("current-fallback")).toBe(false);
-    expect(diagnostics.some((diagnostic) => diagnostic.includes("cannot override frozen workflow args presence"))).toBe(
-      true,
-    );
+    ).get("legacy-meta");
+
+    expect(run).toBeUndefined();
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("workflow journal meta model/thinking"))).toBe(true);
+  });
+
+  it("requires an explicit frozen-args marker in the schema-v4 creation fact", () => {
+    const diagnostics: string[] = [];
+    const runs = replayJournal([runCreated("missing-marker", { frozenArgsPresent: undefined })], {
+      onInvalid: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    expect(runs.has("missing-marker")).toBe(false);
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("presence marker is required"))).toBe(true);
   });
 
   it("validates frozen args marker consistency and conflicting duplicate markers", () => {
@@ -156,7 +215,7 @@ describe("workflow journal replay (schema v3)", () => {
 
     const duplicate = replayJournal([
       runCreated("duplicate-marker", { frozenArgsPresent: false }),
-      runCreated("duplicate-marker"),
+      runCreated("duplicate-marker", { frozenArgsPresent: true, args: { target: "x" } }),
     ]);
     expect(duplicate.has("duplicate-marker")).toBe(false);
   });
@@ -180,16 +239,69 @@ describe("workflow journal replay (schema v3)", () => {
     });
   });
 
-  it("quarantines a schema-v2 declarative run instead of replaying it", () => {
+  it("quarantines present malformed frozen run options", () => {
+    const invalidOptions: Array<[string, unknown]> = [
+      ["frozenMaxAgents", 0],
+      ["frozenConcurrency", "four"],
+      ["frozenAgentRetries", -1],
+      ["frozenTokenBudget", false],
+      ["frozenAgentTimeoutMs", 0],
+      ["frozenExcludeTools", ["ok", 42]],
+      ["toolset", ""],
+    ];
+
+    for (const [key, value] of invalidOptions) {
+      const runId = `malformed-${key}`;
+      const runs = replayJournal([runCreated(runId, { [key]: value })]);
+      expect(runs.has(runId)).toBe(false);
+    }
+  });
+
+  it("bounds terminal results in run recovery events", () => {
+    const diagnostics: string[] = [];
+    const terminalResults = Array.from({ length: 1_001 }, () => ({
+      status: "completed",
+      compactionCount: 0,
+      updatedAt: 2,
+    }));
+    const runs = replayJournal(
+      [
+        runCreated("recovery-limit"),
+        {
+          type: "custom" as const,
+          customType: "pi-workflows:journal",
+          data: {
+            kind: "run_recovery",
+            schemaVersion: JOURNAL_SCHEMA_VERSION,
+            runId: "recovery-limit",
+            status: "interrupted",
+            branchGeneration: 1,
+            rotations: [],
+            terminalResults,
+            recoveryId: `r4-${"c".repeat(64)}`,
+            timestamp: 2,
+          },
+        },
+      ],
+      { onInvalid: (diagnostic) => diagnostics.push(diagnostic) },
+    );
+    expect(runs.has("recovery-limit")).toBe(false);
+    expect(diagnostics.some((diagnostic) => diagnostic.includes("terminalResults are invalid"))).toBe(true);
+  });
+
+  it("quarantines a schema-v3 run instead of replaying it", () => {
     const diagnostics: string[] = [];
     const v2 = {
       type: "custom" as const,
       customType: "pi-workflows:journal",
       data: {
         kind: "run_created",
-        schemaVersion: 2,
+        schemaVersion: 3,
         runId: "old",
-        definition: { name: "old", phases: [], tasks: [], background: true },
+        script: SCRIPT,
+        scriptHash: "h".repeat(64),
+        meta: { name: "old", description: "old" },
+        frozenArgsPresent: false,
         timestamp: 1,
       },
     };
@@ -198,16 +310,47 @@ describe("workflow journal replay (schema v3)", () => {
     expect(diagnostics.length).toBe(1);
   });
 
+  it("retains tier identity from call attempts when a run is restored", () => {
+    const run = replayJournal([runCreated("attempts"), callAttempt("attempts", "0", 2)]).get("attempts");
+    expect(run?.callTiers["0"]).toEqual({ tier: "low" });
+    expect(run?.callStatus["0"]).toBe("running");
+  });
+
+  it("retains attempt tier identity when a terminal result omits optional tier fields", () => {
+    const runId = "partial-terminal-tier";
+    const attemptId = `${runId}/0/attempt-1`;
+    const run = replayJournal([
+      runCreated(runId),
+      callAttempt(runId, "0", 2),
+      callResult(runId, "0", 3, {
+        result: { status: "completed", compactionCount: 0, updatedAt: 3, attemptId },
+        attemptId,
+        owner: { extension: "pi-workflows", runId, nodeId: "0", attemptId },
+      }),
+    ]).get(runId);
+
+    expect(run?.callTiers["0"]).toEqual({ tier: "low" });
+  });
+
   it("replays call_result facts keyed by call index and settles the run", () => {
     const runs = replayJournal([
       runCreated("r2"),
       transition("r2", "running", 2),
-      callResult("r2", "0", 3, { result: { status: "completed", result: "ok", compactionCount: 0, updatedAt: 3 } }),
+      callResult("r2", "0", 3, {
+        result: {
+          status: "completed",
+          result: "ok",
+          tier: "low",
+          compactionCount: 0,
+          updatedAt: 3,
+        },
+      }),
       transition("r2", "completed", 4, { finalResult: { report: "done" } }),
     ]);
     const run = runs.get("r2");
     expect(run?.status).toBe("completed");
     expect(run?.callResults["0"]?.result).toBe("ok");
+    expect(run?.callResults["0"]?.tier).toBe("low");
     expect(run?.callStatus["0"]).toBe("completed");
     expect(run?.finalResult).toEqual({ report: "done" });
   });
@@ -254,6 +397,7 @@ describe("workflow journal replay (schema v3)", () => {
       sourceStatus: "running" as const,
       attemptId: `${run.runId}/call-0/attempt-2`,
       generation: 2,
+      tier: "cheap",
       owner: {
         extension: "pi-workflows" as const,
         runId: run.runId,
@@ -268,7 +412,7 @@ describe("workflow journal replay (schema v3)", () => {
       status: "interrupted",
       branchGeneration: 0,
       rotations: [rotation],
-      recoveryId: `r3-${"a".repeat(64)}`,
+      recoveryId: `r4-${"a".repeat(64)}`,
       timestamp: 5,
     };
     applyRecoveryEvent(run, event);
@@ -276,6 +420,37 @@ describe("workflow journal replay (schema v3)", () => {
     expect(run.attempts["0"]).toBe(2);
     expect(run.attemptIds["0"]).toBe(`${run.runId}/call-0/attempt-2`);
     expect(run.callStatus["0"]).toBe("running");
+    expect(run.callTiers["0"]).toEqual({ tier: "cheap" });
+  });
+
+  it("preserves call tier identity when an older recovery rotation omits it", () => {
+    const run = replayJournal([runCreated("rotation-identity"), callAttempt("rotation-identity", "0", 2)]).get(
+      "rotation-identity",
+    );
+    if (!run) throw new Error("run rotation-identity missing");
+    applyRecoveryEvent(run, {
+      kind: "attempt_recovery",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      nodeId: "0",
+      branchGeneration: 0,
+      rotation: {
+        nodeId: "0",
+        sourceAttemptId: `${run.runId}/0/attempt-1`,
+        sourceGeneration: 1,
+        sourceStatus: "running",
+        attemptId: `${run.runId}/0/attempt-2`,
+        generation: 2,
+        owner: {
+          extension: "pi-workflows",
+          runId: run.runId,
+          nodeId: "0",
+          attemptId: `${run.runId}/0/attempt-2`,
+        },
+      },
+      timestamp: 3,
+    });
+    expect(run.callTiers["0"]).toEqual({ tier: "low" });
   });
 
   it("applies a terminal recovery that marks the run stopped and non-resumable", () => {
@@ -291,13 +466,42 @@ describe("workflow journal replay (schema v3)", () => {
       terminalResults: [],
       blockedNodeIds: [],
       error: "workflow stopped",
-      recoveryId: `r3-${"b".repeat(64)}`,
+      recoveryId: `r4-${"b".repeat(64)}`,
       timestamp: 5,
     };
     applyTerminalRecoveryEvent(run, terminal);
     expect(run.status).toBe("stopped");
     expect(run.nonResumable).toBe(true);
     expect(run.error).toBe("workflow stopped");
+  });
+
+  it("does not let a delayed identity transition regress a terminal call", () => {
+    const runId = "late-tier-transition";
+    const entries = [
+      runCreated(runId),
+      transition(runId, "running", 2),
+      callResult(runId, "0", 3, {
+        result: { status: "completed", result: "done", compactionCount: 0, updatedAt: 3 },
+      }),
+      {
+        type: "custom" as const,
+        customType: "pi-workflows:journal",
+        data: {
+          kind: "call_transition",
+          schemaVersion: JOURNAL_SCHEMA_VERSION,
+          runId,
+          nodeId: "0",
+          status: "running",
+          tier: "cheap",
+          timestamp: 4,
+        },
+      },
+      transition(runId, "completed", 5),
+    ];
+
+    const run = replayJournal(entries).get(runId);
+    expect(run?.callStatus["0"]).toBe("completed");
+    expect(run?.callTiers["0"]).toEqual({ tier: "cheap" });
   });
 
   it("replays nested workflow results without a managed attempt id", () => {
@@ -379,6 +583,48 @@ describe("workflow journal replay (schema v3)", () => {
     expect(journal.get("r6:1")?.result).toEqual({ nested: true });
     expect(journal.get("r6:1")?.storeDelta).toEqual({ k: "v" });
     expect(journal.get("r6:2")).toBeUndefined();
+  });
+
+  it("ignores a delayed call result from a superseded attempt", () => {
+    const runId = "stale-call-result";
+    const firstAttemptId = `${runId}/0/attempt-1`;
+    const secondAttemptId = `${runId}/0/attempt-2`;
+    const attempt2 = {
+      type: "custom" as const,
+      customType: "pi-workflows:journal",
+      data: {
+        kind: "call_attempt",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId,
+        nodeId: "0",
+        attemptId: secondAttemptId,
+        generation: 2,
+        owner: { extension: "pi-workflows" as const, runId, nodeId: "0", attemptId: secondAttemptId },
+        timestamp: 4,
+      },
+    };
+    const firstResult = callResult(runId, "0", 3, {
+      callHash: "old-hash",
+      attemptId: firstAttemptId,
+      owner: { extension: "pi-workflows" as const, runId, nodeId: "0", attemptId: firstAttemptId },
+      result: { status: "completed", result: "old", attemptId: firstAttemptId, compactionCount: 0, updatedAt: 3 },
+    });
+    const secondResult = callResult(runId, "0", 5, {
+      callHash: "new-hash",
+      attemptId: secondAttemptId,
+      owner: { extension: "pi-workflows" as const, runId, nodeId: "0", attemptId: secondAttemptId },
+      result: { status: "completed", result: "new", attemptId: secondAttemptId, compactionCount: 0, updatedAt: 5 },
+    });
+
+    const journal = buildResumeJournal([
+      runCreated(runId),
+      callAttempt(runId, "0", 2),
+      firstResult,
+      attempt2,
+      secondResult,
+      firstResult,
+    ]);
+    expect(journal.get(`${runId}:0`)).toMatchObject({ hash: "new-hash", result: "new" });
   });
 
   it("deduplicates identical creation and honors durable removal", () => {

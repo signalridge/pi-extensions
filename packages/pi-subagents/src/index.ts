@@ -86,17 +86,22 @@ import {
   buildAgentTierListText,
   buildAgentTierParameterDescription,
   buildCompactAgentTierListText,
+  type DefaultAgentTierSelection,
   findUnknownAgentTierReferences,
   getAgentTiersConfiguredSettings,
   getAgentTiersSettings,
+  getDefaultAgentTierSelection,
   getDefaultAgentTierText,
+  getRoutingPolicySnapshot,
   isValidAgentTierKey,
   listAgentTierKeys,
   MAX_AGENT_TIER_KEY_LENGTH,
   offerableTierThinking,
   removeAgentTierProfile,
+  selectAgentTier,
   setAgentTiersSettings,
   setDefaultAgentTier,
+  shippedFallbackAgentTier,
   upsertAgentTierProfile,
 } from "./agent-tiers.js";
 import {
@@ -139,7 +144,7 @@ import {
   stripAgentPrefix,
 } from "./mention.js";
 import { runMentionClone } from "./mention-clone.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resolver.js";
 import {
   checkModelScope,
   isScopeModelsEnabled,
@@ -222,7 +227,6 @@ import {
   getSessionContextPercent,
   type LifetimeUsage,
 } from "./usage.js";
-import { getWorkflowSettings, resolveWorkflowTier, setWorkflowSettings } from "./workflow-tiers.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 
 // ---- Shared helpers ----
@@ -800,6 +804,8 @@ function activateRootRuntime(
       durationMs,
       tokens,
       ...(record.outputFile ? { outputFile: record.outputFile } : {}),
+      ...(record.invocation?.agentTier === undefined ? {} : { tier: record.invocation.agentTier }),
+      ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: record.invocation.agentTierSnapshot } : {}),
       ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
     };
   }
@@ -836,6 +842,8 @@ function activateRootRuntime(
       ...(terminal?.tokenCount
         ? { tokens: { total: terminal.tokenCount } }
         : {}),
+      ...(tombstone.tier === undefined ? {} : { tier: tombstone.tier }),
+      ...(tombstone.tierSnapshot ? { tierSnapshot: tombstone.tierSnapshot } : {}),
       owner: snapshotOwner(tombstone.owner),
     };
   }
@@ -859,6 +867,8 @@ function activateRootRuntime(
       compactionCount: terminal.compactionCount,
       ...(terminal.outputFile ? { outputFile: terminal.outputFile } : {}),
       ...(terminal.tokenCount ? { tokens: terminal.tokenCount } : {}),
+      ...(tombstone.tier === undefined ? {} : { tier: tombstone.tier }),
+      ...(tombstone.tierSnapshot ? { tierSnapshot: tombstone.tierSnapshot } : {}),
       owner: snapshotOwner(tombstone.owner),
     });
   }
@@ -924,6 +934,8 @@ function activateRootRuntime(
         ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
           ? { tokens: record.lifetimeUsage.input + record.lifetimeUsage.output }
           : {}),
+        ...(record.invocation?.agentTier === undefined ? {} : { tier: record.invocation.agentTier }),
+        ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: record.invocation.agentTierSnapshot } : {}),
         ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
       });
 
@@ -968,6 +980,7 @@ function activateRootRuntime(
         id: record.id,
         type: record.type,
         description: record.description,
+        ...(record.invocation?.agentTier === undefined ? {} : { tier: record.invocation.agentTier }),
         ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
       });
     },
@@ -981,6 +994,8 @@ function activateRootRuntime(
         reason: info.reason,
         tokensBefore: info.tokensBefore,
         compactionCount: record.compactionCount,
+        ...(record.invocation?.agentTier === undefined ? {} : { tier: record.invocation.agentTier }),
+        ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: record.invocation.agentTierSnapshot } : {}),
         ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
       });
     },
@@ -994,6 +1009,7 @@ function activateRootRuntime(
         type: record.type,
         description: record.description,
         isBackground: record.isBackground,
+        ...(record.invocation?.agentTier === undefined ? {} : { tier: record.invocation.agentTier }),
         owner: snapshotOwner(record.owner),
       });
     },
@@ -1224,6 +1240,7 @@ function activateRootRuntime(
       pi.events.emit("subagents:ready", {
         version: PROTOCOL_VERSION,
         capabilities: PROTOCOL_CAPABILITIES,
+        routingPolicy: getRoutingPolicySnapshot(),
       });
     }
     // `@` completion for agent handles. Registered at most ONCE for the
@@ -1422,14 +1439,6 @@ function activateRootRuntime(
     fleet.ensureTimer();
   }
 
-  const splitManagedModelSpec = (spec: string): { model: string; thinking?: "minimal" | "low" | "medium" | "high" | "xhigh" | "max" } => {
-    const separator = spec.lastIndexOf(":");
-    const suffix = separator > spec.indexOf("/") ? spec.slice(separator + 1) : "";
-    const thinking = ["minimal", "low", "medium", "high", "xhigh", "max"].includes(suffix)
-      ? (suffix as "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-      : undefined;
-    return thinking ? { model: spec.slice(0, separator), thinking } : { model: spec };
-  };
   /**
    * Add the same activity, transcript, and FleetView wiring used by Agent-tool
    * background runs without expanding the managed RPC's policy surface.
@@ -1446,90 +1455,55 @@ function activateRootRuntime(
     reloadCustomAgents();
     const dispatch = resolveSpawnType(request.type);
     if (!dispatch.ok) throw new Error(dispatch.message);
-    const workflowSettings = getWorkflowSettings();
-    if (request.tier === undefined && workflowSettings.blockedDefaultTier) {
-      throw new Error(
-        "workflow defaultTier is blocked by malformed configuration",
-      );
-    }
-    const effectiveTier = request.tier ?? workflowSettings.defaultTier;
-    const normalizedRequest = {
-      ...request,
-      type: dispatch.type,
-      ...(effectiveTier === undefined ? {} : { tier: effectiveTier }),
-    };
     const customConfig = getAgentConfig(dispatch.type);
-    const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
-      workflowTier: effectiveTier,
-    });
-    const requestedModel = request.model ? splitManagedModelSpec(request.model) : undefined;
-    const requestedThinking = request.thinking === "off" ? undefined : request.thinking;
-    const parentThinking = (() => {
-      const level = (piRef as unknown as { getThinkingLevel?: () => unknown }).getThinkingLevel?.();
-      return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
-        ? level
-        : undefined;
+    const agentTiers = getAgentTiersSettings();
+    // Materialize only the *identity* of the tier this call will land on, so a
+    // tombstone and the lifecycle events carry it before runAgent's resolution
+    // callback fires. runAgent stays authoritative for source, model, thinking,
+    // and the snapshot — this is a label, not a decision.
+    //
+    // Asked, not restated: the same `selectAgentTier` the runner uses, with the
+    // same `requireTier` the manager will set, so the label cannot name a tier
+    // other than the one that runs. A fail-closed condition throws here; the
+    // runner owns that refusal and its message, so the label is simply absent
+    // and the spawn fails there with the diagnostic that names the cause.
+    const effectiveTier = (() => {
+      try {
+        return selectAgentTier(
+          { requestedTier: request.tier, requireTier: true, agentConfig: customConfig },
+          agentTiers,
+        )?.tier;
+      } catch {
+        return undefined;
+      }
     })();
-    const tierResolution = effectiveTier
-      ? resolveWorkflowTier({
-          tier: effectiveTier,
-          agentConfig: customConfig,
-          modelOverride: requestedModel?.model,
-          thinkingOverride: requestedThinking,
-          parentModel: ctxRef.model,
-          parentThinking,
-          modelRegistry: ctxRef.modelRegistry,
-        })
-      : undefined;
-    const resolvedRequestedModel = requestedModel
-      ? resolveModel(requestedModel.model, ctxRef.modelRegistry)
-      : undefined;
-    if (typeof resolvedRequestedModel === "string") throw new Error(resolvedRequestedModel);
-    const modelInput = requestedModel?.model ?? resolvedConfig.modelInput;
-    // An exact managed model is still checked by pi-subagents' model-scope policy;
-    // workflows never bypass the host's enabled-model restrictions.
-    if (effectiveTier === undefined || requestedModel !== undefined) {
-      const model = resolvedRequestedModel ?? resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model;
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: ctxRef.cwd,
-        modelRegistry: ctxRef.modelRegistry,
-        callerSupplied: requestedModel !== undefined,
-        agentLabel: customConfig?.displayName ?? dispatch.type,
-        modelInput,
-      });
-      if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
-      if (scopeVerdict.kind === "warn" && ctxRef.hasUI) ctxRef.ui.notify(scopeVerdict.message, "warning");
-    }
+    // `request.tier` already rides the spread; the only field this changes is
+    // the agent type, which `resolveSpawnType` may have redirected.
+    const normalizedRequest = { ...request, type: dispatch.type };
+    // Only the non-tier fields are read here. The manager marks every managed
+    // spawn `requireAgentTier`, so a tier always owns model and thinking; asking
+    // `resolveAgentInvocationConfig` to decide that again would be work whose
+    // answer this path discards.
+    const resolvedConfig = resolveAgentInvocationConfig(customConfig, {});
+    // Model and thinking are resolved only by the runner's tier path. There is
+    // no second selector on this wire, so nothing here can silently win or be
+    // silently dropped; a call with no tier and no default fails closed.
     const effectiveMaxTurns = normalizeMaxTurns(
       resolvedConfig.maxTurns ?? getDefaultMaxTurns(),
     );
     const effectiveIsolation = request.isolation ?? resolvedConfig.isolation;
-    const configuredModel =
-      resolvedConfig.modelInput && resolvedConfig.modelInput !== "inherit"
-        ? resolveModel(resolvedConfig.modelInput, ctxRef.modelRegistry)
-        : undefined;
-    const effectiveModel =
-      resolvedRequestedModel ??
-      tierResolution?.model ??
-      (typeof configuredModel === "string" ? undefined : configuredModel) ??
-      (effectiveTier === undefined ? resolveConfiguredDefaultModel(ctxRef.modelRegistry) ?? ctxRef.model : undefined);
     const effectiveExcludeTools = [...new Set([...(customConfig?.disallowedTools ?? []), ...(request.excludeTools ?? [])])];
     const managedPolicy: ManagedSpawnPolicy = {
-      // The managed request may select an exact model, but resolution and scope
-      // checks above remain owned by pi-subagents.
-      model: effectiveModel,
       maxTurns: effectiveMaxTurns,
       isolated: resolvedConfig.isolated,
       inheritContext: resolvedConfig.inheritContext,
-      thinkingLevel: (tierResolution?.thinkingLevel ?? requestedThinking ?? resolvedConfig.thinking ?? parentThinking ?? undefined) as "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined,
       isolation: effectiveIsolation,
       toolset: request.toolset,
       excludeTools: effectiveExcludeTools,
       policyFingerprint: JSON.stringify(customConfig ?? null),
       rootSessionId: ctxRef.sessionManager.getSessionId(),
       invocation: {
-        tier: effectiveTier,
+        ...(effectiveTier === undefined ? {} : { agentTier: effectiveTier }),
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
         isolated: resolvedConfig.isolated,
         inheritContext: resolvedConfig.inheritContext,
@@ -1901,7 +1875,6 @@ function activateRootRuntime(
       manager.setMaxSubagentSpawnsPerBranch(n),
     setFallbackSubagent,
     setWorktreeIsolation: setWorktreeIsolationEnabled,
-    setWorkflow: setWorkflowSettings,
     setAgentTiers: setAgentTiersSettings,
   });
   pi.events.emit("subagents:settings_loaded", { settings: startupSettings });
@@ -2551,18 +2524,18 @@ Terse command-style prompts produce shallow, generic work.
         // Get agent config (if any)
         const customConfig = getAgentConfig(subagentType);
 
-        const resolvedConfig = resolveAgentInvocationConfig(
-          customConfig,
-          params,
-        );
+        const resolvedConfig = resolveAgentInvocationConfig(customConfig, {
+          ...params,
+          agentTiers: getAgentTiersSettings(),
+        });
 
-        // Resolve model from agent config first; tool-call params only fill gaps.
-        // With neither, runAgent falls to the configured `defaultModel` before the
-        // parent, so mirror that here — the scope check below and the model label
-        // must describe the model that will actually run.
-        let model =
-          resolveConfiguredDefaultModel(ctx.modelRegistry) ?? ctx.model;
-        if (resolvedConfig.modelInput) {
+        // A selected Agent tier owns final model/thinking resolution. Keep both
+        // fields unset here so runAgent is the only resolver and ordinary Agent
+        // calls cannot accidentally bypass the profile with a parent/default pin.
+        let model = resolvedConfig.agentTierSelected
+          ? undefined
+          : resolveConfiguredDefaultModel(ctx.modelRegistry) ?? ctx.model;
+        if (!resolvedConfig.agentTierSelected && resolvedConfig.modelInput) {
           const resolved = resolveModel(
             resolvedConfig.modelInput,
             ctx.modelRegistry,
@@ -2575,21 +2548,22 @@ Terse command-style prompts produce shallow, generic work.
           }
         }
 
-        // Scope validation: the effective resolved model is checked against the
-        // user's enabledModels list. Policy (hard error vs warn-and-proceed) lives
-        // in model-scope.ts so the nested delegation tools apply the same rule.
-        const scopeVerdict = checkModelScope({
-          model,
-          cwd: ctx.cwd,
-          modelRegistry: ctx.modelRegistry,
-          callerSupplied: resolvedConfig.modelFromParams,
-          agentLabel: customConfig?.displayName ?? subagentType,
-          modelInput: resolvedConfig.modelInput,
-        });
-        if (scopeVerdict.kind === "error")
-          return textResult(scopeVerdict.message);
-        if (scopeVerdict.kind === "warn")
-          ctx.ui.notify(scopeVerdict.message, "warning");
+        // Tiered model scope is checked after the single final resolution in
+        // runAgent. Only the legacy no-tier path is checked here.
+        if (!resolvedConfig.agentTierSelected) {
+          const scopeVerdict = checkModelScope({
+            model,
+            cwd: ctx.cwd,
+            modelRegistry: ctx.modelRegistry,
+            callerSupplied: resolvedConfig.modelFromParams,
+            agentLabel: customConfig?.displayName ?? subagentType,
+            modelInput: resolvedConfig.modelInput,
+          });
+          if (scopeVerdict.kind === "error")
+            return textResult(scopeVerdict.message);
+          if (scopeVerdict.kind === "warn")
+            ctx.ui.notify(scopeVerdict.message, "warning");
+        }
 
         const thinking = resolvedConfig.thinking;
         const inheritContext = resolvedConfig.inheritContext;
@@ -2616,19 +2590,20 @@ Terse command-style prompts produce shallow, generic work.
           writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
         };
 
+        // Untiered spawns only. A tier resolves its model inside runAgent, and
+        // its resolution callback supplies the label from there — computing one
+        // here would name a model this path never resolved.
         const parentModelId = ctx.model?.id;
-        const effectiveModelId = model?.id;
         const modelName =
-          effectiveModelId && effectiveModelId !== parentModelId
-            ? (model?.name ?? effectiveModelId)
-                .replace(/^Claude\s+/i, "")
-                .toLowerCase()
-            : undefined;
+          model && model.id !== parentModelId ? shortModelLabel(model) : undefined;
         const effectiveMaxTurns = normalizeMaxTurns(
           resolvedConfig.maxTurns ?? getDefaultMaxTurns(),
         );
         const agentInvocation: AgentInvocation = {
           modelName,
+          ...((resolvedConfig.requestedAgentTier ?? customConfig?.agentTier) === undefined
+            ? {}
+            : { agentTier: resolvedConfig.requestedAgentTier ?? customConfig?.agentTier }),
           thinking,
           // Explicit value only — the default fallback would just add noise.
           // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
@@ -2688,10 +2663,16 @@ Terse command-style prompts produce shallow, generic work.
               // at fire time, and the original is what a user edits.
               subagent_type: requestedType,
               prompt: params.prompt as string,
+              // Only an explicitly requested tier is frozen into the job. An
+              // agent's frontmatter tier is deliberately not copied: it is read
+              // again at fire time, so editing the agent file still takes
+              // effect, and it keeps its "frontmatter" source rather than being
+              // replayed as a caller choice.
+              tier: resolvedConfig.requestedAgentTier,
               // Store the resolved policy input (agent config first, tool params second)
               // so scheduled fires use the same model fallback as an immediate spawn.
-              model: resolvedConfig.modelInput,
-              thinking: thinking,
+              model: resolvedConfig.agentTierSelected ? undefined : resolvedConfig.modelInput,
+              thinking: resolvedConfig.agentTierSelected ? undefined : thinking,
               max_turns: effectiveMaxTurns,
               isolated: isolated,
               isolation: isolation,
@@ -2844,11 +2825,11 @@ Terse command-style prompts produce shallow, generic work.
           // call as failed instead of returning a successful-looking text result.
           id = manager.spawn(pi, ctx, subagentType, params.prompt, {
             description: params.description,
-            model,
+            model: resolvedConfig.agentTierSelected ? undefined : model,
             maxTurns: effectiveMaxTurns,
             isolated,
             inheritContext,
-            thinkingLevel: thinking,
+            thinkingLevel: resolvedConfig.agentTierSelected ? undefined : thinking,
             agentTier: resolvedConfig.requestedAgentTier,
             isBackground: true,
             isolation,
@@ -2994,11 +2975,11 @@ Terse command-style prompts produce shallow, generic work.
             params.prompt,
             {
               description: params.description,
-              model,
+              model: resolvedConfig.agentTierSelected ? undefined : model,
               maxTurns: effectiveMaxTurns,
               isolated,
               inheritContext,
-              thinkingLevel: thinking,
+              thinkingLevel: resolvedConfig.agentTierSelected ? undefined : thinking,
               agentTier: resolvedConfig.requestedAgentTier,
               isolation,
               invocation: agentInvocation,
@@ -4396,19 +4377,13 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       worktreeIsolation: isWorktreeIsolationEnabled(),
       maxSubagentDepth: getMaxSubagentDepth(),
       maxSubagentSpawnsPerBranch: manager.getMaxSubagentSpawnsPerBranch(),
-      ...(Object.keys(getWorkflowSettings().tiers ?? {}).length > 0 ||
-      getWorkflowSettings().defaultTier !== undefined ||
-      getWorkflowSettings().blockedDefaultTier === true ||
-      (getWorkflowSettings().blockedTiers?.length ?? 0) > 0
-        ? { workflow: getWorkflowSettings() }
-        : {}),
-      // Same shape as the workflow block above: written back only when the user
-      // actually configured tiers, so the snapshot never materializes an empty
-      // catalogue — or the shipped `fast` fallback — into the project settings
-      // file.
+      // Written back only when the user actually configured tiers, so the
+      // snapshot never materializes an empty catalogue — or the shipped
+      // profiles and default — into the project settings file.
       ...(Object.keys(getAgentTiersConfiguredSettings().profiles ?? {}).length >
         0 ||
       getAgentTiersConfiguredSettings().defaultTier !== undefined ||
+      getAgentTiersConfiguredSettings().noDefaultTier === true ||
       getAgentTiersConfiguredSettings().blockedDefaultTier === true ||
       (getAgentTiersConfiguredSettings().blockedProfiles?.length ?? 0) > 0
         ? { agentTiers: getAgentTiersConfiguredSettings() }
@@ -4448,8 +4423,19 @@ Do not wrap the response in a markdown code fence. Return only the file contents
    * the numeric fields hand off to a text prompt.
    */
   const PICKER_IDS = new Set(["defaultModel"]);
-  /** Row value standing in for "no default tier configured". Not a tier key — keys reject whitespace, not words. */
-  const NO_DEFAULT_TIER = "none";
+  /**
+   * Row values for the two "no default tier" states, which behave differently:
+   * leaving the field unset still lets a managed workflow call reach the shipped
+   * fallback, while "none" withdraws that too. Both contain a space, which a
+   * tier key may not, so a real tier can never shadow either one.
+   *
+   * Neither names the fallback tier. These strings are the sentinels the setter
+   * below matches on, so they have to stay literal and stable — and *which*
+   * tier `unset` reaches depends on the catalogue, which can remove it. The
+   * row description says what it actually resolves to right now.
+   */
+  const UNSET_DEFAULT_TIER = "unset (workflows use the shipped fallback)";
+  const NO_DEFAULT_TIER = "none (workflows fail closed)";
   /** Menu entry that starts a new tier instead of editing an existing one. */
   const NEW_TIER_ENTRY = "+ New tier...";
 
@@ -4790,12 +4776,25 @@ Do not wrap the response in a markdown code fence. Return only the file contents
         {
           id: "defaultTier",
           label: "Default tier",
-          description:
-            tierKeys.length > 0
-              ? "Tier applied when neither the caller nor the agent names one. Edit the tiers themselves in /agents → Model tiers."
-              : "No tiers defined yet — create one in /agents → Model tiers.",
-          currentValue: getAgentTiersSettings().defaultTier ?? NO_DEFAULT_TIER,
-          values: [NO_DEFAULT_TIER, ...tierKeys],
+          description: (() => {
+            if (tierKeys.length === 0) return "No tiers defined yet — create one in /agents → Model tiers.";
+            const fallback = shippedFallbackAgentTier();
+            // Named from the resolver, not from a constant: on a catalogue that
+            // removed the shipped profile, "unset" reaches nothing and behaves
+            // exactly like "none", and the menu has to say so rather than
+            // promise a tier that is gone.
+            const unset =
+              fallback === undefined
+                ? '"unset" reaches no fallback here (the shipped profile has been removed), so managed workflow calls fail closed either way'
+                : `"unset" leaves managed workflow calls on the shipped "${fallback}"`;
+            return `Tier applied when neither the caller nor the agent names one. ${unset}; "none" withdraws that fallback so they fail closed. Edit the tiers themselves in /agents → Model tiers.`;
+          })(),
+          currentValue: (() => {
+            const selection = getDefaultAgentTierSelection();
+            if (selection.kind === "tier") return selection.tier;
+            return selection.kind === "none" ? NO_DEFAULT_TIER : UNSET_DEFAULT_TIER;
+          })(),
+          values: [UNSET_DEFAULT_TIER, NO_DEFAULT_TIER, ...tierKeys],
         },
         {
           id: "joinMode",
@@ -4959,15 +4958,26 @@ Do not wrap the response in a markdown code fence. Return only the file contents
           );
         }
       } else if (id === "defaultTier") {
-        const tier = value === NO_DEFAULT_TIER ? undefined : value;
+        const selection: DefaultAgentTierSelection =
+          value === UNSET_DEFAULT_TIER
+            ? { kind: "unset" }
+            : value === NO_DEFAULT_TIER
+              ? { kind: "none" }
+              : { kind: "tier", tier: value };
         setAgentTiersSettings(
-          setDefaultAgentTier(getAgentTiersSettings(), tier),
+          setDefaultAgentTier(getAgentTiersSettings(), selection),
         );
         notifyApplied(
           ctx,
-          tier === undefined
-            ? "Default tier cleared. Spawns that name no tier use the default model."
-            : `Default tier set to ${tier}. The tool description updates on the next pi session.`,
+          selection.kind === "tier"
+            ? `Default tier set to ${selection.tier}. The tool description updates on the next pi session.`
+            : selection.kind === "none"
+              ? "Default tier set to none. Spawns that name no tier use the agent's own tier or the default model, and managed workflow calls now fail closed rather than falling back to the shipped tier."
+              : `Default tier unset. Spawns that name no tier use the agent's own tier or the default model, and managed workflow calls ${
+                  shippedFallbackAgentTier() === undefined
+                    ? "fail closed, because this catalogue no longer defines the shipped fallback profile"
+                    : `fall back to the shipped "${shippedFallbackAgentTier()}"`
+                }.`,
         );
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);

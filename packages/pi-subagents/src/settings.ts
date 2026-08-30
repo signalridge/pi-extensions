@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier, MAX_AGENT_TIER_PROFILES } from "@signalridge/pi-subagents-protocol";
 // Imported only for the applySettings fallback so a persisted defaultToolTimeoutMs
 // takes effect even before the host wires the new applier — avoids needing to
 // edit index.ts in the same change.
@@ -22,17 +22,15 @@ const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set(AGENT_MENTION_MOD
 /** A tier's thinking value: a level, or `inherit` to keep the parent's. */
 export type TierThinking = ThinkingLevel | "inherit";
 
-/** Historical name for {@link TierThinking}, kept for the workflow tier types. */
-export type WorkflowThinking = TierThinking;
-
 /**
  * One user-named (model, thinking) pair for ordinary subagent spawns.
  *
- * Separate from {@link WorkflowTierProfile} because the key space differs: these
- * names are whatever the user chose, while workflow tiers are the protocol's
- * fixed small/medium/large. `description` is what the host agent reads in the
- * tool description to decide between tiers, so it is prose about the job the
- * tier is for, not about the model.
+ * The key space is whatever the user chose. `description` is what the host
+ * agent reads in the tool description to decide between tiers, so it is prose
+ * about the job the tier is for, not about the model.
+ *
+ * Managed workflow calls name a tier from this same catalogue; there is no
+ * second workflow-tier vocabulary.
  */
 export interface AgentTierProfile {
   /** `inherit` keeps the parent model; other values are provider/model references. */
@@ -47,6 +45,15 @@ export interface AgentTierProfile {
 export interface AgentTiersSettings {
   /** Applied when neither the caller nor the agent names a tier. */
   defaultTier?: string;
+  /**
+   * The user chose to have no default at all.
+   *
+   * Distinct from an absent `defaultTier`, which still lets a managed workflow
+   * call reach the shipped fallback in `agent-tiers.ts`. This is how a user
+   * withdraws that fallback as well, the same way `blockedProfiles` says "do not
+   * substitute a shipped profile".
+   */
+  noDefaultTier?: boolean;
   /** A configured entry replaces the complete entry inherited from global settings. */
   profiles?: Record<string, AgentTierProfile>;
   /** Tombstones for malformed explicit profiles; not a user policy field. */
@@ -55,41 +62,11 @@ export interface AgentTiersSettings {
   blockedDefaultTier?: boolean;
 }
 
-export interface WorkflowTierProfile {
-  /** `inherit` keeps the parent model; other values are provider/model references. */
-  model: string;
-  /** `inherit` keeps the parent Thinking level; other values are clamped natively. */
-  thinking: WorkflowThinking;
-}
-
-/** Workflow policy configured by the user and resolved only by pi-subagents. */
-export interface WorkflowSettings {
-  /** Optional default used when a managed workflow task omits its tier. */
-  defaultTier?: WorkflowTier;
-  /** A configured entry replaces the complete entry inherited from global settings. */
-  tiers?: Partial<Record<WorkflowTier, WorkflowTierProfile>>;
-  /** Persistence tombstones for malformed explicit tier entries; not a user policy field. */
-  blockedTiers?: WorkflowTier[];
-  /** Persistence tombstone for a malformed defaultTier; not a user policy field. */
-  blockedDefaultTier?: boolean;
-}
-
-
-export const DEFAULT_WORKFLOW_TIER_PROFILES: Readonly<Record<WorkflowTier, WorkflowTierProfile>> = {
-  // Defaults are provider-neutral. Users may pin a tier to any concrete
-  // provider/model in the same complete profile, but the extension must not
-  // silently choose a vendor-specific model on a new machine.
-  small: { model: "inherit", thinking: "low" },
-  medium: { model: "inherit", thinking: "medium" },
-  large: { model: "inherit", thinking: "high" },
-};
 export interface SubagentsSettings {
-  /** Semantic model-plus-thinking profiles used by workflow-owned spawns. */
-  workflow?: WorkflowSettings;
   /**
-   * User-named model tiers for ordinary subagent spawns. Independent of
-   * `workflow` above: the key space is arbitrary, and `pi-workflows` never reads
-   * these. See `agent-tiers.ts` for resolution and precedence.
+   * User-named model tiers. The one tier catalogue: ordinary Agent spawns, the
+   * scheduler, nested delegation, and managed `pi-workflows` calls all name a
+   * key from here. See `agent-tiers.ts` for resolution and precedence.
    */
   agentTiers?: AgentTiersSettings;
   /**
@@ -304,9 +281,7 @@ export interface SettingsAppliers {
   setMaxSubagentDepth: (n: number) => void;
   setMaxSubagentSpawnsPerBranch: (n: number) => void;
   setFallbackSubagent: (v: string | undefined) => void;
-  /** Optional because non-runtime settings tests and consumers need not apply workflow state. */
-  setWorkflow?: (settings: WorkflowSettings) => void;
-  /** Optional for the same reason as `setWorkflow`. */
+  /** Optional because non-runtime settings tests and consumers need not apply tier state. */
   setAgentTiers?: (settings: AgentTiersSettings) => void;
 }
 
@@ -332,12 +307,7 @@ export const TIER_THINKING_LEVELS: readonly TierThinking[] = [
   "max",
 ];
 const VALID_THINKING_LEVELS: ReadonlySet<string> = new Set(TIER_THINKING_LEVELS);
-const WORKFLOW_TIER_NAMES: readonly WorkflowTier[] = ["small", "medium", "large"];
 const MAX_MODEL_REFERENCE_LENGTH = 512;
-/** Mirrors MAX_AGENT_TIER_KEY_LENGTH in agent-tiers.ts; duplicated to keep settings dependency-free. */
-const MAX_AGENT_TIER_KEY_LENGTH = 64;
-/** Bounds a hand-edited config; far above any realistic number of tiers. */
-const MAX_AGENT_TIER_PROFILES = 64;
 const MAX_AGENT_TIER_DESCRIPTION_LENGTH = 512;
 
 // Sanity ceilings — prevent hand-edited configs from asking for values that
@@ -377,58 +347,8 @@ export function isModelReference(value: unknown): value is string {
   return slash > 0 && slash < model.length - 1;
 }
 
-function validThinkingLevel(value: unknown): value is WorkflowThinking {
+function validThinkingLevel(value: unknown): value is TierThinking {
   return typeof value === "string" && VALID_THINKING_LEVELS.has(value);
-}
-
-/**
- * A profile is all-or-nothing. In particular, never turn `{ model: ... }` into
- * a profile whose thinking silently inherits from the parent: that would make a
- * typo in a policy file look like an intentional policy choice.
- */
-function sanitizeWorkflowProfile(raw: unknown): WorkflowTierProfile | undefined {
-  if (!isRecord(raw)) return undefined;
-  const keys = Object.keys(raw);
-  if (keys.some((key) => key !== "model" && key !== "thinking")) return undefined;
-  if (!Object.hasOwn(raw, "model") || !Object.hasOwn(raw, "thinking")) return undefined;
-  if (!isModelReference(raw.model) || !validThinkingLevel(raw.thinking)) return undefined;
-  return { model: raw.model.trim(), thinking: raw.thinking };
-}
-
-function sanitizeWorkflow(raw: unknown): WorkflowSettings | undefined {
-  if (!isRecord(raw)) return undefined;
-  const out: WorkflowSettings = {};
-  if (isWorkflowTierValue(raw.defaultTier)) out.defaultTier = raw.defaultTier;
-  if (Object.hasOwn(raw, "defaultTier") && !isWorkflowTierValue(raw.defaultTier)) out.blockedDefaultTier = true;
-  if (raw.blockedDefaultTier === true) out.blockedDefaultTier = true;
-  if (Object.hasOwn(raw, "blockedTiers")) {
-    const rawBlocked = raw.blockedTiers;
-    const blocked = Array.isArray(rawBlocked) && rawBlocked.every(isWorkflowTierValue)
-      ? [...new Set(rawBlocked)]
-      : [...WORKFLOW_TIER_NAMES];
-    if (blocked.length > 0) out.blockedTiers = blocked;
-  }
-  const tiersValue = raw.tiers;
-  if (isRecord(tiersValue)) {
-    const tiers: Partial<Record<WorkflowTier, WorkflowTierProfile>> = {};
-    for (const tier of WORKFLOW_TIER_NAMES) {
-      if (!Object.hasOwn(tiersValue, tier)) continue;
-      const profile = sanitizeWorkflowProfile(tiersValue[tier]);
-      if (profile) tiers[tier] = profile;
-    }
-    if (Object.keys(tiers).length > 0) out.tiers = tiers;
-  }
-  return out.defaultTier !== undefined || out.tiers !== undefined || out.blockedTiers !== undefined || out.blockedDefaultTier !== undefined ? out : undefined;
-}
-
-function isAgentTierKey(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    value.length <= MAX_AGENT_TIER_KEY_LENGTH &&
-    value.trim() === value &&
-    !/\s/u.test(value)
-  );
 }
 
 /**
@@ -461,23 +381,25 @@ function sanitizeAgentTierProfile(raw: unknown): AgentTierProfile | undefined {
 function sanitizeAgentTiers(raw: unknown): AgentTiersSettings | undefined {
   if (!isRecord(raw)) return undefined;
   const out: AgentTiersSettings = {};
-  if (isAgentTierKey(raw.defaultTier)) out.defaultTier = raw.defaultTier;
-  if (Object.hasOwn(raw, "defaultTier") && !isAgentTierKey(raw.defaultTier)) out.blockedDefaultTier = true;
+  if (isManagedAgentTier(raw.defaultTier)) out.defaultTier = raw.defaultTier;
+  if (Object.hasOwn(raw, "defaultTier") && !isManagedAgentTier(raw.defaultTier)) out.blockedDefaultTier = true;
   if (raw.blockedDefaultTier === true) out.blockedDefaultTier = true;
+  if (raw.noDefaultTier === true && out.defaultTier === undefined) out.noDefaultTier = true;
   if (Array.isArray(raw.blockedProfiles)) {
-    const blocked = [...new Set(raw.blockedProfiles.filter(isAgentTierKey))];
+    const blocked = [...new Set(raw.blockedProfiles.filter(isManagedAgentTier))];
     if (blocked.length > 0) out.blockedProfiles = blocked;
   }
   if (isRecord(raw.profiles)) {
     const profiles: Record<string, AgentTierProfile> = {};
     for (const key of Object.keys(raw.profiles).slice(0, MAX_AGENT_TIER_PROFILES)) {
-      if (!isAgentTierKey(key)) continue;
+      if (!isManagedAgentTier(key)) continue;
       const profile = sanitizeAgentTierProfile(raw.profiles[key]);
       if (profile) profiles[key] = profile;
     }
     if (Object.keys(profiles).length > 0) out.profiles = profiles;
   }
   return out.defaultTier !== undefined ||
+    out.noDefaultTier !== undefined ||
     out.profiles !== undefined ||
     out.blockedProfiles !== undefined ||
     out.blockedDefaultTier !== undefined
@@ -485,9 +407,25 @@ function sanitizeAgentTiers(raw: unknown): AgentTiersSettings | undefined {
     : undefined;
 }
 
-function isWorkflowTierValue(value: unknown): value is WorkflowTier {
-  return value === "small" || value === "medium" || value === "large";
+/**
+ * Announce the retired `workflow` key once per process.
+ *
+ * `sanitize` runs on both settings files on every load and again on every
+ * project write, so warning at the call site would repeat the same line several
+ * times per session and once more each time the user saves Settings. The key is
+ * one fact about the configuration, not an event; state it once.
+ */
+let warnedRetiredWorkflowKey = false;
+function warnRetiredWorkflowKey(): void {
+  if (warnedRetiredWorkflowKey) return;
+  warnedRetiredWorkflowKey = true;
+  console.warn(
+    '[pi-subagents] the "workflow" settings key is retired and ignored; ' +
+      'managed workflow calls name an "agentTiers" key directly. ' +
+      'Move any routing you had there to "agentTiers" (its "defaultTier" replaces "workflow.defaultTier").',
+  );
 }
+
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
   if (!raw || typeof raw !== "object") return {};
@@ -597,8 +535,9 @@ function sanitize(raw: unknown): SubagentsSettings {
     out.worktreeIsolation = r.worktreeIsolation;
   }
 
-  const workflow = sanitizeWorkflow(r.workflow);
-  if (workflow) out.workflow = workflow;
+  // `workflow` is retired: workflow calls now name a key from `agentTiers`.
+  // Warn by name rather than silently dropping a policy the user still believes in.
+  if (Object.hasOwn(r, "workflow")) warnRetiredWorkflowKey();
   const agentTiers = sanitizeAgentTiers(r.agentTiers);
   if (agentTiers) out.agentTiers = agentTiers;
   return out;
@@ -614,21 +553,9 @@ function projectPath(cwd: string): string {
 
 /**
  * Read a settings file. Missing file is silent (returns `{}`). A file that
- * exists but can't be parsed emits a warning to stderr and blocks workflow-tier
+ * exists but can't be parsed emits a warning to stderr and blocks Agent-tier
  * policy so users aren't silently reverted to defaults.
  */
-interface WorkflowSource {
-  present: boolean;
-  object: boolean;
-  defaultTierPresent: boolean;
-  defaultTier?: WorkflowTier;
-  tiersPresent: boolean;
-  tiersObject: boolean;
-  tierEntries: Partial<Record<WorkflowTier, WorkflowTierProfile | undefined>>;
-  blockedTiers: WorkflowTier[];
-  blockedDefaultTier: boolean;
-}
-
 /**
  * Presence of each agent-tier entry in one file, kept separate from the
  * sanitized value so the merge can tell "the project did not mention this
@@ -640,6 +567,7 @@ interface AgentTiersSource {
   object: boolean;
   defaultTierPresent: boolean;
   defaultTier?: string;
+  noDefaultTier: boolean;
   profilesPresent: boolean;
   profilesObject: boolean;
   profileEntries: Record<string, AgentTierProfile | undefined>;
@@ -649,21 +577,7 @@ interface AgentTiersSource {
 
 interface ReadSettings {
   settings: SubagentsSettings;
-  workflow: WorkflowSource;
   agentTiers: AgentTiersSource;
-}
-
-function emptyWorkflowSource(): WorkflowSource {
-  return {
-    present: false,
-    object: false,
-    defaultTierPresent: false,
-    blockedDefaultTier: false,
-    tiersPresent: false,
-    tiersObject: false,
-    tierEntries: {},
-    blockedTiers: [],
-  };
 }
 
 function emptyAgentTiersSource(): AgentTiersSource {
@@ -672,6 +586,7 @@ function emptyAgentTiersSource(): AgentTiersSource {
     object: false,
     defaultTierPresent: false,
     blockedDefaultTier: false,
+    noDefaultTier: false,
     profilesPresent: false,
     profilesObject: false,
     profileEntries: {},
@@ -692,17 +607,18 @@ function agentTiersSource(raw: unknown): AgentTiersSource {
     object: true,
     defaultTierPresent: Object.hasOwn(value, "defaultTier"),
     blockedDefaultTier:
-      (Object.hasOwn(value, "defaultTier") && !isAgentTierKey(value.defaultTier)) || value.blockedDefaultTier === true,
-    ...(isAgentTierKey(value.defaultTier) ? { defaultTier: value.defaultTier } : {}),
+      (Object.hasOwn(value, "defaultTier") && !isManagedAgentTier(value.defaultTier)) || value.blockedDefaultTier === true,
+    ...(isManagedAgentTier(value.defaultTier) ? { defaultTier: value.defaultTier } : {}),
     profilesPresent: Object.hasOwn(value, "profiles"),
+    noDefaultTier: value.noDefaultTier === true,
     profilesObject: isRecord(value.profiles),
     profileEntries: {},
-    blockedProfiles: Array.isArray(value.blockedProfiles) ? value.blockedProfiles.filter(isAgentTierKey) : [],
+    blockedProfiles: Array.isArray(value.blockedProfiles) ? value.blockedProfiles.filter(isManagedAgentTier) : [],
   };
 
   if (isRecord(value.profiles)) {
     for (const key of Object.keys(value.profiles).slice(0, MAX_AGENT_TIER_PROFILES)) {
-      if (!isAgentTierKey(key)) continue;
+      if (!isManagedAgentTier(key)) continue;
       const profile = sanitizeAgentTierProfile(value.profiles[key]);
       source.profileEntries[key] = profile;
       if (!profile) source.blockedProfiles.push(key);
@@ -739,8 +655,13 @@ function mergeAgentTierSources(
   if (project.defaultTierPresent) {
     if (project.defaultTier !== undefined) merged.defaultTier = project.defaultTier;
     else merged.blockedDefaultTier = true;
+  } else if (project.noDefaultTier) {
+    // The project said "none" explicitly; that outranks a global default and
+    // stops the shipped one from filling the gap.
+    merged.noDefaultTier = true;
   } else {
     if (global.defaultTier !== undefined) merged.defaultTier = global.defaultTier;
+    else if (global.noDefaultTier) merged.noDefaultTier = true;
     if (global.blockedDefaultTier || project.blockedDefaultTier) merged.blockedDefaultTier = true;
   }
 
@@ -762,6 +683,7 @@ function mergeAgentTierSources(
       }
       continue;
     }
+    if (blocked.has(key)) continue;
     const inherited = global.profileEntries[key];
     if (inherited) profiles[key] = inherited;
   }
@@ -769,6 +691,7 @@ function mergeAgentTierSources(
   if (Object.keys(profiles).length > 0) merged.profiles = profiles;
   if (blocked.size > 0) merged.blockedProfiles = [...blocked].sort((a, b) => a.localeCompare(b));
   return merged.defaultTier !== undefined ||
+    merged.noDefaultTier !== undefined ||
     merged.profiles !== undefined ||
     merged.blockedProfiles !== undefined ||
     merged.blockedDefaultTier !== undefined
@@ -776,70 +699,18 @@ function mergeAgentTierSources(
     : undefined;
 }
 
-/** Preserve invalid workflow entry presence so project policy cannot resurrect a global entry. */
-function workflowSource(raw: unknown): WorkflowSource {
-  if (!isRecord(raw) || !Object.hasOwn(raw, "workflow")) return emptyWorkflowSource();
-  const value = raw.workflow;
-  if (!isRecord(value)) {
-    return {
-      ...emptyWorkflowSource(),
-      present: true,
-      object: false,
-      blockedTiers: [...WORKFLOW_TIER_NAMES],
-      blockedDefaultTier: true,
-    };
-  }
-  const tiersValue = value.tiers;
-  const blockedTiers: WorkflowTier[] = [];
-  if (Object.hasOwn(value, "blockedTiers")) {
-    const rawBlocked = value.blockedTiers;
-    if (Array.isArray(rawBlocked) && rawBlocked.every(isWorkflowTierValue)) blockedTiers.push(...new Set(rawBlocked));
-    else blockedTiers.push(...WORKFLOW_TIER_NAMES);
-  }
-  const source: WorkflowSource = {
-    present: true,
-    object: true,
-    defaultTierPresent: Object.hasOwn(value, "defaultTier"),
-    blockedDefaultTier:
-      (Object.hasOwn(value, "defaultTier") && !isWorkflowTierValue(value.defaultTier)) || value.blockedDefaultTier === true,
-    ...(isWorkflowTierValue(value.defaultTier) ? { defaultTier: value.defaultTier } : {}),
-    tiersPresent: Object.hasOwn(value, "tiers"),
-    tiersObject: isRecord(tiersValue),
-    tierEntries: {},
-    blockedTiers,
-  };
-  if (Object.hasOwn(value, "tiers") && !source.tiersObject) blockedTiers.push(...WORKFLOW_TIER_NAMES);
-  if (isRecord(tiersValue)) {
-    for (const tier of WORKFLOW_TIER_NAMES) {
-      if (!Object.hasOwn(tiersValue, tier)) continue;
-      const profile = sanitizeWorkflowProfile(tiersValue[tier]);
-      source.tierEntries[tier] = profile;
-      if (!profile) blockedTiers.push(tier);
-    }
-  }
-  source.blockedTiers = [...new Set(blockedTiers)];
-  return source;
-}
-
 function readSettingsFile(path: string): ReadSettings {
   if (!existsSync(path)) {
-    return { settings: {}, workflow: emptyWorkflowSource(), agentTiers: emptyAgentTiersSource() };
+    return { settings: {}, agentTiers: emptyAgentTiersSource() };
   }
   try {
     const raw: unknown = JSON.parse(readFileSync(path, "utf-8"));
-    return { settings: sanitize(raw), workflow: workflowSource(raw), agentTiers: agentTiersSource(raw) };
+    return { settings: sanitize(raw), agentTiers: agentTiersSource(raw) };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.warn(`[pi-subagents] Ignoring malformed settings at ${path}: ${reason}`);
     return {
       settings: {},
-      workflow: {
-        ...emptyWorkflowSource(),
-        present: true,
-        object: false,
-        blockedTiers: [...WORKFLOW_TIER_NAMES],
-        blockedDefaultTier: true,
-      },
       // An unreadable file may have held the tier catalogue; block rather than
       // fall through to whatever global happens to define.
       agentTiers: { ...emptyAgentTiersSource(), present: true, object: false, blockedDefaultTier: true },
@@ -848,7 +719,7 @@ function readSettingsFile(path: string): ReadSettings {
 }
 
 /**
- * Load merged settings: global provides defaults, project overrides. Workflow
+ * Load merged settings: global provides defaults, project overrides. Agent-tier
  * profiles are complete replacement units: a project entry never inherits one
  * field from the global entry, and an invalid project entry blocks that global
  * entry instead of silently reviving it.
@@ -856,63 +727,14 @@ function readSettingsFile(path: string): ReadSettings {
 export function loadSettings(cwd: string = process.cwd()): SubagentsSettings {
   const global = readSettingsFile(globalPath());
   const project = readSettingsFile(projectPath(cwd));
-  const { workflow: _globalWorkflow, agentTiers: _globalAgentTiers, ...globalSettings } = global.settings;
-  const { workflow: _projectWorkflow, agentTiers: _projectAgentTiers, ...projectSettings } = project.settings;
-  const workflow = mergeWorkflowSources(global.workflow, project.workflow);
+  const { agentTiers: _globalAgentTiers, ...globalSettings } = global.settings;
+  const { agentTiers: _projectAgentTiers, ...projectSettings } = project.settings;
   const agentTiers = mergeAgentTierSources(global.agentTiers, project.agentTiers);
   return {
     ...globalSettings,
     ...projectSettings,
-    ...(workflow ? { workflow } : {}),
     ...(agentTiers ? { agentTiers } : {}),
   };
-}
-
-function mergeWorkflowSources(global: WorkflowSource, project: WorkflowSource): WorkflowSettings | undefined {
-  if (!global.present && !project.present) return undefined;
-
-  const merged: WorkflowSettings = {};
-  if (project.present && !project.object) {
-    merged.blockedTiers = [...WORKFLOW_TIER_NAMES];
-    merged.blockedDefaultTier = true;
-    return merged;
-  }
-  if (project.defaultTierPresent) {
-    if (project.defaultTier !== undefined) {
-      merged.defaultTier = project.defaultTier;
-    } else {
-      merged.blockedDefaultTier = true;
-    }
-  } else {
-    if (global.defaultTier !== undefined) merged.defaultTier = global.defaultTier;
-    if (global.blockedDefaultTier || project.blockedDefaultTier) merged.blockedDefaultTier = true;
-  }
-
-  const blocked = new Set<WorkflowTier>([...global.blockedTiers, ...project.blockedTiers]);
-  const tiers: Partial<Record<WorkflowTier, WorkflowTierProfile>> = {};
-  for (const tier of WORKFLOW_TIER_NAMES) {
-    if (project.tiersPresent && !project.tiersObject) {
-      blocked.add(tier);
-      continue;
-    }
-    if (project.tiersObject && Object.hasOwn(project.tierEntries, tier)) {
-      const profile = project.tierEntries[tier];
-      if (profile) {
-        tiers[tier] = profile;
-        blocked.delete(tier);
-      } else {
-        blocked.add(tier);
-      }
-      continue;
-    }
-    if (Object.hasOwn(global.tierEntries, tier)) {
-      const profile = global.tierEntries[tier];
-      if (profile) tiers[tier] = profile;
-    }
-  }
-  if (Object.keys(tiers).length > 0) merged.tiers = tiers;
-  if (blocked.size > 0) merged.blockedTiers = WORKFLOW_TIER_NAMES.filter((tier) => blocked.has(tier));
-  return merged.defaultTier !== undefined || merged.tiers !== undefined || merged.blockedTiers !== undefined || merged.blockedDefaultTier !== undefined ? merged : undefined;
 }
 
 /**
@@ -980,7 +802,6 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   if (typeof s.rememberAgents === "boolean") appliers.setRememberAgents(s.rememberAgents);
   if (s.agentMentions) appliers.setAgentMentions(s.agentMentions);
   if (typeof s.supervisorQuestions === "boolean") appliers.setSupervisorQuestions(s.supervisorQuestions);
-  if (s.workflow) appliers.setWorkflow?.(s.workflow);
   // Applied unconditionally so a session that had tiers and no longer does gets
   // the empty catalogue rather than keeping the previous one.
   appliers.setAgentTiers?.(s.agentTiers ?? {});

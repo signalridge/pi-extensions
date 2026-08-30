@@ -68,10 +68,11 @@ Three rules keep this honest:
   `CHECK_VERSIONS_OFFLINE=1` skips the network entirely.
 - **A peer dependent is only bumped when the new version leaves its declared
   range** (`onlyUpdatePeerDependentsWhenOutOfRange`). `pi-workflows` declares
-  `"@signalridge/pi-subagents": ">=1.0.0"` and reaches it only through the
-  versioned event protocol, so a subagents major that stays inside that range
-  is not a reason to republish workflows. Tighten the declared range when a
-  change really does break the dependent; that is what makes the bump happen.
+  `"@signalridge/pi-subagents": ">=1.9.0"` and reaches it through the versioned
+  event protocol, so a subagents release that stays inside that range is not a
+  reason to republish workflows. Tighten the declared range when a change really
+  does require the dependent to move; that is what makes the bump happen — a
+  protocol version bump always does, because the peer check is exact.
 
 The `___experimentalUnsafeOptions_WILL_CHANGE_IN_PATCH` prefix on that option is
 Changesets' own warning that it may be renamed in a patch release. This is safe

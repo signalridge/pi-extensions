@@ -29,7 +29,7 @@ export interface CapabilityEntry {
 }
 
 /** The contract format version. Bump on any breaking surface change. */
-export const WORKFLOW_CAPABILITY_CONTRACT_VERSION = "1.0.0";
+export const WORKFLOW_CAPABILITY_CONTRACT_VERSION = "2.0.0";
 
 /**
  * The runtime globals a script can rely on. `options` documents each helper's
@@ -44,8 +44,12 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       { name: "label", kind: "string", optional: true, default: "derived from phase and call count" },
       { name: "phase", kind: "string", optional: true, default: "current phase" },
       { name: "schema", kind: "plain JSON Schema", optional: true, default: "none" },
-      { name: "model", kind: "string", optional: true, default: "pi-subagents model resolver" },
-      { name: "tier", kind: "small|medium|large", optional: true, default: "pi-subagents workflow tier" },
+      {
+        name: "tier",
+        kind: "agent tier key",
+        optional: true,
+        default: "the agent's own tier, else agentTiers.defaultTier",
+      },
       { name: "isolation", kind: '"worktree"', optional: true, default: "pi-subagents worktree policy" },
       { name: "thread", kind: "string", optional: true, default: "fresh session per call" },
       { name: "toolset", kind: "string", optional: true, default: "configured host/agent toolset hint" },
@@ -60,7 +64,9 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       "resume replays only the longest unchanged prefix; the first miss and every later call execute live",
       "replayed calls do not consume the real-dispatch maxAgents or token/phase budgets",
       "spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict",
-      "explicit model is resolved and scope-checked by pi-subagents; unavailable selectors fail closed",
+      "tier names a key in the host's agentTiers catalogue; a key it does not define is rejected before dispatch",
+      "resolveAgentTier in pi-subagents owns model, thinking, clamping, availability, and the resolution snapshot",
+      "there is no per-call model or thinking: a tier is the only model policy a workflow can express",
       "same-thread calls must be sequential and preserve a stable workflow thread name",
       "threads cannot be combined with worktree isolation",
     ],
@@ -308,6 +314,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     constraints: [
       "must be the first statement",
       "name and description must be nonblank literals",
+      "workflow meta and phase metadata cannot contain model or thinking fields",
       "spread, computed keys, methods, template interpolation, and __proto__/constructor/prototype are rejected",
     ],
   },

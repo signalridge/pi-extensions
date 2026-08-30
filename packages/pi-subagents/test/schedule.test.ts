@@ -338,6 +338,23 @@ describe("SubagentScheduler — fire path", () => {
     expect(manager.spawn).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves the requested Agent tier through persistence and fire", () => {
+    const job = scheduler.addJob({
+      name: "tiered", description: "x", schedule: "1s",
+      subagent_type: "general-purpose", prompt: "x", tier: "cheap",
+    });
+    expect(scheduler.list().find((item) => item.id === job.id)?.tier).toBe("cheap");
+
+    vi.advanceTimersByTime(1_000);
+    expect(manager.spawn).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "general-purpose",
+      "x",
+      expect.objectContaining({ agentTier: "cheap" }),
+    );
+  });
+
   it("fire passes bypassQueue: true to manager.spawn", () => {
     scheduler.addJob({
       name: "every-1s", description: "x", schedule: "1s",

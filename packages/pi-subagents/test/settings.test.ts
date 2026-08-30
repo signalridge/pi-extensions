@@ -60,10 +60,7 @@ describe("settings persistence", () => {
     writeFileSync(projectFile(), "also not json");
     // An unreadable file may have held either catalogue, so neither may fall
     // through to whatever the other file happens to define.
-    expect(loadSettings(projectDir)).toEqual({
-      workflow: { blockedTiers: ["small", "medium", "large"], blockedDefaultTier: true },
-      agentTiers: { blockedDefaultTier: true },
-    });
+    expect(loadSettings(projectDir)).toEqual({ agentTiers: { blockedDefaultTier: true } });
   });
 
   it("loads from global when no project file", () => {
@@ -102,55 +99,46 @@ describe("settings persistence", () => {
     });
   });
 
-  it("merges complete workflow tier entries with project precedence", () => {
-    writeGlobal({
-      workflow: {
-        defaultTier: "small",
-        tiers: {
-          small: { model: "anthropic/haiku", thinking: "low" },
-          medium: { model: "anthropic/sonnet", thinking: "medium" },
-        },
-      },
-    });
-    writeProject({
-      workflow: {
-        defaultTier: "large",
-        tiers: {
-          small: { model: "openai/gpt-5", thinking: "high" },
-          large: { model: "openai/gpt-5", thinking: "max" },
-        },
-      },
-    });
-
-    expect(loadSettings(projectDir).workflow).toEqual({
-      defaultTier: "large",
-      tiers: {
-        small: { model: "openai/gpt-5", thinking: "high" },
-        medium: { model: "anthropic/sonnet", thinking: "medium" },
-        large: { model: "openai/gpt-5", thinking: "max" },
-      },
-    });
+  it("retires the workflow settings key by name, warning once rather than per read", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // In both files, so a single load sanitizes the retired key twice.
+      writeGlobal({ workflow: { defaultTier: "small" } });
+      writeProject({
+        maxConcurrent: 3,
+        workflow: { defaultTier: "medium", tiers: { small: { agentTier: "low" } } },
+      });
+      // Retired, not honored: a workflow call names an agentTiers key directly.
+      expect(loadSettings(projectDir)).toEqual({ maxConcurrent: 3 });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('"workflow" settings key is retired'));
+      // The key is one fact about the configuration, not an event. `sanitize`
+      // runs on both files on every load and again on every project write, so
+      // warning per call site would repeat this several times a session.
+      loadSettings(projectDir);
+      saveSettings({ maxConcurrent: 3 }, projectDir);
+      expect(warning).toHaveBeenCalledTimes(1);
+    } finally {
+      warning.mockRestore();
+    }
   });
 
-  it("blocks incomplete or invalid workflow profiles without reading legacy keys", () => {
-    writeProject({
-      workflowTiers: { small: { model: "anthropic/ignored", thinking: "low" } },
-      workflow: {
-        tiers: {
-          small: { model: " anthropic/haiku ", thinking: "medium" },
-          high: { model: "anthropic/ignored", thinking: "low" },
-          medium: { model: "bare-model", thinking: "medium" },
-          large: { model: "openai/gpt-5" },
-        },
-      },
-    });
-
-    expect(loadSettings(projectDir).workflow).toEqual({
-      tiers: { small: { model: "anthropic/haiku", thinking: "medium" } },
-      blockedTiers: ["medium", "large"],
-    });
+  it("round-trips an explicit no-default-tier choice", () => {
+    // A shipped fallback exists for managed calls, so "none" has to survive as
+    // a value distinct from an absent field. Losing it on save would leave
+    // managed calls still falling back to the shipped tier.
+    saveSettings({ agentTiers: { noDefaultTier: true } }, projectDir);
+    expect(loadSettings(projectDir).agentTiers).toEqual({ noDefaultTier: true });
   });
 
+  it("lets a project say 'no default' over a global default tier", () => {
+    writeGlobal({ agentTiers: { defaultTier: "everyday", profiles: { everyday: { model: "p/m", thinking: "low" } } } });
+    writeProject({ agentTiers: { noDefaultTier: true } });
+    const merged = loadSettings(projectDir).agentTiers;
+    expect(merged?.defaultTier).toBeUndefined();
+    expect(merged?.noDefaultTier).toBe(true);
+    // The catalogue itself still comes through; only the default was cancelled.
+    expect(merged?.profiles?.everyday).toBeDefined();
+  });
 
   it("round-trips values: saveSettings then loadSettings", () => {
     const settings = {
@@ -160,13 +148,9 @@ describe("settings persistence", () => {
       defaultJoinMode: "smart" as const,
       schedulingEnabled: false,
       toolDescriptionMode: "compact" as const,
-      workflow: {
-        defaultTier: "large" as const,
-        tiers: {
-          small: { model: "inherit", thinking: "inherit" as const },
-          medium: { model: "anthropic/sonnet", thinking: "medium" as const },
-          large: { model: "openai-codex/gpt-5.6-luna", thinking: "max" as const },
-        },
+      agentTiers: {
+        defaultTier: "high",
+        profiles: { high: { model: "provider/model", thinking: "high" } },
       },
     };
     saveSettings(settings, projectDir);
@@ -481,7 +465,6 @@ describe("settings persistence", () => {
       writeFileSync(projectFile(), "not valid json {{{");
       try {
         expect(loadSettings(projectDir)).toEqual({
-          workflow: { blockedTiers: ["small", "medium", "large"], blockedDefaultTier: true },
           agentTiers: { blockedDefaultTier: true },
         });
         expect(spy).toHaveBeenCalledTimes(1);

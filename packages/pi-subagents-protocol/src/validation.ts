@@ -1,16 +1,19 @@
+import { createHash } from "node:crypto";
 import { CHILD_CONTEXT_CAPABILITY, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION } from "./channels.js";
 import type {
   ChildContextReply,
+  ManagedAgentTierProfile,
   ManagedOwner,
   ManagedProtocolCapabilities,
   ManagedProtocolPing,
   ManagedQuiescenceResponse,
+  ManagedRoutingPolicy,
+  ManagedRoutingPolicySnapshot,
   ManagedSpawnRequest,
   ManagedSpawnResponse,
   ManagedTerminalSnapshot,
-  ManagedThinking,
+  ManagedTierThinking,
   RpcReply,
-  WorkflowTier,
 } from "./types.js";
 
 export type RecordValue = Record<string, unknown>;
@@ -38,6 +41,17 @@ export function rejectUnknownKeys(value: RecordValue, allowed: ReadonlySet<strin
   }
 }
 
+/**
+ * The single definition of a tier key's bound, for the wire and for its peers.
+ *
+ * pi-subagents re-exports this rather than restating it: a key it accepted but
+ * the wire rejected could never reach a managed peer, so a second copy could
+ * only ever be a way for the two to disagree.
+ */
+export const MAX_AGENT_TIER_KEY_LENGTH = 64;
+/** Bounds a hand-edited catalogue; far above any realistic number of tiers. */
+export const MAX_AGENT_TIER_PROFILES = 64;
+
 const OWNER_KEYS = new Set(["extension", "runId", "nodeId", "attemptId"]);
 const MANAGED_REQUEST_KEYS = new Set([
   "requestId",
@@ -46,8 +60,6 @@ const MANAGED_REQUEST_KEYS = new Set([
   "prompt",
   "description",
   "tier",
-  "model",
-  "thinking",
   "toolset",
   "excludeTools",
   "isolation",
@@ -63,7 +75,7 @@ const TERMINAL_KEYS = new Set([
   "compactionCount",
   "completedAt",
 ]);
-const SPAWN_RESPONSE_KEYS = new Set(["id", "state", "created", "terminal"]);
+const SPAWN_RESPONSE_KEYS = new Set(["id", "tier", "state", "created", "terminal"]);
 const QUIESCENCE_KEYS = new Set(["settled", "pending", "diagnostic"]);
 const CAPABILITY_KEYS = new Set([
   "managedSpawn",
@@ -71,17 +83,33 @@ const CAPABILITY_KEYS = new Set([
   "ownedStop",
   "childContext",
   "ownedQuiescence",
-  "workflowTiers",
+  "agentTiers",
   "managedPolicy",
 ]);
+const ROUTING_POLICY_KEYS = new Set(["defaultTier", "profiles", "blockedProfiles", "blockedDefaultTier"]);
+const AGENT_PROFILE_KEYS = new Set(["model", "thinking"]);
 
-export function isWorkflowTier(value: unknown): value is WorkflowTier {
-  return value === "small" || value === "medium" || value === "large";
+/**
+ * Agent-tier names are open to users but remain bounded, whitespace-free keys.
+ *
+ * The single definition, shared with pi-subagents for the reason given on
+ * {@link MAX_AGENT_TIER_KEY_LENGTH}. Whitespace is excluded because the key is
+ * rendered as a bare token in tool descriptions and error messages, where a key
+ * containing a space would read as two keys.
+ */
+export function isManagedAgentTier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_AGENT_TIER_KEY_LENGTH &&
+    value.trim() === value &&
+    !/\s/u.test(value)
+  );
 }
 
-export function isManagedThinking(value: unknown): value is ManagedThinking {
+export function isManagedTierThinking(value: unknown): value is ManagedTierThinking {
   return (
-    value === "off" ||
+    value === "inherit" ||
     value === "minimal" ||
     value === "low" ||
     value === "medium" ||
@@ -90,6 +118,7 @@ export function isManagedThinking(value: unknown): value is ManagedThinking {
     value === "max"
   );
 }
+
 export function parseRpcRequestId(raw: unknown): string {
   return boundedString(asRecord(raw, "RPC request").requestId, "requestId", 128);
 }
@@ -126,18 +155,17 @@ export function parseManagedOwner(raw: unknown, requireAttempt = false): Managed
   };
 }
 
+const TIER_KEY_DIAGNOSTIC = `must be a non-empty whitespace-free key of at most ${MAX_AGENT_TIER_KEY_LENGTH} characters`;
+
 export function parseManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
   const value = asRecord(raw, "managed spawn request");
   rejectUnknownKeys(value, MANAGED_REQUEST_KEYS, "managed spawn request");
   const owner = parseManagedOwner(value.owner, true);
   if (owner.attemptId === undefined) throw new Error("owner.attemptId is required");
   const tier = value.tier;
-  if (tier !== undefined && !isWorkflowTier(tier)) {
-    throw new Error("managed spawn tier must be one of small, medium, or large");
+  if (tier !== undefined && !isManagedAgentTier(tier)) {
+    throw new Error(`managed spawn tier ${TIER_KEY_DIAGNOSTIC}`);
   }
-  const model = value.model === undefined ? undefined : boundedString(value.model, "model", 512);
-  const thinking = value.thinking === undefined ? undefined : value.thinking;
-  if (thinking !== undefined && !isManagedThinking(thinking)) throw new Error("managed spawn thinking is invalid");
   const toolset = value.toolset === undefined ? undefined : boundedString(value.toolset, "toolset", 128);
   const thread = value.thread === undefined ? undefined : boundedString(value.thread, "thread", 128);
   const excludeTools =
@@ -157,8 +185,6 @@ export function parseManagedSpawnRequest(raw: unknown): ManagedSpawnRequest {
     prompt: boundedString(value.prompt, "prompt", 100_000),
     description: boundedString(value.description, "description", 512),
     ...(tier === undefined ? {} : { tier }),
-    ...(model === undefined ? {} : { model }),
-    ...(thinking === undefined ? {} : { thinking }),
     ...(toolset === undefined ? {} : { toolset }),
     ...(excludeTools === undefined ? {} : { excludeTools }),
     ...(isolation === undefined ? {} : { isolation }),
@@ -209,6 +235,9 @@ export function parseManagedSpawnResponse(raw: unknown): ManagedSpawnResponse {
   const value = asRecord(raw, "managed spawn response");
   rejectUnknownKeys(value, SPAWN_RESPONSE_KEYS, "managed spawn response");
   const id = boundedString(value.id, "managed spawn id", 128);
+  const tier = value.tier;
+  if (tier !== undefined && !isManagedAgentTier(tier))
+    throw new Error(`managed spawn response tier ${TIER_KEY_DIAGNOSTIC}`);
   const state = value.state;
   if (
     state !== undefined &&
@@ -233,6 +262,7 @@ export function parseManagedSpawnResponse(raw: unknown): ManagedSpawnResponse {
   }
   return {
     id,
+    ...(tier === undefined ? {} : { tier }),
     ...(state === undefined ? {} : { state }),
     ...(value.created === undefined ? {} : { created: value.created }),
     ...(terminal === undefined ? {} : { terminal }),
@@ -258,28 +288,155 @@ function parseCapabilities(raw: unknown): ManagedProtocolCapabilities {
   const value = asRecord(raw, "protocol capabilities");
   rejectUnknownKeys(value, CAPABILITY_KEYS, "protocol capabilities");
   for (const key of CAPABILITY_KEYS) {
-    if ((key === "childContext" || key === "workflowTiers" || key === "managedPolicy") && value[key] === undefined)
-      continue;
     if (typeof value[key] !== "boolean") throw new Error(`protocol capability ${key} is invalid`);
   }
   return {
     managedSpawn: value.managedSpawn as boolean,
     lifecycleOwner: value.lifecycleOwner as boolean,
     ownedStop: value.ownedStop as boolean,
-    ...(value.childContext === undefined ? {} : { childContext: value.childContext as boolean }),
+    childContext: value.childContext as boolean,
     ownedQuiescence: value.ownedQuiescence as boolean,
-    ...(value.workflowTiers === undefined ? {} : { workflowTiers: value.workflowTiers as boolean }),
-    ...(value.managedPolicy === undefined ? {} : { managedPolicy: value.managedPolicy as boolean }),
+    agentTiers: value.agentTiers as boolean,
+    managedPolicy: value.managedPolicy as boolean,
   };
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("routing policy contains an unsupported value");
+}
+
+/** Canonical JSON used by both the provider and the workflow peer. */
+export function canonicalizeRoutingPolicy(policy: ManagedRoutingPolicy): string {
+  return canonicalJson(policy);
+}
+
+/** Stable policy identity; object key ordering never changes the result. */
+export function routingPolicyFingerprint(policy: ManagedRoutingPolicy): string {
+  return createHash("sha256").update(canonicalizeRoutingPolicy(policy)).digest("hex");
+}
+
+/**
+ * Everything about the host's policy that can change how ONE tier resolves.
+ *
+ * A caller's replay cache keys on this rather than on the whole-catalogue
+ * fingerprint, so defining or editing an unrelated tier does not invalidate
+ * work that never used it.
+ *
+ * The tier is required, and deliberately so. There is no honest per-tier
+ * identity for a call that named none: the host resolves those against the
+ * agent's own frontmatter tier *before* `defaultTier`, and frontmatter is not
+ * on this wire — an agent is represented to a managed caller by its name only.
+ * Folding in `defaultTier` for an omitted tier would therefore be wrong in both
+ * directions, replaying work whose real tier had changed while invalidating
+ * work that never touched the default. A caller with no tier to name has to
+ * fall back to {@link routingPolicyFingerprint}.
+ */
+export function agentTierPolicyIdentity(policy: ManagedRoutingPolicy | undefined, tier: string): unknown {
+  if (!policy) return null;
+  const profile = policy.profiles[tier];
+  return {
+    tier,
+    model: profile?.model ?? null,
+    thinking: profile?.thinking ?? null,
+    blocked: policy.blockedProfiles.includes(tier),
+  };
+}
+
+/**
+ * Reject, never normalize. `boundedString` trims, which would have quietly
+ * turned `" low"` into `"low"` here while a profile key or `defaultTier`
+ * carrying the same whitespace is refused outright — one validator disagreeing
+ * with its own siblings about what a tier key is.
+ */
+function parseTierKeyList(raw: unknown, label: string, max: number): string[] {
+  if (!Array.isArray(raw) || raw.length > max) throw new Error(`${label} is invalid`);
+  const values = raw.map((value, index) => {
+    if (!isManagedAgentTier(value)) throw new Error(`${label}[${index}] ${TIER_KEY_DIAGNOSTIC}`);
+    return value;
+  });
+  if (new Set(values).size !== values.length) throw new Error(`${label} contains duplicates`);
+  return values;
+}
+
+function parseAgentTierProfile(raw: unknown, label: string): ManagedAgentTierProfile {
+  const value = asRecord(raw, label);
+  rejectUnknownKeys(value, AGENT_PROFILE_KEYS, label);
+  const model = boundedString(value.model, `${label}.model`, 512);
+  if (model !== "inherit" && /\s/u.test(model)) throw new Error(`${label}.model must not contain whitespace`);
+  if (!isManagedTierThinking(value.thinking)) throw new Error(`${label}.thinking is invalid`);
+  return { model, thinking: value.thinking };
+}
+
+function parseRoutingPolicy(raw: unknown): ManagedRoutingPolicy {
+  const value = asRecord(raw, "routing policy");
+  rejectUnknownKeys(value, ROUTING_POLICY_KEYS, "routing policy");
+  const defaultTier = value.defaultTier;
+  if (defaultTier !== null && !isManagedAgentTier(defaultTier)) {
+    throw new Error("routing policy defaultTier is invalid");
+  }
+  const profiles = asRecord(value.profiles, "routing policy.profiles");
+  if (Object.keys(profiles).length > MAX_AGENT_TIER_PROFILES) {
+    throw new Error("routing policy has too many profiles");
+  }
+  const normalizedProfiles: Record<string, ManagedAgentTierProfile> = {};
+  for (const [key, profile] of Object.entries(profiles)) {
+    if (!isManagedAgentTier(key)) throw new Error("routing policy profile key is invalid");
+    normalizedProfiles[key] = parseAgentTierProfile(profile, `Agent-tier profile ${key}`);
+  }
+  const blockedProfiles = parseTierKeyList(
+    value.blockedProfiles,
+    "routing policy.blockedProfiles",
+    MAX_AGENT_TIER_PROFILES,
+  );
+  if (typeof value.blockedDefaultTier !== "boolean") throw new Error("routing policy blockedDefaultTier is invalid");
+  return {
+    defaultTier,
+    profiles: normalizedProfiles,
+    blockedProfiles,
+    blockedDefaultTier: value.blockedDefaultTier,
+  };
+}
+
+/**
+ * The fingerprint on the wire is redundant by construction — the receiver has
+ * the policy and recomputes it here — and that is exactly what it is for. A
+ * peer whose canonicalization has drifted from ours would otherwise agree about
+ * every field and disagree only about replay identity, which surfaces much
+ * later as a run that re-executes work it should have replayed. Comparing the
+ * two makes that a startup failure with a name instead.
+ */
+function parseRoutingPolicySnapshot(raw: unknown): ManagedRoutingPolicySnapshot {
+  const value = asRecord(raw, "routing policy snapshot");
+  rejectUnknownKeys(value, new Set(["policy", "fingerprint"]), "routing policy snapshot");
+  const policy = parseRoutingPolicy(value.policy);
+  const fingerprint = boundedString(value.fingerprint, "routing policy fingerprint", 64);
+  if (!/^[0-9a-f]{64}$/u.test(fingerprint) || routingPolicyFingerprint(policy) !== fingerprint) {
+    throw new Error("routing policy fingerprint is invalid");
+  }
+  return { policy, fingerprint };
 }
 
 export function parseProtocolPing(raw: unknown): ManagedProtocolPing {
   const value = asRecord(raw, "protocol ping");
-  rejectUnknownKeys(value, new Set(["version", "capabilities"]), "protocol ping");
+  rejectUnknownKeys(value, new Set(["version", "capabilities", "routingPolicy"]), "protocol ping");
   if (typeof value.version !== "number" || !Number.isInteger(value.version) || value.version < 1) {
     throw new Error("protocol version is invalid");
   }
-  return { version: value.version, capabilities: parseCapabilities(value.capabilities) };
+  return {
+    version: value.version,
+    capabilities: parseCapabilities(value.capabilities),
+    routingPolicy: parseRoutingPolicySnapshot(value.routingPolicy),
+  };
 }
 
 export function parseChildContextReply(raw: unknown): ChildContextReply {
@@ -291,16 +448,10 @@ export function parseChildContextReply(raw: unknown): ChildContextReply {
   return { child: value.child, capability: CHILD_CONTEXT_CAPABILITY };
 }
 
-export function workflowTierCapabilityMatch(capabilities: ManagedProtocolCapabilities): boolean {
-  return capabilities.workflowTiers === true;
-}
-
+/** Every v4 capability is required; there is no partial peer to negotiate with. */
 export function requiredCapabilitiesMatch(capabilities: ManagedProtocolCapabilities): boolean {
-  return (
-    capabilities.managedSpawn === PROTOCOL_CAPABILITIES.managedSpawn &&
-    capabilities.lifecycleOwner === PROTOCOL_CAPABILITIES.lifecycleOwner &&
-    capabilities.ownedStop === PROTOCOL_CAPABILITIES.ownedStop &&
-    capabilities.ownedQuiescence === PROTOCOL_CAPABILITIES.ownedQuiescence
+  return (Object.keys(PROTOCOL_CAPABILITIES) as (keyof ManagedProtocolCapabilities)[]).every(
+    (key) => capabilities[key] === PROTOCOL_CAPABILITIES[key],
   );
 }
 

@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isNonNegativeFiniteNumber, nonNegativeFiniteNumber, normalizeTokenBudget } from "./accounting.js";
 import type { GoalStatus } from "./prompts.js";
@@ -238,12 +239,28 @@ function normalizeSafetyPauseCause(value: unknown): SafetyPauseCause | undefined
   return value === "continuation_limit" || value === "no_progress" ? value : undefined;
 }
 
+/**
+ * Atomic for the same reason `saveGoalSettings` is: this file holds every
+ * project's goal state, so a torn write while clearing one project's entry
+ * would take the rest with it.
+ */
 export function clearLegacyPersistedGoal(cwd: string) {
   if (!existsSync(STATE_FILE)) return;
   const goals = readState();
   delete goals[cwd];
-  mkdirSync(dirname(STATE_FILE), { recursive: true });
-  writeFileSync(STATE_FILE, `${JSON.stringify(goals, null, 2)}\n`);
+  const document = `${JSON.stringify(goals, null, 2)}\n`;
+  const temporaryPath = join(dirname(STATE_FILE), `.${basename(STATE_FILE)}.${randomUUID()}.tmp`);
+  try {
+    mkdirSync(dirname(STATE_FILE), { recursive: true });
+    writeFileSync(temporaryPath, document, { encoding: "utf8", flag: "wx" });
+    renameSync(temporaryPath, STATE_FILE);
+  } finally {
+    try {
+      rmSync(temporaryPath, { force: true });
+    } catch {
+      // Best-effort cleanup must not replace the clear result.
+    }
+  }
 }
 
 function readState(): Record<string, unknown> {

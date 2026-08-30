@@ -4,7 +4,7 @@ Use this page for routine scripts. Open the generated capability index only when
 
 ## Script envelope
 
-Start with the only legal export: `export const meta = { name, description, phases?: [{ title, detail?, model? }] }`. Values are nonblank literals; declare only used phases and call `phase()` before each phase's work. The remaining body already runs inside an async function: write helpers as ordinary declarations; `export default` and other exports are invalid. Return the result explicitly.
+Start with the only legal export: `export const meta = { name, description, phases?: [{ title, detail? }] }`. Values are nonblank literals; declare only used phases and call `phase()` before each phase's work. Workflow meta and phase objects must not contain `model` or `thinking`; those retired fields are rejected. The remaining body already runs inside an async function: write helpers as ordinary declarations; `export default` and other exports are invalid. Return the result explicitly.
 
 The runtime supplies `agent`, `parallel`, `pipeline`, `orchestrate`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`. Imports, `require()`, filesystem modules, `Date.now()`, `Math.random()`, and no-argument `new Date()` are unavailable. The Node VM realm is implementation substrate, not a security boundary or public API.
 
@@ -17,7 +17,7 @@ The runtime supplies `agent`, `parallel`, `pipeline`, `orchestrate`, `workflow`,
 
 ## Data and failure
 
-Call `agent(prompt, { label, schema? })`; it returns text, a schema-validated value, or recoverable `null`. Nonrecoverable limit, validation, and budget failures throw. Record each intended work ID before filtering. A `null` means missing coverage, never a negative finding.
+Call `agent(prompt, { label, schema?, tier? })`; it returns text, a schema-validated value, or recoverable `null`. `tier` names a key in the host's agent-tier catalogue. Nonrecoverable limit, validation, budget, unknown-tier, and unavailable-tier failures throw. Record each intended work ID before filtering. A `null` means missing coverage, never a negative finding.
 
 Use `agent(prompt, { thread: "implementer" })` when the same managed subagent must receive a later follow-up with its complete conversation intact. Reuse a thread name sequentially; never put same-thread calls in one `parallel()` batch. Threads are scoped to one workflow run/session and cannot use worktree isolation. A pause or process restart may require a fresh thread session.
 
@@ -25,6 +25,6 @@ When JavaScript reads fields, pass a small plain JSON Schema. Schema noncomplian
 
 ## Routing and support
 
-An explicit per-call `model` wins. A named `agentType` model overrides `tier`; specifying `tier` suppresses the phase/run model and delegates model/thinking resolution to pi-subagents. Without a per-call selector, the phase/run model is used when present, followed by pi-subagents defaults and the parent session. Explicit unavailable models and tiers fail closed. Worktree isolation is also fail-closed and remains owned by pi-subagents. See [registry ownership](registry-ownership.md).
+`tier` is a key in the host's agent-tier catalogue, not a model ID. The catalogue and its names belong to the user running the workflow; read the available keys from the destination context rather than assuming any particular name exists. A tier this host does not define is rejected before dispatch — only the scripts shipped with this package reroute to the host default instead, because they cannot know the catalogue they will land in. pi-subagents' `resolveAgentTier()` alone resolves the final model, thinking, clamping, availability, and snapshot. A tier the host does not define is rejected before dispatch. Omitting `tier` uses the agent's own tier, then `agentTiers.defaultTier`; a host whose default has been cleared rejects the call instead of inheriting the parent model. There is no per-call model or thinking, and workflow meta and phases may not carry them either. Worktree isolation remains owned by pi-subagents. See [registry ownership](registry-ownership.md).
 
 Generated entries marked `supported` are authoring API. `console` and whole-script Markdown fences are compatibility-only. VM realm facilities are internal. Active model routes and agent types are dynamic. Use `log()` in new scripts.

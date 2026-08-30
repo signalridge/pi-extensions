@@ -1,4 +1,4 @@
-import type { Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
   defineTool,
@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
-import { buildAgentTierParameterDescription } from "./agent-tiers.js";
+import { buildAgentTierParameterDescription, getAgentTiersSettings } from "./agent-tiers.js";
 import {
   buildAgentRegistry,
   getAgentConfigIn,
@@ -53,7 +53,7 @@ interface NestedSpawnOptions {
   description: string;
   /** User-named model tier; resolved by the runner like every other spawn path. */
   agentTier?: string;
-  model?: Model<any>;
+  model?: Model<Api>;
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
@@ -224,9 +224,15 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
 
       const config = getAgentConfigIn(registry, resolvedType);
-      const invocation = resolveAgentInvocationConfig(config, params);
-      let model = ctx.model;
-      if (invocation.modelInput) {
+      const invocation = resolveAgentInvocationConfig(config, {
+        ...params,
+        agentTiers: getAgentTiersSettings(),
+      });
+      // Leave model/thinking unset whenever an Agent tier may apply. runAgent
+      // is the sole final resolver; pre-resolving here would let a parent or
+      // legacy field bypass the selected profile.
+      let model: Model<Api> | undefined = invocation.agentTierSelected ? undefined : ctx.model;
+      if (!invocation.agentTierSelected && invocation.modelInput) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
         if (typeof resolvedModel === "string") {
           if (invocation.modelFromParams) return textResult(resolvedModel, true);
@@ -236,17 +242,19 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       }
 
       // Same scopeModels policy as the top-level Agent tool — a nested spawn
-      // must not escape the allowlist. A "warn" verdict proceeds silently:
-      // child sessions have no UI surface to toast to.
-      const scopeVerdict = checkModelScope({
-        model,
-        cwd: context.configCwd,
-        modelRegistry: ctx.modelRegistry,
-        callerSupplied: invocation.modelFromParams,
-        agentLabel: config?.displayName ?? resolvedType,
-        modelInput: invocation.modelInput,
-      });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
+      // must not escape the allowlist. A tier's final model is scope-checked by
+      // runAgent after resolution; checking it here would duplicate resolution.
+      if (!invocation.agentTierSelected) {
+        const scopeVerdict = checkModelScope({
+          model,
+          cwd: context.configCwd,
+          modelRegistry: ctx.modelRegistry,
+          callerSupplied: invocation.modelFromParams,
+          agentLabel: config?.displayName ?? resolvedType,
+          modelInput: invocation.modelInput,
+        });
+        if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message, true);
+      }
 
       // The whole branch shares the root session's transcript directory; read it
       // off the owning parent rather than this child session's own id.
@@ -254,18 +262,23 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
         description: params.description,
+        // Only the caller's own tier. An agent's frontmatter tier is read by
+        // `resolveAgentTier` itself, and passing it here would relabel its
+        // source as "call" — which turns a scopeModels warning into a refusal
+        // and blames the caller for a choice the agent file made.
         agentTier: invocation.requestedAgentTier,
-        model,
+        model: invocation.agentTierSelected ? undefined : model,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
         inheritContext: invocation.inheritContext,
-        thinkingLevel: invocation.thinking,
+        thinkingLevel: invocation.agentTierSelected ? undefined : invocation.thinking,
         isolation: invocation.isolation,
         invocation: {
-          ...(invocation.requestedAgentTier === undefined
+          // Display only: the effective tier, whoever named it.
+          ...(invocation.requestedAgentTier === undefined && config?.agentTier === undefined
             ? {}
-            : { agentTier: invocation.requestedAgentTier }),
-          thinking: invocation.thinking,
+            : { agentTier: invocation.requestedAgentTier ?? config?.agentTier }),
+          thinking: invocation.agentTierSelected ? undefined : invocation.thinking,
           maxTurns: invocation.maxTurns,
           isolated: invocation.isolated,
           inheritContext: invocation.inheritContext,

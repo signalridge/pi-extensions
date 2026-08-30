@@ -31,7 +31,7 @@
     "@earendil-works/pi-coding-agent": "0.84.1"
   },
   "scripts": {
-    "test": "node tests/session-boundary.test.mjs",
+    "test": "node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "check": "bun run lint && bun run typecheck && bun run test",

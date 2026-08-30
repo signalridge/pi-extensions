@@ -40,6 +40,8 @@ export interface NewJobInput {
   schedule: string;
   subagent_type: SubagentType;
   prompt: string;
+  /** User-named Agent tier preserved until fire time. */
+  tier?: string;
   model?: string;
   thinking?: ThinkingLevel;
   max_turns?: number;
@@ -103,6 +105,7 @@ export class SubagentScheduler {
       intervalMs: detected.intervalMs,
       subagent_type: input.subagent_type,
       prompt: input.prompt,
+      tier: input.tier,
       model: input.model,
       thinking: input.thinking,
       max_turns: input.max_turns,

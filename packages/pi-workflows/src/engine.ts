@@ -19,10 +19,12 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import type { ManagedSpawnResponse } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   buildResumeJournal,
   type CallResult,
+  type CallTierIdentity,
   deriveRecoveryId,
   JOURNAL_ENTRY_TYPE,
   JOURNAL_SCHEMA_VERSION,
@@ -39,6 +41,7 @@ import {
 import {
   createManagedSpawnClient,
   type DispatchTask,
+  type ManagedProtocolCheck,
   type ManagedSpawnClient,
   type WorkflowEventBus,
 } from "./rpc-client.js";
@@ -85,6 +88,8 @@ export interface ScriptStartOptions {
   concurrency?: number;
   agentRetries?: number;
   tokenBudget?: number | null;
+  /** True for a script this package ships; see WorkflowRunOptions.shippedScript. */
+  shippedScript?: boolean;
   agentTimeoutMs?: number | null;
   toolset?: string;
   excludeTools?: string[];
@@ -100,7 +105,13 @@ export interface ScriptStartOptions {
       timeoutMs?: number;
     },
   ) => Promise<unknown>;
-  loadSavedWorkflow?: (name: string) => string | undefined;
+  /**
+   * Resolve a nested `workflow(name)` reference. The result reports whether the
+   * script it returned ships with this package, because that decides how the
+   * child frame treats a tier name the host does not define — see
+   * `WorkflowRunOptions.shippedScript`.
+   */
+  loadSavedWorkflow?: (name: string) => { script: string; shippedScript?: boolean } | undefined;
   mainModel?: string;
 }
 
@@ -140,7 +151,14 @@ export interface ScriptRunState {
   /** Frozen run parameters — resume reuses the original values, ignoring new budget/toolset overrides. */
   frozenOptions: Pick<
     ScriptStartOptions,
-    "tokenBudget" | "maxAgents" | "concurrency" | "agentRetries" | "agentTimeoutMs" | "toolset" | "excludeTools"
+    | "tokenBudget"
+    | "maxAgents"
+    | "concurrency"
+    | "agentRetries"
+    | "agentTimeoutMs"
+    | "toolset"
+    | "shippedScript"
+    | "excludeTools"
   >;
   /** Abort controller for this run's script execution. */
   controller: AbortController;
@@ -152,6 +170,8 @@ export interface ScriptRunState {
   result?: unknown;
   /** Per-call-index generation base for A4 spawnKey rotation (seeded from journal). */
   generations: Map<string, number>;
+  /** Resolved tier identity for live calls, including stopped terminal results. */
+  callTiers: Map<string, CallTierIdentity>;
   /** Live dispatch waiters keyed by agent id. */
   agentWaiters: Map<string, AgentLifecycleWaiter>;
   /** Owner-validated terminal events emitted before their spawn reply/waiter. */
@@ -170,6 +190,19 @@ function isTerminalWorkflow(status: string): boolean {
 
 function managedTerminalStatus(snapshot: { status: string }): "completed" | "failed" | "stopped" {
   return snapshot.status === "completed" ? "completed" : snapshot.status === "failed" ? "failed" : "stopped";
+}
+
+function updateCallTierIdentity(state: ScriptRunState, nodeId: string, tier: unknown): boolean {
+  if (!isManagedAgentTier(tier)) return false;
+  if (state.callTiers.get(nodeId)?.tier === tier) return false;
+  const identity: CallTierIdentity = { tier };
+  state.callTiers.set(nodeId, identity);
+  state.run.callTiers[nodeId] = identity;
+  return true;
+}
+
+function callIndexFromOwnerNode(nodeId: string): string | undefined {
+  return nodeId.startsWith("call-") ? nodeId.slice("call-".length) : undefined;
 }
 
 function renderWorkflowValue(value: unknown): string {
@@ -220,10 +253,12 @@ function resultFromLifecycle(
   error: string | undefined,
   compactionCount: number,
   tokenCount?: number,
+  tier?: string,
 ): CallResult {
   return {
     status,
     ...(agentId ? { agentId } : {}),
+    ...(tier === undefined ? {} : { tier }),
     ...(result !== undefined && result.length > 0 ? { result } : {}),
     ...(error !== undefined && error.length > 0 ? { error } : {}),
     ...(tokenCount !== undefined ? { tokenCount } : {}),
@@ -259,6 +294,9 @@ export class WorkflowEngine {
     Set<{ resolve: (run: ScriptRun) => void; reject: (e: unknown) => void; settled: boolean; cleanup: () => void }>
   >();
   private unsubscribeLifecycle: () => void;
+  private readonly protocolGate: () => Promise<ManagedProtocolCheck>;
+  private readonly disposeController = new AbortController();
+  private disposed = false;
   private lifecyclePaused = false;
   private branchQuiescePromise: Promise<WorkflowQuiesceResult> | undefined;
   private recoveryBranchGeneration = 0;
@@ -273,8 +311,35 @@ export class WorkflowEngine {
     private readonly client: ManagedSpawnClient,
     private readonly journal: JournalWriter,
     private readonly readEntries: () => readonly SessionEntryLike[] = () => [],
+    protocolGate?: () => Promise<ManagedProtocolCheck>,
   ) {
+    this.protocolGate =
+      protocolGate ??
+      (() => this.client.checkProtocol?.() ?? Promise.reject(new Error("managed protocol check is unavailable")));
     this.unsubscribeLifecycle = this.attachLifecycle();
+  }
+
+  private async awaitProtocol(): Promise<ManagedProtocolCheck> {
+    if (this.disposed) throw new WorkflowEngineDisposedError();
+    let rejectDisposed: ((reason?: unknown) => void) | undefined;
+    const disposed = new Promise<never>((_, reject) => {
+      rejectDisposed = reject;
+    });
+    const onDisposed = () => rejectDisposed?.(new WorkflowEngineDisposedError());
+    this.disposeController.signal.addEventListener("abort", onDisposed, { once: true });
+    let result: ManagedProtocolCheck;
+    try {
+      result = await Promise.race([this.protocolGate(), disposed]);
+    } finally {
+      this.disposeController.signal.removeEventListener("abort", onDisposed);
+    }
+    if (this.disposed) throw new WorkflowEngineDisposedError();
+    return result;
+  }
+
+  /** Whether this engine can still accept new workflow executions. */
+  isDisposed(): boolean {
+    return this.disposed;
   }
 
   private attachLifecycle(): () => void {
@@ -295,7 +360,13 @@ export class WorkflowEngine {
   }
 
   private onLifecycle(eventName: string, raw: unknown): void {
-    if (eventName !== "subagents:completed" && eventName !== "subagents:failed") return;
+    if (
+      eventName !== "subagents:created" &&
+      eventName !== "subagents:started" &&
+      eventName !== "subagents:completed" &&
+      eventName !== "subagents:failed"
+    )
+      return;
     if (!raw || typeof raw !== "object") return;
     const data = raw as Record<string, unknown>;
     const agentId = typeof data.id === "string" ? data.id : typeof data.agentId === "string" ? data.agentId : undefined;
@@ -319,6 +390,40 @@ export class WorkflowEngine {
     };
     const state = this.runs.get(owner.runId);
     if (state?.run.status !== "running" || state.lifecycleSuspended || state.controller.signal.aborted) return;
+    const callNodeId = callIndexFromOwnerNode(owner.nodeId);
+    if (callNodeId === undefined) return;
+
+    // Validate ownership and the current attempt before accepting any identity
+    // from the host. A delayed lifecycle fact from an older attempt must not
+    // overwrite the tier identity of the current attempt.
+    const spawnKey = `${owner.runId}/${owner.nodeId}/${owner.attemptId}`;
+    const pending = state.pendingSpawns.get(spawnKey);
+    const waiter = state.agentWaiters.get(agentId);
+    const waiterMatches = Boolean(
+      waiter &&
+        !waiter.settled &&
+        waiter.executionGeneration === state.executionGeneration &&
+        owner.nodeId === `call-${waiter.callIndex}` &&
+        owner.attemptId === `attempt-${waiter.generation}`,
+    );
+    const pendingMatches = Boolean(
+      pending && pending.executionGeneration === state.executionGeneration && sameWorkflowOwner(pending.owner, owner),
+    );
+    if (!waiterMatches && !pendingMatches) return;
+    // Top-level journal attempts carry the full run/node/attempt identity while
+    // lifecycle owners carry the short attempt token. Nested calls have no
+    // top-level attempt fact and are fenced by their pending/waiter owner.
+    const currentAttemptId = state.run.attemptIds[callNodeId];
+    if (currentAttemptId !== undefined && currentAttemptId !== `${owner.runId}/${callNodeId}/${owner.attemptId}`)
+      return;
+
+    if (updateCallTierIdentity(state, callNodeId, data.tier)) {
+      this.persistCallTierIdentity(state, callNodeId);
+    }
+    // Created/started lifecycle facts carry managed identity before the RPC
+    // reply is necessarily available. They are observation-only here; terminal
+    // ownership is handled below once a completion/failure fact arrives.
+    if (eventName !== "subagents:completed" && eventName !== "subagents:failed") return;
 
     const lifecycleStatus =
       eventName === "subagents:completed"
@@ -353,15 +458,7 @@ export class WorkflowEngine {
       ...(Array.isArray(data.history) ? { history: [...data.history] } : {}),
     };
 
-    const waiter = state.agentWaiters.get(agentId);
-    if (waiter) {
-      if (
-        waiter.settled ||
-        waiter.executionGeneration !== state.executionGeneration ||
-        owner.nodeId !== `call-${waiter.callIndex}` ||
-        owner.attemptId !== `attempt-${waiter.generation}`
-      )
-        return;
+    if (waiterMatches && waiter) {
       this.resolveAgentWaiter(state, agentId, waiter, delivery);
       return;
     }
@@ -369,17 +466,31 @@ export class WorkflowEngine {
     // spawn-managed can emit a terminal lifecycle event synchronously before its
     // reply continuation registers the agent-id waiter. Buffer only an owner
     // that is currently awaiting that exact reply in this execution generation.
-    const spawnKey = `${owner.runId}/${owner.nodeId}/${owner.attemptId}`;
-    const pending = state.pendingSpawns.get(spawnKey);
-    if (
-      !pending ||
-      pending.executionGeneration !== state.executionGeneration ||
-      !sameWorkflowOwner(pending.owner, owner) ||
-      state.bufferedTerminals.has(spawnKey) ||
-      state.bufferedTerminals.size >= MAX_AGENTS_PER_RUN
-    )
+    if (!pendingMatches || state.bufferedTerminals.has(spawnKey) || state.bufferedTerminals.size >= MAX_AGENTS_PER_RUN)
       return;
     state.bufferedTerminals.set(spawnKey, { ...delivery, owner, executionGeneration: state.executionGeneration });
+  }
+
+  /** Persist a host-normalized tier learned before the managed reply arrives. */
+  private persistCallTierIdentity(state: ScriptRunState, nodeId: string): void {
+    const attemptId = state.run.attemptIds[nodeId];
+    const identity = state.callTiers.get(nodeId);
+    // Nested workflow frames are in-memory only; only a top-level call has a
+    // durable attempt owner and can safely receive a journal transition.
+    if (!attemptId || identity?.tier === undefined) return;
+    this.persist(state.run.runId, `call-tier:${nodeId}`, () =>
+      this.write({
+        kind: "call_transition",
+        schemaVersion: JOURNAL_SCHEMA_VERSION,
+        runId: state.run.runId,
+        nodeId,
+        status: "running",
+        tier: identity.tier,
+        attemptId,
+        owner: { extension: "pi-workflows", runId: state.run.runId, nodeId, attemptId },
+        timestamp: Date.now(),
+      }),
+    );
   }
 
   private resolveAgentWaiter(
@@ -397,6 +508,9 @@ export class WorkflowEngine {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.disposeController.abort();
     this.unsubscribeLifecycle();
     this.quarantinedRunIds.clear();
     for (const state of this.runs.values()) {
@@ -405,25 +519,25 @@ export class WorkflowEngine {
     }
     this.rejectWaiters(new WorkflowWaitAbortedError());
     this.runs.clear();
-    for (const timer of this.providerResumeTimers.values()) clearTimeout(timer);
-    this.providerResumeTimers.clear();
+    this.clearJournalRetries();
     this.branchQuiescePromise = undefined;
   }
 
   suspendLifecycle(): void {
-    if (this.lifecyclePaused) return;
+    if (this.disposed || this.lifecyclePaused) return;
     this.lifecyclePaused = true;
     this.unsubscribeLifecycle();
   }
 
   resumeLifecycle(): void {
-    if (!this.lifecyclePaused) return;
+    if (this.disposed || !this.lifecyclePaused) return;
     this.lifecyclePaused = false;
     this.unsubscribeLifecycle = this.attachLifecycle();
   }
 
   /** Stop owned agents while Pi replaces the active session-tree branch. */
   async quiesceForBranchChange(): Promise<WorkflowQuiesceResult> {
+    if (this.disposed) return { settled: true, pending: [] };
     if (this.branchQuiescePromise) return this.branchQuiescePromise;
     this.clearJournalRetries();
 
@@ -506,11 +620,15 @@ export class WorkflowEngine {
    * the body it executes).
    */
   async start(script: string, options: ScriptStartOptions = {}): Promise<ScriptStartResult> {
+    if (this.disposed) throw new WorkflowEngineDisposedError();
+    const protocol = await this.awaitProtocol();
+    if (this.disposed) throw new WorkflowEngineDisposedError();
     const { meta } = parseWorkflowScript(script);
     const now = Date.now();
     const runId = randomUUID();
     const scriptHash = hashScript(script);
     const toolset = options.toolset;
+    const shippedScript = options.shippedScript === true ? true : undefined;
     const durableArgs = cloneWorkflowArgs(options.args);
     const runtimeArgs = cloneWorkflowArgs(durableArgs);
     const journalArgs = cloneWorkflowArgs(durableArgs);
@@ -539,6 +657,7 @@ export class WorkflowEngine {
       meta,
       ...(durableArgs === undefined ? {} : { args: durableArgs }),
       frozenArgsPresent,
+      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -552,6 +671,7 @@ export class WorkflowEngine {
       attempts: {},
       attemptIds: {},
       callResults: {},
+      callTiers: {},
       workflowResultGenerations: {},
       compactions: {},
       startedAt: now,
@@ -566,6 +686,7 @@ export class WorkflowEngine {
       meta,
       ...(journalArgs === undefined ? {} : { args: journalArgs }),
       frozenArgsPresent,
+      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -584,10 +705,12 @@ export class WorkflowEngine {
         ...(frozenAgentRetries !== undefined ? { agentRetries: frozenAgentRetries } : {}),
         ...(frozenAgentTimeoutMs !== undefined ? { agentTimeoutMs: frozenAgentTimeoutMs } : {}),
         ...(options.toolset ? { toolset: options.toolset } : {}),
+        ...(shippedScript === undefined ? {} : { shippedScript }),
         ...(options.excludeTools ? { excludeTools: [...options.excludeTools] } : {}),
       },
       controller: new AbortController(),
       generations: new Map(),
+      callTiers: new Map(Object.entries(run.callTiers ?? {})),
       agentWaiters: new Map(),
       bufferedTerminals: new Map(),
       pendingSpawns: new Map(),
@@ -598,7 +721,7 @@ export class WorkflowEngine {
     this.runs.set(runId, state);
     this.setWorkflowStatus(run, "running");
     state.executionGeneration += 1;
-    state.execution = this.execute(runId, script, startOptions, undefined, state.executionGeneration);
+    state.execution = this.execute(runId, script, startOptions, undefined, state.executionGeneration, protocol);
     // A run-fatal abort/stop already journals its terminal state; never let a
     // leftover rejection become an unhandled promise rejection.
     void state.execution.catch(() => {});
@@ -633,6 +756,9 @@ export class WorkflowEngine {
     options: ScriptStartOptions = {},
     replacementScript?: string,
   ): Promise<ScriptStartResult | undefined> {
+    if (this.disposed) throw new WorkflowEngineDisposedError();
+    const protocol = await this.awaitProtocol();
+    if (this.disposed) throw new WorkflowEngineDisposedError();
     const state = this.runs.get(runId);
     if (!state) return undefined;
     if (state.lifecycleSuspended) return undefined;
@@ -664,26 +790,9 @@ export class WorkflowEngine {
         }),
       );
     }
-    let resumeArgs: unknown;
-    if (run.frozenArgsPresent === undefined && run.args === undefined && options.args !== undefined) {
-      const durableArgs = cloneWorkflowArgs(options.args);
-      const runArgs = cloneWorkflowArgs(options.args);
-      resumeArgs = cloneWorkflowArgs(options.args);
-      const timestamp = Date.now();
-      this.appendRequired({
-        kind: "run_args",
-        schemaVersion: JOURNAL_SCHEMA_VERSION,
-        runId,
-        args: durableArgs,
-        timestamp,
-      });
-      run.args = runArgs;
-      run.updatedAt = timestamp;
-    } else {
-      // A current false marker freezes intentional omission; resume-supplied
-      // args are fallback input only for genuinely legacy schema-v3 runs.
-      resumeArgs = cloneWorkflowArgs(run.args);
-    }
+    // Arguments are frozen in every schema-v4 run_created fact. Resume never accepts
+    // replacement args and never backfills the pre-schema-v4 run_args contract.
+    const resumeArgs = cloneWorkflowArgs(run.args);
     const resumeJournal = buildResumeJournal(entries);
     // Seed generation bases from journaled attemptIds so a live re-dispatch of a
     // previously-journaled call never reuses a spawnKey (A4).
@@ -705,11 +814,19 @@ export class WorkflowEngine {
       agentRetries: frozen.agentRetries,
       agentTimeoutMs: frozen.agentTimeoutMs,
       toolset: frozen.toolset,
+      shippedScript: frozen.shippedScript,
       excludeTools: frozen.excludeTools ? [...frozen.excludeTools] : undefined,
     };
     state.bufferedTerminals.clear();
     state.executionGeneration += 1;
-    state.execution = this.execute(runId, run.script, resumeOptions, resumeJournal, state.executionGeneration);
+    state.execution = this.execute(
+      runId,
+      run.script,
+      resumeOptions,
+      resumeJournal,
+      state.executionGeneration,
+      protocol,
+    );
     void state.execution.catch(() => {});
     if (options.background) return { runId, status: run.status, background: true };
     try {
@@ -726,6 +843,10 @@ export class WorkflowEngine {
     runId?: string,
     entries?: readonly SessionEntryLike[],
   ): Promise<{ action: string; runs?: unknown[]; run?: unknown }> {
+    if (this.disposed) {
+      if (action === "list") return { action, runs: [] };
+      throw new WorkflowEngineDisposedError();
+    }
     if (action === "list") return { action, runs: this.list() };
     if (!runId) throw new Error(`${action} requires runId`);
     const state = this.runs.get(runId);
@@ -855,7 +976,9 @@ export class WorkflowEngine {
     options: ScriptStartOptions,
     resumeJournal?: Map<string, JournalEntry>,
     executionGeneration?: number,
+    protocol?: ManagedProtocolCheck,
   ): Promise<WorkflowRunResult<unknown>> {
+    if (this.disposed) throw new WorkflowEngineDisposedError();
     const state = this.runs.get(runId);
     if (!state) throw new Error(`workflow run not found: ${runId}`);
     const generation = executionGeneration ?? state.executionGeneration;
@@ -871,6 +994,12 @@ export class WorkflowEngine {
         args: options.args,
         agent: runner,
         mainModel: options.mainModel,
+        ...(protocol === undefined
+          ? {}
+          : {
+              routingPolicy: protocol.routingPolicy,
+              routingPolicyFingerprint: protocol.routingPolicyFingerprint,
+            }),
         concurrency: options.concurrency,
         agentRetries: options.agentRetries,
         tokenBudget: options.tokenBudget,
@@ -881,6 +1010,7 @@ export class WorkflowEngine {
         executionNonce: `${generation}-${randomUUID()}`,
         resumeJournal,
         toolset: options.toolset,
+        shippedScript: options.shippedScript,
         excludeTools: options.excludeTools,
         confirm: options.confirm,
         loadSavedWorkflow: options.loadSavedWorkflow,
@@ -947,6 +1077,7 @@ export class WorkflowEngine {
    * namespace so a changed child cannot reuse a stale managed identity.
    */
   private async dispatchAgent(runId: string, prompt: string, runOptions: AgentRunOptions): Promise<unknown> {
+    if (this.disposed) throw new WorkflowEngineDisposedError();
     const state = this.runs.get(runId);
     if (!state) throw new Error(`workflow run not found: ${runId}`);
     if (state.lifecycleSuspended || state.controller.signal.aborted) {
@@ -977,16 +1108,25 @@ export class WorkflowEngine {
     const attemptId = `${runId}/${nodeId}/attempt-${generation}`;
 
     const type = runOptions.agentType ?? "general-purpose";
-    const tier =
-      runOptions.tier === "small" || runOptions.tier === "medium" || runOptions.tier === "large"
-        ? runOptions.tier
-        : undefined;
+    const tier = runOptions.tier;
+    if (tier !== undefined && !isManagedAgentTier(tier)) {
+      throw new WorkflowError(
+        `agent tier must be a non-empty, whitespace-free key (received ${String(tier)})`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    // This dispatch is authoritative for the current script revision. Do not
+    // carry an identity from the previous script: deleting `tier` must clear
+    // the recorded one instead of silently preserving the old route.
+    const tierIdentity: CallTierIdentity = tier === undefined ? {} : { tier };
+    state.callTiers.set(nodeId, tierIdentity);
+    run.callTiers[nodeId] = tierIdentity;
     const task: DispatchTask = {
       subagent_type: type,
       prompt,
       description: runOptions.label ?? `workflow call ${callIndex}`,
       ...(tier === undefined ? {} : { tier }),
-      ...(runOptions.model === undefined ? {} : { model: runOptions.model }),
       ...(runOptions.thread === undefined ? {} : { thread: runOptions.thread }),
       ...(runOptions.toolset === undefined ? {} : { toolset: runOptions.toolset }),
       ...(runOptions.excludeTools === undefined ? {} : { excludeTools: runOptions.excludeTools }),
@@ -1005,6 +1145,7 @@ export class WorkflowEngine {
           nodeId,
           attemptId,
           generation,
+          ...(tierIdentity.tier === undefined ? {} : { tier: tierIdentity.tier }),
           owner: { extension: "pi-workflows", runId, nodeId, attemptId },
           timestamp: Date.now(),
         }),
@@ -1039,7 +1180,7 @@ export class WorkflowEngine {
     let pendingId = "";
     let response: ManagedSpawnResponse | string;
     try {
-      response = await this.client.spawn(task, runId, spawnNodeId, spawnAttemptId, undefined, externalSignal);
+      response = await this.client.spawn(task, runId, spawnNodeId, spawnAttemptId, externalSignal);
     } finally {
       externalSignal.removeEventListener("abort", onPendingAbort);
       state.pendingSpawns.delete(spawnKey);
@@ -1060,6 +1201,14 @@ export class WorkflowEngine {
         { recoverable: true },
       );
     }
+    if (typeof response !== "string" && updateCallTierIdentity(state, nodeId, response.tier)) {
+      this.persistCallTierIdentity(state, nodeId);
+    }
+    // Report the tier the host actually selected back to the runtime, which
+    // journals it: a call that named none still resolved to something, and the
+    // run's own record of what ran should say what.
+    const resolvedTierIdentity = state.callTiers.get(nodeId);
+    if (resolvedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(resolvedTierIdentity.tier);
     if (typeof response === "string") {
       pendingId = response;
     } else if (response.terminal) {
@@ -1087,6 +1236,7 @@ export class WorkflowEngine {
           terminal.error,
           terminal.compactionCount,
           terminal.tokenCount,
+          resolvedTierIdentity?.tier ?? tier,
         );
         result.attemptId = attemptId;
         if (!nested) this.commitCallTerminal(runId, nodeId, result);
@@ -1171,6 +1321,7 @@ export class WorkflowEngine {
         snapshot.error,
         snapshot.compactionCount,
         snapshot.tokenCount,
+        state.callTiers.get(nodeId)?.tier ?? tier,
       );
       result.attemptId = attemptId;
       if (!nested) this.commitCallTerminal(runId, nodeId, result);
@@ -1178,6 +1329,8 @@ export class WorkflowEngine {
         throw wrapError(new Error(snapshot.error), { agentLabel: runOptions.label });
       }
     }
+    const completedTierIdentity = state.callTiers.get(nodeId);
+    if (completedTierIdentity?.tier !== undefined) runOptions.onTierResolved?.(completedTierIdentity.tier);
     return snapshot.result ?? "";
   }
 
@@ -1187,9 +1340,12 @@ export class WorkflowEngine {
     const run = state.run;
     const nodeId = String(entry.index);
     const result = entry.result;
+    const callTierIdentity: CallTierIdentity =
+      entry.tier === undefined ? (run.callTiers[nodeId] ?? {}) : { tier: entry.tier };
     const callResult: CallResult = {
       status: "completed",
       ...(typeof result === "string" && result.length === 0 ? {} : { result }),
+      ...callTierIdentity,
       compactionCount: 0,
       updatedAt: Date.now(),
     };
@@ -1211,6 +1367,7 @@ export class WorkflowEngine {
     };
     this.persist(runId, `call-result:${nodeId}`, () => this.write(event));
     run.callResults[nodeId] = callResult;
+    run.callTiers[nodeId] = callResult.tier === undefined ? {} : { tier: callResult.tier };
     run.callStatus[nodeId] = "completed";
     run.updatedAt = Date.now();
   }
@@ -1222,6 +1379,7 @@ export class WorkflowEngine {
     const result: CallResult = {
       status: "completed",
       ...(entry.result === undefined ? {} : { result: entry.result }),
+      ...(entry.tier === undefined ? {} : { tier: entry.tier }),
       compactionCount: 0,
       updatedAt: Date.now(),
     };
@@ -1245,6 +1403,7 @@ export class WorkflowEngine {
     this.appendRequired(event);
     state.run.workflowResultGenerations[nodeId] = event.generation;
     state.run.callResults[nodeId] = result;
+    state.run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
     state.run.callStatus[nodeId] = "completed";
     state.run.updatedAt = Date.now();
   }
@@ -1266,6 +1425,7 @@ export class WorkflowEngine {
     };
     this.persist(runId, `call-terminal:${nodeId}`, () => this.write(event));
     run.callResults[nodeId] = result;
+    run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
     run.callStatus[nodeId] = result.status;
     if (result.agentId) run.agentIds[nodeId] = result.agentId;
     run.compactions[nodeId] = Math.max(run.compactions[nodeId] ?? 0, result.compactionCount);
@@ -1343,6 +1503,8 @@ export class WorkflowEngine {
           undefined,
           "workflow stopped",
           run.compactions[nodeId] ?? 0,
+          undefined,
+          state.callTiers.get(nodeId)?.tier,
         );
         result.attemptId = run.attemptIds[nodeId];
         terminalResults.push({
@@ -1497,11 +1659,19 @@ export class WorkflowEngine {
       this.providerResumeTimers.delete(runId);
       const state = this.runs.get(runId);
       if (state?.run.status !== "paused") return;
-      void this.resume(runId, this.readEntries(), { background: true }).catch((error: unknown) => {
-        console.warn(
-          `[pi-workflows] automatic provider-limit resume failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      });
+      void Promise.resolve()
+        .then(() => {
+          const current = this.runs.get(runId);
+          if (current?.run.status !== "paused") return;
+          // resume() is the single authorization gate and captures the fresh
+          // routing-policy fingerprint for this execution.
+          return this.resume(runId, this.readEntries(), { background: true });
+        })
+        .catch((error: unknown) => {
+          console.warn(
+            `[pi-workflows] automatic provider-limit resume failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
     }, delay);
     timer.unref?.();
     this.providerResumeTimers.set(runId, timer);
@@ -1556,6 +1726,7 @@ export class WorkflowEngine {
   // ── restore / summary ──────────────────────────────────────────────────────
 
   restore(entries: readonly SessionEntryLike[], branchGeneration = 0): void {
+    if (this.disposed) return;
     // A branch replay is a replacement, not a merge. Runs absent from the new
     // branch must not remain controllable or append facts into it.
     this.clearJournalRetries();
@@ -1579,10 +1750,12 @@ export class WorkflowEngine {
           ...(run.frozenAgentRetries !== undefined ? { agentRetries: run.frozenAgentRetries } : {}),
           ...(run.frozenAgentTimeoutMs !== undefined ? { agentTimeoutMs: run.frozenAgentTimeoutMs } : {}),
           ...(run.toolset ? { toolset: run.toolset } : {}),
+          ...(run.shippedScript === undefined ? {} : { shippedScript: run.shippedScript }),
           ...(run.frozenExcludeTools ? { excludeTools: [...run.frozenExcludeTools] } : {}),
         },
         controller: new AbortController(),
         generations: new Map(),
+        callTiers: new Map(Object.entries(run.callTiers ?? {})),
         agentWaiters: new Map(),
         bufferedTerminals: new Map(),
         pendingSpawns: new Map(),
@@ -1656,6 +1829,13 @@ export class WorkflowEngine {
 
 function hashScript(script: string): string {
   return createHash("sha256").update(script).digest("hex");
+}
+
+export class WorkflowEngineDisposedError extends Error {
+  constructor() {
+    super("Workflow engine is disposed");
+    this.name = "WorkflowEngineDisposedError";
+  }
 }
 
 export class WorkflowWaitAbortedError extends Error {

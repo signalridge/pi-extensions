@@ -4,13 +4,11 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { WorkflowTier } from "@signalridge/pi-subagents-protocol";
 import type { AgentTierResolutionSnapshot } from "./agent-tiers.js";
 import type { LifetimeUsage } from "./usage.js";
-import type { WorkflowTierResolutionSnapshot } from "./workflow-tiers.js";
 import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
 
-export type { ThinkingLevel, WorkflowTier };
+export type { ThinkingLevel };
 
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
@@ -237,18 +235,18 @@ export interface ResumableAgentEntry {
 }
 
 export interface AgentInvocation {
-  /** Short display name, e.g. "haiku" — only set when different from parent. */
+  /**
+   * Short display name, e.g. "haiku". Set only when the spawn is not simply
+   * running the parent's model: an untiered spawn that resolved a different one,
+   * or a tier whose profile pins one. A tier that inherits leaves this absent,
+   * which is how the UI says "same model as the parent".
+   */
   modelName?: string;
   thinking?: ThinkingLevel;
-  /** Semantic workflow tier selected by the workflow definition. */
-  tier?: WorkflowTier;
-  /** Immutable model/thinking resolution captured by pi-subagents. */
-  tierSnapshot?: WorkflowTierResolutionSnapshot;
   /**
-   * User-named tier applied to an ordinary spawn. Deliberately a separate field
-   * from `tier` above: that one is the workflow protocol's small/medium/large
-   * union, and widening it to hold arbitrary names would take the protocol's
-   * exhaustiveness with it.
+   * The tier applied to this spawn, from any caller — the Agent tool, nested
+   * delegation, the scheduler, or a managed workflow call. All four name a key
+   * from the one `agentTiers` catalogue.
    */
   agentTier?: string;
   /** Immutable model/thinking resolution for `agentTier`. */
@@ -269,7 +267,6 @@ export type AgentRecordSnapshot = Omit<Readonly<AgentRecord>, "session" | "abort
   readonly lifetimeUsage: Readonly<LifetimeUsage>;
   readonly pendingSteers?: readonly string[];
   readonly invocation?: Readonly<AgentInvocation> & {
-    readonly tierSnapshot?: Readonly<NonNullable<AgentInvocation["tierSnapshot"]>>;
     readonly agentTierSnapshot?: Readonly<NonNullable<AgentInvocation["agentTierSnapshot"]>>;
   };
 };

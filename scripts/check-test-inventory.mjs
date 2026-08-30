@@ -21,13 +21,21 @@ const packageDirs = readdirSync(packagesRoot)
   .filter((name) => statSync(join(packagesRoot, name)).isDirectory())
   .sort();
 let checked = 0;
+const untested = [];
 for (const directory of packageDirs) {
   const packageRoot = join(packagesRoot, directory);
   const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
   const testFiles = walk(packageRoot)
     .filter((path) => TEST_FILE.test(path.replaceAll("\\", "/")))
     .map((path) => path.replace(`${packageRoot}/`, "").replaceAll("\\", "/"));
-  if (testFiles.length === 0) continue;
+  // A package with no tests at all used to be skipped silently, which let two
+  // packages ship without any. The rule this file exists to enforce — that a
+  // published package's behavior is covered — is not met by having nothing to
+  // check.
+  if (testFiles.length === 0) {
+    untested.push(manifest.name);
+    continue;
+  }
   const command = manifest.scripts?.test;
   assert.equal(typeof command, "string", `${manifest.name} has tests but no default test script`);
   // A command that names one test file cannot silently omit a sibling test. A
@@ -47,5 +55,6 @@ for (const directory of packageDirs) {
   checked += testFiles.length;
   console.log(`test-inventory: ${manifest.name}: ${testFiles.length} test file(s)`);
 }
+assert.equal(untested.length, 0, `package(s) with no test files at all: ${untested.join(", ")}`);
 assert.ok(checked > 0, "no package tests discovered");
 console.log(`check-test-inventory: ${checked} test files covered by package test scripts`);

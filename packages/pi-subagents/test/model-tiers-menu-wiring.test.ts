@@ -257,10 +257,14 @@ describe("/agents → Model tiers", () => {
     await handler(undefined, ctx);
 
     const tierMenu = offered.find(o => o.title === "Model tiers");
-    // The shipped `fast` tier is present (editable) alongside the blocked key.
+    // The shipped ladder is present (editable) alongside the blocked key. None
+    // is marked "(default)": the shipped fallback is scoped to managed calls
+    // and is not the catalogue's default tier.
     expect(tierMenu?.options).toEqual([
       "broken — blocked (malformed profile in subagents.json)",
-      "fast — inherit · thinking low",
+      "high — inherit · thinking high",
+      "low — inherit · thinking low",
+      "medium — inherit · thinking medium",
       "+ New tier...",
     ]);
     // Redefining retires the tombstone in the same write.

@@ -127,11 +127,14 @@ import {
   SUBAGENT_TOOL_NAMES,
   setDefaultMaxTokens,
   setDefaultMaxToolCalls,
+  setDefaultModel,
 } from "../src/agent-runner.js";
+import { setAgentTiersSettings } from "../src/agent-tiers.js";
 import {
   AGENT_DEFINITION_GENERATION_OVERRIDE,
   INTERNAL_AGENT_CONFIG_OVERRIDE,
 } from "../src/internal-run.js";
+import { setScopeModelsEnabled } from "../src/model-scope.js";
 
 /** The most recent session built by `createSession` — read by `lastToolsPassed()`. */
 let lastSession: ReturnType<typeof createSession>["session"] | undefined;
@@ -191,6 +194,7 @@ const ctx = {
 const pi = {} as any;
 
 beforeEach(() => {
+  setAgentTiersSettings({});
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
@@ -202,6 +206,178 @@ beforeEach(() => {
   vi.mocked(createNestedSubagentTools).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
   lastSession = undefined;
+});
+
+describe("agent-runner tier policy", () => {
+  const fastModel = { id: "fast", name: "Fast", provider: "test", reasoning: true } as any;
+
+  it("uses the Agent tier default for managed workflow calls", async () => {
+    const { session } = createSession("TIERED");
+    createAgentSession.mockResolvedValue({ session });
+    setAgentTiersSettings({
+      defaultTier: "low",
+      profiles: { low: { model: "test/fast", thinking: "low" } },
+    });
+    const context = {
+      ...ctx,
+      model: { id: "parent", provider: "test", reasoning: true } as any,
+      modelRegistry: {
+        find: vi.fn((provider: string, id: string) => provider === "test" && id === "fast" ? fastModel : undefined),
+        getAvailable: vi.fn(() => [fastModel]),
+      },
+    } as any;
+    const snapshots: unknown[] = [];
+
+    await runAgent(context, "Explore", "Say TIERED", {
+      pi,
+      model: { id: "override", provider: "test", reasoning: true } as any,
+      thinkingLevel: "max",
+      requireAgentTier: true,
+      onAgentTierResolved: (snapshot) => snapshots.push(snapshot),
+    });
+
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ model: fastModel }));
+    expect(snapshots).toEqual([expect.objectContaining({ tier: "low", source: "default", configuredModel: "test/fast" })]);
+  });
+
+  it("uses the shipped default tier for a managed call on an unconfigured host", async () => {
+    // A fresh install must be able to run a workflow. The shipped `medium`
+    // profile inherits its model, so this commits to an effort level, not a
+    // vendor: the parent model is what actually runs.
+    const { session } = createSession("SHIPPED");
+    createAgentSession.mockResolvedValue({ session });
+    const parentModel = { id: "parent", provider: "test", reasoning: true } as any;
+    const snapshots: any[] = [];
+
+    await runAgent({ ...ctx, model: parentModel } as any, "Explore", "Say SHIPPED", {
+      pi,
+      requireAgentTier: true,
+      onAgentTierResolved: (snapshot) => snapshots.push(snapshot),
+    });
+
+    expect(snapshots).toEqual([
+      expect.objectContaining({ tier: "medium", source: "default", configuredModel: "inherit" }),
+    ]);
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ model: parentModel }));
+  });
+
+  it("hands the display the model a tier pinned, and nothing when the profile inherits", async () => {
+    // The Agent tool cannot compute this label any more: a tiered spawn leaves
+    // its model unresolved so the tier owns it outright. Without the label
+    // riding back on the resolution callback, a tier pinning a specific model
+    // would show its tier name and no model at all.
+    const { session } = createSession("LABEL");
+    createAgentSession.mockResolvedValue({ session });
+    const fastModel = { id: "fast", provider: "test", name: "Claude Haiku 4.5", reasoning: true } as any;
+    const parentModel = { id: "parent", provider: "test", name: "Parent", reasoning: true } as any;
+    const context = {
+      ...ctx,
+      model: parentModel,
+      modelRegistry: {
+        find: vi.fn((provider: string, id: string) => (provider === "test" && id === "fast" ? fastModel : undefined)),
+        getAvailable: vi.fn(() => [fastModel]),
+      },
+    } as any;
+    setAgentTiersSettings({
+      profiles: {
+        pinned: { model: "test/fast", thinking: "low" },
+        inheriting: { model: "inherit", thinking: "low" },
+      },
+    });
+
+    const labels: (string | undefined)[] = [];
+    const record = (_snapshot: unknown, modelLabel?: string) => labels.push(modelLabel);
+    await runAgent(context, "general-purpose", "Say LABEL", { pi, agentTier: "pinned", onAgentTierResolved: record });
+    await runAgent(context, "general-purpose", "Say LABEL", {
+      pi,
+      agentTier: "inheriting",
+      onAgentTierResolved: record,
+    });
+
+    // The pi-ai display name, normalized the same way the untiered path does.
+    // The inheriting profile pinned nothing, so the agent is on the parent's
+    // model — which the UI shows by omitting it.
+    expect(labels).toEqual(["haiku 4.5", undefined]);
+  });
+
+  it("leaves an ordinary spawn untiered on an unconfigured host so defaultModel still decides", async () => {
+    // The shipped fallback is scoped to `requireAgentTier`. Were it installed as
+    // the catalogue's `defaultTier` instead, it would own every ordinary spawn
+    // and `defaultModel` — a documented setting with its own Settings row —
+    // could never take effect again.
+    const { session } = createSession("DEFAULTED");
+    createAgentSession.mockResolvedValue({ session });
+    const parentModel = { id: "parent", provider: "test", reasoning: true } as any;
+    const configuredDefault = { id: "configured", provider: "test", reasoning: true } as any;
+    const snapshots: any[] = [];
+    setDefaultModel("test/configured");
+    try {
+      await runAgent(
+        {
+          ...ctx,
+          model: parentModel,
+          modelRegistry: {
+            find: vi.fn((provider: string, id: string) =>
+              provider === "test" && id === "configured" ? configuredDefault : undefined,
+            ),
+            getAvailable: vi.fn(() => [configuredDefault]),
+          },
+        } as any,
+        "general-purpose",
+        "Say DEFAULTED",
+        { pi, onAgentTierResolved: (snapshot) => snapshots.push(snapshot) },
+      );
+    } finally {
+      setDefaultModel(undefined);
+    }
+
+    expect(snapshots).toEqual([]);
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({ model: configuredDefault }));
+  });
+
+  it("scope-checks a workflow tier the same way it scope-checks a host tier", async () => {
+    // A workflow naming a tier per dispatch is the same act as the host model
+    // naming one, so it gets the same refusal — and the message has to name the
+    // model that would have run, not the profile's literal "inherit".
+    setAgentTiersSettings({ profiles: { low: { model: "inherit", thinking: "low" } } });
+    const scopedCwd = mkdtempSync(join(tmpdir(), "agent-runner-scope-"));
+    mkdirSync(join(scopedCwd, ".pi"), { recursive: true });
+    const allowedModel = { id: "allowed", name: "Allowed", provider: "test", reasoning: true } as any;
+    writeFileSync(join(scopedCwd, ".pi", "settings.json"), JSON.stringify({ enabledModels: ["test/allowed"] }));
+    setScopeModelsEnabled(true);
+    const context = {
+      ...ctx,
+      cwd: scopedCwd,
+      model: { id: "parent", provider: "test", reasoning: true } as any,
+      modelRegistry: {
+        find: vi.fn((provider: string, id: string) =>
+          provider === "test" && id === "allowed" ? allowedModel : undefined,
+        ),
+        getAvailable: vi.fn(() => [allowedModel]),
+      },
+    } as any;
+
+    try {
+      await expect(
+        runAgent(context, "Explore", "Say SCOPED", { pi, agentTier: "low", requireAgentTier: true }),
+      ).rejects.toThrow(/Model not in scope: "test\/parent"/);
+      expect(createAgentSession).not.toHaveBeenCalled();
+    } finally {
+      setScopeModelsEnabled(false);
+      rmSync(scopedCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a managed workflow call instead of inheriting the parent when no tier can apply", async () => {
+    // `noDefaultTier` is the user saying "no default at all"; a managed call
+    // then has nothing to resolve and must refuse rather than quietly running
+    // every workflow agent on the session's model.
+    setAgentTiersSettings({ noDefaultTier: true });
+    const parentModel = { id: "parent", provider: "test", reasoning: true } as any;
+    await expect(runAgent({ ...ctx, model: parentModel } as any, "Explore", "must fail", { pi, requireAgentTier: true }))
+      .rejects.toThrow(/No agent tier selected for "Explore"/);
+    expect(createAgentSession).not.toHaveBeenCalled();
+  });
 });
 
 describe("agent-runner final output capture", () => {

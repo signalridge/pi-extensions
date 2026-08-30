@@ -41,7 +41,11 @@ describe("cross-extension RPC", () => {
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({
         success: true,
-        data: { version: PROTOCOL_VERSION, capabilities: expect.any(Object) },
+        data: {
+          version: PROTOCOL_VERSION,
+          capabilities: expect.any(Object),
+          routingPolicy: expect.any(Object),
+        },
       });
     });
 

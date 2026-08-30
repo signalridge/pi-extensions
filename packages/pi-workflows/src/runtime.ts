@@ -21,6 +21,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import vm from "node:vm";
+import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
+import { agentTierPolicyIdentity, isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import { parse } from "acorn";
 import { checkRuntimeBindings } from "./capabilities.js";
 import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
@@ -37,24 +39,12 @@ import { SharedStore } from "./shared-store.js";
 export interface WorkflowMetaPhase {
   title: string;
   detail?: string;
-  /**
-   * Phase-level model preference — currently validated but not routed.
-   * Per-call model routing requires a protocol extension (see README
-   * "Intentional divergences"); use agent({ tier }) instead.
-   */
-  model?: string;
 }
 
 export interface WorkflowMeta {
   name: string;
   description: string;
   phases?: WorkflowMetaPhase[];
-  /**
-   * Run-level model preference — currently validated but not routed.
-   * Per-call model routing requires a protocol extension (see README
-   * "Intentional divergences"); use agent({ tier }) instead.
-   */
-  model?: string;
 }
 
 /** A resolved, journaled agent() call. */
@@ -65,6 +55,8 @@ export interface JournalEntry {
   hash: string;
   result: unknown;
   storeDelta?: Record<string, unknown>;
+  /** Agent tier this call resolved to, as the host reported it. */
+  tier?: string;
   /** Generation for a nested workflow replay boundary. */
   generation?: number;
   /** Logical agents represented by a nested workflow replay boundary. */
@@ -108,7 +100,6 @@ export interface AgentRunOptions {
   schema?: unknown;
   signal?: AbortSignal;
   instructions?: string;
-  model?: string;
   tier?: string;
   cwd?: string;
   /** Named subagent type; resolved by pi-subagents at dispatch. */
@@ -129,7 +120,14 @@ export interface AgentRunOptions {
   /** Additional tool names denied for this call. */
   excludeTools?: string[];
   onModelResolved?: (id: string) => void;
-  onModelFallback?: (info: { tier: string; requestedSpec: string }) => void;
+  /**
+   * The tier the host actually selected, which may be one this call did not
+   * name — an agent's own tier, or the host's default. A callback rather than a
+   * mutation of `tier`: the dispatcher does not own this object, and reading a
+   * reply back out of an input field would only work while every layer happened
+   * to preserve its identity.
+   */
+  onTierResolved?: (tier: string) => void;
   onUsage?: (usage: AgentUsage) => void;
   onHistory?: (history: unknown[]) => void;
 }
@@ -138,7 +136,12 @@ export interface AgentOptions {
   label?: string;
   phase?: string;
   schema?: unknown;
-  model?: string;
+  /**
+   * Agent tier: a key from the host's `agentTiers` catalogue. This is the only
+   * model control a workflow has — there is no per-call model or thinking, so
+   * a script cannot pin a vendor the host did not choose. Omitting it uses the
+   * agent's own tier, else the host's configured default.
+   */
   tier?: string;
   isolation?: "worktree";
   agentType?: string;
@@ -167,6 +170,27 @@ export interface WorkflowRunOptions {
   agent?: WorkflowAgentRunner;
   /** The session's main model (provider/id), shown for default agents. */
   mainModel?: string;
+  /** The host's Agent-tier catalogue, captured fresh for this start/resume. */
+  routingPolicy?: ManagedRoutingPolicy;
+  /**
+   * This script ships with the package rather than being written here.
+   *
+   * The tier catalogue belongs to the user, names included. A script we ship
+   * cannot assert that `low` exists on someone whose tiers are called
+   * `cheap`/`deep`, so its tier is a preference: an undefined one falls back to
+   * the host's default with a warning. A script the user wrote names tiers from
+   * the user's own catalogue, so an undefined one there is a typo and fails
+   * closed rather than quietly running a different model.
+   */
+  shippedScript?: boolean;
+  /**
+   * Whole-catalogue identity, used wherever a per-tier one would be dishonest:
+   * a nested `workflow()` boundary, where the parent caches one value for a
+   * child whose per-call tiers it cannot see, and an `agent()` call that names
+   * no tier, whose real tier may come from the agent's frontmatter. A call that
+   * names its tier keys on that tier's policy instead.
+   */
+  routingPolicyFingerprint?: string;
   /** Engine-owned execution nonce used to isolate stale nested managed calls. */
   executionNonce?: string;
   /** Runtime frame depth; siblings inherit the same depth and may run concurrently. */
@@ -190,16 +214,29 @@ export interface WorkflowRunOptions {
   sharedRuntime?: SharedRuntime;
   initialTokenUsage?: AgentUsage;
   sharedStore?: SharedStore;
-  loadSavedWorkflow?: (name: string) => string | undefined;
+  /**
+   * Resolve a nested `workflow(name)` reference, reporting whether the script
+   * it returned ships with this package. Shipped-ness travels with the script,
+   * not with the frame that called it — see `shippedScript`.
+   */
+  loadSavedWorkflow?: (name: string) => { script: string; shippedScript?: boolean } | undefined;
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
-  onAgentStart?: (event: { id: string; label: string; phase?: string; prompt: string; model?: string }) => void;
+  onAgentStart?: (event: {
+    id: string;
+    label: string;
+    phase?: string;
+    prompt: string;
+    model?: string;
+    tier?: string;
+  }) => void;
   onAgentEnd?: (event: {
     id: string;
     label: string;
     phase?: string;
+    tier?: string;
     result: unknown;
     tokens?: number;
     tokenUsage?: AgentUsage;
@@ -473,26 +510,29 @@ function propertyKey(node: unknown, path: string): string {
 
 function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (!meta || typeof meta !== "object") throw new Error("meta must be an object");
-  const value = meta as WorkflowMeta;
+  const value = meta as WorkflowMeta & Record<string, unknown>;
   if (typeof value.name !== "string" || !value.name.trim() || value.name.length > 512)
     throw new Error("meta.name must be a non-empty string of at most 512 characters");
   if (typeof value.description !== "string" || !value.description.trim() || value.description.length > 100_000)
     throw new Error("meta.description must be a non-empty string of at most 100000 characters");
-  if (value.model !== undefined && typeof value.model !== "string") throw new Error("meta.model must be a string");
+  if (Object.hasOwn(value, "model") || Object.hasOwn(value, "thinking")) {
+    throw new Error("workflow meta model/thinking fields are unsupported; use agent({ tier })");
+  }
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
     for (const phase of value.phases) {
       if (
         !phase ||
         typeof phase !== "object" ||
-        typeof phase.title !== "string" ||
-        !phase.title.trim() ||
-        phase.title.length > 512
+        typeof (phase as { title?: unknown }).title !== "string" ||
+        !(phase as { title: string }).title.trim() ||
+        (phase as { title: string }).title.length > 512
       ) {
         throw new Error("each meta phase must have a title string");
       }
-      if ((phase as WorkflowMetaPhase).model !== undefined && typeof (phase as WorkflowMetaPhase).model !== "string") {
-        throw new Error("each meta phase model must be a string when present");
+      const phaseRecord = phase as unknown as Record<string, unknown>;
+      if (Object.hasOwn(phaseRecord, "model") || Object.hasOwn(phaseRecord, "thinking")) {
+        throw new Error("workflow phase model/thinking fields are unsupported; use agent({ tier })");
       }
     }
   }
@@ -527,24 +567,42 @@ function hashIdentity(value: unknown): string {
 /**
  * Stable identity hash for an agent() call. Must cover every input that can
  * change the outcome so a cache-miss is never served on resume. The agent
- * definition is represented by the agentType name (the definition itself lives
- * in pi-subagents; a name-only key is the honest observable).
+ * definition is represented by the agentType name — the definition itself lives
+ * in pi-subagents, so a name-only key is the honest observable, and there is no
+ * second agent-definition field to hash beside it.
  */
 function hashAgentCall(
   prompt: string,
-  model: string | undefined,
   phase: string | undefined,
   options: AgentOptions,
-  agentDefKey: string | null,
+  routingPolicy: ManagedRoutingPolicy | undefined,
+  routingPolicyFingerprint: string | undefined,
 ): string {
+  // A call that names its tier is keyed on that tier's policy alone, so
+  // defining or editing an unrelated tier cannot invalidate it.
+  //
+  // A call that names none cannot be keyed that way, and keying it on
+  // `defaultTier` would be worse than coarse — it would be wrong. The host
+  // resolves an unnamed tier against the agent's own frontmatter tier first and
+  // only then the default, and frontmatter is invisible here: the agent
+  // definition lives in pi-subagents and reaches this side as a name. Keyed on
+  // the default, editing the tier the agent actually declares would replay
+  // stale work, while editing the default would invalidate work that never
+  // touched it. The whole-catalogue fingerprint is the coarse answer that is at
+  // least sound, and it is stable across the original run and its resume, which
+  // the tier the host selected is not — that one is only known after dispatch,
+  // and this hash is computed before it.
+  const tierPolicy =
+    options.tier === undefined
+      ? (routingPolicyFingerprint ?? null)
+      : agentTierPolicyIdentity(routingPolicy, options.tier);
   return hashIdentity({
     prompt,
-    model: model ?? null,
     tier: options.tier ?? null,
+    tierPolicy,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
     thread: options.thread ?? null,
-    agentDef: agentDefKey,
     schema: options.schema ?? null,
     isolation: options.isolation ?? null,
     toolset: options.toolset ?? null,
@@ -930,6 +988,11 @@ export async function runWorkflow<T = unknown>(
   const agentTimeoutMs = normalizeAgentTimeout(options.agentTimeoutMs);
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
+  // The host's catalogue, known before the first call. A tier name that is not
+  // in it is a typo, and catching it here beats discovering it on dispatch.
+  // Undefined when no policy was supplied (in-process tests, nested frames that
+  // inherit the parent's checks) — then only the key shape is enforced.
+  const knownTiers = options.routingPolicy ? new Set(Object.keys(options.routingPolicy.profiles)) : undefined;
 
   const state: RuntimeState = {
     logs: [],
@@ -1090,16 +1153,52 @@ export async function runWorkflow<T = unknown>(
       log(`agentType "${agentOptions.agentType}" resolves in pi-subagents at dispatch`);
     }
 
-    // Model precedence: explicit per-call model > phase/run model. A tier is
-    // deliberately left to pi-subagents so its configured profile wins over the
-    // phase default. The model string may carry a `:thinking` suffix understood by
-    // the managed protocol.
-    const phaseModel = meta.phases?.find((candidate) => candidate.title === assignedPhase)?.model ?? meta.model;
-    const modelSpec = agentOptions.model ?? (agentOptions.tier === undefined ? phaseModel : undefined);
+    // A tier is a key in the host's catalogue, so the only shape check this
+    // side can make is the key shape. An unknown key is the host's call to
+    // refuse — it is the one that knows what is defined, and its error names
+    // the available tiers.
+    if (agentOptions.tier !== undefined && !isManagedAgentTier(agentOptions.tier)) {
+      throw new WorkflowError(
+        `agent tier must be a non-empty, whitespace-free key (received ${JSON.stringify(agentOptions.tier)})`,
+        WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+        { recoverable: false },
+      );
+    }
+    let effectiveTier = agentOptions.tier;
+    if (effectiveTier !== undefined && knownTiers && !knownTiers.has(effectiveTier)) {
+      if (options.shippedScript) {
+        // Our own script naming a tier this host does not define. Drop it and
+        // let the host's default decide, which is the user's policy either way.
+        log(`agent tier ${JSON.stringify(effectiveTier)} is not defined here; using the host default`);
+        effectiveTier = undefined;
+      } else {
+        // A typo would otherwise surface only when this call reaches dispatch,
+        // possibly deep into a run. The catalogue is known at start; check now.
+        throw new WorkflowError(
+          `unknown agent tier ${JSON.stringify(effectiveTier)}; this host defines: ${
+            [...knownTiers].sort().join(", ") || "(none)"
+          }`,
+          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+          { recoverable: false },
+        );
+      }
+    }
+    // Everything downstream — the resume hash, the dispatch, the journal —
+    // works from the tier that will actually be requested, not the one the
+    // script wrote, so a dropped name cannot make a cached call look different
+    // from the live one.
+    const tieredOptions: AgentOptions =
+      effectiveTier === agentOptions.tier ? agentOptions : { ...agentOptions, tier: effectiveTier };
 
     // Deterministic resume key: assigned at lexical call time, before the limiter.
     const callIndex = nextCallIndex();
-    const callHash = hashAgentCall(promptText, modelSpec, assignedPhase, agentOptions, agentOptions.agentType ?? null);
+    const callHash = hashAgentCall(
+      promptText,
+      assignedPhase,
+      tieredOptions,
+      options.routingPolicy,
+      options.routingPolicyFingerprint,
+    );
     // Store delta key: runId-namespaced so a nested workflow() call's
     // callIndex-0 can never collide with the parent's (see SharedStore doc).
     const deltaKey = `${runId}:${callIndex}`;
@@ -1117,11 +1216,22 @@ export async function runWorkflow<T = unknown>(
     if (hashMatches && !cachedEmptyOutput && callIndex < state.firstMiss) {
       shared.agentCount++;
       frameAgentCount++;
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt: promptText });
+      // The journal holds the tier the host actually selected, which may be a
+      // default the script never named. Replay reports that durable identity
+      // rather than re-deriving one from the script.
+      const replayTier = cached.tier ?? effectiveTier;
+      options.onAgentStart?.({
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        prompt: promptText,
+        ...(replayTier === undefined ? {} : { tier: replayTier }),
+      });
       options.onAgentEnd?.({
         id: deltaKey,
         label,
         phase: assignedPhase,
+        tier: replayTier,
         result: cached.result,
         tokens: 0,
       });
@@ -1166,7 +1276,13 @@ export async function runWorkflow<T = unknown>(
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
 
-      options.onAgentStart?.({ id: deltaKey, label, phase: assignedPhase, prompt: promptText });
+      options.onAgentStart?.({
+        id: deltaKey,
+        label,
+        phase: assignedPhase,
+        prompt: promptText,
+        ...(effectiveTier === undefined ? {} : { tier: effectiveTier }),
+      });
 
       // Worktree creation and cleanup remain owned by pi-subagents; the request
       // carries the explicit per-call policy without touching the host filesystem here.
@@ -1206,6 +1322,9 @@ export async function runWorkflow<T = unknown>(
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
           let onRunFatal: (() => void) | undefined;
+          // Filled in from the host's reply, which may name a tier this call
+          // did not: an agent's own tier, or the configured default.
+          let resolvedTier = effectiveTier;
           try {
             throwIfAborted();
             if (batch?.cancelled) throw agentLimitError();
@@ -1238,8 +1357,7 @@ export async function runWorkflow<T = unknown>(
               schema,
               signal: agentController.signal,
               instructions: buildAgentInstructions(assignedPhase, agentOptions, resolvedIsolation),
-              model: modelSpec,
-              tier: agentOptions.tier,
+              tier: effectiveTier,
               agentType: agentOptions.agentType,
               isolation: resolvedIsolation,
               toolset: options.toolset ?? agentOptions.toolset,
@@ -1251,6 +1369,9 @@ export async function runWorkflow<T = unknown>(
               thread: agentOptions.thread,
               onModelResolved: (id: string) => {
                 void id; // display model tracking is engine-side
+              },
+              onTierResolved: (tier: string) => {
+                resolvedTier = tier;
               },
               onUsage: (u: AgentUsage) => {
                 usage = u;
@@ -1313,6 +1434,7 @@ export async function runWorkflow<T = unknown>(
               runId,
               hash: callHash,
               result,
+              ...(resolvedTier === undefined ? {} : { tier: resolvedTier }),
               storeDelta: store.commitDelta(deltaKey),
             });
             options.onAgentEnd?.({
@@ -1320,9 +1442,9 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result,
+              tier: resolvedTier,
               tokens,
               tokenUsage: usage,
-              model: modelSpec,
             });
             return result;
           } catch (error) {
@@ -1350,9 +1472,9 @@ export async function runWorkflow<T = unknown>(
               label,
               phase: assignedPhase,
               result: null,
+              tier: resolvedTier,
               tokens,
               tokenUsage: usage,
-              model: modelSpec,
               error: workflowError.message,
               errorCode: workflowError.code,
               recoverable: workflowError.recoverable,
@@ -1512,7 +1634,12 @@ export async function runWorkflow<T = unknown>(
     }
     const callIndex = nextCallIndex();
     const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
-    const childScript = resolved ?? String(nameOrScript);
+    const childScript = resolved?.script ?? String(nameOrScript);
+    // A named script carries its own shipped-ness; a raw script literal is the
+    // caller's own text and shares the caller's. Inheriting the frame's flag for
+    // a resolved script would let a user script run a built-in under the strict
+    // tier check — a hard failure on any host that renamed the shipped tiers.
+    const childShippedScript = resolved ? resolved.shippedScript === true : options.shippedScript === true;
     const workflowName = String(nameOrScript);
     const argsPresent = childArgs !== undefined;
     const callHash = hashIdentity({
@@ -1521,6 +1648,10 @@ export async function runWorkflow<T = unknown>(
       script: childScript,
       argsPresent,
       args: argsPresent ? childArgs : null,
+      // Part of the identity because it decides how the child treats a tier
+      // name the host does not define: dropped, or fatal.
+      shippedScript: childShippedScript,
+      routingPolicyFingerprint: options.routingPolicyFingerprint ?? null,
     });
     const cached = options.resumeJournal?.get(`${runId}:${callIndex}`);
     if (cached != null && cached.hash === callHash && callIndex < state.firstMiss) {
@@ -1540,6 +1671,7 @@ export async function runWorkflow<T = unknown>(
       const child = await runWorkflow(childScript, {
         ...options,
         args: childArgs,
+        shippedScript: childShippedScript,
         sharedRuntime: shared,
         sharedStore: store,
         workflowDepth: workflowDepth + 1,
