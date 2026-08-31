@@ -2,7 +2,7 @@
 name: workflow-patterns
 description: Choose and run one of Pi's built-in multi-agent workflows for research, adversarial review, code review, multi-perspective analysis, or codebase auditing. Use when the request matches a named pattern; use workflow-authoring instead for a new script or custom topology.
 metadata:
-  version: "1.5.0"
+  version: "1.6.0"
 ---
 
 # Built-in workflow patterns
