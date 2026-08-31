@@ -28,12 +28,21 @@ JavaScript.
 - Bound graph tasks, fan-out items, loops, retries, agents, concurrency, and
   evidence size. Invocation-level token and time caps are user constraints, not
   substitutes for algorithmic bounds.
-- Route an agent call with `tier: "<key>"`, naming a tier the destination host
-  defines. Omitting `tier` uses the agent's own tier, then the host's configured
-  default; a host whose default has been cleared rejects the call rather than
-  inheriting the parent model. There is no per-call `model`/`thinking`, and
-  neither may appear in workflow meta or phase profiles. Never guess a tier or
-  agent-type name—use names supplied by the current environment and follow
+- Route an agent call with `strength: "low" | "medium" | "high"` — this
+  package's own word for how much effort a step deserves, and the only routing
+  word a workflow has. It is **not** an agent-tier key: a `strengths` table
+  alone binds a strength to a tier — the user's, or the shipped default on a
+  host that configured none — and a strength no table defines dispatches with no
+  tier and takes the agent's own default. So name the effort the step deserves
+  and never reach for a catalogue name; a word outside the three is rejected
+  before dispatch, as is `tier:` itself. There is no default: omitting
+  `strength` dispatches with no tier and lets the agent type's own tier stand,
+  so label the calls whose cost you mean to steer and leave the rest alone.
+  There is no per-call `model`/`thinking`/`tier`, and none may
+  appear in workflow meta or phase profiles. `agent()` and `checkpoint()` reject
+  any option name they do not read rather than ignoring it, so pass only the
+  documented keys. Never guess an agent-type name—use
+  names supplied by the current environment and follow
   [registry ownership](references/registry-ownership.md).
 - Workflows have no imports, filesystem/network APIs, timers, or unrestricted
   Node APIs. Pass timestamps, randomness, and external decisions through `args`.
@@ -56,7 +65,9 @@ JavaScript.
    the child can see the parent conversation.
 6. **Add quality only where it changes a decision.** Use a schema before reading
    structured fields, then use `verify`, `judgePanel`, `gate`, or
-   `completenessCheck` with explicit bounds.
+   `completenessCheck` with explicit bounds. These dispatch on your behalf, so
+   pass `strength` when the default (`low`, or `medium` for
+   `completenessCheck`) is not the effort that gate deserves.
 7. **Aggregate and report.** Return a bounded JSON result containing the answer,
    coverage, and important failures. If the workflow runs in the background,
    the run ID is the handle for later control/resume.
@@ -176,8 +187,8 @@ Before shipping a workflow change:
 - read [debugging](references/debugging.md) when reproducing a failure;
 - read [the review checklist](references/review.md) before accepting topology;
 - read [the generated capability index](references/capabilities.md) when a
-  signature, default, or support boundary is disputed; remember that a tier
-  names a key in the host catalogue while model/thinking resolution stays in
-  pi-subagents;
+  signature, default, or support boundary is disputed; remember that a strength
+  is this package's own vocabulary, bound to a host tier only by the user's
+  `strengths` table, while model/thinking resolution stays in pi-subagents;
 - ensure every package-relative example/reference link remains inside the
   publishable package.

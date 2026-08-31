@@ -9,5 +9,5 @@ When copying a workflow between installations:
 1. Check the destination's generated version and exact capability facts.
 2. Re-check every supported global, option, and constraint used by the script.
 3. Treat compatibility entries as preservation aids, not portable recommendations.
-4. Re-resolve tier keys and agent types from destination context; both come from the destination host's configuration, and static docs intentionally contain no live catalogue entries.
+4. Re-resolve agent types from destination context; they come from the destination host's configuration, and static docs intentionally contain no live registry entries. Strengths need no re-resolution — the vocabulary is fixed and the mapping belongs to the destination, whether that is the user's table or the shipped default.
 5. Prefer runtime behavior when prose and execution disagree, and report the documentation mismatch rather than changing behavior during an authoring fix.

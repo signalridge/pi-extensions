@@ -34,6 +34,14 @@ export const WORKFLOW_CAPABILITY_CONTRACT_VERSION = "2.0.0";
 /**
  * The runtime globals a script can rely on. `options` documents each helper's
  * accepted inputs with defaults; `constraints` states the behavioral contract.
+ *
+ * The strength option's type is spelled out on each of the four helpers that
+ * take it, rather than derived from `WORKFLOW_STRENGTHS`, because this array
+ * must stay literal-only: `check:capabilities` evaluates it in an empty VM
+ * realm so the published contract can be read without executing this package.
+ * `strengths.test.ts` pins the four copies against the vocabulary the runtime
+ * enforces, which is the drift protection a shared constant would otherwise
+ * have provided.
  */
 export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
   {
@@ -45,10 +53,10 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       { name: "phase", kind: "string", optional: true, default: "current phase" },
       { name: "schema", kind: "plain JSON Schema", optional: true, default: "none" },
       {
-        name: "tier",
-        kind: "agent tier key",
+        name: "strength",
+        kind: '"low" | "medium" | "high"',
         optional: true,
-        default: "the agent's own tier, else agentTiers.defaultTier",
+        default: "no tier is sent; the agent's own tier, else agentTiers.defaultTier",
       },
       { name: "isolation", kind: '"worktree"', optional: true, default: "pi-subagents worktree policy" },
       { name: "thread", kind: "string", optional: true, default: "fresh session per call" },
@@ -64,11 +72,15 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       "resume replays only the longest unchanged prefix; the first miss and every later call execute live",
       "replayed calls do not consume the real-dispatch maxAgents or token/phase budgets",
       "spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict",
-      "tier names a key in the host's agentTiers catalogue; a key it does not define is rejected before dispatch",
+      "strength is this package's own vocabulary, not an agentTiers key; a word outside low/medium/high is rejected before dispatch",
+      "a strengths table alone binds a strength to an agent tier; an unmapped strength dispatches with no tier and takes the agent's own default",
+      "a call that names no strength also dispatches with no tier; there is no default strength, so an unlabelled call never outranks the agent type's own tier",
+      "an unconfigured host uses a shipped default table: each strength on the catalogue tier of the same name, where the host defines one",
       "resolveAgentTier in pi-subagents owns model, thinking, clamping, availability, and the resolution snapshot",
-      "there is no per-call model or thinking: a tier is the only model policy a workflow can express",
+      "there is no per-call model, thinking, or tier: a strength is the only model policy a workflow can express",
       "same-thread calls must be sequential and preserve a stable workflow thread name",
       "threads cannot be combined with worktree isolation",
+      "an option name outside this list is rejected before dispatch, not ignored; tier, model, and thinking name their replacement",
     ],
   },
   {
@@ -136,6 +148,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       { name: "reviewers", kind: "number", optional: true, default: "2" },
       { name: "threshold", kind: "number", optional: true, default: "0.5" },
       { name: "lens", kind: "string | string[]", optional: true, default: "none" },
+      { name: "strength", kind: '"low" | "medium" | "high"', optional: true, default: '"low"' },
     ],
     constraints: ["threshold comparison is inclusive; real is false when no reviewer succeeds"],
   },
@@ -146,6 +159,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     options: [
       { name: "judges", kind: "number", optional: true, default: "3" },
       { name: "rubric", kind: "string", optional: true, default: "overall quality and correctness" },
+      { name: "strength", kind: '"low" | "medium" | "high"', optional: true, default: '"low"' },
     ],
     constraints: ["highest mean score wins with stable input index as the tie-break; empty input returns undefined"],
   },
@@ -164,8 +178,8 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     name: "completenessCheck",
     classification: "runtime-global",
-    signature: "completenessCheck(taskArgs, results) => Promise<{ complete, missing? } | null>",
-    options: [],
+    signature: "completenessCheck(taskArgs, results, options?) => Promise<{ complete, missing? } | null>",
+    options: [{ name: "strength", kind: '"low" | "medium" | "high"', optional: true, default: '"medium"' }],
     constraints: ["only the first 4,000 characters of serialized result evidence are sent to the critic"],
   },
   {
@@ -199,6 +213,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
     constraints: [
       "consumes one agent slot and no tokens",
       "journaled answers replay only within an unchanged resume prefix",
+      "an option name outside this list is rejected rather than ignored, since a dropped headless silently auto-approves",
     ],
   },
   { name: "log", classification: "runtime-global", signature: "log(message) => void", options: [], constraints: [] },

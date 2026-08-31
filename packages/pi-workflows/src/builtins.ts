@@ -55,7 +55,7 @@ const plan = await agent(
   'You are planning web research for this question:\\n' + question +
   '\\n\\nProduce ' + angles + ' diverse, specific search queries that together cover the question from different angles. ' +
   'Use your web search tools when helpful to refine them.',
-  { label: 'plan queries', tier: 'medium', schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } }
+  { label: 'plan queries', strength: 'medium', schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } }
 )
 const planned = plan && Array.isArray(plan.queries) ? plan.queries.filter((q) => typeof q === 'string' && q.trim().length > 0) : []
 const queries = (planned.length > 0 ? planned : [question]).slice(0, angles)
@@ -67,7 +67,7 @@ const gathered = await parallel(queries.map((q, i) => () =>
     '\\n\\nSteps: (1) run a web search for the query; (2) fetch the most relevant result URLs; ' +
     '(3) extract concrete, verifiable factual claims, each tagged with the exact source URL it came from. ' +
     'Do NOT invent sources or claims — report only what the fetched pages actually say.',
-    { label: 'research ' + (i + 1), tier: 'low', schema: { type: 'object', properties: { sources: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, claims: { type: 'array', items: { type: 'string' } } }, required: ['url', 'claims'] } } }, required: ['sources'] } }
+    { label: 'research ' + (i + 1), strength: 'low', schema: { type: 'object', properties: { sources: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, claims: { type: 'array', items: { type: 'string' } } }, required: ['url', 'claims'] } } }, required: ['sources'] } }
   )
 ))
 const allSources = gathered.filter(Boolean).flatMap((g) => (g && g.sources) || [])
@@ -77,7 +77,7 @@ const verdict = await agent(
   'Cross-check these research sources. Group claims that assert the same fact across different source URLs. ' +
   'Keep a claim only if it is supported by at least ' + minSupport + ' distinct source URLs OR by one clearly authoritative source. ' +
   'Discard claims found in a single weak source or that conflict with others.\\n\\nSOURCES JSON:\\n' + JSON.stringify(allSources),
-  { label: 'cross-check', tier: 'medium', schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } } }, required: ['supported'] } }
+  { label: 'cross-check', strength: 'medium', schema: { type: 'object', properties: { supported: { type: 'array', items: { type: 'object', properties: { claim: { type: 'string' }, sources: { type: 'array', items: { type: 'string' } } }, required: ['claim', 'sources'] } }, discarded: { type: 'array', items: { type: 'string' } } }, required: ['supported'] } }
 )
 
 phase('Report')
@@ -85,7 +85,7 @@ const report = await agent(
   'Write a concise, well-structured research report that answers the question using ONLY the supported claims below. ' +
   'Cite source URLs inline next to each claim. If the evidence is thin, say so explicitly.\\n\\n' +
   'QUESTION: ' + question + '\\n\\nSUPPORTED CLAIMS JSON:\\n' + JSON.stringify((verdict && verdict.supported) || []),
-  { label: 'write report', tier: 'medium' }
+  { label: 'write report', strength: 'medium' }
 )
 
 return { question, queries, supported: (verdict && verdict.supported) || [], report }`;
@@ -107,7 +107,7 @@ const threshold = (args && args.threshold) || 0.5
 phase('Investigate')
 const investigation = await agent(
   'Investigate the following and list concrete, individually-checkable findings:\\n' + task,
-  { label: 'investigate', tier: 'medium', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }
+  { label: 'investigate', strength: 'medium', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }
 )
 const findings = (investigation && Array.isArray(investigation.findings) ? investigation.findings : [])
 
@@ -118,7 +118,7 @@ const judged = await parallel(findings.map((f, i) => () =>
       'You are a skeptical reviewer. Try to REFUTE this finding for the task below. ' +
       'Default to real=false when uncertain. Investigate with the available tools if needed.\\n\\n' +
       'TASK: ' + task + '\\nFINDING: ' + f,
-      { label: 'refute ' + (i + 1) + '.' + (r + 1), tier: 'low', schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } }
+      { label: 'refute ' + (i + 1) + '.' + (r + 1), strength: 'low', schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } }
     )
   )).then((votes) => {
     const valid = votes.filter(Boolean)
@@ -134,7 +134,7 @@ const report = await agent(
   'Synthesize the surviving findings into a concise review. For each finding, note the skeptic agreement ' +
   '(realVotes/totalVotes). Do not include findings that failed the refutation pass.\\n\\n' +
   'TASK: ' + task + '\\n\\nSURVIVING FINDINGS JSON:\\n' + JSON.stringify(survivors),
-  { label: 'consensus report', tier: 'medium' }
+  { label: 'consensus report', strength: 'medium' }
 )
 
 return { findings, judged: judged.filter(Boolean), survivors, report }`;
@@ -154,13 +154,13 @@ const diffSource = (args && args.diffSource) || 'provided diff'
 
 phase('Scan')
 const finders = await parallel([
-  () => agent('You are a correctness reviewer. Find bugs, race conditions, error-handling gaps, and edge-case failures in this diff.\\n\\n' + diff, { label: 'correctness', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are a reuse reviewer. Find duplicated logic, reinvented wheels, and missed opportunities to reuse existing code or libraries.\\n\\n' + diff, { label: 'reuse', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are a simplification reviewer. Find over-engineering, unnecessary complexity, and simpler alternatives.\\n\\n' + diff, { label: 'simplification', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are an efficiency reviewer. Find performance problems, avoidable allocations, and scaling risks.\\n\\n' + diff, { label: 'efficiency', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are an architecture reviewer. Assess the change at the right altitude: design fit, layering, boundaries, and future maintenance.\\n\\n' + diff, { label: 'altitude', tier: 'medium', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are a security reviewer. Find trust-boundary, injection, secret-leak, permission, and unsafe-input risks in this diff.\\n\\n' + diff, { label: 'security', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
-  () => agent('You are a testability reviewer. Find missing regression tests, observability gaps, and rollout/recovery risks in this diff.\\n\\n' + diff, { label: 'testability', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a correctness reviewer. Find bugs, race conditions, error-handling gaps, and edge-case failures in this diff.\\n\\n' + diff, { label: 'correctness', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a reuse reviewer. Find duplicated logic, reinvented wheels, and missed opportunities to reuse existing code or libraries.\\n\\n' + diff, { label: 'reuse', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a simplification reviewer. Find over-engineering, unnecessary complexity, and simpler alternatives.\\n\\n' + diff, { label: 'simplification', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are an efficiency reviewer. Find performance problems, avoidable allocations, and scaling risks.\\n\\n' + diff, { label: 'efficiency', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are an architecture reviewer. Assess the change at the right altitude: design fit, layering, boundaries, and future maintenance.\\n\\n' + diff, { label: 'altitude', strength: 'medium', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a security reviewer. Find trust-boundary, injection, secret-leak, permission, and unsafe-input risks in this diff.\\n\\n' + diff, { label: 'security', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
+  () => agent('You are a testability reviewer. Find missing regression tests, observability gaps, and rollout/recovery risks in this diff.\\n\\n' + diff, { label: 'testability', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } } }, required: ['findings'] } }),
 ])
 const candidates = finders.filter(Boolean).flatMap((f) => (f && f.findings) || [])
 
@@ -168,7 +168,7 @@ phase('Verify')
 const verified = await parallel(candidates.map((finding, i) => () =>
   agent('You are a skeptical verifier. For this candidate finding, check whether it is a REAL issue in the diff. ' +
     'Default to real=false when uncertain.\\n\\nCANDIDATE: ' + finding + '\\n\\nDIFF:\\n' + diff,
-    { label: 'verify ' + (i + 1), tier: 'low', schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } })
+    { label: 'verify ' + (i + 1), strength: 'low', schema: { type: 'object', properties: { real: { type: 'boolean' }, reason: { type: 'string' } }, required: ['real'] } })
 ))
 
 phase('Report')
@@ -179,7 +179,7 @@ const report = await agent(
   'Write a ranked code review report for this diff (' + diffSource + '). ' +
   'Include only verified findings, ordered by severity, each with a concrete location and fix suggestion.\\n\\n' +
   'VERIFIED FINDINGS JSON:\\n' + JSON.stringify(ranked),
-  { label: 'final report', tier: 'medium' }
+  { label: 'final report', strength: 'medium' }
 )
 
 return { candidates, ranked, report }`;
@@ -199,13 +199,13 @@ const perspectives = (args && Array.isArray(args.perspectives) && args.perspecti
 phase('Perspectives')
 const views = await parallel(perspectives.map((p, i) => () =>
   agent('Evaluate this topic from the perspective of: ' + p + '. Be concrete and specific; note risks, trade-offs, and what matters most from this angle.\\n\\nTOPIC: ' + topic,
-    { label: 'perspective ' + (i + 1), tier: 'low', schema: { type: 'object', properties: { angle: { type: 'string' }, points: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['angle', 'points', 'risks'] } })
+    { label: 'perspective ' + (i + 1), strength: 'low', schema: { type: 'object', properties: { angle: { type: 'string' }, points: { type: 'array', items: { type: 'string' } }, risks: { type: 'array', items: { type: 'string' } } }, required: ['angle', 'points', 'risks'] } })
 ))
 
 phase('Synthesis')
 const synthesis = await agent(
   'Synthesize these perspectives into a balanced assessment. Identify where perspectives agree, where they conflict, and give a bottom-line recommendation with the key trade-offs.\\n\\nTOPIC: ' + topic + '\\n\\nPERSPECTIVES JSON:\\n' + JSON.stringify(views.filter(Boolean)),
-  { label: 'synthesis', tier: 'medium' }
+  { label: 'synthesis', strength: 'medium' }
 )
 
 return { views: views.filter(Boolean), synthesis }`;
@@ -229,21 +229,21 @@ const map = await agent(
   'Explore the codebase at ' + root + ' and produce a structural map: top-level modules, entry points, ' +
   'data flow, and where complexity concentrates. Use the available file tools.\\n' +
   (focus ? 'Focus/checks requested: ' + focus + '\\n' : ''),
-  { label: 'map', tier: 'medium', schema: { type: 'object', properties: { modules: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, purpose: { type: 'string' }, risk: { type: 'string' } }, required: ['name', 'purpose'] } }, entryPoints: { type: 'array', items: { type: 'string' } }, complexityHotspots: { type: 'array', items: { type: 'string' } } }, required: ['modules'] } }
+  { label: 'map', strength: 'medium', schema: { type: 'object', properties: { modules: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, purpose: { type: 'string' }, risk: { type: 'string' } }, required: ['name', 'purpose'] } }, entryPoints: { type: 'array', items: { type: 'string' } }, complexityHotspots: { type: 'array', items: { type: 'string' } } }, required: ['modules'] } }
 )
 
 phase('Audit')
 const audits = await parallel([
-  () => agent('Audit this codebase for correctness risks: error handling, boundary conditions, concurrency, security. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'correctness', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
-  () => agent('Audit this codebase for maintainability: coupling, duplication, naming, test coverage, documentation. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'maintainability', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
-  () => agent('Audit this codebase for operational health: dependencies, build, deployment, observability, secrets handling. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'operations', tier: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
+  () => agent('Audit this codebase for correctness risks: error handling, boundary conditions, concurrency, security. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'correctness', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
+  () => agent('Audit this codebase for maintainability: coupling, duplication, naming, test coverage, documentation. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'maintainability', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
+  () => agent('Audit this codebase for operational health: dependencies, build, deployment, observability, secrets handling. Use file tools.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map), { label: 'operations', strength: 'low', schema: { type: 'object', properties: { findings: { type: 'array', items: { type: 'string' } }, severity: { type: 'string' } }, required: ['findings'] } }),
 ])
 
 phase('Report')
 const report = await agent(
   'Write a codebase health audit report: overall health score, ranked findings across dimensions with concrete locations, ' +
   'and a prioritized remediation roadmap.\\n\\nSTRUCTURE:\\n' + JSON.stringify(map) + '\\n\\nAUDITS JSON:\\n' + JSON.stringify(audits.filter(Boolean)),
-  { label: 'audit report', tier: 'medium' }
+  { label: 'audit report', strength: 'medium' }
 )
 
 return { map, audits: audits.filter(Boolean), report }`;

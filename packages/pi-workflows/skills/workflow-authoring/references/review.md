@@ -22,9 +22,10 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 
 - Does JavaScript consume structured fields only after a small plain JSON Schema guarantees them?
 - Does synthesis receive complete coverage and failure ledgers?
-- Does every `tier` name a key the destination host actually defines, rather than a guessed one?
-- Is the tier the only model/thinking policy source, via pi-subagents' `resolveAgentTier()`?
-- Did every tier or agent-type name come from context with a name and purpose?
+- Does every call name a `strength` from `low`/`medium`/`high`, chosen for the effort the step deserves rather than copied from a tier name?
+- Does every helper that dispatches for you (`verify`, `judgePanel`, `completenessCheck`) either take its documented default deliberately or pass an explicit `strength`?
+- Is the strength the only model/thinking policy source, resolved through the active `strengths` table and then pi-subagents' `resolveAgentTier()`?
+- Did every agent-type name come from context with a name and purpose?
 
 ## Lifecycle
 

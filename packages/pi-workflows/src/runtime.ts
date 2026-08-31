@@ -33,6 +33,13 @@ import {
   type OrchestrationTaskContext,
 } from "./orchestrator.js";
 import { SharedStore } from "./shared-store.js";
+import {
+  defaultStrengthTable,
+  isWorkflowStrength,
+  WORKFLOW_STRENGTH_LIST,
+  type WorkflowStrength,
+  type WorkflowStrengthTable,
+} from "./strengths.js";
 
 // ── Meta contract ────────────────────────────────────────────────────────────
 
@@ -83,6 +90,24 @@ export interface SharedRuntime {
   runFatalController: AbortController;
   inFlight: Set<Promise<unknown>>;
   activeThreads: Set<string>;
+  /**
+   * Strengths whose routing this run has already reported.
+   *
+   * Shared with nested frames rather than kept per frame: the answer is the
+   * same in a child, and a run that says "reported once" has to mean once for
+   * the run and not once per `workflow()` boundary.
+   */
+  routedStrengths: Set<string>;
+  /**
+   * The strength → tier table this run honors, resolved once at the top frame.
+   *
+   * Shared rather than recomputed per frame for the same reason the set above
+   * is: a nested frame inherits the same table and the same catalogue, so it
+   * would reach an identical answer and log an identical complaint about any
+   * stale entry — once per `workflow()` boundary. Resolving once also makes it
+   * structural, rather than merely likely, that one run honors one table.
+   */
+  strengths: ReadonlyMap<string, string>;
 }
 
 /** Counting semaphore with a FIFO resolve queue. */
@@ -137,12 +162,24 @@ export interface AgentOptions {
   phase?: string;
   schema?: unknown;
   /**
-   * Agent tier: a key from the host's `agentTiers` catalogue. This is the only
-   * model control a workflow has — there is no per-call model or thinking, so
-   * a script cannot pin a vendor the host did not choose. Omitting it uses the
-   * agent's own tier, else the host's configured default.
+   * Workflow strength: how much effort this step deserves, `low`/`medium`/`high`.
+   *
+   * The only model control a workflow has and the only routing word it speaks.
+   * There is no per-call model, thinking, or Agent tier, so a script cannot pin
+   * a vendor or a catalogue key the host did not choose. Which Agent tier a
+   * strength runs on is the user's `strengths` table and nothing else — a
+   * strength that table does not define dispatches with no tier at all and
+   * takes the agent's ordinary default.
+   *
+   * There is no default. Omitting it dispatches with no tier at all, the same
+   * as an unmapped strength and the same as any ordinary Agent spawn: a script
+   * that named no strength stated no opinion, and the host's own precedence —
+   * the agent type's frontmatter tier before the configured default — is the
+   * right answer to that. A default would have outranked the agent's own tier
+   * on every unlabelled call, which is the one thing this indirection exists to
+   * avoid doing.
    */
-  tier?: string;
+  strength?: WorkflowStrength;
   isolation?: "worktree";
   agentType?: string;
   timeoutMs?: number | null;
@@ -173,16 +210,42 @@ export interface WorkflowRunOptions {
   /** The host's Agent-tier catalogue, captured fresh for this start/resume. */
   routingPolicy?: ManagedRoutingPolicy;
   /**
-   * This script ships with the package rather than being written here.
+   * The user's strength → Agent tier table: the whole of workflow model routing.
    *
-   * The tier catalogue belongs to the user, names included. A script we ship
-   * cannot assert that `low` exists on someone whose tiers are called
-   * `cheap`/`deep`, so its tier is a preference: an undefined one falls back to
-   * the host's default with a warning. A script the user wrote names tiers from
-   * the user's own catalogue, so an undefined one there is a typo and fails
-   * closed rather than quietly running a different model.
+   * A script names a strength and nothing else. This table is the only thing
+   * that binds one to an Agent tier, so a strength it does not define reaches
+   * dispatch carrying no tier and takes the agent's ordinary default — the
+   * agent's own frontmatter tier, then the host's configured default.
+   *
+   * Omitted entirely is not "no mappings": it means {@link defaultStrengthTable},
+   * which starts each strength on the catalogue tier of the same name wherever
+   * this host defines one. That is a default *table* and not a fallback rule,
+   * and the difference is what keeps re-pricing possible. A rule would be
+   * unremovable, so making a 26-agent fan-out cheaper would still mean editing
+   * the tier itself — dragging the Explore agent and everything else that names
+   * it. A table is replaced by writing one, and a strength the written table
+   * omits stays unmapped even on a host that defines a tier of the same name.
+   *
+   * Values are keys in the host's one catalogue and nothing else: pi-subagents
+   * still owns every model, every thinking level, and the only
+   * `resolveAgentTier()`. No entry may ever grow a `model` or `thinking` field
+   * — that is the line between this and the retired `workflow.tiers` key, which
+   * carried both and so became a second model policy behind a second resolver.
+   *
+   * One hop: a strength resolves to a tier, and that tier is never looked up as
+   * a strength in turn.
+   *
+   * Read fresh for each start and resume, never frozen onto the run, so editing
+   * the table and resuming re-routes the calls that have not run.
+   *
+   * That is a re-spend, not a free redirect. A call's resume identity keys on
+   * the tier it requests, so every *finished* call whose strength moved misses
+   * its journal entry — and resume replays only the longest unchanged prefix, so
+   * the first such miss takes everything after it live as well. Re-routing a run
+   * that is mostly done costs roughly the run. Start a new one instead when the
+   * point of the edit was to spend less.
    */
-  shippedScript?: boolean;
+  strengths?: WorkflowStrengthTable;
   /**
    * Whole-catalogue identity, used wherever a per-tier one would be dishonest:
    * a nested `workflow()` boundary, where the parent caches one value for a
@@ -214,12 +277,8 @@ export interface WorkflowRunOptions {
   sharedRuntime?: SharedRuntime;
   initialTokenUsage?: AgentUsage;
   sharedStore?: SharedStore;
-  /**
-   * Resolve a nested `workflow(name)` reference, reporting whether the script
-   * it returned ships with this package. Shipped-ness travels with the script,
-   * not with the frame that called it — see `shippedScript`.
-   */
-  loadSavedWorkflow?: (name: string) => { script: string; shippedScript?: boolean } | undefined;
+  /** Resolve a nested `workflow(name)` reference to the script it names. */
+  loadSavedWorkflow?: (name: string) => string | undefined;
   confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
@@ -516,7 +575,7 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
   if (typeof value.description !== "string" || !value.description.trim() || value.description.length > 100_000)
     throw new Error("meta.description must be a non-empty string of at most 100000 characters");
   if (Object.hasOwn(value, "model") || Object.hasOwn(value, "thinking")) {
-    throw new Error("workflow meta model/thinking fields are unsupported; use agent({ tier })");
+    throw new Error("workflow meta model/thinking fields are unsupported; use agent({ strength })");
   }
   if (value.phases !== undefined) {
     if (!Array.isArray(value.phases)) throw new Error("meta.phases must be an array");
@@ -532,7 +591,7 @@ function validateMeta(meta: unknown): asserts meta is WorkflowMeta {
       }
       const phaseRecord = phase as unknown as Record<string, unknown>;
       if (Object.hasOwn(phaseRecord, "model") || Object.hasOwn(phaseRecord, "thinking")) {
-        throw new Error("workflow phase model/thinking fields are unsupported; use agent({ tier })");
+        throw new Error("workflow phase model/thinking fields are unsupported; use agent({ strength })");
       }
     }
   }
@@ -565,6 +624,19 @@ function hashIdentity(value: unknown): string {
 }
 
 /**
+ * The strength vocabulary as a stable value, for hashing.
+ *
+ * Sorted with a code-unit comparison rather than `localeCompare` for the reason
+ * `getRoutingPolicySnapshot` gives about `blockedProfiles`: this reaches an
+ * identity hash, and a locale-dependent order would let one table hash two ways
+ * on two machines, or on one machine after its locale changed.
+ */
+function canonicalStrengths(strengths: ReadonlyMap<string, string>): [string, string][] | null {
+  if (strengths.size === 0) return null;
+  return [...strengths].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+/**
  * Stable identity hash for an agent() call. Must cover every input that can
  * change the outcome so a cache-miss is never served on resume. The agent
  * definition is represented by the agentType name — the definition itself lives
@@ -575,30 +647,34 @@ function hashAgentCall(
   prompt: string,
   phase: string | undefined,
   options: AgentOptions,
+  tier: string | undefined,
   routingPolicy: ManagedRoutingPolicy | undefined,
   routingPolicyFingerprint: string | undefined,
 ): string {
-  // A call that names its tier is keyed on that tier's policy alone, so
+  // Keyed on the tier this call will actually request, never on the strength
+  // that chose it. The strength is a name for a routing decision; the tier is
+  // the decision, so two runs whose tables differ but land on the same tier
+  // must replay, and one whose table moved this strength elsewhere must not.
+  //
+  // A call that resolved to a tier is keyed on that tier's policy alone, so
   // defining or editing an unrelated tier cannot invalidate it.
   //
-  // A call that names none cannot be keyed that way, and keying it on
-  // `defaultTier` would be worse than coarse — it would be wrong. The host
-  // resolves an unnamed tier against the agent's own frontmatter tier first and
-  // only then the default, and frontmatter is invisible here: the agent
-  // definition lives in pi-subagents and reaches this side as a name. Keyed on
-  // the default, editing the tier the agent actually declares would replay
-  // stale work, while editing the default would invalidate work that never
-  // touched it. The whole-catalogue fingerprint is the coarse answer that is at
-  // least sound, and it is stable across the original run and its resume, which
-  // the tier the host selected is not — that one is only known after dispatch,
-  // and this hash is computed before it.
+  // A call whose strength is unmapped resolves to no tier and cannot be keyed
+  // that way, and keying it on `defaultTier` would be worse than coarse — it
+  // would be wrong. The host resolves an untiered call against the agent's own
+  // frontmatter tier first and only then the default, and frontmatter is
+  // invisible here: the agent definition lives in pi-subagents and reaches this
+  // side as a name. Keyed on the default, editing the tier the agent actually
+  // declares would replay stale work, while editing the default would
+  // invalidate work that never touched it. The whole-catalogue fingerprint is
+  // the coarse answer that is at least sound, and it is stable across the
+  // original run and its resume, which the tier the host selected is not — that
+  // one is only known after dispatch, and this hash is computed before it.
   const tierPolicy =
-    options.tier === undefined
-      ? (routingPolicyFingerprint ?? null)
-      : agentTierPolicyIdentity(routingPolicy, options.tier);
+    tier === undefined ? (routingPolicyFingerprint ?? null) : agentTierPolicyIdentity(routingPolicy, tier);
   return hashIdentity({
     prompt,
-    tier: options.tier ?? null,
+    tier: tier ?? null,
     tierPolicy,
     phase: phase ?? null,
     agentType: options.agentType ?? null,
@@ -630,6 +706,104 @@ function hashCheckpoint(promptText: string, options: CheckpointOptions): string 
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────
+
+/**
+ * Every key {@link AgentOptions} accepts, and every key {@link CheckpointOptions}
+ * does.
+ *
+ * Spelled out because an interface leaves no runtime value to enumerate, and a
+ * script is JavaScript evaluated in a VM, so the compiler never sees the object
+ * these guard. The `satisfies` clause is what keeps the list honest anyway: a
+ * `Record` of the interface's keys is missing-key-checked, and the excess
+ * property check on the literal catches the other direction — so adding an
+ * option without listing it here, or listing one that no longer exists, is a
+ * type error rather than a silently unreachable option.
+ */
+const AGENT_OPTION_KEYS: ReadonlySet<string> = new Set(
+  Object.keys({
+    label: 0,
+    phase: 0,
+    schema: 0,
+    strength: 0,
+    isolation: 0,
+    agentType: 0,
+    timeoutMs: 0,
+    retries: 0,
+    thread: 0,
+    toolset: 0,
+    excludeTools: 0,
+  } satisfies Record<keyof AgentOptions, unknown>),
+);
+
+const CHECKPOINT_OPTION_KEYS: ReadonlySet<string> = new Set(
+  Object.keys({
+    default: 0,
+    headless: 0,
+    kind: 0,
+    choices: 0,
+    timeoutMs: 0,
+  } satisfies Record<keyof CheckpointOptions, unknown>),
+);
+
+/**
+ * Keys that used to mean something, or that a script author reaches for out of
+ * habit, answered by name instead of by the generic list.
+ *
+ * `tier` was this package's own option before a strength stood between a script
+ * and the host catalogue. `model`/`thinking` never were — `meta` and phase
+ * profiles have always rejected them — but an author who tries them on `meta`
+ * and gets a clear refusal will try them here next, and the two surfaces should
+ * answer the same way.
+ */
+const RETIRED_AGENT_OPTIONS: Readonly<Record<string, string>> = {
+  tier: `name a strength instead: one of ${WORKFLOW_STRENGTH_LIST}`,
+  model: "a strength is the only model policy a workflow can express",
+  thinking: "a strength is the only model policy a workflow can express",
+};
+
+/**
+ * Refuse an options object carrying a key this runtime does not read.
+ *
+ * Fails closed because the alternative is not "harmless": an unknown key is
+ * dropped before the call hash is built, so it changes neither the dispatch nor
+ * the resume identity — the run simply spends at a policy nobody chose, and a
+ * resume replays it without ever noticing. `agent({ strenght: "low" })` would
+ * quietly run every step untiered; `checkpoint(p, { headles: "abort" })` would
+ * quietly auto-approve in headless mode instead of aborting. Neither shows up
+ * in a log.
+ *
+ * A script is authored against this contract and evaluated as plain JavaScript,
+ * so a typo has no other gate to catch it. The closed vocabulary made a
+ * misspelled *strength* fail; this is the same argument one level up, for the
+ * option name itself.
+ */
+function validateCallOptions(
+  callee: "agent" | "checkpoint",
+  options: unknown,
+  allowed: ReadonlySet<string>,
+  retired: Readonly<Record<string, string>> = {},
+): void {
+  if (typeof options !== "object" || options === null || Array.isArray(options)) {
+    throw new WorkflowError(
+      `${callee}() options must be a plain object (received ${
+        Array.isArray(options) ? "an array" : JSON.stringify(options)
+      })`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+  for (const key of Object.keys(options)) {
+    if (allowed.has(key)) continue;
+    const hint = retired[key];
+    throw new WorkflowError(
+      `${callee}() received an unknown option ${JSON.stringify(key)}; ${
+        hint ?? `valid options are: ${[...allowed].join(", ")}`
+      }`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+}
 
 function defaultAgentLabel(phase: string | undefined, index: number): string {
   return phase ? `${phase} agent ${index}` : `agent ${index}`;
@@ -988,10 +1162,13 @@ export async function runWorkflow<T = unknown>(
   const agentTimeoutMs = normalizeAgentTimeout(options.agentTimeoutMs);
   const runId = options.runId ?? `run-${started.toString(36)}`;
   const baseCwd = options.cwd ?? process.cwd();
-  // The host's catalogue, known before the first call. A tier name that is not
-  // in it is a typo, and catching it here beats discovering it on dispatch.
-  // Undefined when no policy was supplied (in-process tests, nested frames that
-  // inherit the parent's checks) — then only the key shape is enforced.
+  // The host's catalogue, known before the first call. A script cannot name a
+  // tier, so this is not a typo check: it is what the strength table is resolved
+  // against at run start — an entry pointing at a tier this host does not define
+  // is dropped there, and an absent table becomes the same-named default only
+  // for the tiers listed here. Undefined when no policy was supplied (in-process
+  // tests), which leaves a configured table unchecked and the default empty.
+  // Only the top frame reads it; a nested one inherits the resolved table.
   const knownTiers = options.routingPolicy ? new Set(Object.keys(options.routingPolicy.profiles)) : undefined;
 
   const state: RuntimeState = {
@@ -1016,6 +1193,58 @@ export async function runWorkflow<T = unknown>(
       ) - 2,
   );
 
+  const log = (message: unknown) => {
+    const text = String(message);
+    state.logs.push(text);
+    options.onLog?.(text);
+  };
+
+  /**
+   * The strength table this run will honor, target-checked once at start.
+   *
+   * Checked here rather than per call so a stale entry is reported once, at the
+   * point where the fix is obvious, instead of once per dispatch. An entry whose
+   * tier this host does not define is dropped rather than fatal: the table is a
+   * routing preference, and a name that went stale should cost the redirect, not
+   * every workflow on the machine. A dropped entry leaves its strength unmapped,
+   * which is the ordinary unconfigured case — the call takes the agent's own
+   * default, exactly as it would on a machine that configured nothing.
+   *
+   * An entry keyed on a word outside the vocabulary is dropped in silence. The
+   * settings layer already refuses to store one, so reaching here means a
+   * hand-edited file, and the run is the wrong place to teach the vocabulary.
+   *
+   * No configured table at all is not "no mappings": it takes
+   * {@link defaultStrengthTable}, whose entries are drawn from this host's own
+   * catalogue and so can never be stale — which is why only a configured table
+   * ever reaches the complaint above. An explicit `{}` is the way to say "no
+   * mappings"; the settings layer stores that one and drops only a table whose
+   * every entry was invalid, so a broken file cannot pass for that statement.
+   *
+   * Resolved once at the top frame and shared, so a nested `workflow()` cannot
+   * re-derive the same answer and repeat the same complaint at its boundary.
+   */
+  const resolveStrengths = (): ReadonlyMap<string, string> => {
+    const configured = options.strengths;
+    if (configured === undefined) return new Map(Object.entries(defaultStrengthTable(knownTiers)));
+    const active = new Map<string, string>();
+    // Re-checked despite the parameter type: this is a public entry point, and
+    // a JS caller reaches it without one. The settings layer runs the same two
+    // guards at read, so a table coming from there passes both twice.
+    for (const [strength, tier] of Object.entries(configured)) {
+      if (!isWorkflowStrength(strength) || !isManagedAgentTier(tier)) continue;
+      if (knownTiers && !knownTiers.has(tier)) {
+        log(
+          `workflow strength ${JSON.stringify(strength)} → tier ${JSON.stringify(tier)} ignored; ` +
+            `this host defines: ${[...knownTiers].sort().join(", ") || "(none)"}`,
+        );
+        continue;
+      }
+      active.set(strength, tier);
+    }
+    return active;
+  };
+
   // Global caps + budget shared with any nested workflow() so they hold across nesting.
   const shared: SharedRuntime = options.sharedRuntime ?? {
     limiter: createLimiter(concurrency),
@@ -1028,6 +1257,8 @@ export async function runWorkflow<T = unknown>(
     runFatalController: new AbortController(),
     inFlight: new Set<Promise<unknown>>(),
     activeThreads: new Set<string>(),
+    routedStrengths: new Set<string>(),
+    strengths: resolveStrengths(),
   };
   const limiter = shared.limiter;
   const isTopLevelRun = !options.sharedRuntime;
@@ -1036,10 +1267,22 @@ export async function runWorkflow<T = unknown>(
   /** agent() promises owned by this runWorkflow frame only. */
   const frameInFlight = new Set<Promise<unknown>>();
 
-  const log = (message: unknown) => {
-    const text = String(message);
-    state.logs.push(text);
-    options.onLog?.(text);
+  const strengths = shared.strengths;
+
+  /**
+   * Report each strength's routing once per run.
+   *
+   * A fan-out asks for the same strength dozens of times and the answer is the
+   * same every time; a line per dispatch would bury the run's own log under it.
+   */
+  const logStrengthRouting = (strength: WorkflowStrength, tier: string | undefined): void => {
+    if (shared.routedStrengths.has(strength)) return;
+    shared.routedStrengths.add(strength);
+    log(
+      tier === undefined
+        ? `workflow strength ${JSON.stringify(strength)} is unmapped; using the agent's own default`
+        : `workflow strength ${JSON.stringify(strength)} runs on agent tier ${JSON.stringify(tier)}`,
+    );
   };
 
   const emitRuntimeEvent = (event: WorkflowRuntimeEvent): void => {
@@ -1099,6 +1342,9 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agent = (promptText: string, agentOptions: AgentOptions = {}): Promise<unknown> => {
+    // First, ahead of the thread bookkeeping below: a malformed options object
+    // must not be able to register a thread it will never release.
+    validateCallOptions("agent", agentOptions, AGENT_OPTION_KEYS, RETIRED_AGENT_OPTIONS);
     const rawThread = agentOptions.thread;
     const thread = rawThread === undefined ? undefined : typeof rawThread === "string" ? rawThread.trim() : "";
     if (rawThread !== undefined && !thread) {
@@ -1153,49 +1399,38 @@ export async function runWorkflow<T = unknown>(
       log(`agentType "${agentOptions.agentType}" resolves in pi-subagents at dispatch`);
     }
 
-    // A tier is a key in the host's catalogue, so the only shape check this
-    // side can make is the key shape. An unknown key is the host's call to
-    // refuse — it is the one that knows what is defined, and its error names
-    // the available tiers.
-    if (agentOptions.tier !== undefined && !isManagedAgentTier(agentOptions.tier)) {
+    // The vocabulary is closed, so a word outside it is a typo rather than a
+    // strength nobody configured, and saying so here beats dispatching in
+    // silence. This is the whole of the check: unlike a tier key, a strength is
+    // ours, so we can answer for it without asking the host anything.
+    if (agentOptions.strength !== undefined && !isWorkflowStrength(agentOptions.strength)) {
       throw new WorkflowError(
-        `agent tier must be a non-empty, whitespace-free key (received ${JSON.stringify(agentOptions.tier)})`,
+        `agent strength must be one of ${WORKFLOW_STRENGTH_LIST} (received ${JSON.stringify(agentOptions.strength)})`,
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: false },
       );
     }
-    let effectiveTier = agentOptions.tier;
-    if (effectiveTier !== undefined && knownTiers && !knownTiers.has(effectiveTier)) {
-      if (options.shippedScript) {
-        // Our own script naming a tier this host does not define. Drop it and
-        // let the host's default decide, which is the user's policy either way.
-        log(`agent tier ${JSON.stringify(effectiveTier)} is not defined here; using the host default`);
-        effectiveTier = undefined;
-      } else {
-        // A typo would otherwise surface only when this call reaches dispatch,
-        // possibly deep into a run. The catalogue is known at start; check now.
-        throw new WorkflowError(
-          `unknown agent tier ${JSON.stringify(effectiveTier)}; this host defines: ${
-            [...knownTiers].sort().join(", ") || "(none)"
-          }`,
-          WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
-          { recoverable: false },
-        );
-      }
-    }
-    // Everything downstream — the resume hash, the dispatch, the journal —
-    // works from the tier that will actually be requested, not the one the
-    // script wrote, so a dropped name cannot make a cached call look different
-    // from the live one.
-    const tieredOptions: AgentOptions =
-      effectiveTier === agentOptions.tier ? agentOptions : { ...agentOptions, tier: effectiveTier };
+    // The strength becomes an Agent tier here and only here, through the user's
+    // table and nothing else. Unmapped resolves to no tier — the call takes the
+    // agent's own default, and no catalogue key is ever inferred from a matching
+    // spelling. One hop: the tier this yields is never looked up as a strength
+    // in turn. There is no catalogue check left to do, because the only tier
+    // that can appear here already passed one at run start.
+    //
+    // A call that named no strength takes that same untiered path rather than a
+    // default rung: see the note in strengths.ts on why a default would have
+    // outranked the agent type's own tier on every unlabelled dispatch.
+    const strength = agentOptions.strength;
+    const effectiveTier = strength === undefined ? undefined : strengths.get(strength);
+    if (strength !== undefined) logStrengthRouting(strength, effectiveTier);
 
     // Deterministic resume key: assigned at lexical call time, before the limiter.
     const callIndex = nextCallIndex();
     const callHash = hashAgentCall(
       promptText,
       assignedPhase,
-      tieredOptions,
+      agentOptions,
+      effectiveTier,
       options.routingPolicy,
       options.routingPolicyFingerprint,
     );
@@ -1633,13 +1868,7 @@ export async function runWorkflow<T = unknown>(
       });
     }
     const callIndex = nextCallIndex();
-    const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
-    const childScript = resolved?.script ?? String(nameOrScript);
-    // A named script carries its own shipped-ness; a raw script literal is the
-    // caller's own text and shares the caller's. Inheriting the frame's flag for
-    // a resolved script would let a user script run a built-in under the strict
-    // tier check — a hard failure on any host that renamed the shipped tiers.
-    const childShippedScript = resolved ? resolved.shippedScript === true : options.shippedScript === true;
+    const childScript = options.loadSavedWorkflow?.(String(nameOrScript)) ?? String(nameOrScript);
     const workflowName = String(nameOrScript);
     const argsPresent = childArgs !== undefined;
     const callHash = hashIdentity({
@@ -1648,9 +1877,14 @@ export async function runWorkflow<T = unknown>(
       script: childScript,
       argsPresent,
       args: argsPresent ? childArgs : null,
-      // Part of the identity because it decides how the child treats a tier
-      // name the host does not define: dropped, or fatal.
-      shippedScript: childShippedScript,
+      // The table decides which tier the child's calls actually request. A
+      // strength resolved inside *this* frame is already covered per call,
+      // because the agent hash keys on the tier that will be requested. The
+      // child's calls are not: the parent caches one value for the whole child
+      // frame, keyed on the whole-catalogue fingerprint — which does not move
+      // when only this table changed. Without it, editing the table and
+      // resuming would replay a child that had been routed the old way.
+      strengths: canonicalStrengths(strengths),
       routingPolicyFingerprint: options.routingPolicyFingerprint ?? null,
     });
     const cached = options.resumeJournal?.get(`${runId}:${callIndex}`);
@@ -1671,7 +1905,6 @@ export async function runWorkflow<T = unknown>(
       const child = await runWorkflow(childScript, {
         ...options,
         args: childArgs,
-        shippedScript: childShippedScript,
         sharedRuntime: shared,
         sharedStore: store,
         workflowDepth: workflowDepth + 1,
@@ -1724,7 +1957,7 @@ export async function runWorkflow<T = unknown>(
   };
   const verify = async (
     item: unknown,
-    opts: { reviewers?: number; threshold?: number; lens?: string | string[] } = {},
+    opts: { reviewers?: number; threshold?: number; lens?: string | string[]; strength?: WorkflowStrength } = {},
   ): Promise<{
     real: boolean;
     realCount: number;
@@ -1743,7 +1976,10 @@ export async function runWorkflow<T = unknown>(
           (_v, i) => () =>
             agent(
               `Adversarially review whether the following is REAL/correct. Try to refute it; default to real=false if unsure.${lenses.length ? ` Focus lens: ${lenses[i % lenses.length]}.` : ""}\n\n${claim}`,
-              { label: `verify ${i + 1}`, schema: VERIFY_SCHEMA },
+              // Defaults low: numerous, narrow, and aggregated by the vote
+              // below, which is what carries the gate rather than any single
+              // reviewer's depth. A caller who wants a deeper gate says so.
+              { label: `verify ${i + 1}`, strength: opts.strength ?? "low", schema: VERIFY_SCHEMA },
             ),
         ),
       )
@@ -1764,7 +2000,7 @@ export async function runWorkflow<T = unknown>(
   };
   const judgePanel = async (
     attempts: unknown[],
-    opts: { judges?: number; rubric?: string } = {},
+    opts: { judges?: number; rubric?: string; strength?: WorkflowStrength } = {},
   ): Promise<
     { index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } | undefined
   > => {
@@ -1788,6 +2024,8 @@ export async function runWorkflow<T = unknown>(
                     `Score this candidate from 0 to 1 on: ${rubric}. Reply with the score.\n\nCandidate:\n${text}`,
                     {
                       label: `judge ${idx + 1}.${j + 1}`,
+                      // Same shape as verify: many narrow scores, aggregated.
+                      strength: opts.strength ?? "low",
                       schema: JUDGE_SCHEMA,
                     },
                   ),
@@ -1867,11 +2105,15 @@ export async function runWorkflow<T = unknown>(
   const completenessCheck = async (
     taskArgs: unknown,
     results: unknown,
+    opts: { strength?: WorkflowStrength } = {},
   ): Promise<{ complete: boolean; missing?: string[] } | null> => {
     emitRuntimeEvent({ type: "quality", stage: "start", helper: "completenessCheck" });
     const verdict = await agent(
       `Given the task and the results gathered so far, list what is still MISSING (modalities not covered, claims unverified, gaps). Be specific and concise.\n\nTask:\n${JSON.stringify(taskArgs)}\n\nResults so far:\n${JSON.stringify(results).slice(0, 4000)}`,
-      { label: "completeness critic", schema: COMPLETENESS_SCHEMA },
+      // Defaults medium, not low like the other two gates: one call, no vote to
+      // average over, and an open-ended read of the whole task rather than one
+      // claim, so there is no redundancy here to carry a shallow verdict.
+      { label: "completeness critic", strength: opts.strength ?? "medium", schema: COMPLETENESS_SCHEMA },
     );
     emitRuntimeEvent({ type: "quality", stage: "end", helper: "completenessCheck" });
     return verdict as { complete: boolean; missing?: string[] } | null;
@@ -1917,6 +2159,7 @@ export async function runWorkflow<T = unknown>(
   // it is gated on the agent counter + abort (not budget). On resume the
   // human's reply replays by callIndex exactly like a cached agent().
   const checkpoint = async (promptText: string, checkpointOptions: CheckpointOptions = {}) => {
+    validateCallOptions("checkpoint", checkpointOptions, CHECKPOINT_OPTION_KEYS);
     throwIfAborted();
     if (typeof promptText !== "string") throw new TypeError("checkpoint(promptText, options?) needs a prompt string");
     const callIndex = nextCallIndex();

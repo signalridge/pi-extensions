@@ -443,15 +443,38 @@ defaults to the key; it is what the host reads when choosing between Agent tiers
 
 ### One catalogue, including for workflows
 
-A managed `pi-workflows` call names a key from this same `agentTiers` catalogue.
-There is no second workflow-tier vocabulary and no mapping layer: a workflow that
-wants cheap work asks for the tier you defined for cheap work.
+A managed `pi-workflows` call arrives naming a key from this same `agentTiers`
+catalogue. There is no second tier catalogue and no second resolver: this package
+still owns every model, every thinking level, and the only `resolveAgentTier()`.
+
+What a workflow *script* writes is not that key. A script names a **strength** —
+`low`, `medium`, `high`, pi-workflows' own word for how much effort a step
+deserves — and a `strengths` table on that side chooses which of your tiers it
+runs on:
 
 ```js
 // in a workflow script
-await agent("summarize this diff", { tier: "low" })
-await agent("design the migration", { tier: "high" })
+await agent("summarize this diff", { strength: "low" })
+await agent("design the migration", { strength: "high" })
 ```
+
+```jsonc
+// pi-workflows' own settings, edited with `/workflows strength`
+{ "strengths": { "low": "cheap-search", "high": "deep" } }
+```
+
+The indirection exists so that re-pricing workflow work does not re-price
+everything else. Workflow fan-outs ask for cheap work by the dozen, and so does
+the `Explore` agent and every spawn that names no tier of its own; if the
+workflow side reached your catalogue directly, making a 26-agent fan-out
+affordable would mean editing the tier all of them share. Pointing a strength
+elsewhere leaves your tiers alone.
+
+Nothing about that reaches this side. By the time a request arrives it carries
+one tier key, and this package cannot tell a mapped call apart from a spawn that
+named the key itself. Nor is it a second *policy*: a `strengths` value is a key
+in this catalogue and never carries a `model` or `thinking` of its own — that is
+the line between it and the retired `workflow.tiers` key, which did.
 
 The tier is resolved by the same `resolveAgentTier()` path an ordinary Agent
 spawn uses — same precedence, same model lookup, same thinking clamping, same
@@ -464,9 +487,12 @@ could silently win or be silently ignored.
 
 Fresh installs ship an effort ladder: `low`, `medium`, `high`. Every shipped
 profile inherits its model, so a new machine gets a working vocabulary without
-this package ever choosing a vendor for you. A managed call that names no tier
-uses the agent's own tier, then `agentTiers.defaultTier`, and finally falls back
-to `medium` so a workflow runs on an unconfigured machine.
+this package ever choosing a vendor for you. Those names are also what
+pi-workflows' shipped default table maps its strengths onto — identity, and only
+where you define the name — so a stock machine runs workflows at the strengths
+their scripts asked for. Rename or remove them and that default simply yields
+nothing: a managed call that names no tier uses the agent's own tier, then
+`agentTiers.defaultTier`, and finally falls back to `medium`.
 
 `medium` inherits its model, so on an unconfigured machine that fallback runs on
 the parent session's model. What it buys is a call with a *named* policy, a
@@ -577,7 +603,7 @@ the global file defines. The menu writes the merged catalogue back to the
 project file, so deleting one of several works, but deleting the last one — or
 clearing a `defaultTier` that only global sets — leaves no `agentTiers` key
 behind, and the global value is inherited again on the next start. Remove it
-from `~/.pi/agent/subagents.json` instead. The same is true of `workflow.tiers`.
+from `~/.pi/agent/subagents.json` instead.
 
 ### Refusals
 
@@ -645,7 +671,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 
 **Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `4`, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
 
-The `workflow` settings key is **retired**. Managed `pi-workflows` calls name an `agentTiers` key directly, so there is no separate workflow routing table; a file that still has one is ignored with a warning naming the key. `agentTiers.defaultTier` replaces what `workflow.defaultTier` used to do. See [One catalogue, including for workflows](#one-catalogue-including-for-workflows).
+The `workflow` settings key is **retired**; a file that still has one is ignored with a warning naming the key. This file holds no workflow routing of its own: a managed `pi-workflows` call arrives naming a key from `agentTiers`, and which key that is was decided on the pi-workflows side by its own `strengths` table — a table of keys into this catalogue, never a second catalogue and never its own `model`/`thinking`. `agentTiers.defaultTier` replaces what `workflow.defaultTier` used to do. See [One catalogue, including for workflows](#one-catalogue-including-for-workflows).
 
 **Default model** (`defaultModel`, unset): the model a non-tiered ordinary subagent runs — see [`defaultModel`](#defaultmodel) for where it sits in precedence, why an unresolvable value falls back instead of failing, and how `"inherit"` lets a project cancel a global default. **Default tier** (`agentTiers.defaultTier`, unset) is the tier applied when neither the caller nor the agent names one; the profiles it selects from live under [`agentTiers`](#model-tiers). It has three settings — a tier name, `unset`, and `none` — which the menu offers separately because the last two behave differently for managed workflow calls; see [Model tiers](#model-tiers) for the table.
 

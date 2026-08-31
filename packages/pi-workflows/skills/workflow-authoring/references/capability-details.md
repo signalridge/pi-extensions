@@ -16,7 +16,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `label`: string (optional); default: derived from phase and call count
 - `phase`: string (optional); default: current phase
 - `schema`: plain JSON Schema (optional)
-- `tier`: agent tier key (optional); default: the agent's own tier, else agentTiers.defaultTier
+- `strength`: "low" \| "medium" \| "high" (optional); default: no tier is sent; the agent's own tier, else agentTiers.defaultTier
 - `isolation`: "worktree" (optional); default: pi-subagents worktree policy
 - `thread`: string (optional); default: fresh session per call
 - `toolset`: string (optional); default: configured host/agent toolset hint
@@ -29,11 +29,15 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: resume replays only the longest unchanged prefix; the first miss and every later call execute live
 - Constraint: replayed calls do not consume the real-dispatch maxAgents or token/phase budgets
 - Constraint: spawnKeys rotate by generation on resume so pi-subagents never raises a fingerprint conflict
-- Constraint: tier names a key in the host's agentTiers catalogue; a key it does not define is rejected before dispatch
+- Constraint: strength is this package's own vocabulary, not an agentTiers key; a word outside low/medium/high is rejected before dispatch
+- Constraint: a strengths table alone binds a strength to an agent tier; an unmapped strength dispatches with no tier and takes the agent's own default
+- Constraint: a call that names no strength also dispatches with no tier; there is no default strength, so an unlabelled call never outranks the agent type's own tier
+- Constraint: an unconfigured host uses a shipped default table: each strength on the catalogue tier of the same name, where the host defines one
 - Constraint: resolveAgentTier in pi-subagents owns model, thinking, clamping, availability, and the resolution snapshot
-- Constraint: there is no per-call model or thinking: a tier is the only model policy a workflow can express
+- Constraint: there is no per-call model, thinking, or tier: a strength is the only model policy a workflow can express
 - Constraint: same-thread calls must be sequential and preserve a stable workflow thread name
 - Constraint: threads cannot be combined with worktree isolation
+- Constraint: an option name outside this list is rejected before dispatch, not ignored; tier, model, and thinking name their replacement
 
 <a id="runtime-global-parallel"></a>
 ## parallel
@@ -91,6 +95,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `reviewers`: number (optional); default: 2
 - `threshold`: number (optional); default: 0.5
 - `lens`: string \| string[] (optional)
+- `strength`: "low" \| "medium" \| "high" (optional); default: "low"
 - Constraint: threshold comparison is inclusive; real is false when no reviewer succeeds
 
 <a id="runtime-global-judgepanel"></a>
@@ -101,6 +106,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Signature: `judgePanel(attempts, options?) => Promise<{ index, attempt, score, judgments } \| undefined>`
 - `judges`: number (optional); default: 3
 - `rubric`: string (optional); default: overall quality and correctness
+- `strength`: "low" \| "medium" \| "high" (optional); default: "low"
 - Constraint: highest mean score wins with stable input index as the tie-break; empty input returns undefined
 
 <a id="runtime-global-loopuntildry"></a>
@@ -120,7 +126,8 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `completenessCheck(taskArgs, results) => Promise<{ complete, missing? } \| null>`
+- Signature: `completenessCheck(taskArgs, results, options?) => Promise<{ complete, missing? } \| null>`
+- `strength`: "low" \| "medium" \| "high" (optional); default: "medium"
 - Constraint: only the first 4,000 characters of serialized result evidence are sent to the critic
 
 <a id="runtime-global-retry"></a>
@@ -155,6 +162,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `timeoutMs`: number (optional)
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
+- Constraint: an option name outside this list is rejected rather than ignored, since a dropped headless silently auto-approves
 
 <a id="runtime-global-log"></a>
 ## log
