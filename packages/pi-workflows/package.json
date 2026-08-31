@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-workflows",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Deterministic JavaScript orchestration workflows backed by pi-subagents managed spawning.",
   "type": "module",
   "license": "MIT",
