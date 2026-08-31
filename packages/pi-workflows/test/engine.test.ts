@@ -15,20 +15,6 @@ import { WorkflowEngine } from "../src/engine.js";
 import { JOURNAL_ENTRY_TYPE, type JournalEvent } from "../src/journal.js";
 import type { DispatchTask, ManagedProtocolCheck, ManagedSpawnClient, WorkflowEventBus } from "../src/rpc-client.js";
 
-/**
- * Adapt a test's name → script map to the nested-workflow resolver contract.
- *
- * The resolver reports where each script came from, because shipped-ness
- * travels with the script rather than with the frame that called it. Test
- * scripts are never shipped, so this only has to supply the script itself.
- */
-function savedScript(resolve: (name: string) => string | undefined): (name: string) => { script: string } | undefined {
-  return (name) => {
-    const script = resolve(name);
-    return script === undefined ? undefined : { script };
-  };
-}
-
 function makeBus(): WorkflowEventBus {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
   return {
@@ -209,6 +195,11 @@ function makeEngine(opts: FakeClientOptions = {}): {
   return { engine, client, entries, bus };
 }
 
+/** Wrap a journal event the way the session branch presents it to the engine. */
+function asSessionEntry(data: JournalEvent) {
+  return { type: "custom" as const, customType: JOURNAL_ENTRY_TYPE, data };
+}
+
 const SIMPLE_SCRIPT = `export const meta = { name: "demo", description: "d" };
 const a = await agent("first");
 const b = await agent("second");
@@ -260,8 +251,8 @@ describe("workflow engine", () => {
       }),
     });
     const script = `export const meta = { name: "policy-engine", description: "p" };
-await agent("first", { tier: "low" });
-await agent("second", { tier: "low" });
+await agent("first", { strength: "low" });
+await agent("second", { strength: "low" });
 return 0;`;
     const started = await engine.start(script, { background: true });
     await new Promise((resolve) => setImmediate(resolve));
@@ -270,16 +261,76 @@ return 0;`;
     await engine.control("pause", started.runId);
     const beforeResume = client.spawned.length;
     thinking = "high";
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     await engine.resume(started.runId, sessionEntries, { background: true });
     await new Promise((resolve) => setImmediate(resolve));
     expect(client.spawned.length).toBe(beforeResume + 1);
     expect(client.spawned.at(-1)?.nodeId).toBe("call-0");
     await engine.control("stop", started.runId);
+  });
+
+  it("keeps the strength table across a resume the engine starts itself", async () => {
+    // The table is deliberately never frozen onto a run, so every resume has to
+    // supply it — including `control("resume")` and the provider-limit retry,
+    // which have no caller to pass options for them. Without the provider they
+    // resume with no table, and since a call's identity keys on the tier it
+    // requested, every finished call misses its journal entry and re-runs
+    // untabled: the exact re-spend the table exists to prevent.
+    const { engine, client, entries } = makeEngine({ manual: true });
+    engine.strengths = () => ({ low: "high" });
+    const script = `export const meta = { name: "resume-strengths", description: "r" };
+await agent("first", { strength: "low" });
+await agent("second", { strength: "low" });
+return 0;`;
+    const started = await engine.start(script, { background: true, strengths: { low: "high" } });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(client.spawned[0]?.task.tier).toBe("high");
+
+    client.complete(client.spawned[0]?.id ?? "", "first result");
+    await new Promise((resolve) => setImmediate(resolve));
+    await engine.control("pause", started.runId);
+    const beforeResume = client.spawned.length;
+
+    // No options: this is the path a user takes through /workflows resume.
+    await engine.control("resume", started.runId, (entries as JournalEvent[]).map(asSessionEntry));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // One new dispatch, not two: the first call replayed from the journal
+    // because its identity still resolves to the same tier.
+    expect(client.spawned.length).toBe(beforeResume + 1);
+    expect(client.spawned.at(-1)?.nodeId).toBe("call-1");
+    expect(client.spawned.at(-1)?.task.tier).toBe("high");
+    await engine.control("stop", started.runId);
+  });
+
+  it("re-reads the strength table for the provider-limit retry it schedules itself", async () => {
+    // The retry fires on a timer with no caller and no user watching, and the
+    // table is deliberately never frozen onto a run — so this path has to read
+    // the current one. Passing none would dispatch untiered; freezing the start
+    // table would dispatch the old tier. Neither is what a user who just edited
+    // the table would be charged for.
+    const { engine, client } = makeEngine({ spawnError: "rate limit; try again in 1 seconds" });
+    engine.strengths = () => ({ low: "low" });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const started = await engine.start(
+        `export const meta = { name: "provider-strength", description: "p" };\nreturn await agent("work", { strength: "low" });`,
+        { background: true, strengths: { low: "low" } },
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(engine.getRun(started.runId)?.status).toBe("paused");
+      expect(client.spawned[0]?.task.tier).toBe("low");
+
+      // The edit a user makes while the run sits rate-limit-paused.
+      engine.strengths = () => ({ low: "custom-small" });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      expect(client.spawned.length).toBeGreaterThan(1);
+      expect(client.spawned.at(-1)?.task.tier).toBe("custom-small");
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it("does not append a run when disposal wins a pending protocol check", async () => {
@@ -342,13 +393,16 @@ return 0;`;
     expect(engine.summary(run)).toMatchObject({ resultPreview: expect.stringContaining('"a"') });
   });
 
-  it("sends the tier verbatim and journals it", async () => {
+  it("sends the tier the strength resolved to, and journals it", async () => {
     const { engine, client, entries } = makeEngine({ answers: { "call-0": { result: "done" } } });
-    const script = `export const meta = { name: "tiered", description: "t" };\nreturn await agent("work", { tier: "low" });`;
-    const result = await engine.start(script, { background: false });
+    const script = `export const meta = { name: "tiered", description: "t" };\nreturn await agent("work", { strength: "low" });`;
+    // The table is what binds the strength to a catalogue key; without it this
+    // call would reach the protocol with no tier at all.
+    const result = await engine.start(script, { background: false, strengths: { low: "low" } });
 
     expect(result.status).toBe("completed");
-    // One field, no mapping: the script names a key from the host's catalogue.
+    // One field on the wire, and it is a catalogue key: pi-subagents cannot tell
+    // this apart from a spawn that named the tier itself.
     expect(client.spawned[0]?.task).toMatchObject({ tier: "low" });
     expect(client.spawned[0]?.task).not.toHaveProperty("agentTier");
     const callResult = (entries as JournalEvent[]).find((entry) => entry.kind === "call_result");
@@ -418,12 +472,11 @@ return 0;`;
 return await workflow("child", { payload: { tag: "original" } });`;
     const started = await engine.start(script, {
       background: true,
-      loadSavedWorkflow: savedScript((name) =>
+      loadSavedWorkflow: (name) =>
         name === "child"
           ? `export const meta = { name: "event-child", description: "c" };
 return await agent("tag=" + args.payload.tag);`
           : undefined,
-      ),
     });
     await new Promise((resolve) => setImmediate(resolve));
     expect(uiTag).toBe("original");
@@ -438,11 +491,10 @@ return await agent("tag=" + args.payload.tag);`
 return await workflow("child");`;
     const started = await engine.start(script, {
       background: true,
-      loadSavedWorkflow: savedScript((name) =>
+      loadSavedWorkflow: (name) =>
         name === "child"
           ? `export const meta = { name: "child", description: "c" };\nreturn await agent("child work");`
           : undefined,
-      ),
     });
     await new Promise((resolve) => setImmediate(resolve));
     expect(client.spawned[0]?.nodeId).toMatch(new RegExp(`^call-${started.runId}-nested-call-0-g1-[0-9a-f-]+:0$`));
@@ -550,7 +602,7 @@ return await workflow("child");`;
   });
 
   it("maps stopped lifecycle failures to a stopped call result", async () => {
-    const script = `export const meta = { name: "stopped", description: "s" };\nawait agent("work", { tier: "low" });\nreturn 0;`;
+    const script = `export const meta = { name: "stopped", description: "s" };\nawait agent("work", { strength: "low" });\nreturn 0;`;
     const { engine, client, entries } = makeEngine({
       manual: true,
       identityBeforeReply: { tier: "custom-small" },
@@ -590,11 +642,7 @@ return await workflow("child");`;
     expect(client.spawned).toHaveLength(1);
     await expect(engine.resume(started.runId, [], { background: true })).resolves.toBeUndefined();
 
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     engine.restore(sessionEntries);
     expect(engine.getState(started.runId)?.lifecycleSuspended).toBe(false);
   });
@@ -709,11 +757,7 @@ return await agent("target=" + target);`;
       frozenArgsPresent: true,
     });
     await engine.control("pause", started.runId);
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     await engine.resume(started.runId, sessionEntries, {
       background: true,
       args: { nested: { target: "replacement" } },
@@ -739,11 +783,7 @@ return await agent("target=" + (args === undefined ? "undefined" : args.target))
     });
 
     await engine.control("pause", started.runId);
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     engine.restore(sessionEntries);
     expect(engine.getRun(started.runId)).toMatchObject({ frozenArgsPresent: false, status: "interrupted" });
 
@@ -819,11 +859,7 @@ return await agent("work");`;
       frozenAgentTimeoutMs: 1_500,
     });
     await engine.control("pause", started.runId);
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     engine.restore(sessionEntries);
     expect(engine.getState(started.runId)?.frozenOptions).toMatchObject({
       maxAgents: 9,
@@ -844,10 +880,10 @@ return await agent("work");`;
     await engine.control("stop", started.runId);
   });
 
-  it("dispatches tier through to the spawn request", async () => {
-    const script = `export const meta = { name: "tiered", description: "t" };\nawait agent("work", { tier: "high" });\nreturn 0;`;
+  it("dispatches the strength's mapped tier through to the spawn request", async () => {
+    const script = `export const meta = { name: "tiered", description: "t" };\nawait agent("work", { strength: "high" });\nreturn 0;`;
     const { engine, client } = makeEngine({ manual: true });
-    const started = await engine.start(script, { background: true });
+    const started = await engine.start(script, { background: true, strengths: { high: "high" } });
     await new Promise((resolve) => setImmediate(resolve));
     expect(client.spawned[0]?.task.tier).toBe("high");
     // Complete it to avoid a dangling run.
@@ -877,11 +913,7 @@ describe("A4 spawnKey generation rotation", () => {
     const revised = `export const meta = { name: "edit-resume", description: "r" };\nawait agent("new prompt");\nreturn 0;`;
     const started = await engine.start(original, { background: true });
     await engine.control("pause", started.runId);
-    const sessionEntries = (entries as JournalEvent[]).map((data) => ({
-      type: "custom" as const,
-      customType: JOURNAL_ENTRY_TYPE,
-      data,
-    }));
+    const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     await engine.resume(started.runId, sessionEntries, { background: true }, revised);
     await new Promise((resolve) => setImmediate(resolve));
     const latest = client.spawned.at(-1);

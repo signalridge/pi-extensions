@@ -61,6 +61,7 @@ import {
   type WorkflowRunResult,
   type WorkflowRuntimeEvent,
 } from "./runtime.js";
+import type { WorkflowStrengthTable } from "./strengths.js";
 
 export const MAX_ATTEMPTS_PER_NODE = 3;
 
@@ -88,8 +89,19 @@ export interface ScriptStartOptions {
   concurrency?: number;
   agentRetries?: number;
   tokenBudget?: number | null;
-  /** True for a script this package ships; see WorkflowRunOptions.shippedScript. */
-  shippedScript?: boolean;
+  /**
+   * The user's strength → Agent tier table; see WorkflowRunOptions.strengths.
+   *
+   * Deliberately absent from `frozenOptions`. The frozen set is the run's
+   * inputs — budget, scale, toolset — which a resume must not silently
+   * renegotiate. Routing is not an input: a resume already re-reads the host's
+   * tier catalogue, and a table frozen against a catalogue that has since moved
+   * would be the one thing in the run still pointing at the old world.
+   *
+   * Being unfrozen makes supplying it every resume's job, including the resumes
+   * the engine starts itself — see {@link WorkflowEngine.strengths}.
+   */
+  strengths?: WorkflowStrengthTable;
   agentTimeoutMs?: number | null;
   toolset?: string;
   excludeTools?: string[];
@@ -105,13 +117,8 @@ export interface ScriptStartOptions {
       timeoutMs?: number;
     },
   ) => Promise<unknown>;
-  /**
-   * Resolve a nested `workflow(name)` reference. The result reports whether the
-   * script it returned ships with this package, because that decides how the
-   * child frame treats a tier name the host does not define — see
-   * `WorkflowRunOptions.shippedScript`.
-   */
-  loadSavedWorkflow?: (name: string) => { script: string; shippedScript?: boolean } | undefined;
+  /** Resolve a nested `workflow(name)` reference to the script it names. */
+  loadSavedWorkflow?: (name: string) => string | undefined;
   mainModel?: string;
 }
 
@@ -151,14 +158,7 @@ export interface ScriptRunState {
   /** Frozen run parameters — resume reuses the original values, ignoring new budget/toolset overrides. */
   frozenOptions: Pick<
     ScriptStartOptions,
-    | "tokenBudget"
-    | "maxAgents"
-    | "concurrency"
-    | "agentRetries"
-    | "agentTimeoutMs"
-    | "toolset"
-    | "shippedScript"
-    | "excludeTools"
+    "tokenBudget" | "maxAgents" | "concurrency" | "agentRetries" | "agentTimeoutMs" | "toolset" | "excludeTools"
   >;
   /** Abort controller for this run's script execution. */
   controller: AbortController;
@@ -289,6 +289,18 @@ export class WorkflowEngine {
   onRunSettled: (() => void) | undefined;
   /** Optional in-process observer for phase/task/quality runtime events. */
   onRuntimeEvent: ((runId: string, event: WorkflowRuntimeEvent) => void) | undefined;
+  /**
+   * The user's current strength → Agent tier table, read fresh per execution.
+   *
+   * A callback rather than a value because the table is deliberately unfrozen:
+   * "read fresh at each start and resume" has to hold for the resumes the
+   * engine starts on its own — `control("resume")` and the provider-limit
+   * retry — which have no caller to pass options for them. Without it those
+   * resume with no table at all, and since a call's identity keys on the tier
+   * it requested, every already-finished call would miss its journal entry and
+   * re-run untabled: the exact re-spend this table exists to prevent.
+   */
+  strengths: (() => WorkflowStrengthTable | undefined) | undefined;
   private readonly waiters = new Map<
     string,
     Set<{ resolve: (run: ScriptRun) => void; reject: (e: unknown) => void; settled: boolean; cleanup: () => void }>
@@ -628,7 +640,6 @@ export class WorkflowEngine {
     const runId = randomUUID();
     const scriptHash = hashScript(script);
     const toolset = options.toolset;
-    const shippedScript = options.shippedScript === true ? true : undefined;
     const durableArgs = cloneWorkflowArgs(options.args);
     const runtimeArgs = cloneWorkflowArgs(durableArgs);
     const journalArgs = cloneWorkflowArgs(durableArgs);
@@ -657,7 +668,6 @@ export class WorkflowEngine {
       meta,
       ...(durableArgs === undefined ? {} : { args: durableArgs }),
       frozenArgsPresent,
-      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -686,7 +696,6 @@ export class WorkflowEngine {
       meta,
       ...(journalArgs === undefined ? {} : { args: journalArgs }),
       frozenArgsPresent,
-      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -705,7 +714,6 @@ export class WorkflowEngine {
         ...(frozenAgentRetries !== undefined ? { agentRetries: frozenAgentRetries } : {}),
         ...(frozenAgentTimeoutMs !== undefined ? { agentTimeoutMs: frozenAgentTimeoutMs } : {}),
         ...(options.toolset ? { toolset: options.toolset } : {}),
-        ...(shippedScript === undefined ? {} : { shippedScript }),
         ...(options.excludeTools ? { excludeTools: [...options.excludeTools] } : {}),
       },
       controller: new AbortController(),
@@ -802,11 +810,15 @@ export class WorkflowEngine {
     this.setWorkflowStatus(run, "running");
     state.controller = new AbortController();
     // Freeze semantics: original run parameters and args win over new options.
-    // Only signal/confirm/background/loadSavedWorkflow/mainModel are per-resume context;
-    // input/budget/scale/toolset are frozen from the original start.
+    // Only signal/confirm/background/loadSavedWorkflow/mainModel/strengths are
+    // per-resume context; input/budget/scale/toolset are frozen from the
+    // original start.
     const frozen = state.frozenOptions;
     const resumeOptions: ScriptStartOptions = {
       ...options,
+      // `??`, not an overwrite: a caller that passed a table meant it, and only
+      // a caller that passed none is asking the engine to read the current one.
+      strengths: options.strengths ?? this.strengths?.(),
       args: resumeArgs,
       tokenBudget: frozen.tokenBudget,
       maxAgents: frozen.maxAgents,
@@ -814,7 +826,6 @@ export class WorkflowEngine {
       agentRetries: frozen.agentRetries,
       agentTimeoutMs: frozen.agentTimeoutMs,
       toolset: frozen.toolset,
-      shippedScript: frozen.shippedScript,
       excludeTools: frozen.excludeTools ? [...frozen.excludeTools] : undefined,
     };
     state.bufferedTerminals.clear();
@@ -1010,7 +1021,7 @@ export class WorkflowEngine {
         executionNonce: `${generation}-${randomUUID()}`,
         resumeJournal,
         toolset: options.toolset,
-        shippedScript: options.shippedScript,
+        strengths: options.strengths,
         excludeTools: options.excludeTools,
         confirm: options.confirm,
         loadSavedWorkflow: options.loadSavedWorkflow,
@@ -1750,7 +1761,6 @@ export class WorkflowEngine {
           ...(run.frozenAgentRetries !== undefined ? { agentRetries: run.frozenAgentRetries } : {}),
           ...(run.frozenAgentTimeoutMs !== undefined ? { agentTimeoutMs: run.frozenAgentTimeoutMs } : {}),
           ...(run.toolset ? { toolset: run.toolset } : {}),
-          ...(run.shippedScript === undefined ? {} : { shippedScript: run.shippedScript }),
           ...(run.frozenExcludeTools ? { excludeTools: [...run.frozenExcludeTools] } : {}),
         },
         controller: new AbortController(),

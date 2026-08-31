@@ -54,9 +54,9 @@ export const meta = {
 
 phase("scan");
 const findings = await parallel([
-  () => agent("Check for cross-package imports", { label: "imports", tier: "low" }),
-  () => agent("Check for secrets", { label: "secrets", tier: "low" }),
-  () => agent("Check for dead code", { label: "dead-code", tier: "low" }),
+  () => agent("Check for cross-package imports", { label: "imports", strength: "low" }),
+  () => agent("Check for secrets", { label: "secrets", strength: "low" }),
+  () => agent("Check for dead code", { label: "dead-code", strength: "low" }),
 ]);
 
 phase("synthesize");
@@ -77,13 +77,13 @@ user's own LLM and run on the user's own machine.
 
 ### Runtime globals
 
-- `agent(prompt, { label, phase, schema, tier, isolation, thread, agentType, toolset, excludeTools, timeoutMs, retries })`
+- `agent(prompt, { label, phase, schema, strength, isolation, thread, agentType, toolset, excludeTools, timeoutMs, retries })`
   — dispatch one subagent through the managed spawn protocol. Returns text, a
   schema-validated value, or recoverable `null` after retries. Replayed journal
   calls consume no real-dispatch cap or token/phase budget. `schema` is a
   plain JSON Schema; the reply is parsed and validated client-side with bounded
   repair across attempts, and exhaustion throws `SCHEMA_NONCOMPLIANCE`.
-  `tier` is the provider-neutral workflow route; `thread` chains sequential turns
+  `strength` is the provider-neutral workflow route; `thread` chains sequential turns
   within a named conversation thread. A legacy programmatic `model` option may
   still be accepted by non-managed callers, but workflow meta/phase model or
   thinking fields are rejected and are never a workflow policy source. Pre-schema-v4
@@ -150,9 +150,12 @@ workflow, and the review skill before accepting a topology or recovery change.
 - `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone.
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,
-  `resume`, `rm`, and `save <name> [runId]` subcommands.
-- `/workflows-models`: points at pi-subagents' `/agents → Model tiers` — there
-  is deliberately no second tier configuration file.
+  `resume`, `rm`, `save <name> [runId]`, and `strength` subcommands.
+- `/workflows strength`: `[<low|medium|high> <tier>|off]` — which Agent tier each
+  workflow strength runs on, and the tiers this host defines. Unconfigured hosts
+  start on a shipped default table (identity, where the host defines the name).
+  The tiers themselves are still configured only in pi-subagents'
+  `/agents → Model tiers`; there is deliberately no second tier configuration file.
 - `/effort` and `/ultracode`: standing `off|high|ultra` effort guidance that auto-arms substantive messages.
 - `/workflows-progress`: `compact|detailed|status|max <N>` controls the persisted live panel.
 - `/deep-research`, `/adversarial-review`, `/code-review`,
@@ -186,52 +189,185 @@ written atomically with a backup.
 
 ## Model routing
 
-`tier` names a key in the host's own `agentTiers` catalogue — the same catalogue an
-ordinary `Agent` call uses. There is no separate workflow-tier vocabulary and no
-mapping layer: a workflow that wants cheap work asks for the tier the user defined
-for cheap work.
+A workflow speaks one word about cost: **strength**, this package's own name for
+how much effort a step deserves. `low`, `medium`, `high` — that is the whole
+vocabulary, and a script may name nothing else.
 
 ```js
-await agent("summarize this diff", { tier: "low" })
-await agent("design the migration", { tier: "high" })
+await agent("summarize this diff", { strength: "low" })
+await agent("design the migration", { strength: "high" })
+await agent("the ordinary case")                          // no strength: see below
 ```
 
-The host's catalogue arrives with the protocol handshake, so a tier this host does
-not define is rejected before any dispatch, naming the ones it does. Resolution
-itself is entirely pi-subagents' `resolveAgentTier()`: it owns the final model,
-thinking level, clamping, availability checks, and the immutable resolution
-snapshot.
+There is no default strength. A call that names none dispatches with **no tier**,
+exactly as an unmapped strength does, and pi-subagents resolves it the way it
+resolves any other spawn: the agent type's own frontmatter tier, then
+`agentTiers.defaultTier`. That matters because a tier a call requests outranks
+the agent type's own — so a default strength would have pinned every unlabelled
+call to whatever it mapped to, overruling `Explore`'s shipped `tier: low` and
+re-pricing the one agent this indirection exists to leave alone. Label the calls
+whose cost you mean to steer; leave the rest to the host.
 
-The catalogue belongs to whoever runs the workflow — the names included. The
-built-in workflows and the ad-hoc script ship with this package, so they cannot
-assert that `low` exists on a machine whose tiers are called `cheap` and `deep`:
-a name they use that the host does not define is dropped, with a log line, and
-the host's own default applies. A script you wrote names tiers from your own
-catalogue, so an undefined one there is a typo and fails closed instead.
+A strength is not an Agent tier. A `strengths` table is the only thing that
+binds one to a tier:
 
-There is no per-call `model` or `thinking`, and `meta`/phase metadata may not carry
-them either — both are rejected explicitly rather than accepted and ignored. A tier
-is the only model policy a workflow can express, which is what keeps a script from
-pinning a vendor the host did not choose.
+```jsonc
+// <agent dir>/workflows/settings.json, or the per-project settings file
+{ "strengths": { "low": "cheap-search", "high": "deep" } }
+```
 
-Omitting `tier` uses the agent's own tier, then `agentTiers.defaultTier`. Fresh
-installs ship `low`/`medium`/`high` profiles, all inheriting their model, and a
-managed call that still names no tier falls back to `medium` — so the built-ins run
-on a new machine without any configuration. That fallback is scoped to managed
-calls: it is not the catalogue's `defaultTier`, so an ordinary `Agent` spawn on the
-same machine keeps falling through to `defaultModel` and the parent session. A host
-whose default has been cleared (`noDefaultTier`) rejects an untiered managed call
-rather than quietly inheriting the parent session's model.
+**An unmapped strength dispatches with no tier at all** and takes the agent's
+ordinary default — the agent's own frontmatter tier, then the host's configured
+default. `{}` is a real table meaning exactly that for every strength.
 
-The managed wire, invocation record, journal, tombstone, and resume state all carry
-the one resolved tier — including one the host defaulted to, so a run's record says
-what actually ran. Resume keys each cached call on the policy for *that call's*
-tier: editing an unrelated tier does not invalidate work that never used it.
+### The default table
+
+A host that has configured nothing does not get "no mappings". It gets a table
+this package ships: each strength on the catalogue tier of the same name,
+**wherever the host defines one**. On a stock install that is
+`low → low, medium → medium, high → high`; on a host whose tiers are called
+`cheap` and `deep` it is empty, and every strength is unmapped. It is computed
+against the live catalogue rather than hardcoded, so it is never an assertion
+about someone else's tier names and never produces a start-up complaint about
+configuration you did not write.
+
+Without it, every shipped script's `low`/`medium` distinction would collapse
+onto pi-subagents' managed default — which is the *more* expensive rung, so an
+unconfigured machine would run its fan-outs dearer, not cheaper.
+
+That it is a **table and not a fallback rule** is the whole design. A rule
+saying "an unmapped strength runs on the tier of the same name" would be
+unremovable, so making a 26-agent fan-out cheaper would still mean editing tier
+`low` itself — dragging the `Explore` agent and everything else that names it. A
+table is replaced by writing one, and a written table that omits `low` leaves it
+unmapped even on a host that defines a tier called `low`. Nothing is ever
+inferred from spelling at dispatch: the binding is always a table entry.
+
+So `low → low` in a written table is a real entry and not a no-op — a table you
+write replaces the default outright, so the entries you leave out are unmapped,
+not inherited.
+
+### Editing it
+
+`/workflows strength` edits the table and also prints the tiers this host
+defines — the one place both halves are visible, since the strengths come from
+this package and the tiers from pi-subagents:
+
+```
+/workflows strength              # show the effective table and the host's tiers
+/workflows strength low cheap    # run workflow strength `low` on Agent tier `cheap`
+/workflows strength low off      # unmapped; back to the agent's own default
+```
+
+Edits land in **this project's** settings, like every other setting this package
+owns. Because the table replaces rather than merges at each level, the command
+seeds the write from the table a run would actually use — the project file, else
+global, else the shipped default — so setting one entry cannot silently discard
+the rest, and `off` clears a mapping this project never wrote. The write is
+therefore a full copy of the current table into the project; edit
+`<agent dir>/workflows/settings.json` by hand for a machine-wide table.
+
+Any key the host's catalogue defines is a legal target — an existing tier, or a
+profile added for exactly this purpose. There is no shortlist and no naming
+convention: the target is checked against the live catalogue at run start, so a
+profile added to `subagents.json` is usable the moment it exists. One hop, never
+chained. An entry whose tier the host does not define is reported once at run
+start and ignored, leaving that strength unmapped — a stale entry costs the
+redirect, not every workflow on the machine.
+
+This is not the retired `workflow.tiers` key and must not become it. That one
+carried its own `model` and `thinking` values, which made it a second model
+policy resolved by a second resolver. A value here is a **key in the host's one
+catalogue**: pi-subagents still owns every model, every thinking level, and the
+only `resolveAgentTier()`, and cannot tell a mapped call apart from a spawn that
+named the key itself.
+
+There is no per-call `model`, `thinking`, or `tier`, and `meta`/phase metadata
+may not carry them either. A strength is the only model policy a workflow can
+express, which is what keeps a script from pinning a vendor the host did not
+choose.
+
+The vocabulary is closed so that a word outside it is a *typo* rather than a
+strength nobody configured: `agent({ strength: "lowe" })` fails before any
+dispatch instead of silently running at the default.
+
+The same argument applies one level up, to the option *name*. `agent()` and
+`checkpoint()` reject any key they do not read, rather than ignoring it:
+
+```js
+await agent("x", { tier: "low" })      // → name a strength instead: one of low, medium, high
+await agent("x", { model: "…" })       // → a strength is the only model policy a workflow can express
+await agent("x", { strenght: "low" })  // → valid options are: label, phase, schema, strength, …
+```
+
+An unknown key is dropped before the call hash is built, so it changes neither
+the dispatch nor the resume identity — the run would simply spend at a policy
+nobody chose, and a resume would replay it without noticing. A script is plain
+JavaScript authored against this contract, so there is no other gate: a
+misspelled option would run every step untiered, and a misspelled
+`checkpoint({ headles: "abort" })` would auto-approve in headless mode instead
+of aborting.
+
+### Helpers that dispatch for you
+
+`verify()`, `judgePanel()`, and `completenessCheck()` spawn agents on the
+script's behalf, so the script cannot label those calls. Each carries a
+documented default and takes an override, which keeps every dispatch inside the
+vocabulary:
+
+```js
+await verify(finding)                              // reviewers run at "low"
+await verify(finding, { strength: "high" })        // unless you say otherwise
+await completenessCheck(args, results)             // one open-ended read: "medium"
+```
+
+These defaults are an opinion, and an opinion outranks the host's: a tier a call
+requests beats `agentTiers.defaultTier`, so on a machine whose default is `high`
+a `completenessCheck` now runs at whatever `medium` maps to rather than at
+`high`. That is the trade for making the helpers re-routable at all — they
+previously named no tier and could never be steered — and the override above is
+how a script takes it back.
+
+### Resume
+
+The table is read fresh at each start and resume — including the resumes the
+engine starts itself, `/workflows resume` and the provider-limit retry — never
+frozen onto a run.
+
+Resume identity keys a call on the tier it will actually request, so editing the
+table and resuming re-routes the calls that have not run — and **also re-runs
+the finished calls whose strength moved**, plus everything after the first such
+miss, because their cached answers came from a different tier. Re-routing
+mid-run is therefore a re-spend; if the point of the edit was to spend less,
+start a new run instead of resuming one that is mostly done. The provider-limit
+retry resumes on a timer with no one watching, so a table edited while a run is
+rate-limit-paused is charged the same way without being asked — stop that run
+before editing if the re-spend is not worth it. A nested
+`workflow()` boundary folds the table into its own key for the same reason: the
+value it caches for the whole child frame would otherwise survive a change that
+re-routes the child.
+
+Fresh installs of pi-subagents ship `low`/`medium`/`high` tier profiles, all
+inheriting their model — which is what the default table above resolves against,
+so the built-ins run on a new machine, at their own strengths, with no
+configuration. A managed call that still names no tier falls back to `medium`;
+that is where an unmapped strength lands. The fallback is scoped to managed
+calls: it is not the catalogue's `defaultTier`, so an ordinary `Agent` spawn on
+the same machine keeps falling through to `defaultModel` and the parent session.
+A host whose default has been cleared (`noDefaultTier`) rejects an untiered
+managed call rather than quietly inheriting the parent session's model — which
+an unmapped strength can reach.
+
+The managed wire, invocation record, journal, tombstone, and resume state all
+carry the one resolved tier — including one the host defaulted to, so a run's
+record says what actually ran. Resume keys each cached call on the policy for
+*that call's* tier: editing an unrelated tier does not invalidate work that never
+used it.
 
 ## Intentional adaptations from upstream
 
 - **No host-side web tools.** Agents reach the web through configured pi-web-access/MCP tools or an agent type's tool policy.
-- **Agent registry and tier catalogue ownership.** `agentType` and the tier catalogue resolve in pi-subagents; the workflow package supplies only a tier key, avoiding a second model/thinking policy.
+- **Agent registry and tier catalogue ownership.** `agentType` and the tier catalogue resolve in pi-subagents; the workflow package supplies only a tier key its own `strengths` table chose, avoiding a second model/thinking policy.
 - **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
 State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters.

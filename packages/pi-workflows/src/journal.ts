@@ -133,12 +133,6 @@ export interface ScriptRun {
   frozenArgsPresent: boolean;
   /** Number of the latest edited-script revision. */
   revision?: number;
-  /**
-   * This run's script ships with the package. Frozen for the same reason
-   * `toolset` is: a resume must keep treating a shipped script's tier names as
-   * preferences, not as assertions about the user's catalogue.
-   */
-  shippedScript?: boolean;
   /** Toolset marker persisted across resume (e.g. "web-research" for deep-research). */
   toolset?: string;
   /** Frozen run params — persisted so resume after restore keeps original budget/scale. */
@@ -238,7 +232,6 @@ export type JournalEvent =
       args?: unknown;
       /** Explicit args presence marker for deterministic resume. */
       frozenArgsPresent: boolean;
-      shippedScript?: boolean;
       toolset?: string;
       frozenMaxAgents?: number;
       frozenConcurrency?: number;
@@ -678,11 +671,6 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
     const frozenArgsPresent = parseFrozenArgsPresence(raw);
     const args = raw.args === undefined ? undefined : parsePersistedValue(raw.args, "workflow args");
     const toolset = Object.hasOwn(raw, "toolset") ? boundedString(raw.toolset, "toolset", 64) : undefined;
-    const shippedScript = (() => {
-      if (!Object.hasOwn(raw, "shippedScript")) return undefined;
-      if (typeof raw.shippedScript !== "boolean") throw new Error("shippedScript is invalid");
-      return raw.shippedScript;
-    })();
     const frozenMaxAgents = (() => {
       if (!Object.hasOwn(raw, "frozenMaxAgents")) return undefined;
       if (typeof raw.frozenMaxAgents !== "number" || !Number.isFinite(raw.frozenMaxAgents) || raw.frozenMaxAgents < 1) {
@@ -752,7 +740,6 @@ function parseEvent(raw: unknown, runs: Map<string, ScriptRun>): JournalEvent {
       meta,
       ...(args === undefined ? {} : { args }),
       frozenArgsPresent,
-      ...(shippedScript === undefined ? {} : { shippedScript }),
       ...(toolset ? { toolset } : {}),
       ...(frozenMaxAgents !== undefined ? { frozenMaxAgents } : {}),
       ...(frozenConcurrency !== undefined ? { frozenConcurrency } : {}),
@@ -1192,7 +1179,6 @@ function applyJournalEvent(runs: Map<string, ScriptRun>, event: JournalEvent): v
       ...(event.args === undefined ? {} : { args: structuredClone(event.args) }),
       frozenArgsPresent: event.frozenArgsPresent,
       revision: 0,
-      ...(event.shippedScript === undefined ? {} : { shippedScript: event.shippedScript }),
       ...(event.toolset ? { toolset: event.toolset } : {}),
       ...(event.frozenMaxAgents !== undefined ? { frozenMaxAgents: event.frozenMaxAgents } : {}),
       ...(event.frozenConcurrency !== undefined ? { frozenConcurrency: event.frozenConcurrency } : {}),

@@ -26,20 +26,6 @@ import {
 } from "../src/runtime.js";
 import { SharedStore } from "../src/shared-store.js";
 
-/**
- * Adapt a test's name → script map to the nested-workflow resolver contract.
- *
- * The resolver reports where each script came from, because shipped-ness
- * travels with the script rather than with the frame that called it. Test
- * scripts are never shipped, so this only has to supply the script itself.
- */
-function savedScript(resolve: (name: string) => string | undefined): (name: string) => { script: string } | undefined {
-  return (name) => {
-    const script = resolve(name);
-    return script === undefined ? undefined : { script };
-  };
-}
-
 // ── meta parsing gate ────────────────────────────────────────────────────────
 
 describe("parseWorkflowScript meta gate", () => {
@@ -224,13 +210,16 @@ console.warn("three");`,
 });
 
 describe("agent() dispatch contract", () => {
-  it("passes prompt, instructions, phase, tier, and schema through to the runner", async () => {
+  it("passes prompt, instructions, phase, resolved tier, and schema through to the runner", async () => {
     let seen: { prompt: string; options?: AgentRunOptions } | undefined;
     await runWorkflow(
       `export const meta = { name: "dispatch", description: "d" };
-const r = await agent("do the thing", { tier: "low", agentType: "Explore", label: "mine", phase: "scan", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
+const r = await agent("do the thing", { strength: "low", agentType: "Explore", label: "mine", phase: "scan", schema: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"] } });
 return r;`,
       {
+        // The tier only reaches the runner because the table binds the strength
+        // to one; without an entry the call would carry no tier at all.
+        strengths: { low: "low" },
         agent: {
           run: async (prompt: string, options?: AgentRunOptions) => {
             seen = { prompt, options };
@@ -324,124 +313,123 @@ return await agent("say nothing");`,
     expect(result).toBeNull();
   });
 
-  it("rejects a tier the host does not define, before any dispatch", async () => {
+  it("rejects an option this runtime does not read, before any dispatch", async () => {
+    // An unknown key is dropped before the call hash is built, so it changes
+    // neither the dispatch nor the resume identity: the run spends at a policy
+    // nobody chose and a resume replays it without noticing. A script is plain
+    // JavaScript authored against this contract, so there is no other gate.
     let dispatched = 0;
-    await expect(
-      runWorkflow(
-        `export const meta = { name: "unknown-tier", description: "u" };
-return await agent("x", { tier: "nope" });`,
-        {
-          routingPolicy: {
-            defaultTier: "medium",
-            profiles: { low: { model: "inherit", thinking: "low" }, medium: { model: "inherit", thinking: "medium" } },
-            blockedProfiles: [],
-            blockedDefaultTier: false,
-          },
-          agent: {
-            run: async () => {
-              dispatched++;
-              return "ok";
-            },
-          },
+    const runner = {
+      agent: {
+        run: async () => {
+          dispatched++;
+          return "ok";
         },
-      ),
-    ).rejects.toThrow(/unknown agent tier "nope"; this host defines: low, medium/);
+      },
+    };
+    const run = (options: string) =>
+      runWorkflow(
+        `export const meta = { name: "unknown-option", description: "u" };
+return await agent("x", ${options});`,
+        runner,
+      );
+
+    // Retired or never-supported routing keys answer by name, so the message
+    // names the replacement rather than only listing what is legal.
+    await expect(run('{ tier: "low" }')).rejects.toThrow(
+      /agent\(\) received an unknown option "tier"; name a strength instead: one of low, medium, high/,
+    );
+    await expect(run('{ model: "some/model" }')).rejects.toThrow(
+      /unknown option "model"; a strength is the only model policy a workflow can express/,
+    );
+    await expect(run('{ thinking: "high" }')).rejects.toThrow(/unknown option "thinking"/);
+
+    // An ordinary typo gets the list instead. This is the closed-vocabulary
+    // argument one level up: a misspelled strength already fails, and so must a
+    // misspelled option name, or the call silently runs untiered.
+    await expect(run('{ strenght: "low" }')).rejects.toThrow(
+      /unknown option "strenght"; valid options are: label, phase, schema, strength, isolation, agentType, timeoutMs, retries, thread, toolset, excludeTools/,
+    );
     expect(dispatched).toBe(0);
   });
 
-  it("treats a shipped script's tier as a preference against the host catalogue", async () => {
-    // The tier catalogue is the user's, names included. A script we ship cannot
-    // assert that "low" exists on a machine whose tiers are called cheap/deep —
-    // so it falls back to the host default instead of refusing to run.
-    const seen: Array<string | undefined> = [];
-    const logs: string[] = [];
-    const routingPolicy = {
-      defaultTier: "standard",
-      profiles: {
-        cheap: { model: "inherit", thinking: "low" },
-        standard: { model: "inherit", thinking: "medium" },
-      },
-      blockedProfiles: [],
-      blockedDefaultTier: false,
-    };
-    const script = `export const meta = { name: "shipped", description: "s" };
-return await agent("x", { tier: "low" });`;
-
-    const { result } = await runWorkflow(script, {
-      shippedScript: true,
-      routingPolicy: routingPolicy as never,
-      onLog: (message: string) => logs.push(message),
-      agent: {
-        run: async (_prompt, options) => {
-          seen.push(options?.tier);
-          return "ok";
-        },
-      },
-    });
-    expect(result).toBe("ok");
-    // Dropped, not substituted: the host's own default decides.
-    expect(seen).toEqual([undefined]);
-    expect(logs.join("\n")).toContain('agent tier "low" is not defined here');
-
-    // The same script written by the user is a typo, and the catalogue is
-    // theirs to fix, so it still fails closed.
-    await expect(
-      runWorkflow(script, { routingPolicy: routingPolicy as never, agent: { run: async () => "ok" } }),
-    ).rejects.toThrow(/unknown agent tier "low"/);
-  });
-
-  it("takes shipped-ness from the nested script, not from the frame that called it", async () => {
-    // A user's script may call a built-in by name. The built-in's tier names are
-    // preferences against whatever catalogue this host defines, so inheriting
-    // the caller's strict rule would fail a run over a tier the built-in never
-    // claimed existed here — and the reverse would silently reroute a user
-    // script's typo.
-    const routingPolicy = {
-      defaultTier: "standard",
-      profiles: { standard: { model: "inherit", thinking: "medium" } },
-      blockedProfiles: [],
-      blockedDefaultTier: false,
-    };
-    const parent = `export const meta = { name: "parent", description: "p" };
-return await workflow("shipped-child");`;
-    const shippedChild = `export const meta = { name: "shipped-child", description: "c" };
-return await agent("x", { tier: "low" });`;
-
-    const seen: Array<string | undefined> = [];
-    const { result } = await runWorkflow(parent, {
-      // The parent is the user's own script: strict for its own tiers.
-      routingPolicy: routingPolicy as never,
-      loadSavedWorkflow: (name) =>
-        name === "shipped-child" ? { script: shippedChild, shippedScript: true } : undefined,
-      agent: {
-        run: async (_prompt, options) => {
-          seen.push(options?.tier);
-          return "ok";
-        },
-      },
-    });
-    expect(result).toBe("ok");
-    // Dropped for the child because the child ships, even though the caller does not.
-    expect(seen).toEqual([undefined]);
-
-    // The same child resolved as a user's saved workflow keeps the strict rule.
-    await expect(
-      runWorkflow(parent, {
-        routingPolicy: routingPolicy as never,
-        loadSavedWorkflow: (name) => (name === "shipped-child" ? { script: shippedChild } : undefined),
-        agent: { run: async () => "ok" },
-      }),
-    ).rejects.toThrow(/unknown agent tier "low"/);
-  });
-
-  it("rejects a malformed tier key without needing the host catalogue", async () => {
+  it("rejects an options value that is not a plain object", async () => {
+    // Reachable from a script, and previously a bare TypeError from reading
+    // `.thread` off a string — or, for an array, an "unknown option 0".
     await expect(
       runWorkflow(
-        `export const meta = { name: "bad-tier", description: "b" };
-return await agent("x", { tier: "two words" });`,
+        `export const meta = { name: "bad-options", description: "b" };
+return await agent("x", "low");`,
         { agent: { run: async () => "ok" } },
       ),
-    ).rejects.toThrow(/whitespace-free key/);
+    ).rejects.toThrow(/agent\(\) options must be a plain object \(received "low"\)/);
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "array-options", description: "b" };
+return await agent("x", ["low"]);`,
+        { agent: { run: async () => "ok" } },
+      ),
+    ).rejects.toThrow(/agent\(\) options must be a plain object \(received an array\)/);
+  });
+
+  it("does not register a thread for a call whose options are rejected", async () => {
+    // The key gate runs ahead of the thread bookkeeping. Were it after, a
+    // rejected call would leave its thread name held and the next legitimate
+    // call on that thread would fail as "already running".
+    const { result } = await runWorkflow(
+      `export const meta = { name: "thread-after-reject", description: "t" };
+try { await agent("x", { thread: "t1", tier: "low" }); } catch {}
+return await agent("y", { thread: "t1" });`,
+      { agent: { run: async () => "ok" } },
+    );
+    expect(result).toBe("ok");
+  });
+
+  it("rejects an unknown checkpoint option, which would otherwise change the headless reply", async () => {
+    // Not a cost argument like agent()'s: a dropped `headless` leaves the
+    // headless path on `default ?? true`, so a typo turns an intended abort
+    // into an automatic approval.
+    await expect(
+      runWorkflow(
+        `export const meta = { name: "bad-checkpoint", description: "c" };
+return await checkpoint("proceed?", { headles: "abort" });`,
+        { agent: { run: async () => "ok" } },
+      ),
+    ).rejects.toThrow(
+      /checkpoint\(\) received an unknown option "headles"; valid options are: default, headless, kind, choices, timeoutMs/,
+    );
+  });
+
+  it("lets a written table unmap a strength the host has a same-named tier for", async () => {
+    // The whole point of the separate vocabulary. A table is the only binding,
+    // so a table that omits `low` leaves it unmapped even though this host
+    // defines a tier called `low` — nothing reaches the catalogue on a matching
+    // spelling. That is what keeps workflow work re-priceable on its own: the
+    // shipped default binds `low → low`, and replacing the table is how you
+    // move it without touching the tier every ordinary spawn also names.
+    const seen: Array<string | undefined> = [];
+    const { result } = await runWorkflow(
+      `export const meta = { name: "same-name", description: "s" };
+return await agent("x", { strength: "low" });`,
+      {
+        routingPolicy: {
+          defaultTier: "medium",
+          profiles: { low: { model: "inherit", thinking: "low" }, medium: { model: "inherit", thinking: "medium" } },
+          blockedProfiles: [],
+          blockedDefaultTier: false,
+        } as never,
+        // Present and deliberately silent about `low`.
+        strengths: { medium: "medium" },
+        agent: {
+          run: async (_prompt, options) => {
+            seen.push(options?.tier);
+            return "ok";
+          },
+        },
+      },
+    );
+    expect(result).toBe("ok");
+    expect(seen).toEqual([undefined]);
   });
 });
 
@@ -997,11 +985,10 @@ return await workflow("empty-child");`;
       runWorkflow(script, {
         maxAgents: 1_000,
         agent: nullRunner(),
-        loadSavedWorkflow: savedScript((name) =>
+        loadSavedWorkflow: (name) =>
           name === "empty-child"
             ? `export const meta = { name: "empty-child", description: "e" };\nreturn "ok";`
             : undefined,
-        ),
         onAgentJournal: () => {
           checkpointFacts += 1;
         },
@@ -1060,13 +1047,12 @@ return 0;`,
       {
         maxAgents: 9,
         concurrency: 4,
-        loadSavedWorkflow: savedScript((name) =>
+        loadSavedWorkflow: (name) =>
           name === "child-script"
             ? `export const meta = { name: "child", description: "c" };
 await parallel(Array.from({ length: args.n }, (_, i) => () => agent("c" + i)));
 return 1;`
             : undefined,
-        ),
         agent: {
           run: async () => {
             active++;
@@ -1090,11 +1076,10 @@ return await parallel([
   () => workflow("child", { tag: "two" }),
 ]);`,
       {
-        loadSavedWorkflow: savedScript((name) =>
+        loadSavedWorkflow: (name) =>
           name === "child"
             ? `export const meta = { name: "child", description: "c" };\nawait agent("child-work");\nreturn args.tag;`
             : undefined,
-        ),
         agent: { run: async () => "x" },
       },
     );
@@ -1117,7 +1102,7 @@ agent("slow child", { label: "slow-child" });
 return { child: "done" };`;
     const firstRun = runWorkflow(parentScript, {
       runId: "nested-frame-drain",
-      loadSavedWorkflow: savedScript((name) => (name === "child" ? childScript : undefined)),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
       agent: {
         run: async () => {
           dispatches += 1;
@@ -1152,7 +1137,7 @@ return { child: "done" };`;
     const replayed = await runWorkflow(parentScript, {
       runId: "nested-frame-drain",
       resumeJournal: journal,
-      loadSavedWorkflow: savedScript((name) => (name === "child" ? childScript : undefined)),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
       agent: {
         run: async () => {
           dispatches += 1;
@@ -1171,7 +1156,7 @@ return { child: "done" };`;
 await workflow("child");
 return 0;`,
         {
-          loadSavedWorkflow: savedScript((name) =>
+          loadSavedWorkflow: (name) =>
             name === "child"
               ? `export const meta = { name: "child", description: "c" };
 await workflow("grandchild");
@@ -1180,7 +1165,6 @@ return 0;`
                 ? `export const meta = { name: "grandchild", description: "g" };
 return 0;`
                 : undefined,
-          ),
           agent: nullRunner(),
         },
       ),
@@ -1196,13 +1180,12 @@ await workflow("child", { tag: "one" });
 await workflow("child", { tag: "two" });
 return 0;`,
       {
-        loadSavedWorkflow: savedScript((name) =>
+        loadSavedWorkflow: (name) =>
           name === "child"
             ? `export const meta = { name: "child", description: "c" };
 await agent("child-work");
 return args.tag;`
             : undefined,
-        ),
         agent: { run: async () => "x" },
         onAgentJournal: (entry) => {
           runIds.push(entry.runId ?? "");
@@ -1222,7 +1205,7 @@ return args.tag;`
     const options = {
       runId: "nested-arg-presence",
       agent: nullRunner(),
-      loadSavedWorkflow: savedScript((name: string) => (name === "child" ? childScript : undefined)),
+      loadSavedWorkflow: (name: string) => (name === "child" ? childScript : undefined),
       onWorkflowJournal: (entry: {
         index: number;
         runId?: string;
@@ -1248,11 +1231,10 @@ return args.tag;`
     const script = `export const meta = { name: "undefined-parent", description: "u" };\nreturn await workflow("child");`;
     const options = {
       runId: "undefined-child-parent",
-      loadSavedWorkflow: savedScript((name: string) =>
+      loadSavedWorkflow: (name: string) =>
         name === "child"
           ? `export const meta = { name: "undefined-child", description: "u" };\nawait agent("side effect");`
           : undefined,
-      ),
       agent: {
         run: async () => {
           childCalls += 1;
@@ -1287,13 +1269,12 @@ const child = await workflow("child", { tag: "stable" });
 return child;`;
     const options = {
       runId: "nested-parent",
-      loadSavedWorkflow: savedScript((name: string) =>
+      loadSavedWorkflow: (name: string) =>
         name === "child"
           ? `export const meta = { name: "child", description: "c" };
 const value = await agent("child-work");
 return args.tag + ":" + value;`
           : undefined,
-      ),
       agent: {
         run: async () => {
           childCalls += 1;
@@ -1368,7 +1349,7 @@ return [a, b, c];`;
     const journal = new Map<string, { index: number; runId: string; hash: string; result: unknown }>();
     const calls: string[] = [];
     const script = `export const meta = { name: "routing-policy", description: "r" };
-return await agent("stable", { tier: "low" });`;
+return await agent("stable", { strength: "low" });`;
     const policy = (lowThinking: "low" | "high", extra?: Record<string, unknown>) => ({
       defaultTier: "medium",
       profiles: {
@@ -1383,6 +1364,7 @@ return await agent("stable", { tier: "low" });`;
       runWorkflow(script, {
         runId: "routing-policy-run",
         routingPolicy: routingPolicy as never,
+        strengths: { low: "low" },
         resumeJournal,
         agent: {
           run: async (prompt: string) => {
@@ -1427,12 +1409,13 @@ return await agent("stable", { tier: "low" });`;
     };
     const script = `export const meta = { name: "untiered-policy", description: "r" };
 const a = await agent("explore", { agentType: "Explore" });
-const b = await agent("named", { tier: "low" });
+const b = await agent("named", { strength: "low" });
 return a + b;`;
     const run = (fingerprint: string, resumeJournal?: typeof journal) =>
       runWorkflow(script, {
         runId: "untiered-policy-run",
         routingPolicy: policy as never,
+        strengths: { low: "low" },
         routingPolicyFingerprint: fingerprint,
         resumeJournal,
         agent: {
@@ -1473,7 +1456,7 @@ return await agent("stable");`;
         runId: "routing-parent-run",
         routingPolicyFingerprint: fingerprint,
         resumeJournal,
-        loadSavedWorkflow: savedScript((name: string) => (name === "child" ? child : undefined)),
+        loadSavedWorkflow: (name: string) => (name === "child" ? child : undefined),
         agent: {
           run: async () => {
             childCalls += 1;

@@ -136,7 +136,6 @@ describe("pi-workflows loader context isolation", () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(fixture.tools).toEqual(["workflow", "workflow_control"]);
     expect(fixture.commands).toContain("workflows");
-    expect(fixture.commands).toContain("workflows-models");
     expect(fixture.commands).toContain("deep-research");
     expect(fixture.commands).toContain("code-review");
     expect(fixture.commands).toContain("effort");

@@ -6,7 +6,7 @@ Preserve candidate or work identity outside helper results that may omit failed 
 
 | Helper | Authoring contract |
 | --- | --- |
-| `completenessCheck(args, results)` | Returns `{ complete, missing? }` or recoverable `null`. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory. |
+| `completenessCheck(args, results, { strength })` | Returns `{ complete, missing? }` or recoverable `null`. Defaults to `strength: "medium"`, not `low` like the other gates: one call, no vote to average over, and an open-ended read of the whole task. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory. |
 | `loopUntilDry({ round, key, consecutiveEmpty, maxRounds })` | `round(index)` is zero-based. Defaults: `JSON.stringify` key, two dry rounds, 50 rounds. Null, non-array, and duplicate-only rounds are dry. Token-budget or agent-limit exhaustion returns the partial array without a termination reason; keep failed-round identity and stopping state outside the helper. |
 
 ## Control

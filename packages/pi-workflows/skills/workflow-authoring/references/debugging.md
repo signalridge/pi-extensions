@@ -8,7 +8,7 @@ Start from the symptom, then reproduce through the real workflow runtime with de
 | `parallel()` rejects input | Promises were passed instead of thunks | [runtime](runtime.md#topology) |
 | Synthesis starts early | Fan-out was not awaited as one complete result set | [pattern selection](pattern-selection.md#fan-out-and-synthesize) |
 | Coverage silently disappears | `null` results were filtered before IDs were ledgered | [lifecycle](lifecycle.md#retry-and-recoverable-failure) |
-| Wrong model or thinking is used | The call named no tier and fell to a default, or named one whose profile is not what you expected | [registry ownership](registry-ownership.md#priority) |
+| Wrong model or thinking is used | The call's strength is unmapped and fell to the agent's default, or the active `strengths` table — the user's, or the shipped default — points it at a profile that is not what you expected | [registry ownership](registry-ownership.md#priority) |
 | Unknown `agentType` log | A live registry name was guessed or is unavailable | [registry ownership](registry-ownership.md#agent-types) |
 | Budget exceeds the number shown | The budget is a soft pre-call gate and work was in flight | [lifecycle](lifecycle.md#bounds-and-budget) |
 | Later calls rerun on resume | An earlier call missed or changed, ending the replayable prefix | [lifecycle](lifecycle.md#resume) |

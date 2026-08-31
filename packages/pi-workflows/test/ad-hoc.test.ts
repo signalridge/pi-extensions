@@ -41,8 +41,8 @@ describe("/workflows run ad-hoc script", () => {
     expect(payload.tasks).toMatchObject([
       { id: "worker", status: "completed", attempts: 1, valuePreview: '"worker result"' },
     ]);
-    expect(script).toMatch(/tier: "medium"/u);
-    expect(script).toMatch(/tier: "low"/u);
+    expect(script).toMatch(/strength: "medium"/u);
+    expect(script).toMatch(/strength: "low"/u);
   });
 
   it("keeps eight large worker values below the managed prompt limit without duplicating outputs", async () => {
@@ -105,7 +105,7 @@ describe("/workflows run ad-hoc script", () => {
       expect(task.valueTruncationMarker).toMatch(/\[TRUNCATED \d+ SOURCE CHARACTERS\]/u);
       expect(synthesizerPrompt.split(`worker-${task.id}-value-`)).toHaveLength(2);
     }
-    expect(script).toMatch(/tier: "medium"/u);
-    expect(script).toMatch(/tier: "low"/u);
+    expect(script).toMatch(/strength: "medium"/u);
+    expect(script).toMatch(/strength: "low"/u);
   });
 });

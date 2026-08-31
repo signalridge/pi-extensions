@@ -15,8 +15,20 @@ import {
   queryChildSessionContextImmediate,
 } from "./rpc-client.js";
 import { listSavedWorkflows, loadSavedWorkflow, saveWorkflow } from "./saved-workflows.js";
+import {
+  defaultStrengthTable,
+  isWorkflowStrength,
+  WORKFLOW_STRENGTH_LIST,
+  WORKFLOW_STRENGTHS,
+  type WorkflowStrengthTable,
+} from "./strengths.js";
 import { liveWidgetLines, showWorkflowNavigator } from "./ui.js";
-import { loadWorkflowSettings, saveWorkflowSettings } from "./workflow-settings.js";
+import {
+  loadProjectWorkflowSettings,
+  loadWorkflowSettings,
+  saveWorkflowSettings,
+  type WorkflowSettings,
+} from "./workflow-settings.js";
 
 const WorkflowToolSchema = Type.Object(
   {
@@ -129,7 +141,7 @@ export function buildAdHocWorkflowScript(prompt: string): string {
 const originalPrompt = ${JSON.stringify(prompt)};
 const plan = await agent("Design a bounded execution plan for this user task. Return 1-8 independent or dependency-linked tasks. Use unique short ids, concise descriptions, exact worker prompts, and only dependencies that appear in the task list. Prefer independent tasks when possible. User task:\\n\\n" + originalPrompt, {
   label: "planner",
-  tier: "medium",
+  strength: "medium",
   schema: {
     type: "object",
     properties: {
@@ -158,7 +170,7 @@ const graph = await orchestrate(plan.tasks.map((task) => ({
   id: task.id,
   description: task.description,
   dependsOn: task.dependsOn || [],
-  run: ({ results, statuses }) => agent(task.prompt + "\\n\\nDependency results (null means unavailable):\\n" + JSON.stringify({ results, statuses }), { label: task.id, tier: "low" }),
+  run: ({ results, statuses }) => agent(task.prompt + "\\n\\nDependency results (null means unavailable):\\n" + JSON.stringify({ results, statuses }), { label: task.id, strength: "low" }),
 })), { onError: "continue" });
 const SYNTHESIS_CONTEXT_LIMIT = 78000;
 function renderContextValue(value) {
@@ -232,7 +244,7 @@ while (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT && (valuePreviewBudget > 1
   synthesisJson = JSON.stringify(synthesisContext);
 }
 if (synthesisJson.length > SYNTHESIS_CONTEXT_LIMIT) throw new Error("Unable to fit the synthesis context within its managed prompt budget");
-return await agent("Synthesize the worker results into a direct answer to the original task. Mention incomplete or failed coverage explicitly.\\n\\nOriginal task, execution plan, and graph ledger:\\n" + synthesisJson, { label: "synthesizer", tier: "medium" });`;
+return await agent("Synthesize the worker results into a direct answer to the original task. Mention incomplete or failed coverage explicitly.\\n\\nOriginal task, execution plan, and graph ledger:\\n" + synthesisJson, { label: "synthesizer", strength: "medium" });`;
 }
 
 export default function piWorkflows(pi: ExtensionAPI): void {
@@ -346,37 +358,35 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   const DEFAULT_EXCLUDED_TOOLS = ["workflow", "workflow_control"] as const;
 
   /**
-   * Resolve a nested `workflow(name)` reference, saying where the script came
-   * from.
+   * Persist one settings change into this project's own file.
    *
-   * Shipped-ness has to be reported per script rather than inherited from the
-   * frame that called it: a user script may call a built-in by name, and a
-   * built-in's tier names are preferences against whatever catalogue the host
-   * defines, while a user script's are assertions about a catalogue the user
-   * owns. Inheriting the caller's flag would apply the wrong rule in both
-   * directions.
+   * `workflowSettings` is the merged view — defaults, then global, then project
+   * — while `saveWorkflowSettings` replaces the project file with whatever it
+   * is handed. Handing it the merged view would copy every global value and
+   * every default into the project on the first edit, and the project would
+   * stop tracking the global file from then on. So the patch lands on project
+   * scope and the merged view is re-derived from what actually landed, which is
+   * also what makes it safe to report the result rather than the intent.
    */
-  const resolveNestedWorkflow = (name: string): { script: string; shippedScript?: boolean } | undefined => {
-    // A saved file shadows a built-in of the same name; it is the user's own
-    // script and keeps the strict tier check.
-    const saved = loadSavedWorkflow(name, sessionCwd);
-    if (saved !== undefined) return { script: saved };
-    const builtin = BUILTIN_WORKFLOWS[name]?.script;
-    return builtin === undefined ? undefined : { script: builtin, shippedScript: true };
+  const persistWorkflowSetting = (patch: WorkflowSettings): void => {
+    saveWorkflowSettings({ ...loadProjectWorkflowSettings(sessionCwd), ...patch }, sessionCwd);
+    workflowSettings = loadWorkflowSettings(sessionCwd);
   };
+
+  /** Resolve a nested `workflow(name)` reference; a saved file shadows a built-in. */
+  const resolveNestedWorkflow = (name: string): string | undefined =>
+    loadSavedWorkflow(name, sessionCwd) ?? BUILTIN_WORKFLOWS[name]?.script;
 
   const resolveScript = (
     script: string | undefined,
     name: string | undefined,
     args: unknown,
-  ): { script: string; source: string; toolset?: string; shippedScript?: boolean } => {
+  ): { script: string; source: string; toolset?: string } => {
     if (script !== undefined && name !== undefined) {
       throw new Error("Provide either `script` or `name`, not both.");
     }
     if (script !== undefined) return { script, source: "inline" };
     if (name !== undefined) {
-      // A saved workflow is the user's own file even when it shadows a built-in
-      // name, so it keeps the strict tier check.
       const saved = loadSavedWorkflow(name, sessionCwd);
       if (saved) return { script: saved, source: `saved:${name}` };
       const builtin = BUILTIN_WORKFLOWS[name];
@@ -384,12 +394,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         // Validate named invocations before starting a potentially expensive fleet.
         // Slash commands provide the same shape through their descriptor primaryArg.
         validateBuiltinArgs(name, args);
-        return {
-          script: builtin.script,
-          source: `builtin:${name}`,
-          toolset: builtin.toolset,
-          shippedScript: true,
-        };
+        return { script: builtin.script, source: `builtin:${name}`, toolset: builtin.toolset };
       }
       throw new Error(`Unknown workflow name "${name}". It is neither a saved workflow nor a built-in.`);
     }
@@ -401,6 +406,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     active = true;
     const workflowEngine = currentEngine();
     workflowEngine.onRunSettled = notifyRunChanged;
+    // `control("resume")` and the provider-limit retry start executions with no
+    // caller to pass options for them, and the strength table is deliberately
+    // never frozen onto a run. Without this they would resume with no table and
+    // re-run every finished call untabled.
+    workflowEngine.strengths = () => workflowSettings.strengths;
     // Command/tool registrations persist across session replacement, but the
     // widget belongs to the newly restored engine and must be refreshed too.
     refreshWidget();
@@ -447,12 +457,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
                 ? (() => {
                     const prior = workflowEngine.getRun(params.resumeFromRunId);
                     if (!prior) throw new Error(`Workflow run not found: ${params.resumeFromRunId}`);
-                    // Resume reads the frozen flag off the restored run, so
-                    // this only has to satisfy the shared shape.
-                    return { script: prior.script, source: "resume", toolset: prior.toolset, shippedScript: undefined };
+                    // Resume replays the stored script; only the shared shape
+                    // has to be satisfied here.
+                    return { script: prior.script, source: "resume", toolset: prior.toolset };
                   })()
                 : resolveScript(params.script, params.name, params.args);
-            const { script, source, toolset, shippedScript } = resolved;
+            const { script, source, toolset } = resolved;
             const options: ScriptStartOptions = {
               args: params.args,
               background: params.background ?? true,
@@ -462,7 +472,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               tokenBudget: params.tokenBudget,
               agentTimeoutMs: params.agentTimeoutMs,
               toolset,
-              ...(shippedScript === undefined ? {} : { shippedScript }),
               excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
               signal,
               mainModel: ctx?.model?.id,
@@ -479,6 +488,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
                     }
                   : undefined,
               loadSavedWorkflow: resolveNestedWorkflow,
+              strengths: workflowSettings.strengths,
             };
             if (params.resumeFromRunId) {
               const replacement = params.script !== undefined || params.name !== undefined ? script : undefined;
@@ -546,7 +556,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
     // /workflows: navigator + run/status/watch/stop/pause/resume/rm/save subcommands
     pi.registerCommand("workflows", {
-      description: "Workflow runs: open the navigator, or run/status/watch/stop/pause/resume/rm/save",
+      description: "Workflow runs: navigator, or run/status/watch/stop/pause/resume/rm/save/strength",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         const tokens = args.trim().split(/\s+/).filter(Boolean);
         const [subcommand, ...rest] = tokens;
@@ -656,20 +666,155 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           }
           return;
         }
+        if (subcommand === "strength") {
+          // The Agent tier catalogue is owned by pi-subagents and still is (A8:
+          // no second tier config file). What this edits is narrower and is
+          // genuinely ours: which Agent tier each workflow strength runs on.
+          //
+          // A subcommand rather than a command of its own, because the reason
+          // to surface it at all is the three-part view below — two lines of
+          // which come from this package and one from the other — and that is
+          // a page to read, not a mode to be in.
+          //
+          // The catalogue lives on the managed peer, so it can legitimately be
+          // unreachable here. Status still has its other two parts, and a set
+          // made against a table that already exists is stored unvalidated: the
+          // run-start check reports a tier this host does not define and drops
+          // that entry, which costs the redirect rather than the run. A set made
+          // with no table at all is refused instead — see below, where the seed
+          // is read.
+          const catalogue = await (async (): Promise<string[] | undefined> => {
+            try {
+              return Object.keys((await awaitProtocol()).routingPolicy.profiles).sort();
+            } catch {
+              return undefined;
+            }
+          })();
+          const knownTiers = catalogue ? new Set(catalogue) : undefined;
+          // What a run would resolve, by the same rule the runtime uses: a
+          // configured table if there is one, else the shipped default. Shown
+          // rather than the configured table alone, because an unconfigured
+          // machine is not an unrouted one and a row reading "(unset)" there
+          // would describe something other than what the next run does.
+          const effective = (): { table: WorkflowStrengthTable; shipped: boolean } => {
+            const configured = workflowSettings.strengths;
+            return configured === undefined
+              ? { table: defaultStrengthTable(knownTiers), shipped: true }
+              : { table: configured, shipped: false };
+          };
+          const describe = (): string => {
+            const { table, shipped } = effective();
+            const rows = WORKFLOW_STRENGTHS.map((name) => {
+              // The default is derived from the catalogue, so without one there
+              // is nothing honest to print: the run will still route these, and
+              // "(unset)" would claim it will not.
+              if (shipped && knownTiers === undefined) return `  ${name} → (default; needs the tier catalogue)`;
+              if (table[name] === undefined) return `  ${name} → (unset; the agent's own default)`;
+              return `  ${name} → ${table[name]}${shipped ? " (default)" : ""}`;
+            });
+            // The shipped default is identity, so on a stock install workflow
+            // work rides the same profiles every ordinary spawn does — the
+            // coupling this indirection exists to let you break, but does not
+            // break on its own. Saying so here is the only place the two steps
+            // out of it are visible together.
+            const decouple = shipped
+              ? "\nThis is the shipped default: each strength on the tier of the same name, so " +
+                "workflow work shares the tiers your ordinary spawns use (Explore among them). " +
+                "To price workflow work on its own, define a tier in /agents → Model tiers, then " +
+                "point a strength at it here."
+              : "";
+            return (
+              `Workflow strengths and the Agent tier each runs on:\n${rows.join("\n")}\n` +
+              `Tiers this host defines: ${catalogue?.join(", ") ?? "(unavailable)"}\n` +
+              "Edits apply to this project; for a machine-wide table edit " +
+              "<agent dir>/workflows/settings.json. The tiers themselves live in " +
+              "/agents → Model tiers; this only says which one a strength uses." +
+              decouple
+            );
+          };
+          const [strength, target] = rest;
+          if (strength === undefined) {
+            ctx.ui.notify(describe(), "info");
+            return;
+          }
+          if (!isWorkflowStrength(strength)) {
+            ctx.ui.notify(`"${strength}" is not a workflow strength. Use one of ${WORKFLOW_STRENGTH_LIST}.`, "warning");
+            return;
+          }
+          if (target === undefined || rest.length !== 2) {
+            ctx.ui.notify(`/workflows strength [<${WORKFLOW_STRENGTHS.join("|")}> <tier>|off]`, "warning");
+            return;
+          }
+          // `off` reads as "unset" unless the host really defines a tier by
+          // that name, in which case the user's own catalogue outranks our
+          // keyword — a tier you cannot point at is worse than a clumsier way
+          // to clear one.
+          const unset = target === "off" && catalogue?.includes("off") !== true;
+          if (!unset && catalogue && !catalogue.includes(target)) {
+            ctx.ui.notify(
+              `"${target}" is not a tier this host defines. Available: ${catalogue.join(", ") || "(none)"}. ` +
+                "Define it in /agents → Model tiers first.",
+              "warning",
+            );
+            return;
+          }
+          const { table: current, shipped } = effective();
+          if (shipped && knownTiers === undefined) {
+            // Seeding from a default we cannot compute would write a one-entry
+            // table, and this key replaces rather than merges — so the other two
+            // strengths would go from routed to unmapped as a side effect of
+            // setting this one. Refusing costs a retry; writing costs a run.
+            ctx.ui.notify(
+              "The tier catalogue is unavailable, so the current table cannot be read. " +
+                "Retry once the managed peer is reachable.",
+              "warning",
+            );
+            return;
+          }
+          // Seeded from the table a run would use, not from this project's file.
+          // Every level of this key replaces the one below rather than merging
+          // into it, so a patch built on project scope would silently drop
+          // whatever the level below contributed: adding one entry would discard
+          // an inherited global table, and `off` against an entry this project
+          // never wrote would write nothing and leave the mapping standing. The
+          // seed does freeze the current table into the project, which is what a
+          // replace-wholesale key costs — the entries a partial file left out
+          // would be unmapped, not inherited.
+          const { [strength]: _cleared, ...others } = current;
+          try {
+            persistWorkflowSetting({ strengths: unset ? others : { ...others, [strength]: target } });
+          } catch (error: unknown) {
+            ctx.ui.notify(
+              `Could not save workflow strength routing: ${error instanceof Error ? error.message : String(error)}`,
+              "warning",
+            );
+            return;
+          }
+          // Show the resolved result rather than echoing the write. The
+          // settings layer can drop what it was handed, and `off` against the
+          // last remaining entry stores an explicit empty table — "map nothing",
+          // which is not the same as the shipped default an absent key would
+          // mean — so a message announcing the write would describe something
+          // other than what the next run will do. Runs already in flight keep
+          // what they started with; the table is read fresh at each start and
+          // resume.
+          //
+          // The one case the table alone cannot explain: the host defines a tier
+          // named `off`, so the keyword lost to it above and this mapped rather
+          // than cleared. The catalogue outranking our keyword is the right call
+          // — a tier you cannot point at is worse than a clumsier way to clear
+          // one — but a user who typed the documented keyword and got a mapping
+          // has to be told which reading won, and where the other one lives.
+          const shadowed =
+            target === "off" && !unset
+              ? '\n\nNote: this host defines a tier named "off", so `off` was read as that tier rather ' +
+                "than as the clear keyword. To leave a strength unmapped here, remove its entry from the " +
+                "`strengths` object in this project's settings.json."
+              : "";
+          ctx.ui.notify(`${describe()}${shadowed}`, "info");
+          return;
+        }
         ctx.ui.notify(`Unknown /workflows subcommand: ${subcommand}`, "warning");
-      },
-    });
-
-    // /workflows-models: tier configuration is owned by pi-subagents; this
-    // command documents the delegation (A8: no second tier config file).
-    pi.registerCommand("workflows-models", {
-      description: "Workflow tier routing: tiers are configured in pi-subagents /agents → Model tiers",
-      handler: async (_args: string, ctx: ExtensionCommandContext) => {
-        ctx.ui.notify(
-          "Workflow tiers (small/medium/large) route through pi-subagents' workflow.tiers settings. " +
-            "Use /agents → Model tiers to configure them.",
-          "info",
-        );
       },
     });
 
@@ -686,21 +831,22 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           );
           return;
         }
+        let patch: WorkflowSettings;
         if (action === "compact" || action === "detailed") {
-          workflowSettings = { ...workflowSettings, progressMode: action };
+          patch = { progressMode: action };
         } else if (action === "max") {
           const max = Number(tokens[1]);
           if (!Number.isInteger(max) || max < 1 || max > 32) {
             ctx.ui.notify("Usage: /workflows-progress max <1-32>", "warning");
             return;
           }
-          workflowSettings = { ...workflowSettings, maxAgentsShown: max };
+          patch = { maxAgentsShown: max };
         } else {
           ctx.ui.notify("Usage: /workflows-progress compact|detailed|status|max <N>", "warning");
           return;
         }
         try {
-          saveWorkflowSettings(workflowSettings, sessionCwd);
+          persistWorkflowSetting(patch);
           refreshWidget();
           ctx.ui.notify(
             `Workflow progress set to ${workflowSettings.progressMode}, max ${workflowSettings.maxAgentsShown}.`,
@@ -723,9 +869,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // an ordinary answer.
     const TRIGGER_WORD_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/u;
     const persistTriggerSettings = (): void => {
-      workflowSettings = { ...workflowSettings, keywordTriggerWord: triggerKeyword, keywordTriggerEnabled };
       try {
-        saveWorkflowSettings(workflowSettings, sessionCwd);
+        persistWorkflowSetting({ keywordTriggerWord: triggerKeyword, keywordTriggerEnabled });
       } catch {
         /* setting changes remain active in memory */
       }
@@ -784,7 +929,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       if (event.text.includes(WORKFLOW_ARMED_DIRECTIVE)) return { action: "continue" as const };
       const effortDirective =
         effortLevel === "ultra"
-          ? "Effort: ULTRA. Be exhaustive: use broad parallel review, verification, and completeness checks; choose the large tier where useful."
+          ? 'Effort: ULTRA. Be exhaustive: use broad parallel review, verification, and completeness checks; give the deepest steps strength: "high".'
           : effortLevel === "high"
             ? "Effort: HIGH. Be thorough: use several independent reviewers and an adversarial verification pass."
             : "";
@@ -806,9 +951,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           return;
         }
         effortLevel = level;
-        workflowSettings = { ...workflowSettings, effort: effortLevel };
         try {
-          saveWorkflowSettings(workflowSettings, sessionCwd);
+          persistWorkflowSetting({ effort: effortLevel });
         } catch {
           /* warning is non-fatal */
         }
@@ -824,9 +968,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       description: "Ultracode: toggle exhaustive workflow effort",
       handler: async (args: string, ctx: ExtensionCommandContext) => {
         effortLevel = args.trim().toLowerCase() === "off" ? "off" : "ultra";
-        workflowSettings = { ...workflowSettings, effort: effortLevel };
         try {
-          saveWorkflowSettings(workflowSettings, sessionCwd);
+          persistWorkflowSetting({ effort: effortLevel });
         } catch {
           /* warning is non-fatal */
         }
@@ -873,9 +1016,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             args: scriptArgs,
             background: true,
             toolset: descriptor.toolset,
-            shippedScript: true,
             excludeTools: [...DEFAULT_EXCLUDED_TOOLS],
             loadSavedWorkflow: resolveNestedWorkflow,
+            strengths: workflowSettings.strengths,
           };
           try {
             const workflowEngine = currentEngine();
@@ -1019,9 +1162,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       const workflowEngine = currentEngine();
       const result = await workflowEngine.start(script, {
         background: true,
-        // We wrote this script, tiers included, so its tier names are a
-        // preference against whatever catalogue this host defines.
-        shippedScript: true,
+        strengths: workflowSettings.strengths,
         mainModel: ctx.model?.id,
       });
       void deliverBackgroundResult(workflowEngine, result.runId);
@@ -1190,6 +1331,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               background: true,
               mainModel: commandCtx?.model?.id,
               loadSavedWorkflow: resolveNestedWorkflow,
+              strengths: workflowSettings.strengths,
             };
             const result = await workflowEngine.start(script, options);
             void deliverBackgroundResult(workflowEngine, result.runId);
