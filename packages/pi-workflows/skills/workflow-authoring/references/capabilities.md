@@ -11,7 +11,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional); default: derived from phase and call count<br>`phase`: string (optional); default: current phase<br>`schema`: plain JSON Schema (optional)<br>`strength`: "low" \| "medium" \| "high" (optional); default: no tier is sent; the agent's own tier, else agentTiers.defaultTier<br>`isolation`: "worktree" (optional); default: pi-subagents worktree policy<br>`thread`: string (optional); default: fresh session per call<br>`toolset`: string (optional); default: configured host/agent toolset hint<br>`excludeTools`: string[] (optional)<br>`agentType`: string (optional); default: general-purpose<br>`timeoutMs`: number \| null (optional); default: 300000 (5min); null disables<br>`retries`: number (optional); default: run retry count |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional); default: derived from phase and call count<br>`phase`: string (optional); default: current phase<br>`schema`: plain JSON Schema (optional)<br>`strength`: "low" \| "medium" \| "high" (optional); default: no tier is sent; the agent's own tier, else agentTiers.defaultTier<br>`isolation`: "worktree" (optional); default: pi-subagents worktree policy<br>`thread`: string (optional); default: fresh session per call<br>`toolset`: string (optional); default: configured host/agent toolset hint<br>`excludeTools`: string[] (optional)<br>`agentType`: string (optional); default: general-purpose<br>`timeoutMs`: number \| null (optional); default: 1800000 (30min); null disables<br>`retries`: number (optional); default: run retry count |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | orchestrate | runtime-global | `orchestrate(tasks, options?) => Promise<{ results, tasks }>` | `onError`: "skip-dependents"\|"continue"\|"fail-fast" (optional); default: "skip-dependents" |
@@ -35,9 +35,9 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | args | workflow-tool-input | `args?: unknown` | — |
 | background | workflow-tool-input | `background?: boolean = true` | — |
 | maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
-| concurrency | workflow-tool-input | `concurrency?: number` | — |
+| concurrency | workflow-tool-input | `concurrency?: number = the host's pi-subagents maxConcurrent` | — |
 | agentRetries | workflow-tool-input | `agentRetries?: number = 0` | — |
-| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = 300000` | — |
+| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = 1800000` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 | export const meta | script-contract | `export const meta = { name, description, phases? }` | — |

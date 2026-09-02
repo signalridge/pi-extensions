@@ -155,6 +155,16 @@ export interface AgentRunOptions {
   onTierResolved?: (tier: string) => void;
   onUsage?: (usage: AgentUsage) => void;
   onHistory?: (history: unknown[]) => void;
+  /**
+   * The agent left the host's queue and is now running.
+   *
+   * A dispatched agent does not necessarily start: it takes a background slot
+   * from pi-subagents, and a fan-out wider than that pool waits. The wall clock
+   * is restarted from this point so queue time is not charged against the work,
+   * which is what let a batch dispatched behind a busy pool fail as timeouts
+   * without any of it having run.
+   */
+  onRunning?: () => void;
 }
 
 export interface AgentOptions {
@@ -260,6 +270,17 @@ export interface WorkflowRunOptions {
   workflowDepth?: number;
   cwd?: string;
   concurrency?: number;
+  /**
+   * The host's background-agent pool size, read live from the peer at each
+   * start and resume.
+   *
+   * It is both the default width and the ceiling: a workflow agent occupies one
+   * of those slots like any other background agent, so dispatching past the pool
+   * does not run wider — it fills the host's single queue ahead of the host's own
+   * spawns. One setting therefore governs the fleet, and a run neither has to
+   * guess it nor can exceed it.
+   */
+  hostMaxConcurrent?: number;
   agentRetries?: number;
   tokenBudget?: number | null;
   signal?: AbortSignal;
@@ -337,9 +358,36 @@ export const MAX_AGENTS_PER_RUN = 1000;
 export const MAX_CALLS_PER_WORKFLOW = 1_000;
 /** Per-call item cap, matching the bounded batch contract used by reference engines. */
 export const MAX_FANOUT_ITEMS = 4_096;
-export const MAX_CONCURRENCY = 16;
+/**
+ * Upper bound on agents in flight at once.
+ *
+ * A dispatched agent is a remote call this process waits on, not work it
+ * performs, so the ceiling guards against a runaway script rather than against
+ * machine capacity. The real throttle belongs to pi-subagents: every managed
+ * spawn takes one of its `maxConcurrent` background slots, so a host that wants
+ * a narrower fleet narrows it there, once, for every agent it runs.
+ */
+export const MAX_CONCURRENCY = 64;
+/**
+ * In-flight agents when neither the run nor the caller names a number.
+ *
+ * Deliberately a constant rather than a function of `hardwareConcurrency`. Core
+ * count measures what this process can compute, and dispatching an agent
+ * computes nothing here; deriving the default from it fanned a 14-core host out
+ * 12 ways and a 4-core host 2 ways for identical, entirely remote work.
+ */
+export const DEFAULT_CONCURRENCY = 16;
 export const MAX_AGENT_RETRIES = 3;
-export const DEFAULT_AGENT_TIMEOUT_MS: number | null = 300_000;
+/**
+ * Wall clock for one agent when neither the call nor the run names one.
+ *
+ * It bounds a hang and nothing else. An agent's real budget is the turn, tool
+ * and token ceiling pi-subagents applies to it, which a deep call legitimately
+ * spends over many minutes; a default an order of magnitude shorter than that
+ * budget turned every wide fan-out of real work into a batch of timeouts. Pass
+ * `null` to remove the wall clock and leave the host's budgets in sole charge.
+ */
+export const DEFAULT_AGENT_TIMEOUT_MS: number | null = 1_800_000;
 export const MAX_SCRIPT_SYNC_MS = 1_000;
 
 // ── Determinism guardrail ────────────────────────────────────────────────────
@@ -865,13 +913,30 @@ async function withTimeout<T>(
   ms: number | null,
   label: string,
   onTimeout?: () => void,
+  /**
+   * Receives a `restart()` that re-arms the clock from now.
+   *
+   * The clock is armed at dispatch and restarted when the agent reports that it
+   * started, rather than only armed on that report: a report that never arrives
+   * must degrade to the old behaviour, not to an agent that can hang forever.
+   */
+  onArm?: (restart: () => void) => void,
 ): Promise<T> {
-  if (ms === null) return promise;
+  if (ms === null) {
+    onArm?.(() => {});
+    return promise;
+  }
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  // The `restart` handed out below outlives this call: the holder keeps it in a
+  // closure that the caller may still reach after the race settles. Re-arming
+  // then would leave a live timer nothing clears, firing `onTimeout` on a
+  // finished agent long after the fact, so settlement makes it inert here
+  // rather than relying on every holder to guard its own call.
+  let settled = false;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeoutId = setTimeout(() => {
+    const fire = () => {
       try {
         onTimeout?.();
       } catch {
@@ -884,12 +949,19 @@ async function withTimeout<T>(
           { recoverable: true },
         ),
       );
-    }, ms);
+    };
+    timeoutId = setTimeout(fire, ms);
+    onArm?.(() => {
+      if (settled) return;
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(fire, ms);
+    });
   });
 
   try {
     return await Promise.race([promise, timeoutPromise]);
   } finally {
+    settled = true;
     if (timeoutId) clearTimeout(timeoutId);
   }
 }
@@ -1185,19 +1257,38 @@ export async function runWorkflow<T = unknown>(
   };
 
   const agentRunner = options.agent;
+  // The host's pool is the width that can actually be achieved, so it is the
+  // default when it is known and the ceiling when it is not the default.
+  // DEFAULT_CONCURRENCY only covers a peer that published no pool size.
+  const requestedConcurrency = options.concurrency ?? options.hostMaxConcurrent ?? DEFAULT_CONCURRENCY;
   const concurrency = normalizeConcurrency(
-    options.concurrency ??
-      Math.max(
-        1,
-        (globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 8,
-      ) - 2,
+    options.hostMaxConcurrent === undefined
+      ? requestedConcurrency
+      : Math.min(requestedConcurrency, options.hostMaxConcurrent),
   );
+  // Only a caller who asked for a specific width can be surprised by the clamp,
+  // and the guidance now tells everything else to omit the field — so the one
+  // caller that set it is exactly the one owed an explanation for the number it
+  // did not get.
+  // Floored, not raw: normalizeConcurrency floors, and reporting 12.5 -> 12 as a
+  // clamp would blame a bound that did not bite.
+  const askedConcurrency = options.concurrency === undefined ? undefined : Math.floor(options.concurrency);
+  const concurrencyClampNotice =
+    askedConcurrency !== undefined && askedConcurrency > concurrency
+      ? `concurrency ${askedConcurrency} clamped to ${concurrency}` +
+        // Name the bound that actually bit. A pool above MAX_CONCURRENCY is not
+        // the reason for the clamp even though it is below what was requested.
+        (concurrency === options.hostMaxConcurrent
+          ? `: the host's subagent pool is ${concurrency}, and dispatching past it only queues`
+          : `: the runtime ceiling is ${MAX_CONCURRENCY}`)
+      : undefined;
 
   const log = (message: unknown) => {
     const text = String(message);
     state.logs.push(text);
     options.onLog?.(text);
   };
+  if (concurrencyClampNotice !== undefined) log(concurrencyClampNotice);
 
   /**
    * The strength table this run will honor, target-checked once at start.
@@ -1584,6 +1675,10 @@ export async function runWorkflow<T = unknown>(
               );
             }
 
+            // Set by withTimeout below, and called by the dispatcher when the
+            // agent leaves the host queue. Undefined until then: a start that
+            // beats the arming simply leaves the full clock ahead of it.
+            let restartTimeout: (() => void) | undefined;
             const runPromise = agentRunner.run(promptText + schemaInstruction + repairFeedback, {
               label,
               sessionName: agentOptions.thread
@@ -1614,9 +1709,20 @@ export async function runWorkflow<T = unknown>(
               onHistory: (history: unknown[]) => {
                 options.onAgentHistory?.({ id: deltaKey, label, phase: assignedPhase, history });
               },
+              onRunning: () => {
+                restartTimeout?.();
+              },
             });
             runPromise.catch(() => {});
-            let result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
+            let result = await withTimeout(
+              runPromise,
+              timeout,
+              label,
+              () => agentController.abort(),
+              (restart) => {
+                restartTimeout = restart;
+              },
+            );
 
             throwIfAborted();
             if (isEmptyTextAgentResult(result, schema)) {

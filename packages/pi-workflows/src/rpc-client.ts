@@ -172,6 +172,16 @@ export interface ManagedProtocolCheck {
   routingPolicy: ManagedRoutingPolicy;
   /** Whole-catalogue identity; used only where a per-tier identity cannot be. */
   routingPolicyFingerprint: string;
+  /**
+   * The host's background-agent pool size, when the peer published one.
+   *
+   * A workflow agent occupies one of those slots like any other background
+   * agent, so this is the width the run can actually achieve; dispatching past
+   * it only fills the host's queue. Undefined means the peer predates the
+   * field or answered through the readiness broadcast, which carries no
+   * requested fields — the caller then falls back to its own default.
+   */
+  maxConcurrent?: number;
 }
 
 export async function checkManagedSpawnProtocol(
@@ -213,7 +223,9 @@ export async function checkManagedSpawnProtocol(
     });
     const sendPing = () => {
       try {
-        events.emit("subagents:rpc:ping", { requestId: id });
+        // Additive reply fields are requested by name: the reply envelope is
+        // strictly parsed, so a peer may not volunteer one.
+        events.emit("subagents:rpc:ping", { requestId: id, include: ["maxConcurrent"] });
       } catch (error: unknown) {
         finish(undefined, error instanceof Error ? error : new Error(String(error)));
       }
@@ -254,6 +266,7 @@ export async function checkManagedSpawnProtocol(
   return {
     routingPolicy: ping.routingPolicy.policy,
     routingPolicyFingerprint: ping.routingPolicy.fingerprint,
+    ...(ping.maxConcurrent === undefined ? {} : { maxConcurrent: ping.maxConcurrent }),
   };
 }
 

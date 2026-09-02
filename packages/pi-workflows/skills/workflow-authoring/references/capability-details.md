@@ -22,7 +22,7 @@ Every exact fact below is projected from the installed extension's capability co
 - `toolset`: string (optional); default: configured host/agent toolset hint
 - `excludeTools`: string[] (optional)
 - `agentType`: string (optional); default: general-purpose
-- `timeoutMs`: number \| null (optional); default: 300000 (5min); null disables
+- `timeoutMs`: number \| null (optional); default: 1800000 (30min); null disables
 - `retries`: number (optional); default: run retry count
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded repair attempts is nonrecoverable
@@ -262,8 +262,12 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `workflow-tool-input`
 - Support: `supported`
-- Signature: `concurrency?: number`
-- Constraint: runtime clamps to 1..16
+- Signature: `concurrency?: number = the host's pi-subagents maxConcurrent`
+- Constraint: runtime clamps to 1..64
+- Constraint: read live from the peer at each start and resume, and also the ceiling: a request above the pool is clamped to it, and the run log records the clamp
+- Constraint: 16 is only the fallback for a peer that publishes no pool size
+- Constraint: pi-subagents maxConcurrent stays the authoritative throttle; one setting governs the whole fleet
+- Constraint: that pool is typically small (4 slots by default), so a wide fan-out runs in waves rather than all at once
 
 <a id="workflow-tool-input-agentretries"></a>
 ## agentRetries
@@ -278,8 +282,10 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `workflow-tool-input`
 - Support: `supported`
-- Signature: `agentTimeoutMs?: number = 300000`
-- Constraint: null disables the hard timeout; default 300000ms (5min)
+- Signature: `agentTimeoutMs?: number = 1800000`
+- Constraint: null disables the hard timeout; default 1800000ms (30min)
+- Constraint: it bounds a hang only; an agent's real budget is the host's turn, tool and token ceiling
+- Constraint: the clock restarts when the host reports the agent left its queue, so waiting for a slot is not charged as work
 
 <a id="workflow-tool-input-tokenbudget"></a>
 ## tokenBudget

@@ -10,6 +10,7 @@ import {
   parseManagedQuiescenceResponse,
   parseManagedSpawnRequest,
   parseManagedSpawnResponse,
+  parsePingIncludes,
   parseProtocolPing,
   parseRpcReply,
   replyChannel,
@@ -59,6 +60,25 @@ test("requires every v4 capability rather than negotiating a partial peer", () =
     expect(() => parseProtocolPing(ping({ capabilities: partial }))).toThrow(/capability/);
     expect(requiredCapabilitiesMatch({ ...capabilities, [key]: false })).toBe(false);
   }
+});
+
+test("carries an opt-in pool size that an older peer may omit", () => {
+  expect(parseProtocolPing(ping())).not.toHaveProperty("maxConcurrent");
+  expect(parseProtocolPing(ping({ maxConcurrent: 40 }))).toMatchObject({ maxConcurrent: 40 });
+  expect(() => parseProtocolPing(ping({ maxConcurrent: 0 }))).toThrow(/maxConcurrent/);
+  expect(() => parseProtocolPing(ping({ maxConcurrent: 1.5 }))).toThrow(/maxConcurrent/);
+  expect(() => parseProtocolPing(ping({ maxConcurrent: "40" }))).toThrow(/maxConcurrent/);
+  // A field nobody asked for still fails: that strictness is why the pool size
+  // is requested by name instead of volunteered.
+  expect(() => parseProtocolPing(ping({ poolSize: 40 }))).toThrow(/protocol ping/);
+});
+
+test("reads requested reply fields as a bounded set of names", () => {
+  expect(parsePingIncludes(["maxConcurrent"]).has("maxConcurrent")).toBe(true);
+  expect(parsePingIncludes(undefined).size).toBe(0);
+  expect(parsePingIncludes("maxConcurrent").size).toBe(0);
+  expect(parsePingIncludes([1, {}, "maxConcurrent"]).size).toBe(1);
+  expect(parsePingIncludes(Array.from({ length: 40 }, (_, i) => `field-${i}`)).size).toBe(8);
 });
 
 test("requires routing-policy metadata on every ping", () => {

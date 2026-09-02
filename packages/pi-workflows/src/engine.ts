@@ -136,10 +136,30 @@ interface AgentLifecycleWaiter {
   generation: number;
   onUsage?: (usage: AgentUsage) => void;
   onHistory?: (history: unknown[]) => void;
+  /** Told once when the host reports this agent left the queue and started. */
+  onRunning?: () => void;
+  startedNotified: boolean;
   executionGeneration: number;
   resolve: (response: ManagedSpawnResponse) => void;
   reject: (error: unknown) => void;
   settled: boolean;
+}
+
+/**
+ * Tell a waiter once that its agent started.
+ *
+ * Once, because the wall clock is restarted from this point: a repeated report
+ * — a duplicate event, or a reply that raced its own lifecycle event — would
+ * keep pushing the deadline out and quietly turn the timeout off.
+ */
+function notifyAgentRunning(waiter: AgentLifecycleWaiter): void {
+  if (waiter.startedNotified || waiter.settled) return;
+  waiter.startedNotified = true;
+  try {
+    waiter.onRunning?.();
+  } catch {
+    /* the clock is best effort; never fail a live agent over it */
+  }
 }
 
 interface AgentTerminalDelivery {
@@ -432,6 +452,10 @@ export class WorkflowEngine {
     if (updateCallTierIdentity(state, callNodeId, data.tier)) {
       this.persistCallTierIdentity(state, callNodeId);
     }
+    // A start is the moment the host admitted this agent from its queue. It is
+    // the only signal that separates waiting for a slot from doing the work, so
+    // the call's wall clock is restarted here rather than at dispatch.
+    if (eventName === "subagents:started" && waiterMatches && waiter) notifyAgentRunning(waiter);
     // Created/started lifecycle facts carry managed identity before the RPC
     // reply is necessarily available. They are observation-only here; terminal
     // ownership is handled below once a completion/failure fact arrives.
@@ -1010,6 +1034,10 @@ export class WorkflowEngine {
           : {
               routingPolicy: protocol.routingPolicy,
               routingPolicyFingerprint: protocol.routingPolicyFingerprint,
+              // Read live at each start and resume, never frozen onto the run:
+              // the pool is a host setting the user can change between them, and
+              // a run that outlived a narrowing would dispatch into a queue.
+              ...(protocol.maxConcurrent === undefined ? {} : { hostMaxConcurrent: protocol.maxConcurrent }),
             }),
         concurrency: options.concurrency,
         agentRetries: options.agentRetries,
@@ -1287,11 +1315,17 @@ export class WorkflowEngine {
         executionGeneration,
         onUsage: runOptions.onUsage,
         onHistory: runOptions.onHistory,
+        onRunning: runOptions.onRunning,
+        startedNotified: false,
         settled: false,
         resolve,
         reject,
       };
       state.agentWaiters.set(pendingId, waiter);
+      // A spawn that was admitted straight away is already running, and its
+      // `subagents:started` event fired before this waiter existed. Only a
+      // reply that says "queued" still has a start to wait for.
+      if (typeof response !== "string" && response.state !== "queued") notifyAgentRunning(waiter);
       externalSignal.addEventListener("abort", waitAbort, { once: true });
       if (externalSignal.aborted) {
         waitAbort();

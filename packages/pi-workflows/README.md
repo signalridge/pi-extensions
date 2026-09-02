@@ -145,8 +145,31 @@ workflow, and the review skill before accepting a topology or recovery change.
 ## Tools and commands
 
 - `workflow`: run a script (`script`) or a saved/built-in workflow (`name`),
-  with `args`, `background` (default true), `maxAgents`, `concurrency`,
-  `agentRetries`, `tokenBudget`, `agentTimeoutMs`, and `resumeFromRunId`.
+  with `args`, `background` (default true), `maxAgents` (default 1000),
+  `concurrency` (defaults to the host's pool size), `agentRetries` (default 0),
+  `tokenBudget` (default unlimited), `agentTimeoutMs` (default 1800000, `null`
+  disables), and `resumeFromRunId`. The execution limits are tuned defaults: a
+  caller that names one narrower than the script needs stops the run rather
+  than shaping it.
+
+  Concurrency is not configured here at all. A workflow agent occupies one of
+  pi-subagents' `maxConcurrent` background slots like any other background
+  agent, so that setting is both the width a run defaults to and the ceiling it
+  is clamped to — read live from the peer at each start and resume, so one
+  setting governs the whole fleet and a run neither guesses it nor exceeds it.
+  The peer publishes it only to a caller that requests it by name, so an older
+  pair still handshakes; a run that learns no pool size falls back to 16. A
+  request above the pool is clamped and the run log says so.
+
+  In practice that pool is usually the *narrower* number, not the wider one: it
+  defaults to 4 background slots, so a default pair runs a fan-out four at a
+  time. That is the honest width rather than a new restriction — dispatching
+  twelve into four slots only ever queued eight — but it does mean a wide
+  fan-out finishes in waves, and `maxConcurrent` is the one place to change
+  that, for workflows and for every other background agent at once.
+
+  `agentTimeoutMs` counts from the moment the host reports the agent left its
+  queue, so waiting for a slot is never charged against the work.
 - `workflow_control`: `list`, `get`, `pause`, `resume`, `stop`, or `rm` a run; `rm` writes a durable removal tombstone.
 - `pi.events` emits `pi-workflows:runtime` snapshots (`{ runId, event }`) for phase, task, quality, retry, and nested-workflow progress; observer failures are contained.
 - `/workflows`: TUI navigator plus `run`, `status`, `watch`, `stop`, `pause`,

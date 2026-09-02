@@ -5,7 +5,7 @@ export const meta = {
 };
 
 // ADAPT: validate and bound work, then keep the schema as small as downstream JavaScript needs.
-const work = args && Array.isArray(args.work) ? args.work.slice(0, 8) : [{ id: "sample" }];
+const work = args && Array.isArray(args.work) ? args.work.slice(0, 24) : [{ id: "sample" }];
 const outputSchema = {
   type: "object",
   properties: {

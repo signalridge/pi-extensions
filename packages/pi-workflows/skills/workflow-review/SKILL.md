@@ -25,9 +25,11 @@ they are available.
    values and their bounds. Confirm that structured fields have a schema and
    that failed/null results remain visible in a ledger.
 4. **Check admission.** Verify finite bounds for task count, fan-out, loops,
-   retries, concurrency, token budget, timeout, and evidence size. Check that
-   a graph validates IDs, references, duplicate edges, and cycles before any
-   callback runs.
+   retries, and evidence size inside the script, and that the invocation leaves
+   `maxAgents`, `concurrency`, `tokenBudget` and `agentTimeoutMs` at their
+   defaults unless the user asked for that limit — a precautionary value there
+   removes coverage rather than cost. Check that a graph validates IDs,
+   references, duplicate edges, and cycles before any callback runs.
 5. **Check failure policy.** Distinguish recoverable child `null` from fatal
    workflow errors. For graphs, verify whether the default
    `skip-dependents`, explicit `continue`, or `fail-fast` policy matches the

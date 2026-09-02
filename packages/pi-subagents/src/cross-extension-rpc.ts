@@ -12,6 +12,7 @@ import {
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   parseManagedSpawnRequest,
+  parsePingIncludes,
 } from "@signalridge/pi-subagents-protocol";
 
 export { CHILD_CONTEXT_CAPABILITY, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION };
@@ -44,6 +45,17 @@ export interface SpawnCapable {
   abortOwned?(id: string, owner: AgentOwner): boolean;
   quiesceOwned?(runId: string, agentIds: string[], timeoutMs: number, owners?: AgentOwner[]): Promise<{ settled: boolean; pending: string[] }>;
   reconcileManaged?(spawnKey: string, owner: AgentOwner): ManagedSpawnResult | undefined;
+  /**
+   * Live background-agent pool size, published to a peer that asks for it.
+   *
+   * Required, unlike the capability members above. Those are advertised in the
+   * ping's `capabilities` and a peer missing one is rejected outright, so a
+   * bridge that forgets to forward one fails loudly. A missing pool size has no
+   * capability bit and no failure: the caller would silently fall back to its
+   * own guess and run at the wrong width. Making it required is what stops a
+   * bridge from omitting it by accident.
+   */
+  getMaxConcurrent(): number;
 }
 
 export interface RpcDeps {
@@ -170,11 +182,22 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   const { events, pi, getCtx, manager } = deps;
   const getRoutingPolicy = deps.getRoutingPolicy ?? getRoutingPolicySnapshot;
 
-  const unsubPing = handleRpc(events, "subagents:rpc:ping", () => ({
-    version: PROTOCOL_VERSION,
-    capabilities: PROTOCOL_CAPABILITIES,
-    routingPolicy: getRoutingPolicy(),
-  }));
+  const unsubPing = handleRpc(events, "subagents:rpc:ping", (params) => {
+    // Additive fields are opt-in by name. The reply envelope is parsed with
+    // rejectUnknownKeys on the caller's side, so volunteering a field would
+    // make every already-published peer reject the handshake; a peer that asks
+    // for one is by construction a peer that knows how to parse it.
+    const include = parsePingIncludes(params.include);
+    const maxConcurrent = include.has("maxConcurrent") ? manager.getMaxConcurrent() : undefined;
+    return {
+      version: PROTOCOL_VERSION,
+      capabilities: PROTOCOL_CAPABILITIES,
+      routingPolicy: getRoutingPolicy(),
+      ...(typeof maxConcurrent === "number" && Number.isInteger(maxConcurrent) && maxConcurrent >= 1
+        ? { maxConcurrent }
+        : {}),
+    };
+  });
 
   const unsubSpawn = handleRpc(events, "subagents:rpc:spawn", (params) => {
     const ctx = getCtx();

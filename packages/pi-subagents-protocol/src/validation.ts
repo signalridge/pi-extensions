@@ -428,15 +428,39 @@ function parseRoutingPolicySnapshot(raw: unknown): ManagedRoutingPolicySnapshot 
 
 export function parseProtocolPing(raw: unknown): ManagedProtocolPing {
   const value = asRecord(raw, "protocol ping");
-  rejectUnknownKeys(value, new Set(["version", "capabilities", "routingPolicy"]), "protocol ping");
+  rejectUnknownKeys(value, new Set(["version", "capabilities", "routingPolicy", "maxConcurrent"]), "protocol ping");
   if (typeof value.version !== "number" || !Number.isInteger(value.version) || value.version < 1) {
     throw new Error("protocol version is invalid");
+  }
+  // Optional in both directions: an older peer sends no pool size, and a caller
+  // that did not request one is not sent it. Absent is a fact the caller can
+  // act on (fall back to its own default), so it is not an error here.
+  if (
+    value.maxConcurrent !== undefined &&
+    (typeof value.maxConcurrent !== "number" || !Number.isInteger(value.maxConcurrent) || value.maxConcurrent < 1)
+  ) {
+    throw new Error("protocol ping maxConcurrent is invalid");
   }
   return {
     version: value.version,
     capabilities: parseCapabilities(value.capabilities),
     routingPolicy: parseRoutingPolicySnapshot(value.routingPolicy),
+    ...(value.maxConcurrent === undefined ? {} : { maxConcurrent: value.maxConcurrent as number }),
   };
+}
+
+/**
+ * Field names a ping request may ask the peer to include in its reply.
+ *
+ * The reply envelope is strictly validated, so a peer may only add a field a
+ * caller asked for by name; anything else it volunteers breaks callers that
+ * predate the field.
+ */
+export function parsePingIncludes(raw: unknown): Set<string> {
+  if (!Array.isArray(raw)) return new Set();
+  const out = new Set<string>();
+  for (const entry of raw.slice(0, 8)) if (typeof entry === "string" && entry.length <= 64) out.add(entry);
+  return out;
 }
 
 export function parseChildContextReply(raw: unknown): ChildContextReply {
