@@ -1,5 +1,118 @@
 # Changelog
 
+## 1.7.0
+### Minor Changes
+
+- f05185e: A workflow now runs at the width of the host's subagent pool rather than a
+  number it picked blind, and stops charging queue time against the agent waiting
+  in it.
+  
+  Two facts were missing on the pi-workflows side, and they compounded. It had no
+  way to learn `maxConcurrent`, so its own width was a constant guess. And a
+  dispatched agent was treated as a running one, though a managed spawn takes a
+  background slot like any other and waits when the pool is full, so a batch
+  dispatched behind a busy pool could fail as timeouts with none of it having run.
+  
+  - The ping reply can now carry the peer's live `maxConcurrent`, and pi-workflows
+    makes it both the default width and the ceiling: an unnamed `concurrency` takes
+    the pool size, and a named one is clamped to it, with the clamp recorded in the
+    run log so a caller who asked for a number learns why it got another. It is
+    read at each start and resume rather than frozen onto the run, because the pool
+    is a setting the user can change in between. One setting therefore governs the
+    whole fleet, which is what the ownership boundary already said and what the
+    code can now honour.
+  - **This narrows the common case, and that is the point.** The pool defaults to
+    4 background slots, so a default pair now runs a fan-out four at a time where
+    it used to dispatch `hardwareConcurrency - 2`. Nothing runs slower for it —
+    dispatching twelve into four slots only ever queued eight, ahead of the host's
+    own spawns — but the width a run reports is now the width it actually has, and
+    `maxConcurrent` is the single place to raise it for workflows and every other
+    background agent at once. A host that had already raised it gets the wide
+    fan-outs its setting always implied.
+  - The field is **requested by name** (`include: ["maxConcurrent"]`) rather than
+    volunteered. A ping envelope is parsed with `rejectUnknownKeys`, so a peer that
+    simply added a field would make every already-published caller reject the
+    handshake and lose workflows entirely. Asking keeps both directions working: an
+    older peer answers without it and the caller falls back to 16, and a caller that
+    never asks gets the v4 envelope unchanged. No version bump, no capability, no
+    lockstep release. Both READMEs document the mechanism, since `include` is now
+    part of the public cross-extension contract.
+  - `agentTimeoutMs` now counts from the moment the host reports the agent left its
+    queue. The clock is still armed at dispatch and restarted on that report, not
+    armed only by it, so a report that never arrives degrades to the old behaviour
+    rather than to an agent that can hang forever. A report that arrives *after* the
+    agent settled is ignored, so a late or duplicate one cannot leave a live timer
+    behind to abort a finished agent.
+  
+  The engine already subscribed to `subagents:started` and already filtered it by
+  workflow owner, so the start signal is the event it was discarding.
+  
+  `getMaxConcurrent` is required on the RPC bridge rather than optional. The other
+  bridge members are capabilities, advertised in the ping and rejected outright
+  when missing, so forgetting one fails loudly; a missing pool size has no
+  capability bit and no failure — the caller would silently fall back to its own
+  guess and run at the wrong width. Required is what makes that omission a compile
+  error instead of a quiet wrong answer.
+- f05185e: Stop the run's own limits from being the thing that keeps a fan-out small.
+  
+  Every execution limit a caller can pass — `maxAgents`, `concurrency`,
+  `agentRetries`, `tokenBudget`, `agentTimeoutMs` — reached the model as a bare
+  number with no stated default, while the authoring skill asked it to "set finite
+  bounds that match the work" for three of them. The result was a caller that
+  priced the run before writing it: fan-outs of one to eight, `concurrency: 1`,
+  and per-agent wall clocks of two to five minutes. Each of those values ends a run
+  rather than shaping it — `AGENT_LIMIT_EXCEEDED` partway through, or a whole
+  batch failing as timeouts — so the precaution removed coverage and not cost.
+  
+  Four changes, and the first two matter most:
+  
+  - Every numeric tool input now states its default and says to omit it, and the
+    guidelines ask for a fan-out sized to the evidence the task has: one agent per
+    independent question, ten to thirty for an ordinary review or audit. The gain
+    named is coverage, not speed — one agent asked one question reads further into
+    it than one agent asked four — because how many of them run at once is the
+    host's pool and not the script's to decide. The authoring and review skills no
+    longer treat the invocation limits as the place to express a bound — that
+    belongs to the script's own task counts, loop rounds, and fan-out widths, which
+    is where the topology is decided. `lifecycle.md` also stops citing two settings
+    keys that never existed (`defaultAgentTimeoutMs`, `defaultTokenBudget`).
+  - `agentTimeoutMs` defaults to 30 minutes rather than 5. It exists to bound a
+    hang; an agent's real budget is the turn, tool and token ceiling pi-subagents
+    applies to it, which a deep call legitimately spends over many minutes. A
+    default an order of magnitude under that budget turned every wide fan-out of
+    real work into a batch of timeouts. `null` still removes the wall clock.
+  - Concurrency defaults to 16 and clamps at 64, up from a default of
+    `hardwareConcurrency - 2` clamped at 16. Core count was the wrong quantity: a
+    dispatched agent is a remote call this process waits on, so the old default
+    fanned a 14-core host out 12 ways and a 4-core host 2 ways for identical work.
+    pi-subagents' `maxConcurrent` remains the authoritative throttle — this is the
+    guard against a runaway script, and a host that wants a narrower fleet still
+    narrows it in one place for every agent it runs.
+  - `strength` gains a criterion instead of three bare words. `high` now means a
+    step whose error is expensive to reverse — an architecture decision, a
+    destructive migration, a security boundary — normally absent from a fan-out and
+    at most one closing step, and the authoring skill and review checklist both say
+    so. The ULTRA effort directive stops asking for it outright: it used to end
+    `give the deepest steps strength: "high"`, which priced every branch of a wide
+    run at the cost of the one that mattered, and now points the exhaustiveness at
+    width and reserves `high` for a step that has that property, if the run has one.
+    Nothing about the mechanism changed — there is still no default strength, and a
+    call naming none still dispatches with no tier.
+  - `/workflows run` plans up to 24 tasks instead of 8. The planner's JSON schema
+    was the only bound on the one path where the model decides the width itself,
+    and 8 was below what an ordinary audit decomposes into. The synthesis step
+    absorbs the extra tasks by shrinking its per-worker excerpt: measured against
+    the 78,000-character context budget, 8 tasks contribute about 6,000 characters
+    each and 24 contribute about 2,500 — three times the coverage at roughly 40%
+    of the depth per worker, and about a quarter more total evidence reaching the
+    synthesizer. Widening past that would need a larger budget, which the wire's
+    100,000-character prompt cap does not leave room for.
+
+### Patch Changes
+
+- Updated dependencies [f05185e]
+  - @signalridge/pi-subagents-protocol@1.5.0
+
 ## 1.6.0
 ### Minor Changes
 
