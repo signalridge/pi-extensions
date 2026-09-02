@@ -7,7 +7,7 @@ export const meta = {
 // ADAPT: accept only a saved workflow name supplied in context; never guess an installed name.
 const savedWorkflowName = args && typeof args.savedWorkflowName === "string" ? args.savedWorkflowName : null;
 if (!savedWorkflowName) throw new Error("args.savedWorkflowName must be supplied by context");
-const jobs = args && Array.isArray(args.jobs) ? args.jobs.slice(0, 8) : [{ id: "sample" }];
+const jobs = args && Array.isArray(args.jobs) ? args.jobs.slice(0, 24) : [{ id: "sample" }];
 const preparationSchema = {
   type: "object",
   properties: { ready: { type: "boolean" } },

@@ -72,6 +72,40 @@ describe("pi-subagents protocol capability check", () => {
     await expect(checkManagedSpawnProtocol(bus)).resolves.toEqual(EXPECTED_CHECK);
   });
 
+  it("asks for the host pool size and carries it through when the peer answers", async () => {
+    const bus = new Bus();
+    let requested: unknown;
+    bus.on("subagents:rpc:ping", (raw) => {
+      const request = raw as { requestId: string; include?: unknown };
+      requested = request.include;
+      bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
+        success: true,
+        data: {
+          version: PROTOCOL_VERSION,
+          capabilities: CAPABILITIES,
+          routingPolicy: ROUTING_POLICY_SNAPSHOT,
+          maxConcurrent: 40,
+        },
+      });
+    });
+    await expect(checkManagedSpawnProtocol(bus)).resolves.toEqual({ ...EXPECTED_CHECK, maxConcurrent: 40 });
+    // Requested by name, because the reply envelope is strictly parsed: a peer
+    // may not volunteer a field to a caller that predates it.
+    expect(requested).toEqual(["maxConcurrent"]);
+  });
+
+  it("accepts a peer that publishes no pool size", async () => {
+    const bus = new Bus();
+    bus.on("subagents:rpc:ping", (raw) => {
+      const request = raw as { requestId: string };
+      bus.emit(`subagents:rpc:ping:reply:${request.requestId}`, {
+        success: true,
+        data: { version: PROTOCOL_VERSION, capabilities: CAPABILITIES, routingPolicy: ROUTING_POLICY_SNAPSHOT },
+      });
+    });
+    await expect(checkManagedSpawnProtocol(bus)).resolves.toEqual(EXPECTED_CHECK);
+  });
+
   it("rejects a peer missing any single capability", async () => {
     for (const key of Object.keys(CAPABILITIES)) {
       const { [key]: _dropped, ...partial } = CAPABILITIES as Record<string, boolean>;

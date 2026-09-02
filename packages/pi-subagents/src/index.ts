@@ -1234,6 +1234,10 @@ function activateRootRuntime(
           quiesceOwned: (runId, agentIds, timeoutMs, owners) =>
             manager.quiesceOwned(runId, agentIds, timeoutMs, owners),
           reconcileManaged: (spawnKey, owner) => manager.reconcileManaged(spawnKey, owner),
+          // The live pool size, not a snapshot: `/subagents` can change it
+          // mid-session, and a peer that sizes its fan-out from this must see
+          // the value that is actually throttling it now.
+          getMaxConcurrent: () => manager.getMaxConcurrent(),
         },
       });
       // Emit only after RPC handlers are armed, and only for a bound session.

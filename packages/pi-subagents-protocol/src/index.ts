@@ -42,6 +42,7 @@ export {
   parseManagedSpawnRequest,
   parseManagedSpawnResponse,
   parseManagedTerminalSnapshot,
+  parsePingIncludes,
   parseProtocolPing,
   parseRpcReply,
   parseRpcRequestId,

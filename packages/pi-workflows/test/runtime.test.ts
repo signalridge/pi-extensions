@@ -12,13 +12,16 @@
  *  - resume: longest-unchanged-prefix replay
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import {
   type AgentRunOptions,
   DEFAULT_AGENT_TIMEOUT_MS,
+  DEFAULT_CONCURRENCY,
   findJsonBlock,
   type JournalEntry,
+  MAX_CONCURRENCY,
+  normalizeConcurrency,
   parseWorkflowScript,
   runWorkflow,
   validateJsonSchema,
@@ -921,12 +924,21 @@ return results.length;`,
     expect(started).toBe(20);
   });
 
-  it("concurrency is clamped to 1..16", async () => {
+  it("concurrency is clamped to 1..64 and defaults to 16", () => {
+    expect(MAX_CONCURRENCY).toBe(64);
+    expect(DEFAULT_CONCURRENCY).toBe(16);
+    expect(normalizeConcurrency(99)).toBe(64);
+    expect(normalizeConcurrency(24)).toBe(24);
+    expect(normalizeConcurrency(0)).toBe(1);
+    expect(normalizeConcurrency(undefined)).toBe(1);
+  });
+
+  it("runs a fan-out wider than the old 16-agent ceiling in one batch", async () => {
     let active = 0;
     let peak = 0;
     await runWorkflow(
       `export const meta = { name: "conc", description: "c" };
-await parallel(Array.from({ length: 8 }, (_, i) => () => agent("t" + i)));
+await parallel(Array.from({ length: 40 }, (_, i) => () => agent("t" + i)));
 return 0;`,
       {
         concurrency: 99,
@@ -941,7 +953,99 @@ return 0;`,
         },
       },
     );
-    expect(peak).toBeLessThanOrEqual(16);
+    expect(peak).toBe(40);
+  });
+
+  it("takes the host pool size as its width when the peer published one", async () => {
+    let active = 0;
+    let peak = 0;
+    await runWorkflow(
+      `export const meta = { name: "host-width", description: "c" };
+await parallel(Array.from({ length: 40 }, (_, i) => () => agent("t" + i)));
+return 0;`,
+      {
+        hostMaxConcurrent: 24,
+        agent: {
+          run: async () => {
+            active++;
+            peak = Math.max(peak, active);
+            await new Promise((r) => setTimeout(r, 5));
+            active--;
+            return "x";
+          },
+        },
+      },
+    );
+    expect(peak).toBe(24);
+  });
+
+  it("clamps a requested concurrency to the host pool", async () => {
+    let active = 0;
+    let peak = 0;
+    await runWorkflow(
+      `export const meta = { name: "host-clamp", description: "c" };
+await parallel(Array.from({ length: 40 }, (_, i) => () => agent("t" + i)));
+return 0;`,
+      {
+        // Dispatching past the pool does not run wider: the surplus waits in the
+        // host queue, ahead of the host's own spawns.
+        concurrency: 60,
+        hostMaxConcurrent: 12,
+        agent: {
+          run: async () => {
+            active++;
+            peak = Math.max(peak, active);
+            await new Promise((r) => setTimeout(r, 5));
+            active--;
+            return "x";
+          },
+        },
+      },
+    );
+    expect(peak).toBe(12);
+  });
+
+  it("says so in the run log when it clamps a width the caller asked for", async () => {
+    const script = `export const meta = { name: "clamp-log", description: "c" };
+await agent("t");
+return 0;`;
+    const runner = { run: async () => "x" };
+
+    const byPool = await runWorkflow(script, { concurrency: 60, hostMaxConcurrent: 12, agent: runner });
+    expect(byPool.logs.join("\n")).toMatch(/concurrency 60 clamped to 12.*pool is 12/u);
+
+    const byCeiling = await runWorkflow(script, { concurrency: 99, agent: runner });
+    expect(byCeiling.logs.join("\n")).toMatch(/concurrency 99 clamped to 64.*ceiling is 64/u);
+
+    // A pool above the runtime ceiling is below the request but is not what bit.
+    const byBoth = await runWorkflow(script, { concurrency: 99, hostMaxConcurrent: 80, agent: runner });
+    expect(byBoth.logs.join("\n")).toMatch(/concurrency 99 clamped to 64.*ceiling is 64/u);
+
+    // A caller that named nothing was not surprised by anything.
+    const silent = await runWorkflow(script, { hostMaxConcurrent: 2, agent: runner });
+    expect(silent.logs.join("\n")).not.toMatch(/clamped/u);
+  });
+
+  it("a run whose peer published no pool size dispatches DEFAULT_CONCURRENCY agents at once", async () => {
+    let active = 0;
+    let peak = 0;
+    await runWorkflow(
+      `export const meta = { name: "conc-default", description: "c" };
+await parallel(Array.from({ length: 40 }, (_, i) => () => agent("t" + i)));
+return 0;`,
+      {
+        agent: {
+          run: async () => {
+            active++;
+            peak = Math.max(peak, active);
+            await new Promise((r) => setTimeout(r, 5));
+            active--;
+            return "x";
+          },
+        },
+      },
+    );
+    expect(peak).toBe(DEFAULT_CONCURRENCY);
   });
 
   it("a breached fan-out cancels only its own batch", async () => {
@@ -1577,8 +1681,62 @@ describe("findJsonBlock / validateJsonSchema", () => {
 // ── timeout and abort ────────────────────────────────────────────────────────
 
 describe("agent timeout and abort", () => {
-  it("DEFAULT_AGENT_TIMEOUT_MS is 300000 (5min) not null", () => {
-    expect(DEFAULT_AGENT_TIMEOUT_MS).toBe(300_000);
+  it("DEFAULT_AGENT_TIMEOUT_MS is 1800000 (30min) not null", () => {
+    expect(DEFAULT_AGENT_TIMEOUT_MS).toBe(1_800_000);
+  });
+
+  it("restarts the clock when the host reports the agent left its queue", async () => {
+    // A dispatched agent is not necessarily a running one: it takes a background
+    // slot from pi-subagents, and a fan-out behind a busy pool waits for one.
+    // Same script, same numbers, same total elapsed time in both halves — the
+    // only difference is whether the host reported the start.
+    const script = `export const meta = { name: "queue-clock", description: "t" };
+return await agent("work");`;
+    const runner = (announceStart: boolean) => ({
+      run: async (_prompt: string, opts?: AgentRunOptions) => {
+        await new Promise((r) => setTimeout(r, 50)); // queued behind the pool
+        if (announceStart) opts?.onRunning?.();
+        await new Promise((r) => setTimeout(r, 130)); // then the work itself
+        return "done";
+      },
+    });
+
+    const announced = await runWorkflow(script, { agentTimeoutMs: 150, agent: runner(true) });
+    expect(announced.result).toBe("done");
+
+    const silent = await runWorkflow(script, { agentTimeoutMs: 150, agent: runner(false) });
+    expect(silent.result).toBeNull();
+    expect(silent.logs.join("\n")).toMatch(/timed out after 150ms/);
+  });
+
+  it("ignores a start report that arrives after the agent already settled", async () => {
+    // The restart closure outlives the race it was made for. Re-arming then
+    // would leave a live timer nothing clears, aborting a finished agent much
+    // later, so the clock must refuse a late report on its own.
+    let announceLate: (() => void) | undefined;
+    const result = await runWorkflow(
+      `export const meta = { name: "late-start", description: "t" };
+return await agent("work");`,
+      {
+        agentTimeoutMs: 60_000,
+        agent: {
+          run: async (_prompt: string, opts?: AgentRunOptions) => {
+            announceLate = () => opts?.onRunning?.();
+            return "done";
+          },
+        },
+      },
+    );
+    expect(result.result).toBe("done");
+
+    vi.useFakeTimers();
+    try {
+      announceLate?.();
+      // A re-arm would register a timer here; an inert restart registers none.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("times out a hung agent using the run-level default", async () => {

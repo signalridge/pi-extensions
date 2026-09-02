@@ -43,6 +43,10 @@ describe("/workflows run ad-hoc script", () => {
     ]);
     expect(script).toMatch(/strength: "medium"/u);
     expect(script).toMatch(/strength: "low"/u);
+    // The planner's own schema is the only thing bounding how wide the ad-hoc
+    // path can go, so the cap is asserted here rather than left to a reviewer.
+    expect(script).toContain("Return 1-24 independent or dependency-linked tasks");
+    expect(script).toContain("maxItems: 24");
   });
 
   it("keeps eight large worker values below the managed prompt limit without duplicating outputs", async () => {

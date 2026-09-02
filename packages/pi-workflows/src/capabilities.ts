@@ -63,7 +63,7 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
       { name: "toolset", kind: "string", optional: true, default: "configured host/agent toolset hint" },
       { name: "excludeTools", kind: "string[]", optional: true, default: "none" },
       { name: "agentType", kind: "string", optional: true, default: "general-purpose" },
-      { name: "timeoutMs", kind: "number | null", optional: true, default: "300000 (5min); null disables" },
+      { name: "timeoutMs", kind: "number | null", optional: true, default: "1800000 (30min); null disables" },
       { name: "retries", kind: "number", optional: true, default: "run retry count" },
     ],
     constraints: [
@@ -284,9 +284,15 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     name: "concurrency",
     classification: "workflow-tool-input",
-    signature: "concurrency?: number",
+    signature: "concurrency?: number = the host's pi-subagents maxConcurrent",
     options: [],
-    constraints: ["runtime clamps to 1..16"],
+    constraints: [
+      "runtime clamps to 1..64",
+      "read live from the peer at each start and resume, and also the ceiling: a request above the pool is clamped to it, and the run log records the clamp",
+      "16 is only the fallback for a peer that publishes no pool size",
+      "pi-subagents maxConcurrent stays the authoritative throttle; one setting governs the whole fleet",
+      "that pool is typically small (4 slots by default), so a wide fan-out runs in waves rather than all at once",
+    ],
   },
   {
     name: "agentRetries",
@@ -298,9 +304,13 @@ export const WORKFLOW_CAPABILITIES: readonly CapabilityEntry[] = [
   {
     name: "agentTimeoutMs",
     classification: "workflow-tool-input",
-    signature: "agentTimeoutMs?: number = 300000",
+    signature: "agentTimeoutMs?: number = 1800000",
     options: [],
-    constraints: ["null disables the hard timeout; default 300000ms (5min)"],
+    constraints: [
+      "null disables the hard timeout; default 1800000ms (30min)",
+      "it bounds a hang only; an agent's real budget is the host's turn, tool and token ceiling",
+      "the clock restarts when the host reports the agent left its queue, so waiting for a slot is not charged as work",
+    ],
   },
   {
     name: "tokenBudget",

@@ -24,7 +24,11 @@ describe("cross-extension RPC", () => {
 
   beforeEach(() => {
     events = createEventBus();
-    manager = { spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
+    manager = {
+      spawn: vi.fn().mockReturnValue("agent-42"),
+      abort: vi.fn().mockReturnValue(true),
+      getMaxConcurrent: () => 4,
+    };
     ctx = { session: true };
     deps = { events, pi: { events }, getCtx: () => ctx, manager };
   });
@@ -47,6 +51,51 @@ describe("cross-extension RPC", () => {
           routingPolicy: expect.any(Object),
         },
       });
+    });
+
+    it("publishes the pool size only to a caller that asked for it by name", async () => {
+      registerRpcHandlers({ ...deps, manager: { ...manager, getMaxConcurrent: () => 40 } });
+      const asked = vi.fn();
+      const silent = vi.fn();
+      events.on("subagents:rpc:ping:reply:req-ask", asked);
+      events.on("subagents:rpc:ping:reply:req-quiet", silent);
+
+      events.emit("subagents:rpc:ping", { requestId: "req-ask", include: ["maxConcurrent"] });
+      events.emit("subagents:rpc:ping", { requestId: "req-quiet" });
+
+      await vi.waitFor(() => expect(asked).toHaveBeenCalled());
+      await vi.waitFor(() => expect(silent).toHaveBeenCalled());
+      expect(asked.mock.calls[0]?.[0]).toMatchObject({ success: true, data: { maxConcurrent: 40 } });
+      // A caller that did not ask must receive the v4 envelope unchanged: it
+      // parses replies with rejectUnknownKeys and would refuse the handshake.
+      const quiet = silent.mock.calls[0]?.[0] as { data: object } | undefined;
+      expect(Object.keys(quiet?.data ?? {})).toEqual([
+        "version",
+        "capabilities",
+        "routingPolicy",
+      ]);
+    });
+
+    it("omits a pool size the manager reports as an unusable number", async () => {
+      // `getMaxConcurrent` is required on the bridge, so absence is a compile
+      // error rather than a runtime case. A nonsense *value* is still possible,
+      // and publishing it would size a peer's fan-out from garbage.
+      for (const bad of [0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const bus = createEventBus();
+        registerRpcHandlers({
+          ...deps,
+          events: bus,
+          pi: { events: bus },
+          manager: { ...manager, getMaxConcurrent: () => bad },
+        });
+        const reply = vi.fn();
+        bus.on("subagents:rpc:ping:reply:req-1", reply);
+        bus.emit("subagents:rpc:ping", { requestId: "req-1", include: ["maxConcurrent"] });
+
+        await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+        expect(reply.mock.calls[0]?.[0]).toMatchObject({ success: true });
+        expect(reply.mock.calls[0]?.[0]).not.toHaveProperty("data.maxConcurrent");
+      }
     });
 
     it("scopes replies — other requestIds do not receive it", async () => {

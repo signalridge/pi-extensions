@@ -25,9 +25,19 @@ JavaScript.
 - Give every work unit a stable ID and every agent call a short unique label.
   Keep IDs beside results before filtering; `null` is missing coverage, not a
   successful finding.
-- Bound graph tasks, fan-out items, loops, retries, agents, concurrency, and
-  evidence size. Invocation-level token and time caps are user constraints, not
-  substitutes for algorithmic bounds.
+- Bound the algorithm inside the script: graph tasks, fan-out items, loop
+  rounds, semantic retries, and evidence size. The invocation-level limits
+  (`maxAgents`, `concurrency`, `agentRetries`, `tokenBudget`, `agentTimeoutMs`)
+  are tuned defaults rather than the place to express a bound; each one stops or
+  fails a run that outgrows it, so a precautionary value cuts the coverage and
+  not the cost. Set one only when the user asked for that limit.
+- Size the fan-out to the evidence the task actually has: one agent per
+  independent question, ten to thirty for an ordinary review or audit. The gain
+  is coverage — one agent asked one question reads further into it than one
+  agent asked four. Speed is a separate matter and not yours to decide: how many
+  of those agents run at once is the host's `maxConcurrent` pool, so a wide
+  fan-out on a narrow pool still finishes in waves. Split for what gets looked
+  at, not for wall-clock.
 - Route an agent call with `strength: "low" | "medium" | "high"` — this
   package's own word for how much effort a step deserves, and the only routing
   word a workflow has. It is **not** an agent-tier key: a `strengths` table
@@ -44,6 +54,15 @@ JavaScript.
   documented keys. Never guess an agent-type name—use
   names supplied by the current environment and follow
   [registry ownership](references/registry-ownership.md).
+- Pick that word by what a wrong answer costs, not by how important the step
+  feels. `low` is retrieval, navigation, and read-heavy breadth. `medium` is the
+  ordinary working rung and where a labelled step belongs unless you can say why
+  not. `high` is for a step whose error is expensive to reverse — an architecture
+  decision, a destructive migration, a security boundary — and a fan-out normally
+  names it zero times, at most once on a closing step that actually decides
+  something. It is not a reward for the hardest-sounding task: routing a whole
+  fan-out to `high` prices every branch at the cost of the one that mattered, and
+  buys depth where the run needed coverage.
 - Workflows have no imports, filesystem/network APIs, timers, or unrestricted
   Node APIs. Pass timestamps, randomness, and external decisions through `args`.
 

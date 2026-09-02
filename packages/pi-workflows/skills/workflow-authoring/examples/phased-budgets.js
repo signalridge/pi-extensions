@@ -5,7 +5,7 @@ export const meta = {
 };
 
 // ADAPT: validate the work and choose phase budgets, prompts, and schemas; add invocation-level tokenBudget only when the user explicitly requests a cap.
-const work = args && Array.isArray(args.work) ? args.work.slice(0, 8) : [{ id: "sample" }];
+const work = args && Array.isArray(args.work) ? args.work.slice(0, 24) : [{ id: "sample" }];
 const phaseBudget =
   args && Number.isFinite(args.phaseBudget) ? Math.max(1, Math.min(args.phaseBudget, 100000)) : 2000;
 const resultSchema = {

@@ -30,7 +30,10 @@ Review author-visible behavior, not formatting preferences. When behavior depend
 ## Lifecycle
 
 - Are runtime retries and semantic retries separately bounded?
-- Are loops, agents, concurrency, timeout, and token spend bounded appropriately?
+- Are loops, graph tasks, fan-out items, and semantic retries bounded inside the script, where the topology is decided?
+- Does the invocation leave `maxAgents`, `concurrency`, `agentRetries`, `tokenBudget` and `agentTimeoutMs` at their defaults unless the user asked for that limit? A precautionary value there removes coverage, not cost.
+- Is the fan-out as wide as the evidence the task has, rather than narrowed by habit?
+- Does `high` appear only on a step whose error is expensive to reverse — normally nowhere, at most once — rather than across a fan-out?
 - Are budget claims honest about soft gates and in-flight overshoot?
 - Are checkpoints limited to implemented confirmation/headless behavior?
 - Does nesting stay one level, allow only safe sibling concurrency, and account for shared limits/store?

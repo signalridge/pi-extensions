@@ -767,6 +767,16 @@ const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (reply) => {
 pi.events.emit("subagents:rpc:ping", { requestId });
 ```
 
+The reply always carries `version`, `capabilities`, and `routingPolicy`. Anything beyond those is **requested by name** through an optional `include` array, and is sent only to a caller that asked:
+
+```typescript
+pi.events.emit("subagents:rpc:ping", { requestId, include: ["maxConcurrent"] });
+```
+
+`include` accepts up to 8 names; unknown ones are ignored. Today the only one is `maxConcurrent`, the live background-agent pool size — the number of background slots a spawn competes for, which `/subagents` can change mid-session, so read it per operation rather than caching it at session start.
+
+Opt-in rather than volunteered, because the envelope is validated with `rejectUnknownKeys`: a field added unconditionally would make every already-published caller reject the handshake and lose the peer entirely. Asking keeps both directions working without a version bump — an older peer answers without the field, and a caller that never asks gets the same envelope it has always parsed. Treat an absent field as "this peer does not publish it" and fall back to your own default; it is not an error.
+
 ### Managed spawn (protocol v4)
 
 Workflow-owned orchestration uses the `subagents:rpc:spawn-managed` channel. Its request may include the core identity fields plus an optional Agent `tier`, `toolset`, `excludeTools`, `thread`, and `isolation: "worktree"`. There is no per-call `model` or `thinking` — the wire validator rejects them:

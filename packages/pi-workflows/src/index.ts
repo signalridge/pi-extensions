@@ -36,11 +36,40 @@ const WorkflowToolSchema = Type.Object(
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
     args: Type.Optional(Type.Any()),
     background: Type.Optional(Type.Boolean()),
-    maxAgents: Type.Optional(Type.Number({ minimum: 1 })),
-    concurrency: Type.Optional(Type.Number({ minimum: 1 })),
-    agentRetries: Type.Optional(Type.Number({ minimum: 0, maximum: 3 })),
-    tokenBudget: Type.Optional(Type.Number({ minimum: 1 })),
-    agentTimeoutMs: Type.Optional(Type.Number({ minimum: 1 })),
+    maxAgents: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        description:
+          "Cap on real agent dispatches for this run. Default 1000, which no ordinary script reaches. Omit it: a value below what the script dispatches stops the run partway with AGENT_LIMIT_EXCEEDED.",
+      }),
+    ),
+    concurrency: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        description:
+          "Agents in flight at once. Defaults to the host's own subagent pool size, which is also the ceiling. Omit it: a lower number runs the same work more slowly and buys nothing, and a higher one is clamped.",
+      }),
+    ),
+    agentRetries: Type.Optional(
+      Type.Number({
+        minimum: 0,
+        maximum: 3,
+        description: "Retries for a recoverable agent failure. Default 0; a failed call returns null to the script.",
+      }),
+    ),
+    tokenBudget: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        description: "Soft token ceiling for the whole run. Default unlimited; exhausting a set budget aborts the run.",
+      }),
+    ),
+    agentTimeoutMs: Type.Optional(
+      Type.Number({
+        minimum: 1,
+        description:
+          "Wall clock per agent, there to bound a hang. Default 1800000 (30min), and it counts from when the agent actually starts, not from dispatch. An agent's real budget is the host's turn, tool and token ceiling. Omit it: a short value fails an entire fan-out as timeouts.",
+      }),
+    ),
     resumeFromRunId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
   },
   { additionalProperties: false },
@@ -139,7 +168,7 @@ function formatStart(result: ScriptStartResult): string {
 export function buildAdHocWorkflowScript(prompt: string): string {
   return `export const meta = { name: "ad-hoc", description: "Plan, execute, and synthesize a bounded multi-agent task graph" };
 const originalPrompt = ${JSON.stringify(prompt)};
-const plan = await agent("Design a bounded execution plan for this user task. Return 1-8 independent or dependency-linked tasks. Use unique short ids, concise descriptions, exact worker prompts, and only dependencies that appear in the task list. Prefer independent tasks when possible. User task:\\n\\n" + originalPrompt, {
+const plan = await agent("Design a bounded execution plan for this user task. Return 1-24 independent or dependency-linked tasks. Use unique short ids, concise descriptions, exact worker prompts, and only dependencies that appear in the task list. Prefer independent tasks when possible, and prefer narrow tasks over few broad ones: a task asked one question is read further into than a task asked four. User task:\\n\\n" + originalPrompt, {
   label: "planner",
   strength: "medium",
   schema: {
@@ -148,14 +177,14 @@ const plan = await agent("Design a bounded execution plan for this user task. Re
       tasks: {
         type: "array",
         minItems: 1,
-        maxItems: 8,
+        maxItems: 24,
         items: {
           type: "object",
           properties: {
             id: { type: "string", minLength: 1, maxLength: 64 },
             description: { type: "string", minLength: 1, maxLength: 500 },
             prompt: { type: "string", minLength: 1, maxLength: 8000 },
-            dependsOn: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 64 } },
+            dependsOn: { type: "array", maxItems: 24, items: { type: "string", minLength: 1, maxLength: 64 } },
           },
           required: ["id", "description", "prompt"],
           additionalProperties: false,
@@ -427,9 +456,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         promptGuidelines: [
           "Provide either a full `script` (raw JavaScript with the meta contract first) or a `name` of a saved/built-in workflow.",
           "Use orchestrate([{ id, dependsOn, run }]) for named dependency graphs; use parallel(() => agent(...), ...) for a simple fan-out and pipeline(items, ...stages) for sequential per-item stages.",
+          "Size the fan-out to the work: one agent per independent piece of evidence the task actually has. Ten to thirty agents is an ordinary review or audit, and a script that splits a broad task four ways is usually four agents each doing one agent's job. The gain is coverage, not speed — how many run at once is the host's pool, not the script's choice.",
+          "Pass script/name/args/background and nothing else unless the user named a specific limit. maxAgents, concurrency, agentRetries, tokenBudget and agentTimeoutMs already default to tuned values, and each one stops or fails the run when it is set too low.",
           "Use background: true for long runs; retrieve results with workflow_control.",
           "Use resumeFromRunId with an edited script to replay the unchanged prefix from cache and re-run the rest live.",
-          "Do not include model, thinking, concurrency, retry, timeout, or turn-limit settings beyond the declared options.",
+          "Inside the script, never name a model, a thinking level, or a turn limit: `strength` is the only routing a call may express.",
         ],
         parameters: WorkflowToolSchema,
         renderCall(args, theme) {
@@ -929,7 +960,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       if (event.text.includes(WORKFLOW_ARMED_DIRECTIVE)) return { action: "continue" as const };
       const effortDirective =
         effortLevel === "ultra"
-          ? 'Effort: ULTRA. Be exhaustive: use broad parallel review, verification, and completeness checks; give the deepest steps strength: "high".'
+          ? 'Effort: ULTRA. Be exhaustive: use broad parallel review, verification, and completeness checks. Width is where the exhaustiveness goes: keep steps at strength: "medium" and reserve "high" for a step whose error is expensive to reverse, if the run has one at all.'
           : effortLevel === "high"
             ? "Effort: HIGH. Be thorough: use several independent reviewers and an adversarial verification pass."
             : "";

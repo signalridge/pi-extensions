@@ -123,6 +123,17 @@ export interface ManagedProtocolPing {
   version: number;
   capabilities: ManagedProtocolCapabilities;
   routingPolicy: ManagedRoutingPolicySnapshot;
+  /**
+   * The peer's live background-agent pool size, present only when the request
+   * asked for it (`include: ["maxConcurrent"]`).
+   *
+   * Requested rather than always sent, because a ping envelope is parsed with
+   * `rejectUnknownKeys`: a field a peer never asked for would make every
+   * already-published client reject the handshake outright. A caller that does
+   * not ask gets the v4 envelope unchanged, and a caller that asks an older
+   * peer gets no field and falls back to its own default.
+   */
+  maxConcurrent?: number;
 }
 
 export interface ChildContextReply {
