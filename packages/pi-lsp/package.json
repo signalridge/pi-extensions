@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-lsp",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Pi extension that exposes configurable, language-agnostic LSP tools through a shared runner.",
   "type": "module",
   "license": "MIT",
