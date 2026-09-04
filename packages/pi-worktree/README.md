@@ -1,4 +1,4 @@
-# 🌳 pi-worktree — Safe Git Worktree Management for Pi
+# pi-worktree — safe Git worktree management for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-worktree)](https://www.npmjs.com/package/@signalridge/pi-worktree) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -8,7 +8,7 @@ Pi cannot change its parent process working directory with `cd`. This extension 
 
 This package is the full interactive worktree manager. It is publishable and stable, and opt-in: install it only if your project allows git worktrees. Some repositories forbid them outright — a worktree placed inside the source tree can be picked up by tooling that scans the tree, so check your repository's own guidance before enabling it.
 
-## ✨ Features
+## Features
 
 - Shows compact main, linked, current, detached, locked, and prunable state in worktree selectors.
 - Creates a new branch worktree or attaches an existing unoccupied local branch.
@@ -23,7 +23,7 @@ This package is the full interactive worktree manager. It is publishable and sta
 - Always previews stale metadata before pruning it and revalidates the preview after confirmation.
 - Runs Git through argv-based subprocess calls, without interpolating user input into shell commands.
 
-## 📦 Install
+## Install
 
 ```bash
 pi install npm:@signalridge/pi-worktree
@@ -42,7 +42,7 @@ just try worktree
 # or: pi -e ./packages/pi-worktree
 ```
 
-## 💬 Usage
+## Usage
 
 Run the command without arguments:
 
@@ -65,7 +65,7 @@ RPC dialogs; print and JSON modes reject the command observably. Operation-speci
 inputs, worktree identity selectors, preflight previews, and destructive confirmations remain
 extension-owned because they carry Git safety and commit-aware revalidation.
 
-## 🌿 Add defaults
+## Add defaults
 
 For a new branch, the current symbolic branch is the default start point. If Pi is running from detached HEAD, the command requires an explicit commit-ish. Git must resolve the start point to exactly one commit.
 
@@ -84,7 +84,7 @@ Leave the path input blank to accept the suggestion. A custom absolute path is u
 
 The MVP does not expose `--force`, `-B`, `--detach`, `--orphan`, or lock options.
 
-## ⚙️ Worktree root settings
+## Worktree root settings
 
 The machine-local user settings file is:
 
@@ -106,12 +106,12 @@ A missing `worktreeRoot` uses `~/.worktrees`; the settings file is created only 
 
 Malformed or invalid settings are warned about but never overwritten, including an invalid edit made while a settings action is open. An initial failure uses `~/.worktrees`; a later failure retains the last valid effective root. Interactive configuration remains blocked until the invalid file is fixed manually. Failed publication leaves the prior file and effective runtime root unchanged, and the save queue remains usable after rejection.
 
-## 🔀 Pi workspace switching
+## Pi workspace switching
 
 Switching uses Pi's public `SessionManager` and `ctx.switchSession()` APIs:
 
 1. The command waits for Pi to become fully idle so the current assistant/tool results are persisted.
-2. A linear persisted session is forked into the target worktree. If `/tree` currently points at an older branch, the documented session entries for that active branch are written to the target instead, so switching cannot jump to a newer serialized leaf.
+2. A linear persisted session is forked into the target worktree. If `/worktree` currently points at an older branch, the documented session entries for that active branch are written to the target instead, so switching cannot jump to a newer serialized leaf.
 3. Pi tears down the old cwd-bound runtime and creates the target runtime.
 4. The extension reports success only through the fresh replacement-session context.
 
@@ -119,7 +119,7 @@ If the current session is completely empty, the extension creates a valid empty 
 
 A successfully created Git worktree is never rolled back merely because Pi session switching fails. Re-run `/worktree` and choose **Switch worktree** after resolving the reported Pi/session issue.
 
-## 🛡️ Safety boundaries
+## Safety boundaries
 
 - The main worktree and current worktree cannot be removed.
 - Locked or stale worktrees cannot be removed through this extension.
@@ -144,7 +144,7 @@ Use Git directly when you intentionally need force removal, branch deletion, cus
 - Project trust and cwd-bound extension/resource loading during a switch remain owned by Pi.
 - The extension registers no LLM tool, background watcher, project settings, or statusline item.
 
-## 📁 Package layout
+## Package layout
 
 ```text
 packages/pi-worktree/
@@ -168,10 +168,6 @@ packages/pi-worktree/
 └── tsconfig.json
 ```
 
-## 🏷️ Keywords
-
-`pi-package`, `pi-extension`, `git`, `worktree`, `workspace`, `session`
-
-## 📄 License
+## License
 
 MIT

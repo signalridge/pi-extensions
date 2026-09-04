@@ -1,4 +1,4 @@
-# 💬 pi-btw — Side Questions for the Pi Coding Agent
+# pi-btw — side questions for the Pi coding agent
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-btw)](https://www.npmjs.com/package/@signalridge/pi-btw) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -6,7 +6,7 @@
 
 Use it when you want to ask a temporary question, inspect context, or get a short explanation while keeping the primary coding task focused.
 
-## ✨ Features
+## Features
 
 - Adds a `/btw` menu for starting or resuming an in-memory side thread or changing pi-btw settings.
 - Keeps `/btw <question>` as a direct fast path that always starts a fresh side thread.
@@ -22,7 +22,7 @@ Use it when you want to ask a temporary question, inspect context, or get a shor
 - Does not append the side question or answer to the main conversation.
 - Works as an independently installable npm Pi extension package.
 
-## 📦 Install
+## Install
 
 ```bash
 pi install npm:@signalridge/pi-btw
@@ -40,7 +40,7 @@ Try this package locally from the repository root:
 pi -e ./packages/pi-btw
 ```
 
-## 🚀 Usage
+## Usage
 
 Open the pi-btw menu or provide the first question immediately:
 
@@ -121,7 +121,7 @@ answers, and visibly rendered errors remain only in memory for Resume during the
 instance; empty drafts, cancelled answers, steering queues, credentials, reloads, session changes,
 and process restarts are not persisted.
 
-## ⚙️ Model and thinking level
+## Model and thinking level
 
 By default, `/btw` uses the current session model. To use an independent model for side
 questions, create:
@@ -169,11 +169,11 @@ or invalid files block saves and remain unchanged. Settings must be valid UTF-8 
 Separate Pi processes and external editors are outside this in-process ordering boundary. The file
 is read for each `/btw` invocation, so edits apply without `/reload`.
 
-## 🧠 Why use pi-btw?
+## Why use pi-btw?
 
 Normal assistant messages become part of the main Pi conversation and can distract the coding agent from the task. `pi-btw` creates a lightweight side channel for context-aware questions, making it useful for pair programming, debugging, code review, and repository exploration.
 
-## 🗂️ Package layout
+## Package layout
 
 ```txt
 packages/pi-btw/
@@ -202,10 +202,6 @@ The package exposes its Pi extension through `package.json`:
 }
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi coding agent, AI coding agent, side question command, agent chat workflow, TypeScript Pi package, npm Pi extension.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

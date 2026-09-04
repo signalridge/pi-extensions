@@ -208,7 +208,6 @@ sentence-ending dot is not a filename dot: "please run a workflow." arms, and
 turn it off entirely with `/workflows-trigger off`.
 
 Saved workflows use project scope first and a user scope fallback; writes are atomic and names are path-safe.
-written atomically with a backup.
 
 ## Model routing
 

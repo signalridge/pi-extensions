@@ -1,4 +1,4 @@
-# 🔎 pi-github-pr — GitHub Pull Request Statusline for Pi Agents
+# pi-github-pr — GitHub pull request statusline for Pi agents
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-github-pr)](https://www.npmjs.com/package/@signalridge/pi-github-pr) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -8,7 +8,7 @@ It only reads PR metadata for the current branch. It counts comments and reviews
 
 It is intentionally ambient: no slash command, no custom tool, no widget, and no comment injection.
 
-## ✨ Features
+## Features
 
 - Automatically shows compact PR status in Pi's statusline.
 - Refreshes the current branch PR every minute and after agent turns.
@@ -30,7 +30,7 @@ The check wording follows GitHub's Checks terminology. The trailing comment coun
 combined comments + reviews count. When rendered by `pi-statusline`, the `github-pr` icon comes
 from pi-statusline icon settings.
 
-## 📦 Install
+## Install
 
 ```bash
 pi install npm:@signalridge/pi-github-pr
@@ -48,7 +48,7 @@ Try this package locally from the repository root:
 pi -e ./packages/pi-github-pr
 ```
 
-## ⚙️ Prerequisites
+## Prerequisites
 
 Install and authenticate GitHub CLI yourself:
 
@@ -61,7 +61,7 @@ gh auth login --hostname github.example.com:8443
 
 The extension shells out to `gh`; GitHub Enterprise hosts and credential storage are delegated to `gh`. It uses the PR URL host (including any port) for follow-up API calls, so no manual `GH_HOST` is required.
 
-## 💬 Behavior
+## Behavior
 
 The extension runs passively:
 
@@ -81,7 +81,7 @@ The extension runs passively:
 - It does not read PR comment bodies, review bodies, inline diff comments, or unresolved review-thread text.
 - While a session is open, refresh runs every 60 seconds in addition to session start, branch changes, and agent turns; each refresh invokes `gh pr view` and one GraphQL count query.
 
-## 📁 Package layout
+## Package layout
 
 ```text
 packages/pi-github-pr/
@@ -94,10 +94,6 @@ packages/pi-github-pr/
 └── tsconfig.json
 ```
 
-## 🏷️ Keywords
-
-`pi-package`, `pi-extension`, `github`, `pull-request`, `statusline`, `gh`
-
-## 📄 License
+## License
 
 MIT

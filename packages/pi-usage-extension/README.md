@@ -6,12 +6,11 @@ A Pi extension that displays aggregated usage statistics across all sessions.
 
 ## Compatibility
 
-- **Pi version:** 0.42.4+
-- **Last updated:** 2026-07-22 (0.9.3)
+- **Pi version:** `0.84.x` — see the `peerDependencies` range.
 
-Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped; otherwise the report is counted. Older Pi versions remain supported.
+Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped; otherwise the report is counted. Sessions recorded by older Pi versions still parse; they simply carry no auxiliary usage.
 
-## Installation
+## Install
 
 ### Pi package manager
 
@@ -141,7 +140,7 @@ The **Graphs** view plots usage over time for the active period as a braille lin
 
 Thinking levels are replayed from `thinking_level_change` entries in each session file; messages before the first recorded change appear as `unknown`. Auxiliary usage has no reliable thinking-level attribution and appears as `Tools/summaries` in that grouping. Reasoning token counts come from `usage.reasoning` where providers report them; pi only records this field since **pi 0.80.3 (30 June 2026)**, so earlier sessions show zero reasoning tokens even though thinking models were in use.
 
-### Time Periods
+### Time periods
 
 | Period | Definition |
 |--------|------------|
@@ -191,7 +190,7 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 | `a` | Show all series *(graphs)* / reset filter and hides *(table)* |
 | `q` / `Esc` | Close |
 
-## Performance & Caching
+## Performance and caching
 
 `/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`. To keep opens fast on large histories (multi-GB, thousands of files):
 
@@ -201,15 +200,15 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 - **0.9.4 bumps the cache format to v7** to retain `parentSession` lineage and prevent stable entry IDs from merging independent sessions; v6 added stable entry IDs and v5 retained child-session linkage. The first open after upgrading does a one-off full rebuild (with a progress message and live file counter), then warm opens are fast again.
 - Large nested-agent tool results use an allocation-safe metadata parser: multi-megabyte output bodies are scanned as bytes rather than decoded and JSON-parsed in full.
 
-## Provider Notes
+## Provider notes
 
-### Cost Tracking
+### Cost tracking
 
 Cost data comes directly from persisted usage values. For assistant messages it is grouped by provider/model. Pi 0.81.0+ can also persist usage reported by tools, compaction, and branch summarization; because those entries do not carry reliable provider/model attribution, `/usage` groups them under `Tools / summaries`, matching Pi's `/session` breakdown. Recognised legacy `subagent` and `subagent_wait` details are used as a fallback when their child session is no longer available. Accuracy depends on the provider or tool reporting costs.
 
 Only persisted usage can be counted. Pi did not add usage metadata retroactively, so historical compaction or branch-summary entries written without `usage` remain unmetered: their exact token and cost vectors cannot be reconstructed. The compatibility audit corpus contained 2,753 such compactions and 20 branch summaries.
 
-### Cache Tokens
+### Cache tokens
 
 Cache token support varies by provider:
 
@@ -223,7 +222,7 @@ The "Cache" column combines both read and write tokens.
 
 `Tokens` and `↑In` include cache writes but intentionally exclude cache reads. That keeps totals aligned with fresh/billed prompt work without letting repeated cache hits swamp the dashboard.
 
-## Data Source
+## Data source
 
 Statistics are parsed recursively from session files in `~/.pi/agent/sessions/`, including nested subagent runs such as `run-0/` directories. Each session is a JSONL file containing assistant messages and, on Pi 0.81.0+, optional usage on tool-result, compaction, and branch-summary entries.
 

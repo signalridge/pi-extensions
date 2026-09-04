@@ -1,6 +1,6 @@
 # @signalridge/pi-subagents
 
-Signalridge's managed subagent package for Pi, including protocol-v3 spawning, lifecycle isolation, Fleet UI, persistence, and recovery.
+Signalridge's managed subagent package for Pi, including protocol-v4 spawning, lifecycle isolation, Fleet UI, persistence, and recovery.
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in foreground or background, steer them mid-run, resume completed sessions, and define your own custom agent types.
 
@@ -50,7 +50,7 @@ pi -e ./packages/pi-subagents
 
 Formatter checks remain disabled for this package, while legacy `noExplicitAny`, control-character regex, and empty-interface rules remain off. Signalridge additions follow the package AGENTS rules and the strict `--error-on-warnings` lint gate.
 
-## Quick Start
+## Quick start
 
 The parent agent spawns sub-agents using the `Agent` tool:
 
@@ -161,7 +161,7 @@ Find auth files · completed
 
 Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
 
-## Default Agent Types
+## Default agent types
 
 | Type | Tools | Model | Prompt Mode | Description |
 |------|-------|-------|-------------|-------------|
@@ -173,7 +173,7 @@ The `general-purpose` agent is a **parent twin** — it receives the parent's en
 
 Default agents can be **ejected** (`/agents` → select agent → Eject) to export them as `.md` files for customization, **overridden** by creating a `.md` file with the same name (e.g. `.pi/agents/general-purpose.md`), or **disabled** per-project with `enabled: false` frontmatter.
 
-## Custom Agents
+## Custom agents
 
 Define custom agent types by creating `.md` files. The filename becomes the agent type name. Any name is allowed — using a default agent's name overrides it.
 
@@ -216,7 +216,7 @@ Then spawn it like any built-in type:
 Agent({ subagent_type: "auditor", prompt: "Review the auth module", description: "Security audit" })
 ```
 
-### Frontmatter Fields
+### Frontmatter fields
 
 All fields are optional — sensible defaults for everything.
 
@@ -376,7 +376,7 @@ Settings
 - **Model tiers** — create, edit and delete the [tier](#model-tiers) profiles. Each row shows what the tier resolves to on this machine (`small — claude-haiku-4-5 · thinking max`), and a tier dropped as malformed is listed as `blocked` so it can be fixed rather than staying invisible. The model picker offers this machine's available models (narrowed to your scope when **Scope models** is on) plus `inherit` and a typed escape hatch; the thinking picker offers only the levels the chosen model actually supports, since the rest would be silently clamped at spawn. Deleting the tier that `defaultTier` names clears the default in the same step
 - **Settings** — configure max concurrency, default max turns, grace turns, default model, default tier, and join mode at runtime
 
-## Graceful Max Turns
+## Graceful max turns
 
 Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 
@@ -397,7 +397,7 @@ Background agents are subject to a configurable concurrency limit (default: 4). 
 
 Foreground agents bypass the queue — they block the parent anyway.
 
-## Join Strategies
+## Join strategies
 
 When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
 
@@ -640,7 +640,7 @@ then `defaultModel`, or the parent's model when none is set.
 Programmatic callers and the legacy RPC may still pass `model`/`thinking`
 directly. That is the escape hatch for code, not a way to configure an agent.
 
-## Model Scope
+## Model scope
 
 **Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
 
@@ -662,7 +662,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 
 **No-op safety:** if `enabledModels` is missing or empty in pi's settings, scope check skips entirely — no false positives, no spurious errors.
 
-## Persistent Settings
+## Persistent settings
 
 Runtime tuning values set via `/agents` → Settings (max concurrency, default max turns, grace turns, nested depth, fallback agent, default model, default tier, default join mode, scheduling on/off, scope models on/off, strict agent files on/off, disable defaults on/off, output transcript on/off, tool description full/compact/custom, fleet view on/off) persist across pi restarts. Two files, merged on load:
 
@@ -839,7 +839,7 @@ pi.events.emit("subagents:rpc:stop", { requestId, agentId: "agent-id-here" });
 Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
 Workflow callers should pass a foreground signal only to their own wait. Managed child cancellation is explicit through the owner-scoped lifecycle RPC; aborting an RPC wait does not abort the child.
 
-## Persistent Agent Memory
+## Persistent agent memory
 
 Agents can have persistent memory across sessions. Set `memory` in frontmatter to enable:
 
@@ -861,7 +861,7 @@ Memory uses a `MEMORY.md` index file and individual memory files with frontmatte
 
 The `disallowed_tools` field is respected when determining write capability — an agent with `tools: write` + `disallowed_tools: write` correctly gets read-only memory.
 
-## Worktree Isolation
+## Worktree isolation
 
 Set `isolation: worktree` to run an agent in a temporary git worktree:
 
@@ -881,7 +881,7 @@ If cleanup cannot be confirmed, the result keeps the worktree path and includes 
 
 The child prompt also states that the temporary worktree is the only writable checkout and names the original base repository as off-limits. This prevents inherited parent instructions from sending the agent back into the shared tree.
 
-## Skill Preloading
+## Skill preloading
 
 Skills can be preloaded by name and injected into the agent's system prompt:
 
@@ -911,7 +911,7 @@ Recursion skips dotfile directories and `node_modules`. A directory that itself 
 
 **Security:** symlinks are rejected at every layer (root, flat file, skill directory, `SKILL.md` inside a skill directory) — intentional deviation from Pi, which follows symlinks. Skill names with path-traversal characters (`..`, `/`, `\`, spaces, leading dot, >128 chars) are rejected.
 
-## Tool Denylist
+## Tool denylist
 
 Block specific tools from an agent even if extensions provide them:
 

@@ -1,4 +1,4 @@
-# 🕒 pi-stamp — Transcript Metadata for Pi
+# pi-stamp — transcript metadata for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-stamp)](https://www.npmjs.com/package/@signalridge/pi-stamp) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -6,7 +6,7 @@
 right-aligned timestamp after each user and assistant message in the interactive transcript. Opt-in
 settings can add response timing, assistant provenance and usage, or tool duration and outcome.
 
-## ✨ Features
+## Features
 
 - Shows each message's recorded creation time on a dim, right-aligned transcript row.
 - Supports 12/24-hour clocks, optional seconds, automatic date context, locales, and time zones.
@@ -22,7 +22,7 @@ settings can add response timing, assistant provenance and usage, or tool durati
 - Uses Pi's current theme, remains width-safe in narrow terminals, and owns no timer, process,
   watcher, network request, custom tool, or persistent status item.
 
-## 📦 Install
+## Install
 
 Install from npm:
 
@@ -42,7 +42,7 @@ Try this package from a local checkout:
 pi -e ./packages/pi-stamp
 ```
 
-## 🚀 Quick start
+## Quick start
 
 Load the extension and use Pi normally. Each new user and assistant message receives a separate dim
 stamp aligned to the terminal's right edge:
@@ -70,7 +70,7 @@ Close
 Settings save immediately. Mounted compatible stamps reformat on the next render, and future stamps
 use the same effective values.
 
-## ⚙️ Settings
+## Settings
 
 The `/stamp` Settings screen provides these controls:
 
@@ -130,7 +130,7 @@ publication.
 `/stamp` supports TUI and RPC dialog modes. Print and JSON command invocations reject without writing
 ad hoc protocol output. Transcript stamps themselves are appended only in TUI mode.
 
-## 🕰️ Timestamp and response-timing semantics
+## Timestamp and response-timing semantics
 
 - A **user** stamp is the timestamp recorded when Pi creates the submitted user message.
 - An **assistant** clock is the timestamp recorded when Pi creates the response stream/message.
@@ -164,7 +164,7 @@ Timing labels are local Pi lifecycle observations, not provider latency telemetr
 network request or refresh task. Relative labels such as `3m ago` remain unavailable because they
 would require periodic background refresh and lifecycle cleanup.
 
-## 🧾 Assistant provenance and usage
+## Assistant provenance and usage
 
 Assistant metadata is captured only when `assistantMetadata` is `"compact"` or `"expanded"` as the
 assistant stamp is finalized. A compact stamp can look like:
@@ -196,7 +196,7 @@ Provider support varies. Every optional field is shown only when present and val
 assistant message. The cost label says `est` because Pi's message value is an estimate based on the
 provider/model usage data available to Pi; the extension performs no price lookup.
 
-## 🛠️ Tool timing
+## Tool timing
 
 With `toolStamps: true`, the extension observes `tool_execution_start` and `tool_execution_end`,
 pairs them by exact `toolCallId`, and appends entries in `turn_end.toolResults` source order:
@@ -216,7 +216,7 @@ or excess observations are ignored. Pending state is cleared on a new turn, agen
 session replacement, reload, and shutdown. Tools that were not observed while tool stamps were
 enabled are not backfilled.
 
-## 🔒 Context and persistence
+## Context and persistence
 
 Stamps use Pi custom session entries. Pi renders those entries in the interactive transcript but
 excludes them from model context. The extension does not modify user, assistant, or tool-result
@@ -236,7 +236,7 @@ a stamp survives `/reload` and session resume while the extension remains loaded
 created before `pi-stamp` recorded them are not backfilled because Pi's current public API cannot
 insert a new custom entry into an older position in the session tree.
 
-## 🚧 Limitations
+## Limitations
 
 - Pi does not currently expose a public decorator for built-in message or tool rows, so stamps appear
   as separate transcript rows rather than inside the original bubble/block.
@@ -245,7 +245,7 @@ insert a new custom entry into an older position in the session tree.
 - There are no arbitrary format strings, relative labels, provider-server latency, token/cost
   estimation beyond Pi's message fields, aggregates, raw diagnostics, or analytics dashboard.
 
-## 🗂️ Package layout
+## Package layout
 
 ```text
 packages/pi-stamp/
@@ -269,11 +269,6 @@ packages/pi-stamp/
 └── tsconfig.json
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi coding agent, message timestamps, assistant provenance, token usage, tool timing,
-transcript metadata, TUI metadata, TypeScript Pi package.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

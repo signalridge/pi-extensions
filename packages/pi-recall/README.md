@@ -1,4 +1,4 @@
-# 🧠 Pi Recall — Saved Messages for Pi
+# pi-recall — saved messages for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-recall)](https://www.npmjs.com/package/@signalridge/pi-recall) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -7,7 +7,7 @@
 
 `@signalridge/pi-recall` saves selected text messages from the active Pi session branch and lets you preview or quote them in another session. Saved content remains local until you explicitly insert a quote into a draft and submit it.
 
-## ✨ Features
+## Features
 
 - Saves any eligible user or assistant text message from the current active session branch—not only the latest message.
 - Recalls saved messages across sessions using **Current cwd**, **All**, or **Current session** scope.
@@ -19,7 +19,7 @@
 - Stores versioned JSONL locally with cross-process locking, private permissions, and atomic replacement.
 - Fails closed when storage is malformed, unsupported, oversized, symlinked, or not a regular file.
 
-## 📦 Install
+## Install
 
 Install persistently from npm:
 
@@ -39,7 +39,7 @@ Try this package from a local checkout:
 pi -e ./packages/pi-recall
 ```
 
-## 🚀 Quick start
+## Quick start
 
 1. Run `/recall`.
 2. Choose **Save a message** and select a text user or assistant message from the active branch.
@@ -61,7 +61,7 @@ The user intentionally recalled and quoted the saved message above.
 
 The quote sent to the editor omits cwd, session IDs, entry IDs, session files, and other local paths.
 
-## 💬 Commands
+## Commands
 
 | Command | Modes | Description |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ The quote sent to the editor omits cwd, session IDs, entry IDs, session files, a
 
 Print and JSON modes reject `/recall` before opening an interactive flow. TUI and RPC expose the same save, preview, quote, delete, status, and help capabilities; RPC uses explicit dialogs instead of terminal shortcuts. In RPC, quoting emits Pi's `set_editor_text` extension UI request.
 
-## 🧭 Recall scopes
+## Recall scopes
 
 - **Current cwd** — saved messages whose normalized absolute source cwd matches the current cwd. This is the default for each new `/recall` interaction.
 - **All** — every valid record in the current Pi agent directory.
@@ -77,7 +77,7 @@ Print and JSON modes reject `/recall` before opening an interactive flow. TUI an
 
 Scope applies only when recalling already saved messages. The save picker intentionally reads only `ctx.sessionManager.getBranch()` from the current session and never scans other session files. TUI scope switching keeps the selected saved record when it remains visible in the new scope; otherwise it selects the first fuzzy-ranked result or the newest result when the query is empty.
 
-## 🔍 TUI fuzzy search
+## TUI fuzzy search
 
 The TUI picker has a visible `Search:` input. It matches complete saved message text, the `user` or `assistant` role, and the optional session name after scope filtering. Matching is case-insensitive and requires every whitespace- or slash-separated token as an ordered subsequence. It ranks closer matches first but does not perform typo-edit-distance correction.
 
@@ -87,7 +87,7 @@ The query and selection survive scope changes and selected-message navigation du
 
 RPC continues to show the complete scoped list through explicit dialogs and does not simulate a hidden fuzzy query or terminal shortcut. Message timestamps, cwd, session IDs, entry IDs, and local paths are not searchable.
 
-## 🔒 Storage, privacy, and recovery
+## Storage, privacy, and recovery
 
 The canonical user file is:
 
@@ -105,7 +105,7 @@ Malformed JSON, duplicate IDs, unknown record types or versions, invalid records
 
 Deleting a message removes it from canonical `pi-recall.jsonl`. It is not secure erasure of filesystem blocks, backups, snapshots, temporary copies left by an operating-system failure, or content already quoted into a session.
 
-## 📝 Message semantics and limits
+## Message semantics and limits
 
 - Eligible sources are `message` entries with role `user` or `assistant` on the active branch.
 - User strings and text blocks are kept; multiple text blocks are joined in source order with newlines.
@@ -119,7 +119,7 @@ Deleting a message removes it from canonical `pi-recall.jsonl`. It is not secure
 
 Terminal controls are removed from labels, previews, metadata, and errors before display, including escape sequences with their DCS/OSC/PM/APC/SOS payloads and bidirectional overrides that would reverse how a recalled message reads. Sanitizing happens before truncation, so a preview budget buys visible characters, and an introducer with no terminator drops only itself rather than hiding the rest of a message from the preview and the fuzzy filter. Full review content is passed through Pi TUI Kit's sanitized review renderer. The raw stored text is not modified merely for display.
 
-## 🚧 Experimental limitations
+## Experimental limitations
 
 - No tags, saved-query persistence, message editing, reordering, batch deletion, import/export, automatic expiry, or automatic context injection.
 - No cross-session transcript browser: only previously saved records can be recalled across sessions.
@@ -127,7 +127,7 @@ Terminal controls are removed from labels, previews, metadata, and errors before
 - The custom TUI picker is keyboard-operated. RPC uses sequential dialogs.
 - Scope and search preferences are not persisted; every new `/recall` interaction starts at **Current cwd** with an empty query.
 
-## 🗂️ Package layout
+## Package layout
 
 ```text
 packages/pi-recall/
@@ -150,10 +150,6 @@ packages/pi-recall/
 └── tsconfig.json
 ```
 
-## 🔎 Keywords
-
-Pi extension, saved messages, message recall, cross-session context, quote manager, JSONL, terminal UI.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

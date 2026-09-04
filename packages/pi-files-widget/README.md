@@ -82,7 +82,7 @@ The `/readfiles` browser requires these tools and will refuse to open until they
 
 Diff viewing is built into the file viewer: open a changed tracked file and press `d` to toggle the git diff view.
 
-## Browser Keybindings
+## Browser keybindings
 
 - `j/k` or `↑/↓`: move
 - `Enter`: open file / expand folder
@@ -96,7 +96,7 @@ Diff viewing is built into the file viewer: open a changed tracked file and pres
 - `+` / `-`: increase/decrease browser height
 - `q`: close
 
-## Viewer Keybindings
+## Viewer keybindings
 
 - `j/k` or `↑/↓`: scroll
 - `PgUp/PgDn`: page up/down

@@ -1,4 +1,4 @@
-# 🧠 pi-lsp — Configurable Language Server Tools for Pi
+# pi-lsp — configurable language server tools for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-lsp)](https://www.npmjs.com/package/@signalridge/pi-lsp) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -6,7 +6,7 @@
 
 The extension is language-agnostic: servers are selected by config and file extension instead of hard-coded language families.
 
-## ✨ Features
+## Features
 
 - Configure LSP servers with simple JSON keyed by server name.
 - Routes diagnostics and source fixes by configured file extensions.
@@ -16,7 +16,7 @@ The extension is language-agnostic: servers are selected by config and file exte
 - Starts language servers only for tool calls, then shuts them down.
 - Shows statusline activity only while LSP tools are running.
 
-## 🎯 When to use pi-lsp
+## When to use pi-lsp
 
 Use pi-lsp when an LSP can answer a targeted question about the files being edited faster than the
 project's authoritative validation commands. It is most useful when:
@@ -55,7 +55,7 @@ This outcome-first framing is informed by
 the protocol was not designed specifically for coding agents, and repository-native checks may
 already provide much of the desired verification value.
 
-## 📦 Install
+## Install
 
 ```bash
 pi install npm:@signalridge/pi-lsp
@@ -73,7 +73,7 @@ Try this package locally from the repository root:
 pi -e ./packages/pi-lsp
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 If no config is provided, pi-lsp ships a broad catalog of direct-command defaults. Servers are started only when matching files are requested. pi-lsp does not download language servers, so install the commands you need and make them available on `PATH`. During no-config diagnostics, unavailable default commands are filtered before workspace discovery. If none can run, diagnostics completes successfully and reports the skipped servers. Explicitly selected or custom-configured missing commands still report an error.
 
@@ -229,7 +229,7 @@ For example, run the configured Ruff server through the project's uv environment
 }
 ```
 
-## ⚠️ Tool changes
+## Tool changes
 
 `lsp_format` is no longer provided. pi-lsp now focuses on LSP diagnostics and source code actions:
 
@@ -238,7 +238,7 @@ For example, run the configured Ruff server through the project's uv environment
 
 Use project formatters or shell commands for formatting workflows.
 
-## 🛠️ Pi tools
+## Pi tools
 
 ### `lsp_diagnostics`
 
@@ -263,7 +263,7 @@ Parameters:
 - `write?`: write fixed text back to the file. Defaults to false.
 - `server?`: optional configured server name.
 
-## 💬 Command
+## Command
 
 ```text
 /lsp
@@ -271,7 +271,7 @@ Parameters:
 
 Shows configured LSP commands and whether each command is available on `PATH`.
 
-## 🗂️ Package layout
+## Package layout
 
 ```txt
 packages/pi-lsp/
@@ -292,10 +292,6 @@ packages/pi-lsp/
 └── package.json
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi Coding Agent, Language Server Protocol, LSP diagnostics, code actions, source fixes, configurable language servers, TypeScript Pi package.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

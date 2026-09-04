@@ -1,4 +1,4 @@
-# 🧭 pi-plan-mode — Codex-like Plan Mode for Pi
+# pi-plan-mode — Codex-like plan mode for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-plan-mode)](https://www.npmjs.com/package/@signalridge/pi-plan-mode) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -6,7 +6,7 @@
 
 Pi core intentionally does not ship a built-in plan mode; this package provides one as an independently installable extension.
 
-## ✨ Features
+## Features
 
 - Adds a state-aware `/plan` launch and management menu, plus `/plan start` for direct activation.
 - Adds `--plan` to start a session in Plan mode.
@@ -22,9 +22,9 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 - Shows Plan mode state in Pi's statusline as `plan active`, `plan ready`, `plan saved`, or `plan implementing`; `@signalridge/pi-statusline` adds the default `📝` icon unless configured otherwise.
 - Persists Plan mode, one session-local saved plan, and active implementation state so resume and compaction retain the exact accepted plan.
 
-## 📦 Install
+## Install
 
-This release requires Pi 0.80.6 or newer.
+This release requires Pi `0.84.x` — see the `peerDependencies` range.
 
 ```bash
 pi install npm:@signalridge/pi-plan-mode
@@ -42,7 +42,7 @@ Try this package locally from the repository root:
 pi -e ./packages/pi-plan-mode
 ```
 
-## 🚀 Usage
+## Usage
 
 ```text
 /plan
@@ -162,7 +162,7 @@ You can also exit directly. Before implementation, direct exit discards the late
 /plan exit
 ```
 
-## ⚙️ Settings
+## Settings
 
 Open **Settings** from an inactive `/plan` menu to edit one flat group of workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, **Export destination**, and **Plan mode shortcut**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands` remains JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
 
@@ -253,7 +253,7 @@ Settings saves are serialized in invocation order inside one Pi process. Each sa
 
 Invalid settings produce a warning and fall back to inherited thinking, available safe-built-in tool defaults, `keep`, and `PLAN.md`. Compatibility: a valid legacy `plan-mode.json` remains readable with a warning and is never modified automatically. If Settings is explicitly saved while only that legacy file exists, the extension creates canonical `pi-plan-mode.json` from the complete legacy document, applies the selected change, preserves unknown fields, and leaves the legacy file untouched. If both files exist, the canonical filename takes precedence.
 
-## 🧠 Codex-like behavior
+## Codex-like behavior
 
 This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 
@@ -266,7 +266,7 @@ This extension maps Codex's `ModeKind::Plan` behavior onto Pi's extension API:
 - Pi extension safety is approximated with tool classification and fail-closed filtering for every effective tool named `bash`; other non-built-in tools remain user-selected at user risk because Pi does not expose standardized tool mutability metadata.
 - Unlike native Codex, this extension uses a terminating Pi tool plus an `agent_settled` ready flow; Pi cannot provide sandbox-level enforcement.
 
-## 🗂️ Package layout
+## Package layout
 
 ```txt
 packages/pi-plan-mode/
@@ -291,10 +291,6 @@ packages/pi-plan-mode/
 }
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi coding agent, plan mode, Codex-like plan mode, AI coding workflow, read-only planning, implementation plan.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

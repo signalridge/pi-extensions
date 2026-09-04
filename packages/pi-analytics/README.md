@@ -1,4 +1,4 @@
-# 📈 pi-analytics — Local Analytics for Pi
+# pi-analytics — local analytics for Pi
 
 [![npm](https://img.shields.io/npm/v/@signalridge/pi-analytics)](https://www.npmjs.com/package/@signalridge/pi-analytics) [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -9,7 +9,7 @@
 
 `@signalridge/pi-analytics` is a local-first [Pi coding agent](https://pi.dev) extension that counts model calls, skill activations, tool activity, and observed provider errors without storing conversation or tool content.
 
-## ✨ Features
+## Features
 
 - Starts collecting settled Pi response cycles after installation with no configuration or startup I/O.
 - Breaks skill activations down by explicit user invocation, model loading, provider, and model.
@@ -21,7 +21,7 @@
 - Uses one writer file per Pi runtime, so concurrent Pi processes never share a routine writer lock.
 - Never starts a server or sends analytics anywhere.
 
-## 📦 Install
+## Install
 
 Install persistently:
 
@@ -43,7 +43,7 @@ pi -e ./packages/pi-analytics
 
 The storage implementation uses Node's built-in filesystem APIs and has no native database dependency.
 
-## 🚀 Quick start
+## Quick start
 
 Complete at least one Pi response, then run:
 
@@ -68,7 +68,7 @@ Recovered errors                    3
 
 Use the menu to change the time range or browse Skills, Tools, Provider reliability, Response cycles, and Data & privacy. Only fully settled cycles are included; active work is omitted.
 
-## 📐 Metric definitions
+## Metric definitions
 
 ### Response cycles and LLM calls
 
@@ -90,7 +90,7 @@ A tool call starts at Pi's `tool_execution_start` event and finishes at `tool_ex
 
 Pi exposes HTTP responses and final assistant failures, not every provider-SDK transport retry. The dashboard therefore labels these values as **observed provider errors**. It reports HTTP 429 and 5xx counts; conservative DNS, timeout, connection, TLS, network, and provider categories; recovered errors; and terminal failures. Error messages are classified in memory and discarded.
 
-## 💬 Command
+## Command
 
 ```text
 /analytics
@@ -100,7 +100,7 @@ The command accepts no arguments. TUI mode uses the full dashboard; RPC mode ada
 
 The root menu contains Change time range, Skills, Tools, Provider reliability, Response cycles, Data & privacy, and Close. Skills and Tools are searchable browse views with details and model breakdowns. Escape goes Back from nested screens and closes the root. Ctrl+C closes the menu. Data deletion uses Pi TUI Kit's standalone confirmation: Back keeps the dashboard open, Ctrl+C closes it in TUI mode, and cancellation never clears data.
 
-## 🔐 Local data and privacy
+## Local data and privacy
 
 Current analytics live under:
 
@@ -128,7 +128,7 @@ Choose **Data & privacy → Clear analytics data…** to atomically publish a fr
 
 The extension then removes the previous generation. If another process still has an obsolete file in use, Clear remains logically complete and reports that physical cleanup is incomplete; stop other Pi processes and clear again. Clearing files is not a secure-erasure guarantee for underlying storage media.
 
-## 🧭 Legacy SQLite data
+## Legacy SQLite data
 
 Versions that used Turso/SQLite stored data in:
 
@@ -141,7 +141,7 @@ The JSONL version deliberately does not open, import, migrate, delete, or rewrit
 
 If legacy history matters, stop every old Pi process first and preserve both files together. If it does not matter, stop every old Pi process before deleting both files manually. Never copy or remove only the main DB while an old process may still own its WAL.
 
-## 🚧 Limitations
+## Limitations
 
 - There are no retention settings; records remain until explicitly cleared.
 - Analytics are best-effort derived metadata. A failed or interrupted local write may be omitted.
@@ -149,7 +149,7 @@ If legacy history matters, stop every old Pi process first and preserve both fil
 - Prometheus, JSON/CSV export, cloud sync, browser dashboards, token/cost reporting, and project attribution are not included.
 - Statistics cover only events visible through Pi's public extension API.
 
-## 🗂️ Package layout
+## Package layout
 
 ```text
 packages/pi-analytics/
@@ -173,10 +173,6 @@ packages/pi-analytics/
 └── tsconfig.json
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi coding agent, local analytics, agent skills, tool usage, model calls, provider reliability, JSON Lines, content-free metrics.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

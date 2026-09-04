@@ -1,4 +1,4 @@
-# 🎯 pi-goal — Goal Mode for the Pi Coding Agent
+# pi-goal — goal mode for the Pi coding agent
 
 [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev) [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
@@ -6,7 +6,7 @@
 
 Goal mode uses Codex-like persistence instructions and sends guarded continuation messages from Pi's fully settled idle boundary until the agent completes the goal, the user pauses or clears it, a safety circuit breaker trips, a true blocker or provider usage limit stops it, or an optional token budget is reached. With ordered goals enabled, the same lifecycle advances through queued objectives one at a time.
 
-## ✨ Features
+## Features
 
 - Adds `/goal <goal_to_complete>` to start goal mode, with confirmation before replacing an existing goal.
 - Bare `/goal` opens a standard current-state manager in the TUI, with guided start, pause,
@@ -36,9 +36,9 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 - Applies one evidence-based completion audit across kickoff, resume, edit, system, continuation, and budget-wrap-up prompts.
 - Optionally exposes a default-off, run-scoped `pi.events` protocol for trusted sibling extensions to start, observe, and cancel one Goal lifecycle without emulating `/goal` input.
 
-## 📦 Install
+## Install
 
-Requires Pi `0.80.6` or newer for the `agent_settled` lifecycle event.
+Requires Pi `0.84.x` — see the `peerDependencies` range. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
 
 ```bash
 pi install npm:@signalridge/pi-goal
@@ -52,7 +52,7 @@ From the repository root:
 pi -e ./packages/pi-goal
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 Settings are optional. When `~/.pi/agent/pi-goal.json` is absent, pi-goal uses these
 built-in defaults without creating the file:
@@ -107,7 +107,7 @@ restores only the exact tools that pi-goal previously hid, while switching to
 
 Tool visibility is a baseline, not ownership of Pi's global active-tool list. Plan mode or another restrictive policy may temporarily hide the tools. pi-goal does not fight that policy on restore or on every turn: activation is rejected if both tools cannot be made available, and an already-active goal is paused without automatic continuation if they disappear. The pause aborts a Goal-owned kickoff, resume, active-edit, or automatic-continuation prompt, but it does not cancel or stale-block an unrelated user or extension turn, including startup follow-ups after a restrictive restore.
 
-## 🚀 Commands
+## Commands
 
 ```text
 /goal
@@ -161,7 +161,7 @@ When the experiment is disabled, queue words retain the original parser behavior
 
 Goal objectives are limited to 4,000 characters. Put longer instructions in a file and reference the file path from `/goal`.
 
-## 🔁 Session and reload behavior
+## Session and reload behavior
 
 Goal state is stored as Pi session state, similar to Codex's thread-owned goals. `/reload` and reopening the same Pi session can restore that session's unfinished goal. An active restored goal already at or above its finite automatic-work limit pauses before another provider request and reports that progress is saved; use `/goal` to review and continue. With `"after-first-goal"`, an unfinished restore marks the tools unlocked in the new extension runtime, but it does not widen an active-tool set already restricted by an earlier lifecycle handler; an active goal instead restores as paused when either terminal tool is missing. If no unfinished goal remains, a fresh runtime starts locked again. Active elapsed time is checkpointed before shutdown and restarted after reload, so offline and stopped wall-clock time is excluded. Automatic-response counts, repeat fingerprints, and safety-pause causes persist across reload and compaction. A direct non-`/goal` user/RPC input resets the safety epoch only while the goal is active and reclassifies the in-flight run as manual; extension input and messages sent while stopped do not reset it. Starting a new Pi session in the same working directory does not inherit the old goal.
 
@@ -171,7 +171,7 @@ If a session still contains multiple goals or a pending queue transition when `e
 
 Older versions wrote unfinished goals to `~/.pi/agent/pi-goal-state.json` keyed by working directory. This version no longer reads that global file, and `/goal clear` removes any legacy entry for the current working directory.
 
-## 📊 Statusline states
+## Statusline states
 
 `pi-goal` writes compact plain status strings for statusline extensions. `@signalridge/pi-statusline` adds the default `🎯` icon unless configured otherwise:
 
@@ -186,7 +186,7 @@ Older versions wrote unfinished goals to `~/.pi/agent/pi-goal-state.json` keyed 
 - `complete` — shown briefly after `goal_complete` succeeds.
 - `queue off` — retained ordered goals are frozen because `experimental.goals` is disabled.
 
-## 💰 Token budgets and elapsed time
+## Token budgets and elapsed time
 
 The TUI budget chooser describes token budgets as cumulative Goal usage, warns that the final model
 call may exceed the chosen value, and keeps the independent automatic-work response limit visible.
@@ -204,7 +204,7 @@ The default 25-response automatic-work limit is a response-count boundary, not a
 
 Elapsed time is accumulated only while status is `active`. Pause, blocked, usage-limited, budget-limited, shutdown, and offline periods do not increase it. Legacy session entries are migrated by preserving their accumulated seconds and starting a fresh active clock when loaded.
 
-## ✅ How completion works
+## How completion works
 
 While a goal is active, `pi-goal` injects persistence rules, a `<goal_id>` stale-turn guard, and exposes `goal_complete`. Kickoff, resume, edited-objective, system, and automatic-continuation prompts all place a trust boundary before the escaped objective, identifying it as user-provided task data; they preserve its full scope across turns and require the agent to derive concrete requirements from the objective and referenced artifacts. They treat the current worktree, command output, tests, runtime behavior, PR state, rendered artifacts, and external state as authoritative; previous conversation and plans are context rather than proof.
 
@@ -216,17 +216,17 @@ If a turn ends before completion, `pi-goal` records usage and creates one contin
 
 Manual compaction does not emit `agent_settled`, so its completion hook uses the same single-flight dispatcher as a narrow idle-only fallback. Pi extensions cannot reserve an idle turn atomically like Codex core; another extension can still win the race after the idle check, and its newer turn supersedes the old continuation intent.
 
-## 🚧 Blocked goals
+## Blocked goals
 
 `goal_blocked` is intentionally narrower than completion or ordinary clarification. Every goal-mode prompt repeats the blocked audit: the model must provide the exact current `goal_id`, a specific reason describing the user or external action required (up to 1,000 characters), concrete evidence from the failed resolution attempts (up to 4,000 characters), and `repeated_turns` showing the same blocker recurred for at least three consecutive goal turns. A resumed goal starts a fresh blocker audit. Empty or oversized reasons/evidence, stale ids, non-whole turn counts, stopped goals, and fewer than three turns are rejected. Accepted blocker reports set `blocked`, stop automatic continuation, and terminate the tool batch when Pi can do so safely.
 
 Do not use `goal_blocked` merely because work is difficult, incomplete, uncertain, awaiting normal clarification, or affected by a recoverable tool/provider failure. The user can resolve the external condition and run `/goal resume` to rotate the goal id and continue.
 
-## 🛑 Interruption and queued-input behavior
+## Interruption and queued-input behavior
 
 A user pause or aborted turn produces `paused`; a terminal provider/account quota error produces `usage_limited`; another non-retryable agent error produces `blocked`. Each stopped transition cancels pending continuation intent or delivery, aborts stale work when applicable, and blocks stale tool calls until the next non-goal user prompt, successful reactivation/replacement, or `/goal clear`. On `/goal clear`, the extension clears goal state, continuation markers, and any stale tool-call block without aborting an unrelated in-flight turn. Retryable provider interruptions and overflow compaction retries stay `active` while Pi retries; no extra continuation is queued, and automatic ownership remains charged through retry `agent_start` events. If matching recovery still exists at `agent_settled`, retries are exhausted and the goal becomes `blocked` before any pending queue transition dispatches. Stale recovery cannot block a replacement goal. User and extension work that starts before settlement supersedes the older continuation intent, and pending messages always take priority.
 
-## 🤝 Managed run RPC
+## Managed run RPC
 
 With `rpc.enabled: true`, pi-goal exposes a session-local, dependency-free protocol over Pi's shared `pi.events` bus. It is intended for trusted sibling extensions that need to start, observe, and cancel one Goal lifecycle without driving the `/goal` command. Installed Pi extensions remain fully privileged: this setting controls only whether pi-goal cooperates with these channels and is not authentication or sandboxing.
 
@@ -296,7 +296,7 @@ Start never prompts for replacement: any pre-existing Goal is rejected. The prot
 
 This breaking contract replaces and removes `pi-goal:rpc:start`, `pi-goal:rpc:pause`, request-scoped start replies, and the global `pi-goal:state` broadcast. No compatibility aliases are registered.
 
-## 🧠 Use cases
+## Use cases
 
 - Finish implementation tasks without stopping at a plan.
 - Keep debugging until the bug is verified fixed.
@@ -304,7 +304,7 @@ This breaking contract replaces and removes `pi-goal:rpc:start`, `pi-goal:rpc:pa
 - Encourage agents to test, lint, or typecheck before completion.
 - Make long-running Pi coding sessions more autonomous.
 
-## 🗂️ Package layout
+## Package layout
 
 ```txt
 packages/pi-goal/
@@ -339,10 +339,6 @@ packages/pi-goal/
 }
 ```
 
-## 🔎 Keywords
-
-Pi extension, Pi coding agent, goal mode, autonomous coding agent, AI agent workflow, task completion, agent loop, verification, TypeScript Pi package.
-
-## 📄 License
+## License
 
 MIT. See [`LICENSE`](./LICENSE).

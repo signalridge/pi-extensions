@@ -10,7 +10,7 @@ This one is cool because:
 
 **Note: This is a flat version without subagents, similar to the [Anthropic plugins implementation](https://github.com/anthropics/claude-code-plugins/tree/main/ralph-loop).**
 
-## Installation
+## Install
 
 ```bash
 pi install npm:@signalridge/pi-ralph-wiggum
@@ -93,7 +93,7 @@ If an already-queued Ralph prompt arrives after a loop has completed, the agent 
 | `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
 | `--reflect-every N` | Reflect every N iterations |
 
-## Agent Tool
+## Agent tool
 
 The agent can self-start loops using `ralph_start`:
 

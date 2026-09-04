@@ -10,7 +10,7 @@ redraws it, and collapses to a width-safe compact summary on narrow terminals.
 │                                                                         │
 │  Ctrl+C interrupt · / commands · ! bash · Ctrl+L clear                  │
 │                                                                         │
-│  Directory:  ~/ghq/github.com/signalridge/pi-extensions                 │
+│  Directory:  ~/code/acme-api                                            │
 │  Branch:     main [+392 -202]                                           │
 │  Session:    (new)                                                      │
 │  Model:      openai-codex / gpt-5.6-luna · thinking max                 │
@@ -18,10 +18,10 @@ redraws it, and collapses to a width-safe compact summary on narrow terminals.
 │  Version:    0.84.1                                                     │
 │                                                                         │
 │  Context:    AGENTS.md                                                  │
-│  Skills:     commit, dev-preferences, toolbelt, write-tui +12           │
-│  Prompts:    /plan, /review, /ship +4                                   │
+│  Skills:     commit, release, review +12                                │
+│  Prompts:    /plan, /ship +4                                            │
 │  Extensions: btw, code-actions, goal, gpt-fast, statusline +18          │
-│  Themes:     catppuccin-mocha, signalridge-ridgeline +2                 │
+│  Themes:     catppuccin-mocha +2                                        │
 │  Tools:      18 active of 42                                            │
 │                                                                         │
 ╰─────────────────────────────────────────────────────────────────────────╯
@@ -29,6 +29,20 @@ redraws it, and collapses to a width-safe compact summary on narrow terminals.
 
 No logo and no wordmark: the card exists to say what this session is, and a
 brand line says nothing a returning user does not already know.
+
+## Install
+
+```bash
+pi install npm:@signalridge/pi-welcome
+```
+
+## Use from this checkout
+
+From the repository root:
+
+```bash
+pi -e ./packages/pi-welcome
+```
 
 ## Turn on `quietStartup`
 
@@ -75,17 +89,3 @@ attacker-controlled in a cloned repository, and the card is a persisted entry
 replayed on every resume. Control characters and bidirectional overrides are
 neutralized at render time, so an entry stored before that landed is cleaned up
 on the way out too.
-
-## Install
-
-```bash
-pi install npm:@signalridge/pi-welcome
-```
-
-## Use from this checkout
-
-From the repository root:
-
-```bash
-pi -e ./packages/pi-welcome
-```

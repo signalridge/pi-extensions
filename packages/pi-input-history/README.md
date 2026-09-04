@@ -26,11 +26,11 @@ pi -e ./packages/pi-input-history
 
 ## Usage
 
-### Persistent History
+### Persistent history
 
 On session start, your last 100 prompts across all sessions are loaded into the editor. Use **↑/↓** arrows to browse them as usual.
 
-### Fuzzy Popup (Ctrl+R)
+### Fuzzy popup (Ctrl+R)
 
 1. Press **Ctrl+R** to open the popup — a large centred two-pane dialog, `fzf --preview` style. The left pane lists your recent prompts newest-first, each row carrying its position and age; the right pane shows the **full text** of the highlighted entry, which one-line summaries cannot convey for long prompts.
 2. Type to fuzzy-filter the list live (subsequence matching, space-separated multi-token).

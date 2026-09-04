@@ -2,7 +2,7 @@
 
 Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on current model, supplementing Pi's AGENTS.md loading.
 
-## How It Works
+## How it works
 
 ```mermaid
 flowchart LR
@@ -87,7 +87,7 @@ Install with:
 ln -s "$(pwd)/agent-guidance/templates/CLAUDE.md" ~/.pi/agent/
 ```
 
-## Configuration (Optional)
+## Configuration (optional)
 
 Create `~/.pi/agent/agent-guidance.json`:
 
