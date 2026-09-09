@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- 1f586f8: Forward mouse input through custom UI borders and align shell-editor mouse hit-testing with its rendered prompt. Keep Herdr working through automatic retries and integrate native, title-free UI waiting spans independently of event-bus blocked ownership.
+
+### Patch Changes
+
+- 1f586f8: - Bound workflow cancellation drains and durably fence unconfirmed cleanup, aborting sibling agents and releasing foreground callers.
+  - Await managed timeout cleanup before script continuation and terminal publication.
+  - Keep failed retry text and length responses discarded by overflow-compaction retry out of successful subagent fallbacks, while retaining valid pre-compaction and non-retried length output.
+  - Account for native prompts spanning reporter activation without dropping out-of-order wait debt.
+  - Reconcile settlement after observer-triggered manual compaction with run/session ownership.
+  - Preserve clipped overlay hit ranges and native container ancestry for editor autocomplete focus.
+  - Reconcile errored writes and edits against pre/post mutation evidence, retaining invocation cwd and releasing evidence when blocked or aborted preflight bypasses tool results.
+- 1f586f8: Preserve Codex opaque checkpoints across Pi's retry-only assistant-tail removal using optional, fingerprint-verified version-1 proof plus explicit lifecycle provenance. Preserve that provenance across same-runtime reload without confusing a new identical assistant response with the persisted tail; persisted rebuilds reset it and unknown provenance fails closed. Bound BTW context and tool-argument construction, including suffix-key storage for wide JSON-shaped objects (enumeration remains linear). Balance out-of-order native UI waiting notifications without affecting manual blocked ownership. Foreground workflow cancellation waits for exact-owner quiescence even when stop is unavailable or rejects after reconciliation already stopped the child, including cancelled spawn allocation recovery; unconfirmed cleanup becomes durably non-resumable with a diagnostic retaining any stop error. Background execution remains detached.
+  
+  These are corrective changes: existing checkpoint fields, exports, and cross-extension protocols remain compatible, so no protocol or major-version bump is required.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+
 ## 1.2.3
 ### Patch Changes
 

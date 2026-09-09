@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.4.1
+### Patch Changes
+
+- d9219d4: Correct shipped documentation that contradicted the code or the manifest.
+  
+  - `pi-subagents`: the summary line still advertised protocol-v3 spawning while
+    the feature list and the managed-spawn section described v4.
+  - `pi-worktree`: the workspace-switching section named `/tree`; the registered
+    command is `/worktree`.
+  - `pi-workflows`: removed an orphaned sentence fragment left behind by an edit
+    to the saved-workflow paragraph.
+  - `pi-plan-mode`, `pi-goal`, `pi-usage-extension`: the stated Pi floor
+    (`0.80.6`, `0.42.4+`) contradicted the declared `^0.84.0` peer range, which
+    resolves to `0.84.x`. `pi-usage-extension` also carried a "Last updated"
+    stamp from a version that predates the workspace baseline.
+  - `pi-welcome`: the example card was a real session capture. It is now a
+    generic sample, and Install moved above the configuration sections instead of
+    sitting below them.
+- 1f586f8: Prevent fresh implementation from silently submitting the approved plan to a different or missing destination model. Preserve the handoff in the replacement editor for explicit model confirmation, and reject source model changes during authentication.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+- d9219d4: Converge every README on one house style: plain sentence-case headings, no
+  decorative emoji.
+  
+  Ten packages carried an emoji heading scheme inherited from their upstream
+  forks while the other nineteen used plain headings, so the same monorepo
+  rendered as two unrelated projects on npmjs.com. Headings are now emoji-free
+  and titles are sentence case.
+  
+  Also removes the `Keywords` section from those ten. It duplicated each
+  package's `package.json` `keywords` field, which is what npm actually indexes,
+  and no plain-style README carried one. `Installation` is now `Install`
+  everywhere.
+  
+  Headings that were Title Case are sentence case too, so one convention now
+  covers the whole monorepo. Existing in-page anchor links are unaffected:
+  GitHub lowercases heading slugs already.
+  
+  Documentation only — no runtime change.
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+  - @signalridge/pi-ui@1.3.1
+
 ## 1.4.0
 ### Minor Changes
 

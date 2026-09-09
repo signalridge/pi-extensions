@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.3
+### Patch Changes
+
+- 1f586f8: Forward mouse input through custom UI borders and align shell-editor mouse hit-testing with its rendered prompt. Keep Herdr working through automatic retries and integrate native, title-free UI waiting spans independently of event-bus blocked ownership.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+
 ## 1.2.2
 ### Patch Changes
 
