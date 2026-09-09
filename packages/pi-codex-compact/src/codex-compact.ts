@@ -8,16 +8,18 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
+  type SessionEntry,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import {
   buildReplacementHistory,
+  CHECKPOINT_KIND,
   type CodexCheckpointDetails,
   checkpointMarker,
   checkpointMarkerVariants,
   createCheckpointDetails,
   fallbackSummary,
-  latestCheckpoint,
+  parseCheckpointDetails,
   projectCheckpointContext,
 } from "./checkpoint.js";
 import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
@@ -30,6 +32,28 @@ import {
 } from "./settings.js";
 import { showCodexCompactMenu } from "./settings-menu.js";
 
+// Extension-owned reload handoff only. Weak keys retain neither sessions nor ctx;
+// one scalar record per live manager, fenced by session identity + checkpoint ID.
+const provenanceKey = Symbol.for("@signalridge/pi-codex-compact/retry-provenance/v1");
+type TailProvenance = { checkpointId: string; mode: "full" | "runtime-omitted" };
+const provenanceGlobal = globalThis as typeof globalThis & {
+  [provenanceKey]?: WeakMap<object, TailProvenance>;
+};
+const tailProvenance = provenanceGlobal[provenanceKey] ?? new WeakMap<object, TailProvenance>();
+provenanceGlobal[provenanceKey] = tailProvenance;
+function provenanceId(ctx: ExtensionContext, checkpointId: string): string {
+  return JSON.stringify([ctx.sessionManager.getSessionId(), checkpointId]);
+}
+function resetTailProvenance(ctx: ExtensionContext): void {
+  tailProvenance.delete(ctx.sessionManager);
+  const checkpoint = activeCheckpoint(ctx);
+  if (checkpoint)
+    tailProvenance.set(ctx.sessionManager, {
+      checkpointId: provenanceId(ctx, checkpoint.details.checkpointId),
+      mode: "full",
+    });
+}
+
 const STATUS_KEY = "codex-compact";
 const EXPERIMENTAL_WARNING =
   "Experimental: Codex Remote Compaction V2 uses an opaque, provider-specific checkpoint. Sessions require this extension and openai-codex for full replay.";
@@ -38,8 +62,18 @@ function isSupportedModel(model: Model<Api> | undefined): model is Model<"openai
   return model?.provider === "openai-codex" && hasApi(model, "openai-codex-responses");
 }
 
+function activeCompaction(entries: SessionEntry[]) {
+  // Pi places the effective compaction first, before any retained older entries.
+  // Searching raw history (or scanning this list backwards) can resurrect a
+  // superseded remote checkpoint after native fallback.
+  const entry = buildContextEntries(entries, entries.at(-1)?.id ?? null)[0];
+  return entry?.type === "compaction" ? entry : undefined;
+}
+
 function activeCheckpoint(ctx: ExtensionContext) {
-  return latestCheckpoint(ctx.sessionManager.getBranch());
+  const entry = activeCompaction(ctx.sessionManager.getBranch());
+  const details = parseCheckpointDetails(entry?.details);
+  return entry && details ? { entry, details } : undefined;
 }
 
 function isCheckpointCompatible(
@@ -77,12 +111,22 @@ function projectedCurrentMessages(
 ): { messages: AgentMessage[]; prior?: CodexCheckpointDetails } {
   const leafId = event.branchEntries.at(-1)?.id ?? null;
   const session = buildSessionContext(event.branchEntries, leafId);
-  const prior = latestCheckpoint(event.branchEntries)?.details;
-  if (!prior) return { messages: session.messages };
+  const compaction = activeCompaction(event.branchEntries);
+  const prior = parseCheckpointDetails(compaction?.details);
+  if (!prior) {
+    const details = compaction?.details;
+    if (
+      (details && typeof details === "object" && "kind" in details && details.kind === CHECKPOINT_KIND) ||
+      compaction?.summary.startsWith("OpenAI Codex Remote Compaction V2 checkpoint ")
+    ) {
+      throw new Error("The active opaque checkpoint is malformed");
+    }
+    return { messages: session.messages };
+  }
   if (prior.modelId !== model.id) {
     throw new Error("The active opaque checkpoint belongs to a different Codex model");
   }
-  const projected = projectCheckpointContext(session.messages, prior);
+  const projected = projectCheckpointContext(session.messages, prior, "full");
   if (!projected) {
     throw new Error("The previous opaque checkpoint could not be projected safely");
   }
@@ -150,6 +194,7 @@ async function compactRemotely(
       modelId: model.id,
       replacementHistory,
       keptMessages: keptMessages(event),
+      willRetry: event.willRetry,
     });
     return {
       compaction: {
@@ -179,6 +224,7 @@ export function createCodexCompactExtension(
     const settingsRuntime = options.settingsRuntime ?? createCodexCompactSettingsRuntime();
     let sessionController = new AbortController();
     let generation = 0;
+    let active = true;
 
     pi.registerCommand("codex-compact", {
       description: "Compact now or configure experimental Codex Remote Compaction V2",
@@ -191,7 +237,9 @@ export function createCodexCompactExtension(
       },
     });
 
-    pi.on("session_start", async (_event, ctx) => {
+    pi.on("session_start", async (event, ctx) => {
+      active = true;
+      if (event.reason !== "reload") resetTailProvenance(ctx);
       sessionController.abort();
       sessionController = new AbortController();
       generation += 1;
@@ -238,21 +286,32 @@ export function createCodexCompactExtension(
     // compaction. Observing `session_compact` keeps both sides of the
     // lifecycle handled and lets the extension re-validate the checkpoint in
     // the post-compaction context without mutating session state.
-    pi.on("session_compact", (_event, ctx) => {
-      if (!settingsRuntime.get().settings.enabled) return;
+    pi.on("session_compact", (event, ctx) => {
+      if (!active) return;
+      resetTailProvenance(ctx);
       const checkpoint = activeCheckpoint(ctx);
-      if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return;
-      // No mutation: `context` and `before_provider_request` already replay
-      // the checkpoint. This handler exists so both compaction events are
-      // subscribed per OPTIMIZATION-SPEC C4 item 53 and future post-compaction
-      // work has a place without reintroducing a second `session_before_compact`.
+      // Pi rebuilds persisted context before this event, then removes the eligible
+      // tail before retry. Only this event plus validated proof establishes omission.
+      if (event.willRetry && checkpoint?.entry.id === event.compactionEntry.id && checkpoint.details.retryTrimmedTail) {
+        tailProvenance.set(ctx.sessionManager, {
+          checkpointId: provenanceId(ctx, checkpoint.details.checkpointId),
+          mode: "runtime-omitted",
+        });
+      }
+    });
+
+    pi.on("session_tree", (_event, ctx) => {
+      if (active) resetTailProvenance(ctx);
     });
 
     pi.on("context", (event, ctx) => {
-      if (!settingsRuntime.get().settings.enabled) return undefined;
+      if (!active || !settingsRuntime.get().settings.enabled) return undefined;
       const checkpoint = activeCheckpoint(ctx);
       if (!checkpoint || !isCheckpointCompatible(checkpoint.details, ctx.model)) return undefined;
-      const messages = projectCheckpointContext(event.messages, checkpoint.details);
+      const provenance = tailProvenance.get(ctx.sessionManager);
+      const mode =
+        provenance?.checkpointId === provenanceId(ctx, checkpoint.details.checkpointId) ? provenance.mode : undefined;
+      const messages = projectCheckpointContext(event.messages, checkpoint.details, mode);
       return messages ? { messages } : undefined;
     });
 
@@ -280,7 +339,9 @@ export function createCodexCompactExtension(
       }
     });
 
-    pi.on("session_shutdown", async (_event, ctx) => {
+    pi.on("session_shutdown", async (event, ctx) => {
+      active = false;
+      if (event.reason !== "reload") tailProvenance.delete(ctx.sessionManager);
       generation += 1;
       sessionController.abort();
       providerWarnings.clear();

@@ -14,6 +14,7 @@ export interface FileNode {
   expanded?: boolean;
   gitStatus?: string;
   agentModified?: boolean;
+  observedChanged?: boolean; // Changed during a failed tool call; authorship unknown
   lineCount?: number;
   diffStats?: DiffStats;
   hasChangedChildren?: boolean; // For directories

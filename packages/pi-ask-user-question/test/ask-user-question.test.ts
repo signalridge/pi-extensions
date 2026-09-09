@@ -100,7 +100,7 @@ test("RPC fallback answers single and batch questions, including Other and Back"
     } as never,
     undefined,
     undefined,
-    { mode: "rpc", hasUI: true, ui: { custom: async () => undefined, select, editor: async () => "Changed" } } as never,
+    { mode: "rpc", hasUI: true, ui: { custom: async () => undefined, select, input: async () => "Changed" } } as never,
   );
   assert.equal(result.details.cancelled, false);
   assert.equal(

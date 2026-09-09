@@ -19,6 +19,8 @@ export interface CodexCheckpointDetails {
   protocol: "remote-compaction-v2";
   replacementHistory: JsonObject[];
   keptMessageFingerprints: string[];
+  /** Verifiable proof of the single assistant tail Pi removes only for retry. */
+  retryTrimmedTail?: AgentMessage;
   createdAt: string;
 }
 
@@ -126,6 +128,16 @@ export function parseCheckpointDetails(value: unknown): CodexCheckpointDetails |
   ) {
     return undefined;
   }
+  if (value.retryTrimmedTail !== undefined) {
+    const tail = value.retryTrimmedTail;
+    if (
+      !isObject(tail) ||
+      tail.role !== "assistant" ||
+      (tail.stopReason !== "error" && tail.stopReason !== "length") ||
+      fingerprintMessage(tail as unknown as AgentMessage) !== value.keptMessageFingerprints.at(-1)
+    )
+      return undefined;
+  }
   const last = value.replacementHistory.at(-1);
   try {
     validateCompactionItem(last);
@@ -199,6 +211,7 @@ function keptLineageEnd(
 export function projectCheckpointContext(
   messages: readonly AgentMessage[],
   details: CodexCheckpointDetails,
+  tailMode?: "full" | "runtime-omitted",
 ): AgentMessage[] | undefined {
   const summaries = new Set(fallbackSummaryVariants(details.checkpointId));
   // `createdAt` is the checkpoint's own authoritative birth time; the rendered summary's
@@ -211,12 +224,20 @@ export function projectCheckpointContext(
   for (let summaryIndex = messages.length - 1; summaryIndex >= 0; summaryIndex--) {
     const summaryMessage = messages[summaryIndex];
     if (summaryMessage?.role !== "compactionSummary" || !summaries.has(summaryMessage.summary)) continue;
-    const keptEnd = keptLineageEnd(
-      messages,
-      details.keptMessageFingerprints,
-      summaryIndex + 1,
-      Number.isFinite(createdAt) ? Math.min(createdAt, summaryMessage.timestamp) : summaryMessage.timestamp,
-    );
+    const timestamp = Number.isFinite(createdAt)
+      ? Math.min(createdAt, summaryMessage.timestamp)
+      : summaryMessage.timestamp;
+    const tail = details.retryTrimmedTail;
+    const mayTrimTail =
+      tail?.role === "assistant" &&
+      (tail.stopReason === "error" || tail.stopReason === "length") &&
+      fingerprintMessage(tail) === details.keptMessageFingerprints.at(-1);
+    // Values prove lineage, never occurrence: a retry can be identical to the old tail.
+    if (mayTrimTail && tailMode === undefined) return undefined;
+    if (tailMode === "runtime-omitted" && !mayTrimTail) return undefined;
+    const fingerprints =
+      tailMode === "runtime-omitted" ? details.keptMessageFingerprints.slice(0, -1) : details.keptMessageFingerprints;
+    const keptEnd = keptLineageEnd(messages, fingerprints, summaryIndex + 1, timestamp);
     if (keptEnd === undefined) continue;
     return [
       ...messages.slice(0, summaryIndex),
@@ -308,6 +329,7 @@ export function createCheckpointDetails(input: {
   keptMessages: readonly AgentMessage[];
   checkpointId?: string;
   createdAt?: string;
+  willRetry?: boolean;
 }): CodexCheckpointDetails {
   const details: CodexCheckpointDetails = {
     kind: CHECKPOINT_KIND,
@@ -321,6 +343,14 @@ export function createCheckpointDetails(input: {
     keptMessageFingerprints: input.keptMessages.map(fingerprintMessage),
     createdAt: input.createdAt ?? new Date().toISOString(),
   };
+  const tail = input.keptMessages.at(-1);
+  if (
+    input.willRetry === true &&
+    tail?.role === "assistant" &&
+    (tail.stopReason === "error" || tail.stopReason === "length")
+  ) {
+    details.retryTrimmedTail = structuredClone(tail);
+  }
   const parsed = parseCheckpointDetails(details);
   if (!parsed) throw new Error("Created an invalid Codex checkpoint");
   return parsed;

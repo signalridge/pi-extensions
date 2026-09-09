@@ -84,8 +84,17 @@ export async function startFreshImplementationSession(
 
   await ctx.waitForIdle();
   if (!request.isCurrent()) return { kind: "stale" };
-  if (!(await preflightModel(ctx, request.isCurrent))) return { kind: "rejected" };
+  const sourceModel = await preflightModel(ctx, request.isCurrent);
+  if (!sourceModel) return { kind: "rejected" };
   if (!request.isCurrent()) return { kind: "stale" };
+  const currentModel = ctx.model;
+  if (currentModel?.provider !== sourceModel.provider || currentModel?.id !== sourceModel.id) {
+    ctx.ui.notify(
+      "The selected model changed during authentication. Confirm the intended model and retry /plan.",
+      "warning",
+    );
+    return { kind: "rejected" };
+  }
 
   const activeImplementation = {
     id: randomUUID(),
@@ -128,6 +137,8 @@ export async function startFreshImplementationSession(
   }
   let setupError: string | undefined;
   let kickoffError: string | undefined;
+  let modelNeedsConfirmation = false;
+  let replaced = false;
 
   if (ctx.mode === "rpc") ctx.ui.notify("Starting fresh implementation session…", "info");
 
@@ -143,8 +154,19 @@ export async function startFreshImplementationSession(
         }
       },
       withSession: async (replacementCtx) => {
+        replaced = true;
         if (setupError) {
           recoverSetupFailure(replacementCtx, handoff, setupError);
+          return;
+        }
+        const destinationModel = replacementCtx.model;
+        if (destinationModel?.provider !== sourceModel.provider || destinationModel?.id !== sourceModel.id) {
+          modelNeedsConfirmation = true;
+          replacementCtx.ui.setEditorText(handoff);
+          replacementCtx.ui.notify(
+            `Fresh session model differs: source ${safeErrorDetail(`${sourceModel.provider}/${sourceModel.id}`)}; destination ${destinationModel ? safeErrorDetail(`${destinationModel.provider}/${destinationModel.id}`) : "none (no model selected)"}. Implementation was not submitted. Select or confirm the intended model, then submit the request in the editor.`,
+            "warning",
+          );
           return;
         }
         try {
@@ -163,6 +185,7 @@ export async function startFreshImplementationSession(
       },
     });
   } catch (error: unknown) {
+    if (replaced) return { kind: "partial" };
     safeNotify(
       ctx,
       `Unable to start a fresh implementation session: ${safeErrorDetail(error)}. The source plan remains available; retry or resume the planning session.`,
@@ -175,7 +198,7 @@ export async function startFreshImplementationSession(
     ctx.ui.notify("Fresh implementation cancelled. The plan remains available.", "info");
     return { kind: "cancelled" };
   }
-  return setupError || kickoffError ? { kind: "partial" } : { kind: "started" };
+  return setupError || kickoffError || modelNeedsConfirmation ? { kind: "partial" } : { kind: "started" };
 }
 
 async function preflightModel(ctx: ExtensionCommandContext, isCurrent: () => boolean) {
@@ -184,6 +207,8 @@ async function preflightModel(ctx: ExtensionCommandContext, isCurrent: () => boo
     ctx.ui.notify("Unable to implement the plan: no model is selected.", "warning");
     return false;
   }
+  // Keep only plain identity data across authentication and session replacement.
+  const identity = { provider: model.provider, id: model.id };
   let auth: Awaited<ReturnType<ExtensionCommandContext["modelRegistry"]["getApiKeyAndHeaders"]>>;
   try {
     auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -198,7 +223,7 @@ async function preflightModel(ctx: ExtensionCommandContext, isCurrent: () => boo
     ctx.ui.notify(`Unable to implement the plan: ${safeErrorDetail(auth.error)}`, "warning");
     return false;
   }
-  return true;
+  return identity;
 }
 
 function recoverSetupFailure(ctx: ReplacementContext, handoff: string, setupError: string) {

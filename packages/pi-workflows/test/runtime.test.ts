@@ -12,6 +12,7 @@
  *  - resume: longest-unchanged-prefix replay
  */
 
+import { getEventListeners } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import {
@@ -830,6 +831,35 @@ return await gate(
 // ── checkpoint ───────────────────────────────────────────────────────────────
 
 describe("checkpoint()", () => {
+  for (const cancel of [false, true]) {
+    it(`cleans checkpoint listeners and runtime waits when cancelled=${cancel}`, async () => {
+      const controller = new AbortController();
+      let checkpointSignal: AbortSignal | undefined;
+      const journal = vi.fn();
+      const confirm = vi.fn(async (_prompt: string, _options: unknown, signal?: AbortSignal) => {
+        checkpointSignal = signal;
+        if (cancel) return new Promise(() => {}); // Legacy callback ignores cancellation.
+        return "answer";
+      });
+      const pending = runWorkflow(
+        'export const meta = { name: "cleanup", description: "test" }; return await checkpoint("wait");',
+        { agent: nullRunner(), signal: controller.signal, confirm, onAgentJournal: journal },
+      );
+      if (cancel) {
+        const rejected = expect(pending).rejects.toThrow("workflow aborted");
+        await vi.waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+        controller.abort();
+        await rejected;
+      } else {
+        expect((await pending).result).toBe("answer");
+      }
+      expect(journal).toHaveBeenCalledTimes(cancel ? 0 : 1);
+      if (!checkpointSignal) throw new Error("checkpoint did not receive a signal");
+      expect(getEventListeners(checkpointSignal, "abort")).toEqual([]);
+      expect(getEventListeners(controller.signal, "abort")).toEqual([]);
+    });
+  }
+
   it("threads a confirm callback when one is provided", async () => {
     const { result } = await runWorkflow(
       `export const meta = { name: "cp", description: "c" };

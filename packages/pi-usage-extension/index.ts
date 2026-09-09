@@ -956,7 +956,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("usage", {
     description: "Show usage statistics dashboard",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      if (!ctx.hasUI) {
+      if (ctx.mode !== "tui") {
+        if (ctx.hasUI) ctx.ui.notify("The /usage dashboard requires TUI mode and is unavailable over RPC.", "warning");
         return;
       }
 

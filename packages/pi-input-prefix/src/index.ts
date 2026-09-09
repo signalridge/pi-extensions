@@ -24,6 +24,30 @@ const RESET = "\x1b[0m";
 const INVERSE_ON = "\x1b[7m";
 const INVERSE_OFF = "\x1b[27m";
 
+// Structural native mouse contract: older supported hosts do not export these types.
+interface TuiMouseEvent {
+  type: "press" | "release" | "move" | "drag" | "click" | "wheel";
+  button: "left" | "middle" | "right" | "none";
+  x: number;
+  y: number;
+  screenX: number;
+  screenY: number;
+  width: number;
+  height: number;
+  shift: boolean;
+  alt: boolean;
+  ctrl: boolean;
+  wheelDelta?: number;
+  clickCount?: number;
+}
+
+interface TuiMouseEventResult {
+  handled?: boolean;
+  capture?: boolean;
+  focus?: boolean;
+  render?: boolean;
+}
+
 interface EditorColors {
   normal: Paint;
   focus: Paint;
@@ -34,6 +58,7 @@ interface EditorColors {
 
 class RoundedPromptEditor extends CustomEditor {
   private readonly colors: EditorColors;
+  private detachedShellPrompt = false;
 
   constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) {
     const focus = theme.selectList.selectedText;
@@ -54,7 +79,23 @@ class RoundedPromptEditor extends CustomEditor {
     super.setPaddingX(Math.max(EDITOR_PADDING, padding));
   }
 
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    // Only the first rendered shell row moves: its bang is overlaid in the
+    // padding and its remaining text shifts left one cell. Wrapping, scrolling,
+    // autocomplete, and grapheme hit-testing remain owned by the base editor.
+    const mapped =
+      this.detachedShellPrompt && event.y === 1
+        ? { ...event, x: event.x < EDITOR_PADDING ? EDITOR_PADDING : event.x + 1 }
+        : event;
+    // Start at the base prototype (including inherited methods), never this override.
+    const base = CustomEditor.prototype as CustomEditor & {
+      handleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
+    };
+    return base.handleMouse?.call(this, mapped);
+  }
+
   render(width: number): string[] {
+    this.detachedShellPrompt = false;
     const original = super.render(width);
     if (original.length < 3) return original;
 
@@ -80,6 +121,7 @@ class RoundedPromptEditor extends CustomEditor {
         if (isShell) {
           const detached = detachLeadingShellBang(firstContent);
           lines[firstContentIndex] = detached.line;
+          this.detachedShellPrompt = detached.detached;
 
           const bang = border("!");
           prompt = detached.cursorOnPrompt
@@ -95,6 +137,7 @@ class RoundedPromptEditor extends CustomEditor {
       return wrapWithRoundedBorder(lines, border, { label });
     } catch {
       // Cosmetic rendering must never make the editor unusable.
+      this.detachedShellPrompt = false;
       return original;
     }
   }

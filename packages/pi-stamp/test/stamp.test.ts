@@ -33,6 +33,7 @@ test("stamp registers one entry renderer, one menu command, and no tools", () =>
     "message_update",
     "session_shutdown",
     "session_start",
+    "session_tree",
     "tool_execution_end",
     "tool_execution_start",
     "turn_end",
@@ -705,6 +706,86 @@ test("session start rebuilds the predecessor cursor from the active branch", asy
   const assistant = assistantMessage(ASSISTANT_TIMESTAMP);
   await emit(mock, "turn_end", { message: assistant, toolResults: [], turnIndex: 0 }, ctx);
   assert.deepEqual(mock.entries, [stampEntry("assistant", ASSISTANT_TIMESTAMP, previous)]);
+});
+
+test("tree navigation restores branch/day predecessor and discards abandoned pending observations", async () => {
+  const session = SessionManager.inMemory();
+  const yesterday = Date.UTC(2026, 6, 29, 23, 59, 58);
+  const today = Date.UTC(2026, 6, 30, 0, 1, 2);
+  session.appendMessage(userMessage(yesterday));
+  const ancestor = session.appendCustomEntry(STAMP_ENTRY_TYPE, { version: 2, role: "user", timestamp: yesterday });
+  session.appendCustomEntry(STAMP_ENTRY_TYPE, { version: 2, role: "assistant", timestamp: today });
+  const mock = createMockPi();
+  stamp(mock.pi, {
+    settingsRuntime: settingsRuntimeWith({ timeZone: "UTC", toolStamps: true }),
+    now: () => today + 1_000,
+  });
+  const { ctx } = createMockContext({ mode: "tui", sessionManager: session });
+  await emit(mock, "session_start", {}, ctx);
+  const abandoned = assistantMessage(today);
+  await emit(mock, "message_start", { message: abandoned }, ctx);
+  await emit(mock, "message_end", { message: abandoned }, ctx);
+  await emit(mock, "message_end", { message: userMessage(today + 1) }, ctx);
+  await emit(mock, "tool_execution_start", { toolCallId: "old", toolName: "read" }, ctx);
+  session.branch(ancestor);
+  await emit(mock, "session_tree", { newLeafId: ancestor }, ctx);
+  await emit(mock, "tool_execution_end", { toolCallId: "old", isError: false }, ctx);
+  await emit(mock, "turn_end", { message: abandoned, toolResults: [{ toolCallId: "old" }] }, ctx);
+  await emit(mock, "agent_end", {}, ctx);
+  assert.deepEqual(mock.entries, []);
+  const user = userMessage(today + 2);
+  await emit(mock, "message_start", { message: user }, ctx);
+  await emit(mock, "message_end", { message: user }, ctx);
+  await emit(mock, "agent_end", {}, ctx);
+  assert.deepEqual(mock.entries, [stampEntry("user", user.timestamp, yesterday)]);
+  const renderer = createStampEntryRenderer(() => ({ ...DEFAULT_STAMP_SETTINGS, timeZone: "UTC" }));
+  const rendered = renderer({ data: mock.entries[0].data } as never, { expanded: false }, {
+    fg: (_color: string, text: string) => text,
+  } as never);
+  assert.match(rendered?.render(80).join("\n") ?? "", /2026-07-30/);
+  session.resetLeaf();
+  await emit(mock, "session_tree", { newLeafId: null }, ctx);
+  await emit(mock, "message_start", { message: user }, ctx);
+  await emit(mock, "message_end", { message: user }, ctx);
+  await emit(mock, "session_shutdown", {}, ctx);
+  assert.deepEqual(mock.entries.at(-1), stampEntry("user", user.timestamp));
+});
+
+test("tree navigation cancels stale async owners but cancelled navigation preserves pending stamps", async () => {
+  const mock = createMockPi();
+  const delayed = deferred<Readonly<StampSettingsState>>();
+  let signal: AbortSignal | undefined;
+  stamp(mock.pi, {
+    settingsRuntime: testSettingsRuntime({
+      reload: async (owner) => {
+        signal = owner;
+        return delayed.promise;
+      },
+    }),
+  });
+  const { ctx, notifications } = createMockContext({ mode: "tui" });
+  const start = emit(mock, "session_start", {}, ctx);
+  await Promise.resolve();
+  await emit(mock, "message_end", { message: userMessage(USER_TIMESTAMP) }, ctx);
+  // A cancelled navigation has no session_tree event; before_tree must not clear state.
+  await emit(mock, "session_before_tree", {}, ctx);
+  await emit(mock, "agent_end", {}, ctx);
+  assert.deepEqual(mock.entries, [stampEntry("user", USER_TIMESTAMP)]);
+  await emit(mock, "session_tree", {}, ctx);
+  assert.equal(signal?.aborted, true);
+  delayed.resolve({ ...defaultSettingsState(), issue: { kind: "invalid", message: "stale issue" } });
+  await start;
+  assert.deepEqual(notifications, []);
+  const flushing = deferred<void>();
+  // Shutdown's asynchronous durability wait must never append after navigation.
+  const second = createMockPi();
+  stamp(second.pi, { settingsRuntime: testSettingsRuntime({ flush: () => flushing.promise }) });
+  await emit(second, "session_start", {}, ctx);
+  const shutdown = emit(second, "session_shutdown", {}, ctx);
+  await emit(second, "session_tree", {}, ctx);
+  flushing.resolve();
+  await shutdown;
+  assert.deepEqual(second.entries, []);
 });
 
 test("a delayed settings reload cannot notify through a replaced session", async () => {

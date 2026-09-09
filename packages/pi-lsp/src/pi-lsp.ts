@@ -52,7 +52,7 @@ const lspDiagnosticsTool = defineTool({
   ],
   parameters: DiagnosticsParameters,
   async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-    const requestedRoot = resolveRoot(params.root);
+    const requestedRoot = resolveRoot(params.root, ctx.cwd);
     const { adapters, timeoutMs } = loadRuntime(ctx.cwd, {
       projectTrusted: ctx.isProjectTrusted(),
     });
@@ -116,7 +116,7 @@ const lspFixTool = defineTool({
     ),
   }),
   async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-    const requestedRoot = resolveRoot(params.root);
+    const requestedRoot = resolveRoot(params.root, ctx.cwd);
     const { adapters, timeoutMs } = loadRuntime(ctx.cwd, {
       projectTrusted: ctx.isProjectTrusted(),
     });

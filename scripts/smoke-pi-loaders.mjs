@@ -232,7 +232,7 @@ async function activateRoots(
   const names = session.getAllTools().map((tool) => tool.name);
   assert.equal(new Set(names).size, names.length, `${label} registered duplicate tools`);
   assert.equal(errors.length, 0, `${label} activation errors: ${errors.join("; ")}`);
-  // AgentSession 0.84 exposes tools but not commands. If a future public
+  // AgentSession 0.85 exposes tools but not commands. If a future public
   // session API provides command discovery, enforce the same uniqueness gate;
   // never reach into Pi's private ExtensionRunner just for this smoke.
   const commandDiscovery = session;
@@ -662,7 +662,7 @@ try {
 `,
     );
 
-    // Use Pi's built-in faux provider so this is a real 0.84.1 AgentSession and
+    // Use Pi's built-in faux provider so this is a real pinned Pi AgentSession and
     // event bus test without credentials or network access.
     const faux = fauxProvider({
       provider: "signalridge-pi-smoke",
@@ -818,7 +818,7 @@ try {
   rmSync(temp, { recursive: true, force: true });
 }
 
-// Pi 0.84's public AgentSession.dispose invalidates extension contexts but does
+// Pi 0.85's public AgentSession.dispose invalidates extension contexts but does
 // not emit session_shutdown; terminate only after every smoke assertion and
 // cleanup above so extension-owned unref timers cannot outlive the temp tree.
 process.exit(0);

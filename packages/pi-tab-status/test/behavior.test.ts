@@ -16,6 +16,7 @@ async function runLifecycle(style: TabStatusStyle, cwd = "/tmp/demo"): Promise<s
     const titles: string[] = [];
     const ctx = {
       cwd,
+      isIdle: () => true,
       hasUI: true,
       ui: { setTitle: (title: string) => titles.push(title) },
     };
@@ -30,11 +31,14 @@ async function runLifecycle(style: TabStatusStyle, cwd = "/tmp/demo"): Promise<s
     await handlers.get("tool_call")?.(
       {
         toolName: "bash",
+        toolCallId: "commit",
         input: { command: "git add . && git commit -m done" },
       } as never,
       ctx as never,
     );
+    await handlers.get("tool_result")?.({ toolCallId: "commit", isError: false } as never, ctx as never);
     await handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] } as never, ctx as never);
+    await handlers.get("agent_settled")?.({} as never, ctx as never);
     await handlers.get("session_shutdown")?.({} as never, ctx as never);
 
     return titles;
@@ -102,4 +106,5 @@ test("does not call terminal UI APIs in headless contexts", async () => {
   await handlers.get("session_start")?.({} as never, ctx as never);
   await handlers.get("agent_start")?.({} as never, ctx as never);
   assert.equal(titleCalls, 0);
+  await handlers.get("session_shutdown")?.({} as never, ctx as never);
 });

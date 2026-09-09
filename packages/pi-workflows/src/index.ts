@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
@@ -157,8 +157,14 @@ function formatStart(result: ScriptStartResult): string {
     `Workflow ${result.background ? "started in background" : result.status}: ${result.runId}`,
     `status=${result.status}`,
   ];
-  if (result.waitAborted)
-    lines.push("wait_aborted=true", "The workflow run continues; retrieve it with workflow_control.");
+  if (result.waitAborted) {
+    lines.push(
+      "wait_aborted=true",
+      result.background
+        ? "Only the wait was cancelled; retrieve the detached run with workflow_control."
+        : "Foreground execution was cancelled; inspect its status with workflow_control before resuming.",
+    );
+  }
   if (result.result) lines.push("", result.result.slice(0, 8_000));
   if (result.error) lines.push("", `error=${result.error.slice(0, 2_000)}`);
   return lines.join("\n");
@@ -337,6 +343,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   const MAX_PENDING_DELIVERIES = 256;
   const PENDING_DELIVERY_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
   let widgetTimer: ReturnType<typeof setInterval> | undefined;
+  let widgetUi: ExtensionContext["ui"] | undefined;
 
   const currentEngine = (): WorkflowEngine => {
     if (!active || !engine || engine.isDisposed())
@@ -345,12 +352,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   };
 
   const clearWidget = (): void => {
-    const tui = (pi as unknown as { ui?: { setWidget?: (key: string, content: string[] | undefined) => void } }).ui;
-    tui?.setWidget?.("pi-workflows", undefined);
+    widgetUi?.setWidget("pi-workflows", undefined);
   };
   const refreshWidget = (): void => {
-    const tui = (pi as unknown as { ui?: { setWidget?: (key: string, content: string[] | undefined) => void } }).ui;
-    if (!tui?.setWidget) return;
+    const tui = widgetUi;
+    if (!tui) return;
     const workflowEngine = engine;
     if (!active || !workflowEngine || workflowEngine.isDisposed()) {
       tui.setWidget("pi-workflows", undefined);
@@ -374,15 +380,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     }
   };
   const notifyRunChanged = (): void => refreshWidget();
-
-  const branchEntries = (): SessionEntryLike[] => {
-    const ctx = (pi as unknown as { currentSessionManager?: { getBranch?: () => unknown } }).currentSessionManager;
-    try {
-      return (ctx?.getBranch?.() as SessionEntryLike[] | undefined) ?? [];
-    } catch {
-      return [];
-    }
-  };
 
   const DEFAULT_EXCLUDED_TOOLS = ["workflow", "workflow_control"] as const;
 
@@ -435,6 +432,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     active = true;
     const workflowEngine = currentEngine();
     workflowEngine.onRunSettled = notifyRunChanged;
+    workflowEngine.onRuntimeEvent = notifyRunChanged;
     // `control("resume")` and the provider-limit retry start executions with no
     // caller to pass options for them, and the strength table is deliberately
     // never frozen onto a run. Without this they would resume with no table and
@@ -509,13 +507,13 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               // Foreground checkpoint confirmation only when the run is not
               // background — background runs are headless by contract.
               confirm:
-                params.background === false && ctx?.hasUI && ctx.mode === "tui"
-                  ? async (promptText, checkpointOptions) => {
+                params.background === false && ctx?.hasUI
+                  ? async (promptText, checkpointOptions, signal) => {
                       if (checkpointOptions.kind === "input")
-                        return ctx.ui.input(promptText, String(checkpointOptions.default ?? ""));
+                        return ctx.ui.input(promptText, String(checkpointOptions.default ?? ""), { signal });
                       if (checkpointOptions.kind === "select")
-                        return ctx.ui.select(promptText, checkpointOptions.choices ?? []);
-                      return ctx.ui.confirm(promptText, promptText);
+                        return ctx.ui.select(promptText, checkpointOptions.choices ?? [], { signal });
+                      return ctx.ui.confirm(promptText, promptText, { signal });
                     }
                   : undefined,
               loadSavedWorkflow: resolveNestedWorkflow,
@@ -525,7 +523,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
               const replacement = params.script !== undefined || params.name !== undefined ? script : undefined;
               const resumed = await workflowEngine.resume(
                 params.resumeFromRunId,
-                branchEntries(),
+                ctx.sessionManager.getBranch(),
                 options,
                 replacement,
               );
@@ -1116,6 +1114,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       } finally {
         workflowEngine.resumeLifecycle();
         branchQuiesce = undefined;
+        refreshWidget();
       }
     });
   };
@@ -1257,6 +1256,10 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         {
           append(event) {
             pi.appendEntry(JOURNAL_ENTRY_TYPE, event);
+            // Journal writes precede some state mutations; refresh once applied.
+            queueMicrotask(() => {
+              if (generation === lifecycleGeneration) refreshWidget();
+            });
           },
         },
         () => {
@@ -1288,7 +1291,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       return;
     }
 
+    if (generation !== lifecycleGeneration) {
+      recoveredEngine.dispose();
+      return;
+    }
     engine = recoveredEngine;
+    widgetUi = ctx.mode === "tui" ? ctx.ui : undefined;
     registerSurface();
 
     // Bind per-session delivery endpoint (A10): capture the session-bound send
@@ -1382,6 +1390,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // engine quiescence; the old session must not accept another run.
     active = false;
     clearWidget();
+    widgetUi = undefined;
     if (widgetTimer) {
       clearInterval(widgetTimer);
       widgetTimer = undefined;

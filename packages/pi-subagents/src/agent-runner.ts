@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -641,6 +642,11 @@ export interface RunResult {
  */
 function collectResponseText(session: AgentSession) {
   let text = "";
+  // Invocation-owned events survive compaction replacing session history.
+  // Retain only the final message and latest nonempty text, not a transcript.
+  let lastMessage: AgentSession["messages"][number] | undefined;
+  let lastNonemptyText = "";
+  let beforeLastMessageText = "";
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
     // message_start also fires for user and toolResult messages — resetting on
     // those would wipe assistant text already collected. Reset only when a new
@@ -651,25 +657,33 @@ function collectResponseText(session: AgentSession) {
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       text += event.assistantMessageEvent.delta;
     }
+    if (event.type === "message_end" && event.message.role === "assistant") {
+      beforeLastMessageText = lastNonemptyText;
+      lastMessage = event.message;
+      text = extractText(event.message.content);
+      // Failed attempts remain visible as the current result, but must never
+      // replace the valid fallback: Pi removes them when retrying. Compaction
+      // may already have removed the earlier valid message from history.
+      if (text.trim() && event.message.stopReason !== "error" && event.message.stopReason !== "aborted") {
+        lastNonemptyText = text.trim();
+      }
+    }
+    if (event.type === "compaction_end" && event.reason === "overflow" && !event.aborted && event.willRetry &&
+        lastMessage?.role === "assistant" && lastMessage.stopReason === "length") {
+      // A length result is legitimate until the SDK actually retries it. On
+      // overflow recovery Pi removes this candidate, including any occurrence
+      // restored by compaction AFTER this notification. Retract its fallback
+      // contribution from invocation state rather than rescanning that history.
+      lastNonemptyText = beforeLastMessageText;
+      text = "";
+      lastMessage = undefined;
+    }
   });
-  return { getText: () => text, unsubscribe };
-}
-
-/**
- * Get the last non-empty assistant text produced during THIS invocation.
- * `startIndex` is the message count captured before the prompt, so the walk-back
- * never crosses into a previous turn: on a resume whose new turn failed empty,
- * this returns "" instead of the prior turn's answer (#144). Defaults to 0 (a
- * fresh spawn, where the whole history belongs to this run).
- */
-function getLastAssistantText(session: AgentSession, startIndex = 0): string {
-  for (let i = session.messages.length - 1; i >= startIndex; i--) {
-    const msg = session.messages[i];
-    if (msg.role !== "assistant") continue;
-    const text = extractText(msg.content).trim();
-    if (text) return text;
-  }
-  return "";
+  return {
+    getText: () => text.trim() || lastNonemptyText,
+    getFailure: () => finalTurnError(lastMessage ? [lastMessage] : []),
+    unsubscribe,
+  };
 }
 
 /**
@@ -683,12 +697,11 @@ function getLastAssistantText(session: AgentSession, startIndex = 0): string {
  * Everything else completes: a clean "stop"/"toolUse" final, and — crucially — a
  * "length" stop that DID produce text (a legitimate truncated-but-useful answer).
  * "aborted" is handled by the manager's abort flag / "stopped" guard, not here.
- * Bounded by `startIndex` (like the text fallback) so a resume that produced no
- * assistant message of its own never inherits a PRIOR turn's stop reason.
+ * Invocation-owned messages exclude historical failures, even after compaction.
  */
-function finalTurnError(session: AgentSession, startIndex = 0): string | undefined {
-  for (let i = session.messages.length - 1; i >= startIndex; i--) {
-    const msg = session.messages[i];
+function finalTurnError(messages: AgentSession["messages"]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
     if (msg.role !== "assistant") continue;
     if (msg.stopReason === "error") {
       return (msg as { errorMessage?: string }).errorMessage?.trim() || "provider error with no output";
@@ -984,6 +997,10 @@ export async function runAgent(
   // into the allowlist, then dropped it at registration with no signal back.
   if (agentConfig?.builtinToolNames?.length) {
     const knownBuiltins = new Set(BUILTIN_TOOL_NAMES);
+    // Optional public capability: do not require a new named export on Pi 0.84.
+    if ("createPowerShellTool" in PiCodingAgent && typeof Reflect.get(PiCodingAgent, "createPowerShellTool") === "function") {
+      knownBuiltins.add("powershell");
+    }
     for (const name of agentConfig.builtinToolNames) {
       if (!knownBuiltins.has(name)) {
         options.onToolActivity?.({
@@ -1167,6 +1184,10 @@ export async function runAgent(
     const denyTools = new Set<string>(
       EXCLUDED_TOOL_NAMES.filter((t) => !nestedToolNames.has(t)),
     );
+    // Keep the historical wildcard defaults; PowerShell is explicit opt-in.
+    if ("createPowerShellTool" in PiCodingAgent && typeof Reflect.get(PiCodingAgent, "createPowerShellTool") === "function" && !builtinToolNameSet.has("powershell")) {
+      denyTools.add("powershell");
+    }
     // Keep only the built-ins the agent asked for — deny the rest.
     for (const name of BUILTIN_TOOL_NAMES) {
       if (!builtinToolNameSet.has(name)) denyTools.add(name);
@@ -1392,6 +1413,9 @@ export async function runAgent(
     handle.unref?.();
     pendingToolTimeouts.set(toolCallId, handle);
   };
+  // Own finalized output before observer dispatch: a synchronous callback
+  // failure must remain visible without erasing the answer it interrupted.
+  const collector = collectResponseText(session);
   const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
@@ -1442,8 +1466,6 @@ export async function runAgent(
     }
   });
 
-  const collector = collectResponseText(session);
-
   // Build the effective prompt: optionally prepend parent context
   let effectivePrompt = prompt;
   const inheritContext = internalOverride?.inheritContext ?? options.inheritContext;
@@ -1454,9 +1476,6 @@ export async function runAgent(
     }
   }
 
-  // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
-  const startLen = session.messages.length;
   try {
     throwIfAborted(options.signal);
     await session.prompt(effectivePrompt);
@@ -1467,7 +1486,7 @@ export async function runAgent(
     pendingToolTimeouts.clear();
   }
 
-  const baseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  const baseText = collector.getText();
   // The acceptance gate runs AFTER the agent is done and its verdict is
   // appended to the result, so the parent reads the check and the claim it is
   // checking side by side. It deliberately does not steer the agent to fix
@@ -1476,7 +1495,7 @@ export async function runAgent(
     ? `${baseText}${await runConfiguredGate(agentConfig.gate, effectiveCwd, options.pi)}`
     : baseText;
   completed = true;
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
+  return { responseText, session, aborted, steered: softLimitReached, failure: collector.getFailure() };
   } finally {
     cleanupAbort();
     // The manager takes ownership only after onSessionCreated is invoked. If
@@ -1505,11 +1524,7 @@ export async function resumeAgent(
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
-  // Boundary for the history fallback: the session already holds prior turns,
-  // so only assistant text produced by THIS resume prompt counts as its output
-  // — a failed resume must not surface the previous turn's answer (#144).
   throwIfAborted(options.signal);
-  const startLen = session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1574,8 +1589,8 @@ export async function resumeAgent(
   }
 
   return {
-    text: collector.getText().trim() || getLastAssistantText(session, startLen),
-    failure: finalTurnError(session, startLen),
+    text: collector.getText(),
+    failure: collector.getFailure(),
   };
 }
 

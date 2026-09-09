@@ -380,7 +380,7 @@ export function createManagedSpawnClient(
           agentId,
           owner,
         },
-        sessionSignal,
+        undefined,
       );
     },
     async reconcileManaged(spawnKey, owner) {
@@ -403,10 +403,15 @@ export function createManagedSpawnClient(
           ...(owners ? { owners } : {}),
           timeoutMs,
         },
-        sessionSignal,
+        undefined,
         timeoutMs + 1_000,
       );
-      if (!isRecord(data) || typeof data.settled !== "boolean" || !Array.isArray(data.pending)) {
+      if (
+        !isRecord(data) ||
+        typeof data.settled !== "boolean" ||
+        !Array.isArray(data.pending) ||
+        !data.pending.every((id) => typeof id === "string" && id.length > 0)
+      ) {
         throw new Error("subagents quiescence returned an invalid response");
       }
       const pending = data.pending.filter((id): id is string => typeof id === "string");

@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_FILES: Record<string, string[]> = {
   anthropic: ["CLAUDE.md"],
@@ -110,7 +110,7 @@ function getDirectories(cwd: string, agentDir: string): string[] {
 }
 
 export default function agentGuidance(pi: ExtensionAPI) {
-  const agentDir = path.join(process.env.HOME || "", ".pi", "agent");
+  const agentDir = getAgentDir();
   const config = loadConfig(agentDir);
 
   pi.on("before_agent_start", async (event, ctx) => {
