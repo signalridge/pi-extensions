@@ -1,10 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, isRecoverableLength } from "@earendil-works/pi-ai";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   createAgentSession,
+  hostCapabilities,
   defaultResourceLoaderCtor,
   loaderExtensionsRef,
   getAgentDir,
@@ -14,6 +17,7 @@ const {
   settingsManagerGetSessionDir,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
+  hostCapabilities: { powershell: false },
   defaultResourceLoaderCtor: vi.fn(),
   loaderExtensionsRef: {
     current: { extensions: [], errors: [], runtime: {} } as {
@@ -31,6 +35,7 @@ const {
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  get createPowerShellTool() { return hostCapabilities.powershell ? () => ({ name: "powershell" }) : undefined; },
   // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
   // (an unknown path becomes an error row, mirroring a failed load) and then
   // runs extensionsOverride over the result.
@@ -144,8 +149,16 @@ function createSession(finalText: string) {
   // pi activates only these four by default when no allowlist is given
   // (agent-session.js `defaultActiveToolNames`).
   let activeToolNames: string[] = ["read", "bash", "edit", "write"];
+  const messages: unknown[] = [];
+  messages.push = (...items: unknown[]) => {
+    const length = Array.prototype.push.apply(messages, items);
+    for (const message of items) {
+      for (const listener of listeners) listener({ type: "message_end", message });
+    }
+    return length;
+  };
   const session = {
-    messages: [] as any[],
+    messages,
     subscribe: vi.fn((listener: (event: any) => void) => {
       listeners.push(listener);
       return () => {};
@@ -195,6 +208,7 @@ const pi = {} as any;
 
 beforeEach(() => {
   setAgentTiersSettings({});
+  hostCapabilities.powershell = false;
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
@@ -381,6 +395,182 @@ describe("agent-runner tier policy", () => {
 });
 
 describe("agent-runner final output capture", () => {
+  for (const invocation of ["run", "resume"] as const) {
+    it(`${invocation} preserves finalized output and reports a synchronous usage observer failure`, async () => {
+      const { session, listeners } = createSession("");
+      const observer = vi.fn(() => {}).mockImplementationOnce(() => { throw new Error("usage observer failed"); });
+      session.prompt.mockImplementation(async () => {
+        const emit = (event: unknown) => { for (const listener of listeners) listener(event); };
+        try {
+          emit({ type: "message_end", message: {
+            role: "assistant", usage: { input: 1, output: 1 },
+            content: [{ type: "text", text: "valid answer" }], stopReason: "stop",
+          } });
+        } catch (error) {
+          // SDK delivery is ordered: an interrupted message_end is followed by an empty error.
+          emit({ type: "message_end", message: {
+            role: "assistant", usage: { input: 0, output: 0 },
+            content: [], stopReason: "error", errorMessage: (error as Error).message,
+          } });
+        }
+      });
+      createAgentSession.mockResolvedValue({ session });
+      const result = invocation === "run"
+        ? await runAgent(ctx, "Explore", "go", { pi, onAssistantUsage: observer })
+        : await resumeAgent(session as never, "go", { onAssistantUsage: observer });
+      expect(observer).toHaveBeenCalledTimes(2);
+      expect(result.failure).toBe("usage observer failed");
+      expect("responseText" in result ? result.responseText : result.text).toBe("valid answer");
+    });
+
+    it(`${invocation} keeps a rolling finalized-text fallback without rescanning compacted messages`, async () => {
+      const { session, listeners } = createSession("");
+      createAgentSession.mockResolvedValue({ session });
+      session.prompt.mockImplementation(async () => {
+        for (let index = 0; index < 500; index++) {
+          let finalized = false;
+          const message = {
+            role: "assistant",
+            stopReason: "stop",
+            get content() {
+              if (finalized) throw new Error("rescanned a discarded finalized message");
+              return [{ type: "text", text: index === 250 ? "latest answer" : index === 0 ? "old answer" : "" }];
+            },
+          };
+          for (const listener of listeners) listener({ type: "message_end", message });
+          finalized = true;
+          session.messages = []; // Compaction must not need an invocation transcript mirror.
+        }
+      });
+      const result = invocation === "run"
+        ? await runAgent(ctx, "Explore", "go", { pi })
+        : await resumeAgent(session as never, "go");
+      expect("responseText" in result ? result.responseText : result.text).toBe("latest answer");
+      expect(result.failure).toBeUndefined();
+    });
+
+    for (const prior of ["", "valid before compaction"]) {
+      it(`${invocation} retracts failed retry text and retains prior valid text (${prior})`, async () => {
+        const { session, listeners } = createSession("");
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt.mockImplementation(async () => {
+          const emit = (message: Record<string, unknown>) => {
+            for (const listener of listeners) listener({ type: "message_start", message });
+            for (const listener of listeners) listener({ type: "message_end", message });
+          };
+          if (prior) emit({ role: "assistant", content: [{ type: "text", text: prior }], stopReason: "toolUse" });
+          session.messages.length = 0;
+          emit({ role: "assistant", content: [{ type: "text", text: "failed partial" }], stopReason: "error" });
+          for (const listener of listeners) listener({ type: "auto_retry_start", attempt: 1 });
+          emit({ role: "assistant", content: [], stopReason: "stop" });
+        });
+        const result = invocation === "run"
+          ? await runAgent(ctx, "Explore", "go", { pi })
+          : await resumeAgent(session as never, "go");
+        expect(result.failure).toBeUndefined();
+        expect("responseText" in result ? result.responseText : result.text).toBe(prior);
+      });
+    }
+
+    for (const prior of ["", "valid before overflow"]) {
+      it(`${invocation} retracts length text discarded by SDK overflow retry (${prior})`, async () => {
+        const { session, listeners } = createSession("");
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt.mockImplementation(async () => {
+          // Bypass createSession's legacy push-to-message_end shortcut: this
+          // regression emits the complete SDK sequence explicitly, exactly once.
+          session.messages = [];
+          const emit = (event: AgentSessionEvent) => { for (const listener of listeners) listener(event); };
+          const truncated = fauxAssistantMessage("discarded truncated answer", { stopReason: "length" });
+          truncated.usage.output = 100;
+          const model = { id: truncated.model, provider: truncated.provider, maxTokens: 4096 };
+          expect(isRecoverableLength(truncated, model.maxTokens)).toBe(true);
+          const message = (value: typeof truncated) => {
+            emit({ type: "message_start", message: value });
+            session.messages.push(value);
+            emit({ type: "message_end", message: value });
+          };
+          emit({ type: "agent_start" });
+          if (prior) message(fauxAssistantMessage(prior, { stopReason: "toolUse" }));
+          message(truncated);
+          emit({ type: "turn_end", message: truncated, toolResults: [] });
+          // SDK agent_end.willRetry is provider-retry only, not overflow recovery.
+          emit({ type: "agent_end", messages: [...session.messages], willRetry: false });
+          session.messages.pop(); // _checkCompaction removes the recoverable length response.
+          emit({ type: "compaction_start", reason: "overflow" });
+          session.messages = [truncated]; // Rebuilt history may retain the discarded entry.
+          emit({ type: "compaction_end", reason: "overflow", aborted: false, willRetry: true,
+            result: { summary: "compacted", firstKeptEntryId: "kept", tokensBefore: 1000 } });
+          session.messages.pop(); // SDK trims the reconstructed response AFTER compaction_end.
+          emit({ type: "agent_start" });
+          const success = fauxAssistantMessage("");
+          message(success);
+          emit({ type: "turn_end", message: success, toolResults: [] });
+          emit({ type: "agent_end", messages: [success], willRetry: false });
+          emit({ type: "agent_settled" });
+        });
+        const result = invocation === "run"
+          ? await runAgent(ctx, "Explore", "go", { pi })
+          : await resumeAgent(session as never, "go");
+        expect(result.failure).toBeUndefined();
+        expect("responseText" in result ? result.responseText : result.text).toBe(prior);
+      });
+    }
+
+    for (const reason of [undefined, "manual", "threshold", "overflow"] as const) {
+      it(`${invocation} retains legitimate final length text without overflow retry (${reason})`, async () => {
+        const { session, listeners } = createSession("");
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt.mockImplementation(async () => {
+          const emit = (event: AgentSessionEvent) => { for (const listener of listeners) listener(event); };
+          const message = fauxAssistantMessage("legitimate truncated answer", { stopReason: "length" });
+          emit({ type: "message_end", message });
+          if (reason) {
+            emit({ type: "compaction_start", reason });
+            emit({ type: "compaction_end", reason, aborted: reason === "overflow", willRetry: false,
+              result: undefined });
+          }
+        });
+        const result = invocation === "run"
+          ? await runAgent(ctx, "Explore", "go", { pi })
+          : await resumeAgent(session as never, "go");
+        expect(result.failure).toBeUndefined();
+        expect("responseText" in result ? result.responseText : result.text).toBe("legitimate truncated answer");
+      });
+    }
+
+    for (const retrySucceeds of [false, true]) {
+      it(`${invocation} preserves final outcome across compaction (retry=${retrySucceeds})`, async () => {
+        const { session, listeners } = createSession("");
+        session.messages.push(...Array.from({ length: 20 }, () => ({
+          role: "assistant", content: [{ type: "text", text: "historical" }],
+          stopReason: "error", errorMessage: "historical failure",
+        })));
+        createAgentSession.mockResolvedValue({ session });
+        session.prompt.mockImplementation(async () => {
+          session.messages = [];
+          const emit = (message: unknown) => {
+            session.messages.push(message);
+            for (const listener of listeners) listener({ type: "message_end", message });
+          };
+          emit({ role: "assistant", content: [], stopReason: "error", errorMessage: "new failure" });
+          if (retrySucceeds) emit({ role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop" });
+        });
+        const result = invocation === "run"
+          ? await runAgent(ctx, "Explore", "go", { pi })
+          : await resumeAgent(session as never, "go");
+        expect(result.failure).toBe(retrySucceeds ? undefined : "new failure");
+        expect("responseText" in result ? result.responseText : result.text).toBe(retrySucceeds ? "recovered" : "");
+      });
+    }
+  }
+
+  it("does not inherit historical errors when resume emits no assistant", async () => {
+    const { session } = createSession("");
+    session.messages.push({ role: "assistant", content: [], stopReason: "error", errorMessage: "old" });
+    session.prompt.mockImplementation(async () => { session.messages = []; });
+    expect(await resumeAgent(session as never, "go")).toEqual({ text: "", failure: undefined });
+  });
   it("returns the final assistant text even when no text_delta events were streamed", async () => {
     const { session } = createSession("LOCKED");
     createAgentSession.mockResolvedValue({ session });
@@ -710,7 +900,7 @@ describe("agent-runner failed-final-turn detection (#144)", () => {
 // is the source of truth for total tokens (survives compaction).
 describe("agent-runner usage callback wiring", () => {
   function emitMessageEnd(listeners: Array<(e: any) => void>, usage: any) {
-    const event = { type: "message_end", message: { role: "assistant", usage } };
+    const event = { type: "message_end", message: { role: "assistant", content: [], usage } };
     for (const l of listeners) l(event);
   }
 
@@ -973,6 +1163,7 @@ function mockRegistry(opts: Record<string, any>): string[] {
     ? [...opts.tools, ...customNames]
     : [
         ...BUILTINS_7,
+        ...(hostCapabilities.powershell ? ["powershell"] : []),
         ...loaderExtensionsRef.current.extensions.flatMap((e) => [...e.tools.keys()]),
         ...customNames,
       ];
@@ -1987,6 +2178,32 @@ describe("agent-runner exclude_extensions", () => {
 
 // ─── unknown built-in tool names in `tools:` (#75) ──────────────────────
 describe("agent-runner unknown built-in tools", () => {
+  for (const available of [false, true]) {
+    it(`recognizes explicit PowerShell only when the host provides it (${available})`, async () => {
+      hostCapabilities.powershell = available;
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ builtinToolNames: ["powershell"] }));
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+      vi.mocked(getToolNamesForType).mockReturnValueOnce(["powershell"]);
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      const onToolActivity = vi.fn();
+      await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+      expect(onToolActivity.mock.calls.some(([activity]) => activity.toolName.startsWith("tools-error:"))).toBe(!available);
+      expect(lastToolsPassed().includes("powershell")).toBe(available);
+    });
+  }
+
+  it("keeps wildcard defaults unchanged on a PowerShell-capable host", async () => {
+    hostCapabilities.powershell = true;
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig());
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    await runAgent(ctx, "Explore", "go", { pi });
+    expect(lastToolsPassed()).toEqual(BUILTINS_7);
+    expect(createAgentSession.mock.calls[0][0].excludeTools).toContain("powershell");
+  });
   it("emits a tools-error warning for each plain entry not in BUILTIN_TOOL_NAMES", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(
@@ -2300,7 +2517,7 @@ describe("agent-runner resource budgets", () => {
 
   const usage = (total: number) => ({ input: total, output: 0, cacheWrite: 0 });
   const emitUsage = (listeners: Array<(e: any) => void>, total: number) => {
-    for (const l of listeners) l({ type: "message_end", message: { role: "assistant", usage: usage(total) } });
+    for (const l of listeners) l({ type: "message_end", message: { role: "assistant", content: [], usage: usage(total) } });
   };
   const emitToolCall = (listeners: Array<(e: any) => void>) => {
     for (const l of listeners) l({ type: "tool_execution_end", toolName: "read" });
@@ -2399,7 +2616,7 @@ describe("agent-runner resource budgets", () => {
         for (const l of listeners) {
           l({
             type: "message_end",
-            message: { role: "assistant", usage: { input: 300, output: 300, cacheWrite: 200 } },
+            message: { role: "assistant", content: [], usage: { input: 300, output: 300, cacheWrite: 200 } },
           });
         }
       });
@@ -2549,7 +2766,7 @@ describe("agent-runner budget overshoot in a single event", () => {
     createAgentSession.mockResolvedValue({ session });
     session.prompt = vi.fn(async () => {
       for (const l of listeners) {
-        l({ type: "message_end", message: { role: "assistant", usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
+        l({ type: "message_end", message: { role: "assistant", content: [], usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
       }
     });
 
@@ -2565,7 +2782,7 @@ describe("agent-runner budget overshoot in a single event", () => {
     createAgentSession.mockResolvedValue({ session });
     session.prompt = vi.fn(async () => {
       for (const l of listeners) {
-        l({ type: "message_end", message: { role: "assistant", usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
+        l({ type: "message_end", message: { role: "assistant", content: [], usage: { input: 5_000, output: 0, cacheWrite: 0 } } });
       }
     });
 

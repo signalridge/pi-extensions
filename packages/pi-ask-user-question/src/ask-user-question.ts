@@ -207,7 +207,7 @@ async function askWithRpcFallback(
     }
     if (choice.kind === "other") {
       const text = await withAbort(
-        ctx.ui.editor(`${progress(index, questions.length)}${question.header}: ${question.question}`, ""),
+        ctx.ui.input(`${progress(index, questions.length)}${question.header}: ${question.question}`, "", { signal }),
         signal,
       );
       if (text === undefined)
@@ -249,7 +249,7 @@ async function selectSingle(
     ...(canGoBack ? [back] : []),
   ];
   const selected = await withAbort(
-    ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options),
+    ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options, { signal }),
     signal,
   );
   if (selected === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };
@@ -283,7 +283,7 @@ async function selectMulti(
       ...(index > 0 ? [back] : []),
     ];
     const choice = await withAbort(
-      ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options),
+      ctx.ui.select(`${progress(index, total)}${question.header}: ${question.question}`, options, { signal }),
       signal,
     );
     if (choice === undefined) return { kind: "cancelled", reason: signal?.aborted ? "aborted" : "cancelled" };

@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import * as piHost from "@earendil-works/pi-coding-agent";
 import { collectSupportedFiles, resolveRoot, resolveSupportedFile } from "./files.js";
 import { LspClient } from "./lsp-client.js";
 import { applyTextEdits, collectWorkspaceEdits, hasOverlappingTextEdits } from "./text-edits.js";
@@ -82,6 +83,23 @@ export async function runFix(
 ) {
   const root = resolveRoot(params.root);
   const file = resolveSupportedFile(adapter, root, params.path);
+  // Namespace lookup keeps loading compatible with hosts predating the public queue.
+  const queue = (piHost as { withFileMutationQueue?: <T>(file: string, run: () => Promise<T>) => Promise<T> })
+    .withFileMutationQueue;
+  const run = () => runFixWindow(adapter, { ...params, root, path: file }, timeoutMs, signal, ctx, statusKey);
+  return params.write && queue ? queue(file, run) : run();
+}
+
+async function runFixWindow(
+  adapter: LspServerAdapter,
+  params: { root: string; path: string; kind?: string; write?: boolean },
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  ctx: StatusContext,
+  statusKey: string,
+) {
+  const root = params.root;
+  const file = params.path;
   const actionKind = params.kind?.trim() || "source.fixAll";
 
   const command = adapter.defaultCommand;
@@ -122,6 +140,7 @@ export async function runFix(
     }
     const changed = newText !== text;
 
+    throwIfAborted(signal, adapter);
     if (params.write && changed) writeFileSync(file, newText);
 
     return textResult(formatEditSummary(adapter, "fix", root, file, changed, params.write, newText), {

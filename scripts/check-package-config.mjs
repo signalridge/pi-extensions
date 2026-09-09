@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import semver from "semver";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
 export const REPOSITORY_ROOT = resolve(dirname(SCRIPT_PATH), "..");
@@ -112,6 +113,29 @@ export function validatePackageManifest(directory, packageRoot, manifest) {
   }
 }
 
+function validateTestedPiPeers(directory, manifest, rootManifest) {
+  for (const [dependency, range] of Object.entries(manifest.peerDependencies ?? {})) {
+    if (!dependency.startsWith("@earendil-works/pi-")) continue;
+    const label = `packages/${directory}/package.json peerDependencies[${dependency}]`;
+    const testedVersion = rootManifest.devDependencies?.[dependency];
+    if (typeof testedVersion !== "string" || semver.valid(testedVersion) !== testedVersion) {
+      throw new Error(
+        `${label} needs an exact tested version in root package.json devDependencies[${dependency}]; ` +
+          `found ${JSON.stringify(testedVersion) ?? "missing"}. Pin the Pi version used by repository checks.`,
+      );
+    }
+    if (typeof range !== "string" || semver.validRange(range) === null) {
+      throw new Error(`${label} has invalid range ${JSON.stringify(range)}; declare a valid semver peer range.`);
+    }
+    if (!semver.satisfies(testedVersion, range)) {
+      throw new Error(
+        `${label} range ${JSON.stringify(range)} excludes root-tested Pi ${testedVersion}; ` +
+          "expand the peer range to admit the tested version while retaining supported versions.",
+      );
+    }
+  }
+}
+
 export function validatePackageConfig(root = REPOSITORY_ROOT) {
   const packagesRoot = resolve(root, "packages");
   if (!existsSync(packagesRoot) || !statSync(packagesRoot).isDirectory()) {
@@ -123,11 +147,17 @@ export function validatePackageConfig(root = REPOSITORY_ROOT) {
     .sort();
   if (directories.length === 0) throw new Error("packages/ must contain at least one package");
 
+  const rootManifestPath = resolve(root, "package.json");
+  if (!isFile(rootManifestPath)) throw new Error("missing root package.json with tested Pi devDependency pins");
+  const rootManifest = readManifest(rootManifestPath);
+
   for (const directory of directories) {
     const packageRoot = resolve(packagesRoot, directory);
     const manifestPath = resolve(packageRoot, "package.json");
     if (!isFile(manifestPath)) throw new Error(`missing package manifest: packages/${directory}/package.json`);
-    validatePackageManifest(directory, packageRoot, readManifest(manifestPath));
+    const manifest = readManifest(manifestPath);
+    validatePackageManifest(directory, packageRoot, manifest);
+    validateTestedPiPeers(directory, manifest, rootManifest);
   }
   return directories.length;
 }

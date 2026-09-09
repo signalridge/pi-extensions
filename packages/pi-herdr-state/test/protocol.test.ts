@@ -25,6 +25,7 @@ function fakePi(): FakePi {
     },
     async emit(event, ...args) {
       await handlers.get(event)?.(...args);
+      eventHandlers.get(event)?.(args[0]);
     },
   };
 }
@@ -45,6 +46,126 @@ async function flushRequests(): Promise<void> {
   await new Promise<void>((resolve) => queueMicrotask(resolve));
   await new Promise<void>((resolve) => queueMicrotask(resolve));
 }
+
+test("agent_end stays working through retry and settles only after the full run", async () => {
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  let idle = false;
+  const ctx = { ...context("tui", "/tmp/retry.jsonl", "retry"), isIdle: () => idle };
+  try {
+    await pi.emit("session_start", { reason: "startup" }, ctx);
+    await pi.emit("agent_end", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(
+      requests.some((r) => (r.params as Request).state === "idle"),
+      false,
+    );
+    await pi.emit("agent_start", {}, ctx);
+    idle = true;
+    await pi.emit("agent_settled", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+    idle = false;
+    await pi.emit("agent_start", {}, ctx);
+    idle = true;
+    await pi.emit("agent_end", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
+
+test("native UI spans coalesce without titles and do not release bus-owned waits", async () => {
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  const ctx = { ...context("tui", "/tmp/wait.jsonl", "wait"), isIdle: () => false };
+  const state = () => (requests.at(-1)?.params as Request | undefined)?.state;
+  try {
+    await pi.emit("session_start", { reason: "startup" }, ctx);
+    await flushRequests();
+    await pi.emit("ui_prompt_start", { title: "private title" }, ctx);
+    await flushRequests();
+    assert.equal(state(), "blocked");
+    await pi.emit("herdr:blocked", { active: true, label: "external" });
+    await pi.emit("ui_prompt_end", {}, ctx);
+    await flushRequests();
+    assert.equal(state(), "blocked");
+    await pi.emit("ui_prompt_start", {}, ctx);
+    await pi.emit("herdr:blocked", { active: false });
+    await flushRequests();
+    assert.equal(state(), "blocked");
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.message, undefined);
+    await pi.emit("ui_prompt_end", {}, ctx);
+    await flushRequests();
+    assert.equal(state(), "working");
+    assert.equal(JSON.stringify(requests).includes("title"), false);
+    await pi.emit("ui_prompt_start", {}, ctx);
+    await flushRequests();
+    await pi.emit("session_shutdown", { reason: "reload" });
+    const shutdownCount = requests.length;
+    await pi.emit("ui_prompt_end", {}, ctx);
+    await flushRequests();
+    assert.equal(requests.length, shutdownCount);
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
+
+test("session ownership changes clear unmatched native end debt and manual ownership", async () => {
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  const first = context("tui", "/tmp/first.jsonl", "first");
+  const second = context("tui", "/tmp/second.jsonl", "second");
+  try {
+    await pi.emit("session_start", { reason: "startup" }, first);
+    await pi.emit("ui_prompt_end", {}, first);
+    await pi.emit("herdr:blocked", { active: true });
+    await pi.emit("session_start", { reason: "resume" }, second);
+    await flushRequests();
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+    await pi.emit("ui_prompt_start", {}, second);
+    await flushRequests();
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "blocked");
+    await pi.emit("ui_prompt_end", {}, second);
+    await flushRequests();
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
+
+test("settling while a native prompt is open stays blocked until its end", async () => {
+  const pi = fakePi();
+  const requests: Request[] = [];
+  createReporter(pi, async (request) => {
+    requests.push(request as Request);
+  });
+  let idle = false;
+  const ctx = { ...context("tui", "/tmp/settled-wait.jsonl", "wait"), isIdle: () => idle };
+  try {
+    await pi.emit("session_start", { reason: "startup" }, ctx);
+    await pi.emit("ui_prompt_start", {}, ctx);
+    idle = true;
+    await pi.emit("agent_settled", {}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "blocked");
+    await pi.emit("ui_prompt_end", {}, ctx);
+    await flushRequests();
+    assert.equal((requests.at(-1)?.params as Request | undefined)?.state, "idle");
+  } finally {
+    await pi.emit("session_shutdown", { reason: "reload" });
+  }
+});
 
 test("uses an absolute session path, falls back to an ID, and clears empty identities", () => {
   assert.deepEqual(sessionRefFromValues("/tmp/pi/session.jsonl", "session-id"), {

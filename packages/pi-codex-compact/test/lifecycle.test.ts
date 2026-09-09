@@ -5,9 +5,14 @@ import {
   type OpenAICodexResponsesOptions,
   type Provider,
 } from "@earendil-works/pi-ai";
-import type { SessionBeforeCompactEvent, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { type SessionBeforeCompactEvent, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
-import { parseCheckpointDetails } from "../src/checkpoint.js";
+import {
+  checkpointMarker,
+  createCheckpointDetails,
+  fallbackSummary,
+  parseCheckpointDetails,
+} from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import {
   type CodexCompactSettingsRuntime,
@@ -58,7 +63,10 @@ function settingsRuntime(overrides = {}): CodexCompactSettingsRuntime {
   };
 }
 
-function fakeProvider(onOptions?: (options: OpenAICodexResponsesOptions) => void): Provider {
+function fakeProvider(
+  onOptions?: (options: OpenAICodexResponsesOptions) => void,
+  onPayload?: (payload: unknown) => void,
+): Provider {
   return {
     id: "openai-codex",
     name: "OpenAI Codex",
@@ -76,6 +84,7 @@ function fakeProvider(onOptions?: (options: OpenAICodexResponsesOptions) => void
             return { role: "user", content: [{ type: "input_text", text }] };
           });
           const payload = await options?.onPayload?.({ model: model.id, input }, model);
+          onPayload?.(payload);
           assert.deepEqual((payload as { input: unknown[] }).input.at(-1), {
             type: "compaction_trigger",
           });
@@ -164,6 +173,105 @@ function event(signal = new AbortController().signal): SessionBeforeCompactEvent
     signal,
   };
 }
+
+test("effective checkpoint selection recovers remote -> native -> remote and fails closed for current corruption", async () => {
+  for (const scenario of [
+    "retained",
+    "native",
+    "native-retains-remote",
+    "mismatch",
+    "malformed",
+    "missing-details",
+    "missing-anchor",
+    "lineage",
+  ] as const) {
+    const session = SessionManager.inMemory();
+    const oldUser = session.appendMessage({ role: "user", content: "old request", timestamp: 1 });
+    const keptMessage = { role: "user" as const, content: "kept request", timestamp: 2 };
+    const keptId = session.appendMessage(keptMessage);
+    const prior = createCheckpointDetails({
+      modelId: scenario === "mismatch" ? "other-model" : model.id,
+      checkpointId: "checkpoint-prior",
+      replacementHistory: [{ type: "compaction", encrypted_content: "prior-opaque" }],
+      keptMessages: scenario === "lineage" ? [{ ...keptMessage, content: "wrong lineage" }] : [keptMessage],
+    });
+    session.appendCompaction(
+      scenario === "missing-anchor" ? "wrong anchor" : fallbackSummary(prior.checkpointId),
+      keptId,
+      123,
+      scenario === "malformed"
+        ? { ...prior, replacementHistory: [] }
+        : scenario === "missing-details"
+          ? undefined
+          : prior,
+      true,
+    );
+    const laterId = session.appendMessage({ role: "user", content: "later request", timestamp: 3 });
+    const native = scenario === "native" || scenario === "native-retains-remote";
+    if (native) session.appendCompaction("native context summary", scenario === "native" ? laterId : oldUser, 100);
+    const afterId = session.appendMessage({ role: "user", content: "after boundary", timestamp: 4 });
+    const mock = createMockPi();
+    let requests = 0;
+    let sentPayload: unknown;
+    createCodexCompactExtension({
+      settingsRuntime: settingsRuntime(),
+      fetch: async () => {
+        requests += 1;
+        return sseResponse();
+      },
+    })(mock.pi);
+    const { ctx, notifications, statuses } = createMockContext({
+      model,
+      hasUI: true,
+      getSystemPrompt: () => "system",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-test-key" }),
+        getProvider: () =>
+          fakeProvider(undefined, (payload) => {
+            sentPayload = payload;
+          }),
+      },
+    });
+    if (native) {
+      const stalePayload = {
+        input: [{ role: "user", content: [{ type: "input_text", text: checkpointMarker(prior.checkpointId) }] }],
+      };
+      assert.equal(
+        await mock.events.get("context")?.[0]({ messages: session.buildSessionContext().messages }, ctx),
+        undefined,
+      );
+      assert.equal(await mock.events.get("before_provider_request")?.[0]({ payload: stalePayload }, ctx), undefined);
+      await mock.events.get("model_select")?.[0]({ model: { ...model, provider: "other" } }, ctx);
+      assert.equal(notifications.length, 0, "superseded checkpoints must not warn about model selection");
+    }
+    const input = event();
+    input.branchEntries = session.getBranch();
+    input.preparation.firstKeptEntryId = afterId;
+    const result = (await mock.events.get("session_before_compact")?.[0](input, ctx)) as
+      | { compaction: { summary: string; details: unknown } }
+      | undefined;
+    if (native || scenario === "retained") {
+      assert.ok(result, scenario);
+      assert.equal(requests, 1);
+      const next = parseCheckpointDetails(result.compaction.details);
+      assert.ok(next);
+      assert.equal(JSON.stringify(sentPayload).includes("prior-opaque"), !native);
+      if (native) assert.match(JSON.stringify(next.replacementHistory), /native context summary/);
+      session.appendCompaction(result.compaction.summary, afterId, 100, next, true);
+      const projected = await mock.events.get("context")?.[0](
+        { messages: session.buildSessionContext().messages },
+        ctx,
+      );
+      assert.ok(projected, "new remote checkpoint replays after native fallback");
+    } else {
+      assert.equal(result, undefined, scenario);
+      assert.equal(requests, 0, scenario);
+      assert.match(notifications.at(-1)?.message ?? "", /using Pi compaction/);
+    }
+    assert.equal(statuses.get("codex-compact"), undefined);
+  }
+});
 
 function sseResponse() {
   const item = { type: "compaction", encrypted_content: "opaque" };
@@ -262,6 +370,61 @@ test("registers the settings command and returns a versioned Remote V2 compactio
   )) as { input: Array<Record<string, unknown>> };
   assert.equal(rewritten.input.at(-2)?.type, "compaction");
   assert.match(JSON.stringify(rewritten.input.at(-1)), /later/);
+});
+
+test("overflow hook derives retry proof from the actual retained assistant, and model guards still apply", async () => {
+  for (const stopReason of ["error", "length", "stop"] as const) {
+    const session = SessionManager.inMemory();
+    const keptId = session.appendMessage({ role: "user", content: "request", timestamp: 1 });
+    const tail = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "retry response" }],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage,
+      stopReason,
+      timestamp: 2,
+    };
+    session.appendMessage(tail);
+    const mock = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch: async () => sseResponse() })(mock.pi);
+    const { ctx } = createMockContext({
+      model,
+      getSystemPrompt: () => "system",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake" }),
+        getProvider: () => fakeProvider(),
+      },
+    });
+    const result = (await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        reason: "overflow",
+        willRetry: true,
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    )) as { compaction: { summary: string; details: unknown } };
+    const details = parseCheckpointDetails(result.compaction.details);
+    assert.ok(details);
+    assert.deepEqual(details.retryTrimmedTail, stopReason === "stop" ? undefined : tail);
+    session.appendCompaction(result.compaction.summary, keptId, 100, details, true);
+    await mock.events.get("session_compact")?.[0](
+      { willRetry: true, compactionEntry: session.getBranch().at(-1) },
+      ctx,
+    );
+    const runtime = session.buildSessionContext().messages.slice(0, -1);
+    const projected = await mock.events.get("context")?.[0]({ messages: runtime }, ctx);
+    if (stopReason === "stop") assert.equal(projected, undefined);
+    else {
+      assert.match(JSON.stringify(projected), /PI_CODEX_REMOTE_CHECKPOINT/);
+      const mismatched = createMockContext({ model: { ...model, id: "different" }, sessionManager: session }).ctx;
+      assert.equal(await mock.events.get("context")?.[0]({ messages: runtime }, mismatched), undefined);
+    }
+  }
 });
 
 test("session lifecycle reloads settings, warns once current, and drops stale reload continuations", async () => {

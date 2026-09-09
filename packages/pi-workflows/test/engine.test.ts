@@ -13,7 +13,13 @@ import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import { WorkflowEngine } from "../src/engine.js";
 import { JOURNAL_ENTRY_TYPE, type JournalEvent } from "../src/journal.js";
-import type { DispatchTask, ManagedProtocolCheck, ManagedSpawnClient, WorkflowEventBus } from "../src/rpc-client.js";
+import {
+  createManagedSpawnClient,
+  type DispatchTask,
+  type ManagedProtocolCheck,
+  type ManagedSpawnClient,
+  type WorkflowEventBus,
+} from "../src/rpc-client.js";
 
 function makeBus(): WorkflowEventBus {
   const listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -645,6 +651,603 @@ return await workflow("child");`;
     const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     engine.restore(sessionEntries);
     expect(engine.getState(started.runId)?.lifecycleSuspended).toBe(false);
+  });
+
+  it("background invocation and waiter cancellation leave detached execution running", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    const invocation = new AbortController();
+    const started = await engine.start(
+      'export const meta = { name: "detached", description: "test" }; return await agent("work");',
+      { background: true, signal: invocation.signal },
+    );
+    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    const waiter = new AbortController();
+    const waiting = engine.waitFor(started.runId, waiter.signal);
+    const rejected = expect(waiting).rejects.toThrow();
+    invocation.abort();
+    waiter.abort();
+    await rejected;
+    expect(engine.getRun(started.runId)?.status).toBe("running");
+    expect(client.stopped).toEqual([]);
+    client.complete(client.spawned[0].id, "finished detached");
+    expect((await engine.waitFor(started.runId)).status).toBe("completed");
+    engine.dispose();
+  });
+
+  it("real RPC client awaits quiescence after immediate stop acknowledgement despite aborted session signal", async () => {
+    const bus = makeBus();
+    const session = new AbortController();
+    const client = createManagedSpawnClient(bus, undefined, session.signal);
+    client.checkProtocol = async () => ({
+      routingPolicy: TEST_ROUTING_POLICY,
+      routingPolicyFingerprint: "test-routing-policy",
+    });
+    let dispatched = 0;
+    let spawnOwner: unknown;
+    let stopped = false;
+    let releaseCleanup: (() => void) | undefined;
+    bus.on("subagents:rpc:spawn-managed", (raw) => {
+      const request = raw as { requestId: string; owner: unknown };
+      spawnOwner = request.owner;
+      dispatched++;
+      bus.emit(`subagents:rpc:spawn-managed:reply:${request.requestId}`, {
+        success: true,
+        data: { id: "rpc-child", state: "running" },
+      });
+    });
+    bus.on("subagents:rpc:stop-owned", (raw) => {
+      const request = raw as { requestId: string; owner: unknown };
+      expect(request.owner).toEqual(spawnOwner);
+      stopped = true;
+      bus.emit(`subagents:rpc:stop-owned:reply:${request.requestId}`, { success: true });
+    });
+    bus.on("subagents:rpc:quiesce-owned", (raw) => {
+      const request = raw as { requestId: string; owners: unknown[]; agentIds: string[] };
+      expect(request.owners).toEqual([spawnOwner]);
+      expect(request.agentIds).toEqual(["rpc-child"]);
+      releaseCleanup = () =>
+        bus.emit(`subagents:rpc:quiesce-owned:reply:${request.requestId}`, {
+          success: true,
+          data: { settled: true, pending: [] },
+        });
+    });
+    const engine = new WorkflowEngine(bus, client, { append() {} });
+    const invocation = new AbortController();
+    let returned = false;
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((value) => {
+      returned = true;
+      return value;
+    });
+    await vi.waitFor(() => expect(dispatched).toBe(1));
+    await new Promise((resolve) => setImmediate(resolve));
+    session.abort();
+    invocation.abort();
+    await vi.waitFor(() => expect(releaseCleanup).toBeTypeOf("function"));
+    expect(stopped).toBe(true);
+    expect(returned).toBe(false);
+    const runId = engine.list()[0].runId;
+    expect(await engine.resume(runId, [])).toBeUndefined();
+    expect(dispatched).toBe(1);
+    releaseCleanup?.();
+    expect((await pending).status).toBe("interrupted");
+    engine.dispose();
+  });
+
+  it("real RPC spawn reconciliation rejects duplicate stop but waits for exact-owner cleanup before resume", async () => {
+    const bus = makeBus();
+    const client = createManagedSpawnClient(bus);
+    client.checkProtocol = async () => ({
+      routingPolicy: TEST_ROUTING_POLICY,
+      routingPolicyFingerprint: "test-routing-policy",
+    });
+    let allocation: { requestId: string; spawnKey: string; owner: unknown } | undefined;
+    let childState = "running";
+    let reconciliations = 0;
+    let rejectedStops = 0;
+    let releaseCleanup: (() => void) | undefined;
+    bus.on("subagents:rpc:spawn-managed", (raw) => {
+      // Allocate, but lose the reply: cancellation must reconcile this child.
+      expect(allocation).toBeUndefined();
+      allocation = raw as NonNullable<typeof allocation>;
+    });
+    bus.on("subagents:rpc:reconcile-managed", (raw) => {
+      const request = raw as { requestId: string; spawnKey: string; owner: unknown };
+      expect(request.spawnKey).toBe(allocation?.spawnKey);
+      expect(request.owner).toEqual(allocation?.owner);
+      // AgentManager.reconcileManaged calls abortOwned synchronously. The stopped
+      // record can still have an unsettled provider/tool cleanup promise.
+      childState = "stopped";
+      reconciliations++;
+      bus.emit(`subagents:rpc:reconcile-managed:reply:${request.requestId}`, {
+        success: true,
+        data: {
+          id: "rpc-race-child",
+          state: childState,
+          terminal: { status: childState, compactionCount: 0, completedAt: Date.now() },
+        },
+      });
+    });
+    bus.on("subagents:rpc:stop-owned", (raw) => {
+      const request = raw as { requestId: string; agentId: string; owner: unknown };
+      expect(request.owner).toEqual(allocation?.owner);
+      expect(request.agentId).toBe("rpc-race-child");
+      expect(childState).toBe("stopped");
+      // abort returns false for an already-stopped root without active descendants;
+      // cross-extension-rpc translates that into this rejection, not a cleanup fact.
+      rejectedStops++;
+      bus.emit(`subagents:rpc:stop-owned:reply:${request.requestId}`, {
+        success: false,
+        error: "Owned agent not found",
+      });
+    });
+    bus.on("subagents:rpc:quiesce-owned", (raw) => {
+      const request = raw as { requestId: string; owners: unknown[]; agentIds: string[]; timeoutMs: number };
+      expect(request.owners).toEqual([allocation?.owner]);
+      expect(request.agentIds).toEqual(["rpc-race-child"]);
+      expect(request.timeoutMs).toBe(8_000);
+      expect(rejectedStops).toBe(1);
+      releaseCleanup = () =>
+        bus.emit(`subagents:rpc:quiesce-owned:reply:${request.requestId}`, {
+          success: true,
+          data: { settled: true, pending: [] },
+        });
+    });
+    const entries: JournalEvent[] = [];
+    const engine = new WorkflowEngine(bus, client, { append: (entry) => entries.push(entry) });
+    const invocation = new AbortController();
+    let returned = false;
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((value) => {
+      returned = true;
+      return value;
+    });
+    await vi.waitFor(() => expect(allocation).toBeDefined());
+    invocation.abort();
+    await vi.waitFor(() => expect(releaseCleanup).toBeTypeOf("function"));
+    expect(reconciliations).toBeGreaterThan(0);
+    expect(returned).toBe(false);
+    const runId = engine.list()[0].runId;
+    await expect(engine.control("resume", runId)).rejects.toThrow();
+    expect(await engine.resume(runId, entries.map(asSessionEntry))).toBeUndefined();
+    expect(returned).toBe(false);
+    releaseCleanup?.();
+    expect((await pending).status).toBe("interrupted");
+    expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
+    expect(entries.some((entry) => entry.kind === "terminal_recovery")).toBe(false);
+    const resumed = await engine.resume(
+      runId,
+      entries.map(asSessionEntry),
+      {},
+      'export const meta = { name: "resumed", description: "test" }; return "resumed";',
+    );
+    expect(resumed?.status).toBe("completed");
+    engine.dispose();
+  });
+
+  it.each(["missing", "rejected"])("positive quiescence permits interruption after %s stop", async (mode) => {
+    const { engine, client } = makeEngine({ manual: true });
+    client.stopOwned =
+      mode === "missing"
+        ? undefined
+        : async () => {
+            throw new Error("Owned agent not found");
+          };
+    const quiesce = vi.fn(async () => ({ settled: true, pending: [] }));
+    client.quiesceOwned = quiesce;
+    const invocation = new AbortController();
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
+    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    invocation.abort();
+    const result = await pending;
+    expect(result.status).toBe("interrupted");
+    expect(quiesce).toHaveBeenCalledTimes(1);
+    expect(engine.getRun(result.runId)?.nonResumable).not.toBe(true);
+    engine.dispose();
+  });
+
+  it("foreground abort interrupts owned agents and prevents subsequent dispatch", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    const invocation = new AbortController();
+    let releaseStop = () => {};
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    client.quiesceOwned = async (runId, ids, _timeout, owners) => {
+      expect(ids).toEqual([client.spawned[0].id]);
+      expect(owners).toEqual([
+        { extension: "pi-workflows", runId, nodeId: client.spawned[0].nodeId, attemptId: client.spawned[0].attemptId },
+      ]);
+      await stopGate;
+      return { settled: true, pending: [] };
+    };
+    let returned = false;
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((result) => {
+      returned = true;
+      return result;
+    });
+    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    invocation.abort();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(returned).toBe(false);
+    expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
+    expect(client.stopped).toEqual([client.spawned[0].id]); // immediate RPC acknowledgement
+    await expect(engine.control("resume", client.spawned[0].runId)).rejects.toThrow();
+    expect(await engine.resume(client.spawned[0].runId, [])).toBeUndefined();
+    expect(client.spawned).toHaveLength(1);
+    releaseStop();
+    const result = await pending;
+    expect(result.status).toBe("interrupted");
+    expect(client.spawned).toHaveLength(1);
+    expect(client.stopped).toEqual([client.spawned[0].id]);
+    engine.dispose();
+  });
+
+  it.each([false, true])(
+    "cancel before spawn ack waits for exact-owner quiescence (rejected=%s)",
+    async (rejectAck) => {
+      const { engine, client } = makeEngine({ manual: true });
+      const spawn = client.spawn.bind(client);
+      let acknowledge = () => {};
+      const ack = new Promise<void>((resolve) => {
+        acknowledge = resolve;
+      });
+      let finishCleanup = () => {};
+      const cleanup = new Promise<void>((resolve) => {
+        finishCleanup = resolve;
+      });
+      client.spawn = async (...args) => {
+        const result = await spawn(...args);
+        await ack;
+        if (rejectAck) throw new Error("spawn RPC aborted");
+        return result;
+      };
+      client.reconcileManaged = async () => ({ id: client.spawned[0].id, state: "running" });
+      let quiescing = false;
+      client.quiesceOwned = async (runId, ids, _timeout, owners) => {
+        expect(owners).toEqual([
+          {
+            extension: "pi-workflows",
+            runId,
+            nodeId: client.spawned[0].nodeId,
+            attemptId: client.spawned[0].attemptId,
+          },
+        ]);
+        expect(ids).toEqual([client.spawned[0].id]);
+        quiescing = true;
+        await cleanup;
+        return { settled: true, pending: [] };
+      };
+      const invocation = new AbortController();
+      let returned = false;
+      const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((value) => {
+        returned = true;
+        return value;
+      });
+      await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+      invocation.abort();
+      acknowledge();
+      await vi.waitFor(() => expect(quiescing).toBe(true));
+      expect(returned).toBe(false);
+      expect(await engine.resume(client.spawned[0].runId, [])).toBeUndefined();
+      finishCleanup();
+      expect((await pending).status).toBe("interrupted");
+      expect(client.spawned).toHaveLength(1);
+      engine.dispose();
+    },
+  );
+
+  it.each(["foreground", "pause"])("bounds %s drain of an arbitrary unresolved script promise", async (mode) => {
+    const { engine, entries } = makeEngine();
+    const signal = new AbortController();
+    const script = `export const meta = { name: "never", description: "d" }; await new Promise(() => {});`;
+    let returned = false;
+    const pending = engine.start(script, { background: mode === "pause", signal: signal.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    vi.useFakeTimers();
+    try {
+      const runId = engine.list()[0].runId;
+      const cancelled = mode === "pause" ? engine.control("pause", runId) : pending;
+      void cancelled.then(() => {
+        returned = true;
+      });
+      signal.abort();
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(returned).toBe(true);
+      expect(engine.getRun(runId)?.nonResumable).toBe(true);
+      expect(await engine.resume(runId, (entries as JournalEvent[]).map(asSessionEntry))).toBeUndefined();
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("foreground resume also bounds unresolved execution and persists its fence", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    const started = await engine.start(SIMPLE_SCRIPT, { background: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    await engine.control("pause", started.runId);
+    const controller = new AbortController();
+    let returned = false;
+    const pending = engine.resume(
+      started.runId,
+      (entries as JournalEvent[]).map(asSessionEntry),
+      { signal: controller.signal },
+      `export const meta = { name: "never-resume", description: "d" }; await new Promise(() => {}); await agent("late");`,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    vi.useFakeTimers();
+    try {
+      void pending.then(() => {
+        returned = true;
+      });
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(returned).toBe(true);
+      const count = client.spawned.length;
+      client.complete("agent-1", "stale completion");
+      expect(client.spawned).toHaveLength(count);
+      const persisted = (entries as JournalEvent[]).map(asSessionEntry);
+      engine.restore(persisted);
+      expect(engine.getRun(started.runId)?.nonResumable).toBe(true);
+      expect(await engine.resume(started.runId, persisted)).toBeUndefined();
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["pause", "foreground"])("%s during successful timeout cleanup remains resumable", async (mode) => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    const invocation = new AbortController();
+    let release = () => {};
+    let cleaning = false;
+    const cleanup = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    client.quiesceOwned = async () => {
+      cleaning = true;
+      await cleanup;
+      return { settled: true, pending: [] };
+    };
+    vi.useFakeTimers();
+    try {
+      const pending = engine.start(
+        `export const meta = { name: "cancel-timeout", description: "d" };
+        return await agent("first", { timeoutMs: 100 });`,
+        { background: mode === "pause", signal: invocation.signal },
+      );
+      await vi.advanceTimersByTimeAsync(101);
+      expect(cleaning).toBe(true);
+      const runId = client.spawned[0].runId;
+      const cancelled = mode === "pause" ? engine.control("pause", runId) : pending;
+      if (mode === "foreground") invocation.abort();
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      await cancelled;
+      expect(engine.getRun(runId)?.status).toBe("interrupted");
+      expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
+      const resumed = engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await resumed).toBeDefined();
+      expect(client.spawned).toHaveLength(2);
+      client.complete("agent-2", "resumed answer");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(engine.getRun(runId)?.status).toBe("completed");
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true])("fatal script failure during timeout cleanup is not resumable (nested=%s)", async (nested) => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    let release = () => {};
+    const cleanup = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    client.quiesceOwned = async () => {
+      await cleanup;
+      return { settled: true, pending: [] };
+    };
+    const body = `void agent("slow", { timeoutMs: 10 });
+      await new Promise(resolve => setTimeout(resolve, 20)); throw new Error("fatal script failure");`;
+    const child = `export const meta = { name: "fatal-child", description: "d" }; ${body}`;
+    const script = `export const meta = { name: "fatal-root", description: "d" };
+      ${nested ? `await workflow(${JSON.stringify(child)});` : body}`;
+    vi.useFakeTimers();
+    try {
+      await engine.start(script, { background: true });
+      await vi.advanceTimersByTimeAsync(21);
+      const runId = client.spawned[0].runId;
+      const paused = engine.control("pause", runId);
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      await paused;
+      expect(engine.getRun(runId)?.status).toBe("failed");
+      await expect(engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry))).rejects.toThrow(
+        /cannot resume/,
+      );
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("pause during unconfirmed timeout cleanup remains non-resumable", async () => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    let release = () => {};
+    const cleanup = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    client.quiesceOwned = async (_runId, ids) => {
+      await cleanup;
+      return { settled: false, pending: ids };
+    };
+    vi.useFakeTimers();
+    try {
+      await engine.start(
+        `export const meta = { name: "unconfirmed-timeout", description: "d" };
+        await agent("slow", { timeoutMs: 10 });`,
+        { background: true },
+      );
+      await vi.advanceTimersByTimeAsync(11);
+      const runId = client.spawned[0].runId;
+      const paused = engine.control("pause", runId);
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      await paused;
+      expect(engine.getRun(runId)?.nonResumable).toBe(true);
+      await expect(engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry))).rejects.toThrow(
+        /non-resumable/,
+      );
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a final timed-out call cannot publish completion before cleanup", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    let release = () => {};
+    client.quiesceOwned = async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { settled: true, pending: [] };
+    };
+    vi.useFakeTimers();
+    try {
+      let returned = false;
+      void engine
+        .start(`export const meta = { name: "final-cleanup", description: "d" };
+        await agent("first", { timeoutMs: 10 }); return "done";`)
+        .then(() => {
+          returned = true;
+        });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(returned).toBe(false);
+      expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(returned).toBe(true);
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("timeout cleanup fences a parallel sibling and releases foreground waiters", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    let release = () => {};
+    client.quiesceOwned = async (_runId, ids) => {
+      if (ids[0] === "agent-1")
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      return { settled: ids[0] !== "agent-1", pending: ids[0] === "agent-1" ? ids : [] };
+    };
+    const script = `export const meta = { name: "timeouts", description: "d" };
+      return await Promise.all([agent("first", { timeoutMs: 10 }), agent("second", { timeoutMs: null })]);`;
+    vi.useFakeTimers();
+    try {
+      let result: Awaited<ReturnType<typeof engine.start>> | undefined;
+      void engine.start(script, { agentTimeoutMs: null }).then((value) => {
+        result = value;
+      });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(client.spawned).toHaveLength(2);
+      release();
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(result?.status).toBe("stopped");
+      expect(client.stopped).toContain("agent-2");
+      client.complete("agent-2", "late");
+      expect(engine.getRun(client.spawned[0].runId)?.status).toBe("stopped");
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("timeout continuation and completion wait for exact-owner cleanup", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    let release = () => {};
+    client.quiesceOwned = async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { settled: true, pending: [] };
+    };
+    vi.useFakeTimers();
+    try {
+      void engine.start(
+        `export const meta = { name: "cleanup", description: "d" };
+        await agent("first", { timeoutMs: 10 }); return await agent("next", { timeoutMs: null });`,
+        { background: true },
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(client.spawned).toHaveLength(1);
+      release();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(client.spawned).toHaveLength(2);
+      client.complete("agent-2", "ok");
+      await vi.advanceTimersByTimeAsync(1);
+      expect(engine.getRun(client.spawned[0].runId)?.status).toBe("completed");
+    } finally {
+      release();
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("timed-out owned quiescence is non-resumable", async () => {
+    const { engine, client } = makeEngine({ manual: true });
+    client.quiesceOwned = async () => new Promise(() => {});
+    const invocation = new AbortController();
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
+    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    vi.useFakeTimers();
+    try {
+      invocation.abort();
+      await vi.advanceTimersByTimeAsync(9_001);
+      const result = await pending;
+      expect(result.status).toBe("stopped");
+      expect(engine.getRun(result.runId)?.error).toContain("timed out");
+      expect(engine.getRun(result.runId)?.nonResumable).toBe(true);
+    } finally {
+      engine.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["missing", "false", "rejected"])("unconfirmed %s quiescence is durably non-resumable", async (mode) => {
+    const { engine, client, entries } = makeEngine({ manual: true });
+    client.quiesceOwned =
+      mode === "missing"
+        ? undefined
+        : async () => {
+            if (mode === "rejected") throw new Error("cleanup failed");
+            return { settled: false, pending: [client.spawned[0].id] };
+          };
+    const invocation = new AbortController();
+    const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
+    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    invocation.abort();
+    const result = await pending;
+    expect(result.status).toBe("stopped");
+    expect(engine.getRun(result.runId)?.nonResumable).toBe(true);
+    expect(engine.getRun(result.runId)?.error).toContain("cleanup unconfirmed");
+    expect(
+      (entries as JournalEvent[]).some((entry) => entry.kind === "terminal_recovery" && entry.status === "stopped"),
+    ).toBe(true);
+    const persisted = (entries as JournalEvent[]).map(asSessionEntry);
+    engine.restore(persisted);
+    expect(engine.getRun(result.runId)?.nonResumable).toBe(true);
+    expect(await engine.resume(result.runId, persisted)).toBeUndefined();
+    engine.dispose();
   });
 
   it("rejects waitFor immediately when its signal is already aborted", async () => {

@@ -71,7 +71,7 @@ export function updateTreeStats(root: FileNode | null): void {
       const totalAdditions = node.diffStats?.additions ?? 0;
       const totalDeletions = node.diffStats?.deletions ?? 0;
       const lineCountComplete = node.lineCount !== undefined;
-      const hasChanges = Boolean(node.gitStatus || node.agentModified);
+      const hasChanges = Boolean(node.gitStatus || node.agentModified || node.observedChanged);
       return { totalLines, totalAdditions, totalDeletions, lineCountComplete, hasChanges };
     }
 
@@ -115,6 +115,7 @@ export function buildFileTreeFromPaths(
   diffStats: Map<string, DiffStats>,
   ignored: Set<string>,
   agentModified: Set<string>,
+  observedChanged: ReadonlySet<string> = new Set(),
 ): FileNode {
   const root: FileNode = {
     name: ".",
@@ -228,6 +229,7 @@ export function buildFileTreeFromPaths(
       parent: current,
       gitStatus: fileGitStatus,
       agentModified: agentModified.has(filePath),
+      observedChanged: observedChanged.has(filePath),
       diffStats: fileDiffStats,
     });
   }

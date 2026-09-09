@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Api, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import btw, {
   BTW_SETTINGS_FILE,
@@ -1092,32 +1093,59 @@ test("btw command rejects non-TUI mode before reading the runtime thinking level
   assert.equal(thinkingLevelReads, 0);
 });
 
-test("buildConversationContext formats user, assistant, and tool content", () => {
-  const context = buildConversationContext([
-    { type: "ignored", message: { role: "user", content: "skip" } },
-    {
-      type: "message",
-      message: {
-        role: "user",
-        content: [
-          { type: "text", text: " Inspect this " },
-          { type: "toolCall", name: "read", arguments: { path: "README.md" } },
-        ],
-      },
+test("buildConversationContext formats Pi-shaped messages, including diagnostic-only tool output", () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage({ role: "user", content: "Inspect this", timestamp: 1 });
+  session.appendMessage({
+    role: "assistant",
+    api: "openai-responses",
+    provider: "openai",
+    model: "test",
+    content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "README.md" } }],
+    stopReason: "toolUse",
+    timestamp: 2,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     },
-    {
-      type: "message",
-      message: {
-        role: "assistant",
-        stopReason: "length",
-        content: [{ type: "toolResult", name: "read", result: { ok: true } }],
-      },
-    },
-  ]);
+  });
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "call-1",
+    toolName: "read",
+    content: [
+      { type: "text", text: "ENOENT: README.md" },
+      { type: "image", data: "image-data-not-text", mimeType: "image/png" },
+    ],
+    isError: true,
+    timestamp: 3,
+  });
+  const context = buildConversationContext(session.getBranch());
+  assert.match(context, /User: Inspect this/);
+  assert.match(context, /Assistant \(toolUse\): Tool call: read\(\{"path":"README\.md"\}\)/);
+  assert.match(context, /Tool result from read: ENOENT: README.md/);
+  assert.doesNotMatch(context, /image-data-not-text|image\/png/);
+});
 
-  assert.match(context, /User: Inspect this\nTool call: read\(\{"path":"README\.md"\}\)/);
-  assert.match(context, /Assistant \(length\): Tool result from read: \{"ok":true\}/);
-  assert.doesNotMatch(context, /skip/);
+test("buildConversationContext bounds large tool output and keeps the newest diagnostics", () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "call-1",
+    toolName: "bash",
+    content: [{ type: "text", text: `old diagnostic${"x".repeat(100_000)}new diagnostic` }],
+    isError: true,
+    timestamp: 1,
+  });
+  const context = buildConversationContext(session.getBranch());
+  assert.match(context, /^\[Earlier context omitted;/);
+  assert.ok(context.length < 100_000);
+  assert.ok(context.endsWith("new diagnostic"));
+  assert.doesNotMatch(context, /old diagnostic/);
 });
 
 test("buildUserPrompt falls back when no conversation context exists", () => {

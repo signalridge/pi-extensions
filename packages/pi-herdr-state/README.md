@@ -6,6 +6,8 @@ The reporter follows the Herdr 0.8+ protocol-v8 bundled Pi integration. It sends
 
 This package is the single owner for the `herdr:pi` source. Keep Herdr's bundled `pi` integration uninstalled; installing both reporters causes competing lifecycle updates.
 
+The pane stays working through automatic retries and compaction until Pi settles (or reports true idle). On Pi versions with native UI prompt events, blocking extension dialogs report `blocked` for the coalesced waiting span without transmitting prompt titles. Native waiting and `herdr:blocked` event-bus ownership are independent: ending either wait does not clear the other. Older Pi versions continue using lifecycle and event-bus reporting.
+
 ## Install
 
 ```bash

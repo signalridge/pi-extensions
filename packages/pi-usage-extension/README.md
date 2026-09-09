@@ -6,7 +6,7 @@ A Pi extension that displays aggregated usage statistics across all sessions.
 
 ## Compatibility
 
-- **Pi version:** `0.84.x` — see the `peerDependencies` range.
+- **Pi version:** `0.84.x` and `0.85.x`; tested with `0.85.1` — see the `peerDependencies` range.
 
 Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped; otherwise the report is counted. Sessions recorded by older Pi versions still parse; they simply carry no auxiliary usage.
 

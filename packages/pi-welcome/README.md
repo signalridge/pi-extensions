@@ -15,7 +15,7 @@ redraws it, and collapses to a width-safe compact summary on narrow terminals.
 │  Session:    (new)                                                      │
 │  Model:      openai-codex / gpt-5.6-luna · thinking max                 │
 │  Budget:     400K · compacts at 270K                                    │
-│  Version:    0.84.1                                                     │
+│  Version:    0.85.1                                                     │
 │                                                                         │
 │  Context:    AGENTS.md                                                  │
 │  Skills:     commit, release, review +12                                │
@@ -31,6 +31,8 @@ No logo and no wordmark: the card exists to say what this session is, and a
 brand line says nothing a returning user does not already know.
 
 ## Install
+
+Supports Pi `0.84.x` and `0.85.x`; tested with `0.85.1` — see the `peerDependencies` range.
 
 ```bash
 pi install npm:@signalridge/pi-welcome

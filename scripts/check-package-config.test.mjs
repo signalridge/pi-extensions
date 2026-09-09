@@ -19,9 +19,12 @@ function makeFixture(
   check = "bun run lint && bun run typecheck && bun run test",
   directory = "pi-demo",
   packageName = `@signalridge/${directory}`,
+  peerDependencies = { "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0" },
+  rootManifest = { devDependencies: { "@earendil-works/pi-coding-agent": "0.85.1" } },
 ) {
   const root = mkdtempSync(join(tmpdir(), "pi-package-config-"));
   tempRoots.push(root);
+  writeFileSync(join(root, "package.json"), JSON.stringify(rootManifest));
   const packageRoot = join(root, "packages", directory);
   mkdirSync(packageRoot, { recursive: true });
   for (const file of ["tsconfig.json", "README.md", "CHANGELOG.md", "LICENSE", "src/index.ts"]) {
@@ -34,6 +37,7 @@ function makeFixture(
     JSON.stringify(
       {
         name: packageName,
+        peerDependencies,
         type: "module",
         private: false,
         pi: { extensions: ["./src/index.ts"] },
@@ -63,6 +67,55 @@ describe("check-package-config", () => {
   });
   it("accepts a complete publishable package manifest", () => {
     assert.equal(validatePackageConfig(makeFixture()), 1);
+  });
+
+  it("accepts a union retaining Pi 0.84 support and admitting tested Pi 0.85.1", () => {
+    assert.equal(validatePackageConfig(makeFixture()), 1);
+  });
+
+  it("rejects a zero-major caret excluding the root-tested Pi version", () => {
+    const root = makeFixture(undefined, undefined, undefined, { "@earendil-works/pi-coding-agent": "^0.84.0" });
+    assert.throws(
+      () => validatePackageConfig(root),
+      /packages\/pi-demo\/package.json peerDependencies\[@earendil-works\/pi-coding-agent\].*excludes root-tested Pi 0\.85\.1/,
+    );
+  });
+
+  for (const range of ["not-semver", 85]) {
+    it(`rejects an invalid Pi peer range: ${JSON.stringify(range)}`, () => {
+      const root = makeFixture(undefined, undefined, undefined, { "@earendil-works/pi-coding-agent": range });
+      assert.throws(() => validatePackageConfig(root), /pi-coding-agent\].*invalid range.*valid semver peer range/);
+    });
+  }
+
+  it("rejects a Pi peer with no corresponding tested root pin", () => {
+    const root = makeFixture(undefined, undefined, undefined, undefined, { devDependencies: {} });
+    assert.throws(
+      () => validatePackageConfig(root),
+      /root package.json devDependencies\[@earendil-works\/pi-coding-agent\].*missing/,
+    );
+  });
+
+  for (const pin of ["^0.85.1", "latest", 85]) {
+    it(`rejects a non-exact tested Pi pin: ${JSON.stringify(pin)}`, () => {
+      const root = makeFixture(undefined, undefined, undefined, undefined, {
+        devDependencies: { "@earendil-works/pi-coding-agent": pin },
+      });
+      assert.throws(() => validatePackageConfig(root), /needs an exact tested version.*Pin the Pi version/);
+    });
+  }
+
+  it("checks each Pi peer against its corresponding root dependency, not just coding-agent", () => {
+    const root = makeFixture(undefined, undefined, undefined, {
+      "@earendil-works/pi-coding-agent": "^0.85.0",
+      "@earendil-works/pi-tui": "^0.85.0",
+    });
+    assert.throws(() => validatePackageConfig(root), /devDependencies\[@earendil-works\/pi-tui\].*missing/);
+  });
+
+  it("does not require root test pins for non-Pi peers", () => {
+    const root = makeFixture(undefined, undefined, undefined, { unrelated: "^1.0.0" }, {});
+    assert.equal(validatePackageConfig(root), 1);
   });
 
   it("rejects a package directory without the pi-* prefix", () => {

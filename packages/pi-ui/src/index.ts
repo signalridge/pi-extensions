@@ -1,9 +1,36 @@
 import { stripVTControlCharacters } from "node:util";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { Container } from "@earendil-works/pi-tui";
+
+// Structural native mouse contract: older supported hosts do not export these types.
+interface TuiMouseEvent {
+  type: "press" | "release" | "move" | "drag" | "click" | "wheel";
+  button: "left" | "middle" | "right" | "none";
+  x: number;
+  y: number;
+  screenX: number;
+  screenY: number;
+  width: number;
+  height: number;
+  shift: boolean;
+  alt: boolean;
+  ctrl: boolean;
+  wheelDelta?: number;
+  clickCount?: number;
+}
+
+interface TuiMouseEventResult {
+  handled?: boolean;
+  capture?: boolean;
+  focus?: boolean;
+  render?: boolean;
+  target?: { component: BorderedComponent };
+}
 
 export interface BorderedComponent {
   render(width: number): string[];
   handleInput?(data: string): void;
+  handleMouse?(event: TuiMouseEvent): TuiMouseEventResult | undefined;
   invalidate(): void;
   dispose?(): void;
   waitForPending?(): Promise<void>;
@@ -85,14 +112,59 @@ export function hasBorderRules(lines: readonly string[]): boolean {
   return isRule(nonEmpty[0] ?? "") && isRule(nonEmpty.at(-1) ?? "");
 }
 
-class BorderAdapter implements BorderedComponent {
+// Keep native ancestry without inheriting the newer Container-only dispatch
+// return type. This adapter also supports passive and non-container components.
+const BorderContainer: new () => Pick<Container, "children" | "addChild"> = Container;
+
+class BorderAdapter extends BorderContainer implements BorderedComponent {
   private readonly inner: BorderedComponent;
   private readonly borderColor: (text: string) => string;
   private focusedValue = false;
+  private addedBorders = false;
+  private contentHeight = 0;
+  private ownsMouseGesture = false;
+  handleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 
   constructor(inner: BorderedComponent, borderColor: (text: string) => string) {
+    super();
+    // Native overlay ancestry uses instanceof Container, not structural children.
+    // Container exists throughout the supported Pi range; mouse types do not.
+    this.addChild(inner);
+    Object.defineProperty(this, "handleMouse", { value: undefined, writable: true, configurable: true });
     this.inner = inner;
     this.borderColor = borderColor;
+    // Keep keyboard-only components passive, including on older Pi versions.
+    if (typeof inner.handleMouse === "function") {
+      this.handleMouse = (event) => {
+        // A new press ends any prior adapter-owned gesture even on a border.
+        if (event.type === "press") this.ownsMouseGesture = false;
+        const continuing = this.ownsMouseGesture && (event.type === "drag" || event.type === "release");
+        if (
+          this.addedBorders &&
+          !continuing &&
+          (this.contentHeight === 0 || event.y < 1 || event.y > this.contentHeight)
+        ) {
+          return undefined;
+        }
+        try {
+          const result = this.inner.handleMouse?.(
+            this.addedBorders
+              ? { ...event, y: event.y - 1, height: Math.max(0, Math.min(this.contentHeight, event.height - 1)) }
+              : event,
+          );
+          // Descendant dispatch targets receive their release directly from Pi;
+          // only retain gestures whose subsequent events return to this adapter.
+          const target = result?.target?.component;
+          if (target && target !== this) this.ownsMouseGesture = false;
+          else if (result?.capture || (event.type === "press" && (result?.handled || result?.focus))) {
+            this.ownsMouseGesture = true;
+          }
+          return result;
+        } finally {
+          if (event.type === "release") this.ownsMouseGesture = false;
+        }
+      };
+    }
     if ("focused" in inner) {
       Object.defineProperty(this, "focused", {
         configurable: true,
@@ -116,7 +188,9 @@ class BorderAdapter implements BorderedComponent {
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
     const lines = this.inner.render(safeWidth);
-    if (hasBorderRules(lines)) return lines;
+    this.contentHeight = lines.length;
+    this.addedBorders = !hasBorderRules(lines);
+    if (!this.addedBorders) return lines;
     const rule = this.borderColor("─".repeat(safeWidth));
     return [rule, ...lines, rule];
   }
@@ -130,6 +204,7 @@ class BorderAdapter implements BorderedComponent {
   }
 
   dispose(): void {
+    this.ownsMouseGesture = false;
     this.inner.dispose?.();
   }
 

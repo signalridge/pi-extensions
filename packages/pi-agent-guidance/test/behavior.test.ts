@@ -1,78 +1,61 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import agentGuidance from "../agent-guidance.js";
 
-function fixture() {
-  const root = mkdtempSync(join(tmpdir(), "pi-agent-guidance-"));
-  mkdirSync(join(root, ".pi", "agent"), { recursive: true });
-  return root;
+for (const override of [false, true]) {
+  test(`loads global configuration and guidance with ${override ? "PI_CODING_AGENT_DIR" : "normal fallback"}`, () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-agent-guidance-"));
+    try {
+      const agentDir = join(root, override ? "custom-agent" : ".pi/agent");
+      const project = join(root, "project");
+      mkdirSync(agentDir, { recursive: true });
+      mkdirSync(project);
+      writeFileSync(join(agentDir, "agent-guidance.json"), JSON.stringify({ models: { "gpt-*": ["SPECIAL.md"] } }));
+      writeFileSync(join(agentDir, "SPECIAL.md"), "global guidance\n");
+      writeFileSync(join(project, "SPECIAL.md"), "project guidance\n");
+      writeFileSync(join(project, "AGENTS.md"), "shared instructions\n");
+      writeFileSync(join(project, "CLAUDE.md"), "provider instructions\n");
+      // Bun caches homedir. Set HOME before starting the isolated process, not
+      // after imports, so fallback coverage never accesses the real agent dir.
+      const env = { ...process.env, HOME: root };
+      delete env.PI_CODING_AGENT_DIR;
+      if (override) env.PI_CODING_AGENT_DIR = agentDir;
+      const result = spawnSync(
+        process.execPath,
+        [
+          "-e",
+          `
+        import assert from "node:assert/strict";
+        import { writeFileSync } from "node:fs";
+        import { join } from "node:path";
+        import { getAgentDir } from "@earendil-works/pi-coding-agent";
+        import agentGuidance from ${JSON.stringify(new URL("../agent-guidance.ts", import.meta.url).href)};
+        assert.equal(getAgentDir(), ${JSON.stringify(agentDir)});
+        let handler;
+        agentGuidance({ on: (_name, callback) => { handler = callback; } });
+        const cwd = ${JSON.stringify(project)};
+        const run = (provider, id) => handler({ systemPrompt: "base" }, { cwd, model: { provider, id } });
+        const prompt = (await run("openai", "gpt-test")).systemPrompt;
+        assert.match(prompt, /global guidance/);
+        assert.match(prompt, /project guidance/);
+        assert.equal(prompt.split("global guidance").length, 2);
+        assert.ok(prompt.indexOf("global guidance") < prompt.indexOf("project guidance"));
+        assert.match((await run("anthropic", "claude")).systemPrompt, /provider instructions/);
+        writeFileSync(join(cwd, "CLAUDE.md"), "shared instructions\\n");
+        assert.equal(await run("anthropic", "claude"), undefined);
+        writeFileSync(join(cwd, "AGENTS.md"), "project guidance\\n");
+        assert.doesNotMatch((await run("openai", "gpt-test")).systemPrompt, /project guidance/);
+        assert.equal(await run("unknown", "other"), undefined);
+      `,
+        ],
+        { env, encoding: "utf8" },
+      );
+      assert.equal(result.status, 0, result.stderr);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 }
-
-test("loads provider guidance from the active project and avoids core duplicates", async () => {
-  const root = fixture();
-  const previousCwd = process.cwd();
-  const previousHome = process.env.HOME;
-  try {
-    process.chdir(root);
-    process.env.HOME = root;
-    writeFileSync(join(root, "AGENTS.md"), "shared instructions\n");
-    writeFileSync(join(root, "CLAUDE.md"), "provider instructions\n");
-    let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
-    agentGuidance({
-      on: (_event: string, callback: (event: unknown, ctx: unknown) => Promise<unknown>) => {
-        handler = callback;
-      },
-    } as never);
-    if (!handler) throw new Error("before_agent_start handler was not registered");
-    const result = await handler(
-      { systemPrompt: "base" },
-      { cwd: root, model: { provider: "anthropic", id: "claude-sonnet" } },
-    );
-    assert.match((result as { systemPrompt: string }).systemPrompt, /provider instructions/);
-    assert.doesNotMatch((result as { systemPrompt: string }).systemPrompt, /shared instructions/);
-
-    writeFileSync(join(root, "CLAUDE.md"), "shared instructions\n");
-    const duplicate = await handler(
-      { systemPrompt: "base" },
-      { cwd: root, model: { provider: "anthropic", id: "claude-sonnet" } },
-    );
-    assert.equal(duplicate, undefined);
-  } finally {
-    process.chdir(previousCwd);
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("selects provider files by model and does not duplicate a parent file", async () => {
-  const root = fixture();
-  const previousCwd = process.cwd();
-  const previousHome = process.env.HOME;
-  try {
-    process.chdir(root);
-    process.env.HOME = root;
-    writeFileSync(
-      join(root, ".pi", "agent", "agent-guidance.json"),
-      JSON.stringify({ models: { "gpt-*": ["CODEX.md"] } }),
-    );
-    writeFileSync(join(root, "CODEX.md"), "codex instructions\n");
-    let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
-    agentGuidance({
-      on: (_event: string, callback: (event: unknown, ctx: unknown) => Promise<unknown>) => {
-        handler = callback;
-      },
-    } as never);
-    if (!handler) throw new Error("before_agent_start handler was not registered");
-    const result = await handler({ systemPrompt: "base" }, { cwd: root, model: { provider: "openai", id: "gpt-5" } });
-    assert.match((result as { systemPrompt: string }).systemPrompt, /codex instructions/);
-  } finally {
-    process.chdir(previousCwd);
-    if (previousHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousHome;
-    rmSync(root, { recursive: true, force: true });
-  }
-});

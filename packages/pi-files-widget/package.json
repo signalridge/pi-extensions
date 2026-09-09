@@ -17,8 +17,8 @@
   },
   "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-files-widget",
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.0",
-    "@earendil-works/pi-tui": "^0.84.0"
+    "@earendil-works/pi-coding-agent": "^0.84.0 || ^0.85.0",
+    "@earendil-works/pi-tui": "^0.84.0 || ^0.85.0"
   },
   "scripts": {
     "postinstall": "node -e \"console.log('pi-files-widget: required deps: bat, delta, glow. Install with: brew install bat git-delta glow')\"",
@@ -34,8 +34,8 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
-    "@earendil-works/pi-tui": "0.84.1"
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-tui": "0.85.1"
   },
   "type": "module",
   "private": false,

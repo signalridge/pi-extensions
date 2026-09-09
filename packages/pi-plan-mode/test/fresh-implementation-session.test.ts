@@ -191,7 +191,7 @@ test("fresh implementation creates a linked destination and hands off only throu
     newSession: async (options: {
       parentSession?: string;
       setup?: (sessionManager: { appendCustomEntry(customType: string, data: unknown): string }) => Promise<void>;
-      withSession?: (ctx: { sendUserMessage(message: string): Promise<void> }) => Promise<void>;
+      withSession?: (ctx: unknown) => Promise<void>;
     }) => {
       newSessionCalls += 1;
       parentSession = options.parentSession;
@@ -202,7 +202,9 @@ test("fresh implementation creates a linked destination and hands off only throu
         },
       });
       await options.withSession?.({
-        async sendUserMessage(message) {
+        model: { provider: "test-provider", id: "test-model" },
+        ui: { notify() {} },
+        async sendUserMessage(message: string) {
           replacementMessages.push(message);
         },
       });
@@ -258,14 +260,15 @@ test("fresh implementation snapshots an in-memory planning branch before replace
     newSession: async (options: {
       parentSession?: string;
       setup?: (sessionManager: { appendCustomEntry(customType: string, data: unknown): string }) => Promise<void>;
-      withSession?: (ctx: {
-        sendUserMessage(message: string): Promise<void>;
-        ui: { notify(message: string, level: string): void };
-      }) => Promise<void>;
+      withSession?: (ctx: unknown) => Promise<void>;
     }) => {
       parentSession = options.parentSession;
       await options.setup?.({ appendCustomEntry: () => "state-entry" });
-      await options.withSession?.({ sendUserMessage: async () => {}, ui: { notify: () => {} } });
+      await options.withSession?.({
+        model: { provider: "test-provider", id: "test-model" },
+        sendUserMessage: async () => {},
+        ui: { notify: () => {} },
+      });
       return { cancelled: false };
     },
   });
@@ -308,7 +311,7 @@ test("saved plans can start fresh without consuming the source session state", a
     select: async () => "Start fresh and implement",
     newSession: async (options: {
       setup?: (sessionManager: { appendCustomEntry(customType: string, data: unknown): string }) => Promise<void>;
-      withSession?: (ctx: { sendUserMessage(message: string): Promise<void> }) => Promise<void>;
+      withSession?: (ctx: unknown) => Promise<void>;
     }) => {
       newSessionCalls += 1;
       await options.setup?.({
@@ -317,7 +320,11 @@ test("saved plans can start fresh without consuming the source session state", a
           return "destination-state";
         },
       });
-      await options.withSession?.({ sendUserMessage: async () => undefined });
+      await options.withSession?.({
+        model: { provider: "test-provider", id: "test-model" },
+        ui: { notify() {} },
+        sendUserMessage: async () => undefined,
+      });
       return { cancelled: false };
     },
   });
@@ -423,7 +430,11 @@ test("fresh replacement reports recoverable setup and kickoff failures as partia
   for (const failure of ["setup", "kickoff"] as const) {
     let appendedState: unknown;
     let replacementMessage = "";
-    const replacement = createMockContext({ mode: "rpc", hasUI: true });
+    const replacement = createMockContext({
+      mode: "rpc",
+      hasUI: true,
+      model: { provider: "test-provider", id: "test-model" },
+    });
     const source = createMockContext({
       mode: "rpc",
       hasUI: true,

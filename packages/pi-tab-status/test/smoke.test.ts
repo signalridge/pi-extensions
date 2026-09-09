@@ -7,13 +7,13 @@ test("registers the tab status lifecycle hooks", () => {
   tabStatus({ on: (event: string) => events.push(event) } as never);
   assert.deepEqual(events, [
     "session_start",
-    "session_before_switch",
     "before_agent_start",
     "agent_start",
     "turn_start",
     "tool_call",
     "tool_result",
     "agent_end",
+    "agent_settled",
     "session_shutdown",
   ]);
 });

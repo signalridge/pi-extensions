@@ -933,13 +933,13 @@ type MessageContentBlock = {
   text?: string;
   name?: string;
   arguments?: unknown;
-  result?: unknown;
 };
 
 type SessionMessage = {
   role?: string;
   content?: unknown;
   stopReason?: string;
+  toolName?: string;
 };
 
 type SessionEntry = {
@@ -949,50 +949,132 @@ type SessionEntry = {
 
 export function buildConversationContext(entries: readonly SessionEntry[]) {
   const sections: string[] = [];
+  // One extra character distinguishes an exact fit from a truncated context.
+  let remaining = MAX_CONTEXT_CHARS + 1;
 
-  for (const entry of entries) {
+  for (let index = entries.length - 1; index >= 0 && remaining > 0; index--) {
+    const entry = entries[index];
     if (entry.type !== "message" || !entry.message?.role) continue;
 
     const role = entry.message.role;
-    if (role !== "user" && role !== "assistant") continue;
+    if (role !== "user" && role !== "assistant" && role !== "toolResult") continue;
 
-    const contentLines = extractContentLines(entry.message.content);
-    if (contentLines.length === 0) continue;
+    const content = extractContentTail(entry.message.content, remaining);
+    if (!content) continue;
+    if (sections.length > 0) {
+      sections.push("\n\n".slice(-remaining));
+      remaining -= Math.min(2, remaining);
+    }
+    if (remaining === 0) break;
+    sections.push(content.slice(-remaining));
+    remaining -= Math.min(content.length, remaining);
+    if (remaining === 0) break;
 
-    const label = role === "user" ? "User" : "Assistant";
+    const label =
+      role === "toolResult"
+        ? `Tool result from ${entry.message.toolName ?? "unknown tool"}`
+        : role === "user"
+          ? "User"
+          : "Assistant";
     const status =
       entry.message.stopReason && entry.message.stopReason !== "stop" ? ` (${entry.message.stopReason})` : "";
-    sections.push(`${label}${status}: ${contentLines.join("\n")}`);
+    const prefix = `${label}${status}: `;
+    sections.push(prefix.slice(-remaining));
+    remaining -= Math.min(prefix.length, remaining);
   }
 
-  return truncateFromStart(sections.join("\n\n"), MAX_CONTEXT_CHARS);
+  return truncateFromStart(sections.reverse().join(""), MAX_CONTEXT_CHARS);
 }
 
-function extractContentLines(content: unknown): string[] {
-  if (typeof content === "string") return [content.trim()].filter(Boolean);
-  if (!Array.isArray(content)) return [];
-
+function extractContentTail(content: unknown, budget: number): string {
+  if (typeof content === "string") return content.trim().slice(-budget);
+  if (!Array.isArray(content)) return "";
   const lines: string[] = [];
-  for (const part of content) {
+  for (let index = content.length - 1; index >= 0 && budget > 0; index--) {
+    const part = content[index];
     if (!part || typeof part !== "object") continue;
     const block = part as MessageContentBlock;
+    let line = "";
     if (block.type === "text" && typeof block.text === "string") {
-      lines.push(block.text.trim());
+      line = block.text.trim().slice(-budget);
     } else if (block.type === "toolCall" && typeof block.name === "string") {
-      lines.push(`Tool call: ${block.name}(${formatJson(block.arguments)})`);
-    } else if (block.type === "toolResult" && typeof block.name === "string") {
-      lines.push(`Tool result from ${block.name}: ${formatJson(block.result)}`);
+      // Construct the suffix first: arguments can dwarf the entire context budget.
+      line = budget > 1 ? `${formatJsonTail(block.arguments, budget - 1)})` : ")";
+      if (line.length < budget) line = `${`Tool call: ${block.name}(`.slice(-(budget - line.length))}${line}`;
     }
+    if (!line) continue;
+    if (lines.length > 0) {
+      lines.push("\n");
+      budget--;
+    }
+    if (budget === 0) break;
+    lines.push(line.slice(-budget));
+    budget -= Math.min(line.length, budget);
   }
-  return lines.filter(Boolean);
+  return lines.reverse().join("");
 }
 
-function formatJson(value: unknown) {
-  if (value === undefined) return "";
+/** Serialize JSON-shaped tool arguments from the end without a full JSON allocation. */
+function formatJsonTail(value: unknown, budget: number): string {
+  const chunks: string[] = [];
+  const ancestors = new Set<object>();
+  const take = (text: string) => {
+    if (budget <= 0) return;
+    chunks.push(text.slice(-budget));
+    budget -= Math.min(text.length, budget);
+  };
+  const visit = (item: unknown): void => {
+    if (budget <= 0) return;
+    if (typeof item === "string") {
+      take(JSON.stringify(item.slice(-budget)));
+    } else if (item !== null && typeof item === "object") {
+      if (ancestors.has(item)) throw new Error("Circular arguments");
+      ancestors.add(item);
+      if (Array.isArray(item)) {
+        take("]");
+        for (let index = item.length - 1; index >= 0 && budget > 0; index--) {
+          if (index < item.length - 1) take(",");
+          visit(item[index] ?? null);
+        }
+        take("[");
+      } else {
+        take("}");
+        const record = item as Record<string, unknown>;
+        // Every JSON-shaped property emits at least one character. Retain at
+        // most budget suffix keys, without allocating a full Object.keys array.
+        // Enumeration is still linear (and the VM may allocate internally).
+        const capacity = Math.max(1, budget);
+        const keys: string[] = [];
+        let count = 0;
+        for (const key in record) {
+          if (!Object.hasOwn(record, key)) continue;
+          keys[count % capacity] = key;
+          count++;
+        }
+        let hasItem = false;
+        for (let index = count - 1; index >= Math.max(0, count - capacity) && budget > 0; index--) {
+          const key = keys[index % capacity];
+          const child = record[key];
+          if (child === undefined || typeof child === "function" || typeof child === "symbol") continue;
+          if (hasItem) take(",");
+          visit(child);
+          take(":");
+          if (budget > 0) take(JSON.stringify(key.slice(-budget)));
+          hasItem = true;
+        }
+        take("{");
+      }
+      ancestors.delete(item);
+    } else {
+      take(JSON.stringify(item) ?? "");
+    }
+  };
+  const limit = budget;
   try {
-    return JSON.stringify(value);
+    visit(value);
+    return chunks.reverse().join("");
   } catch {
-    return String(value);
+    return String(value).slice(-limit);
   }
 }
 

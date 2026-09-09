@@ -116,6 +116,8 @@ export type Limiter = <T>(fn: () => Promise<T>) => Promise<T>;
 /** The dispatch boundary the engine implements over spawn-managed RPC. */
 export interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions): Promise<unknown>;
+  /** Managed runners bound and confirm cleanup of aborted dispatches. */
+  waitForCleanup?(): Promise<void>;
 }
 
 export interface AgentRunOptions {
@@ -300,7 +302,7 @@ export interface WorkflowRunOptions {
   sharedStore?: SharedStore;
   /** Resolve a nested `workflow(name)` reference to the script it names. */
   loadSavedWorkflow?: (name: string) => string | undefined;
-  confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
+  confirm?: (promptText: string, options: CheckpointOptions, signal?: AbortSignal) => Promise<unknown>;
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onRuntimeEvent?: (event: WorkflowRuntimeEvent) => void;
@@ -921,6 +923,7 @@ async function withTimeout<T>(
    * must degrade to the old behaviour, not to an agent that can hang forever.
    */
   onArm?: (restart: () => void) => void,
+  waitForCleanup?: () => Promise<void>,
 ): Promise<T> {
   if (ms === null) {
     onArm?.(() => {});
@@ -934,9 +937,11 @@ async function withTimeout<T>(
   // finished agent long after the fact, so settlement makes it inert here
   // rather than relying on every holder to guard its own call.
   let settled = false;
+  let timedOut = false;
 
   const timeoutPromise = new Promise<never>((_, reject) => {
     const fire = () => {
+      timedOut = true;
       try {
         onTimeout?.();
       } catch {
@@ -963,6 +968,9 @@ async function withTimeout<T>(
   } finally {
     settled = true;
     if (timeoutId) clearTimeout(timeoutId);
+    // The timeout wins the race immediately, but managed cleanup must settle
+    // (or durably fence the run) before script continuation and journal output.
+    if (timedOut) await waitForCleanup?.();
   }
 }
 
@@ -1722,6 +1730,7 @@ export async function runWorkflow<T = unknown>(
               (restart) => {
                 restartTimeout = restart;
               },
+              options.agent?.waitForCleanup,
             );
 
             throwIfAborted();
@@ -1789,6 +1798,18 @@ export async function runWorkflow<T = unknown>(
             });
             return result;
           } catch (error) {
+            // A timeout waits for managed cleanup before reaching this catch.
+            // Explicit cancellation may arrive during that await; it wins only
+            // over this recoverable timeout, never over a fatal cleanup fence.
+            if (
+              options.signal?.aborted &&
+              !shared.runFatalController.signal.aborted &&
+              error instanceof WorkflowError &&
+              error.recoverable &&
+              error.code === WorkflowErrorCode.AGENT_TIMEOUT
+            ) {
+              throwIfAborted();
+            }
             if (isAborted()) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
@@ -2285,7 +2306,34 @@ export async function runWorkflow<T = unknown>(
 
     let reply: unknown;
     if (options.confirm) {
-      reply = await options.confirm(promptText, checkpointOptions);
+      // Host-only cancellation must not affect author options or replay hashes.
+      const signal = options.signal
+        ? AbortSignal.any([options.signal, shared.runFatalController.signal])
+        : shared.runFatalController.signal;
+      const confirm = options.confirm;
+      let onAbort: (() => void) | undefined;
+      try {
+        const cancelled = new Promise<never>((_resolve, reject) => {
+          onAbort = () => {
+            try {
+              throwIfAborted();
+            } catch (error) {
+              reject(error);
+            }
+          };
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        });
+        // Older host callbacks may ignore the optional signal. Still release
+        // the runtime wait, and observe any eventual callback rejection.
+        const answer = Promise.resolve().then(() => {
+          throwIfAborted();
+          return confirm(promptText, checkpointOptions, signal);
+        });
+        reply = await Promise.race([answer, cancelled]);
+      } finally {
+        if (onAbort) signal.removeEventListener("abort", onAbort);
+      }
     } else if (checkpointOptions.headless === "abort") {
       throw new WorkflowError(
         `checkpoint "${promptText}" needs human input but none is available (headless run)`,

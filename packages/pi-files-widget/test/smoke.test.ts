@@ -10,5 +10,11 @@ test("registers the file browser command and lifecycle hooks", () => {
     on: (event: string) => events.push(event),
   } as never);
   assert.deepEqual(commands, ["readfiles"]);
-  assert.deepEqual(events, ["tool_result", "session_start", "session_before_switch"]);
+  assert.deepEqual(events, [
+    "tool_call",
+    "tool_result",
+    "tool_execution_end",
+    "session_start",
+    "session_before_switch",
+  ]);
 });

@@ -230,6 +230,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   let generation = 0;
   let sessionController = new AbortController();
   let tuiSessionActive = false;
+  let acceptingTurnEvents = true;
   let lastStampTimestamp: number | undefined;
   let activeAssistantTiming: AssistantTimingObservation | undefined;
   let finalizedAssistantTiming: FinalizedAssistantTiming | undefined;
@@ -364,6 +365,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     finalizedAssistantTiming = undefined;
     activeToolTimings.clear();
     tuiSessionActive = ctx.mode === "tui";
+    acceptingTurnEvents = true;
     lastStampTimestamp = lastStampTimestampFromBranch(ctx.sessionManager.getBranch());
     try {
       const state = await settingsRuntime.reload(controller.signal);
@@ -381,7 +383,22 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     }
   });
 
+  pi.on("session_tree", (_event, ctx) => {
+    // Navigation succeeded. Do not invalidate on session_before_tree: another
+    // extension or the user may still cancel it.
+    sessionController.abort(new Error("pi-stamp branch replaced"));
+    sessionController = new AbortController();
+    generation += 1;
+    pendingUserStamps.length = 0;
+    activeAssistantTiming = undefined;
+    finalizedAssistantTiming = undefined;
+    activeToolTimings.clear();
+    acceptingTurnEvents = false;
+    lastStampTimestamp = lastStampTimestampFromBranch(ctx.sessionManager.getBranch());
+  });
+
   pi.on("turn_start", () => {
+    acceptingTurnEvents = true;
     activeAssistantTiming = undefined;
     finalizedAssistantTiming = undefined;
     activeToolTimings.clear();
@@ -390,6 +407,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   pi.on("tool_execution_start", (event) => {
     if (
       !tuiSessionActive ||
+      !acceptingTurnEvents ||
       !settingsRuntime.get().settings.toolStamps ||
       activeToolTimings.size >= MAX_TOOL_STAMP_OBSERVATIONS ||
       activeToolTimings.has(event.toolCallId) ||
@@ -421,6 +439,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   });
 
   pi.on("message_start", (event) => {
+    if (event.message.role === "user" || event.message.role === "assistant") acceptingTurnEvents = true;
     flushPendingUsers();
     if (!tuiSessionActive || event.message.role !== "assistant" || !isValidTimestamp(event.message.timestamp)) {
       return;
@@ -445,7 +464,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   });
 
   pi.on("message_end", (event) => {
-    if (!tuiSessionActive || !isValidTimestamp(event.message.timestamp)) return;
+    if (!tuiSessionActive || !acceptingTurnEvents || !isValidTimestamp(event.message.timestamp)) return;
     if (event.message.role === "user") {
       pendingUserStamps.push({ role: "user", timestamp: event.message.timestamp });
       return;
@@ -473,6 +492,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   });
 
   pi.on("turn_end", (event) => {
+    if (!acceptingTurnEvents) return;
     const timing = finalizedAssistantTiming;
     activeAssistantTiming = undefined;
     finalizedAssistantTiming = undefined;

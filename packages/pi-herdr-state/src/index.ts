@@ -279,6 +279,9 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   let currentSession: SessionRef | undefined;
   let working = false;
   let blockedCount = 0;
+  // Native emits are independent async notifications: an end may overtake a
+  // delayed start listener. Keep signed debt, separate from manual ownership.
+  let uiPromptBalance = 0;
   let blockedMessage: string | undefined;
   let lastState: AgentState | undefined;
   let lastMessage: string | undefined;
@@ -289,7 +292,7 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
   let lastReportedSessionKey: string | undefined;
 
   function desired(): AgentState {
-    if (blockedCount > 0) return "blocked";
+    if (blockedCount > 0 || uiPromptBalance > 0) return "blocked";
     return working ? "working" : "idle";
   }
 
@@ -325,7 +328,13 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
 
   function sync(ctx: unknown): void {
     if (ctx) lastCtx = ctx;
-    currentSession = readSessionRef(lastCtx);
+    const nextSession = readSessionRef(lastCtx);
+    if (sessionKey(nextSession) !== sessionKey(currentSession)) {
+      uiPromptBalance = 0;
+      blockedCount = 0;
+      blockedMessage = undefined;
+    }
+    currentSession = nextSession;
   }
 
   function reportCurrentSession(reason: unknown, force: boolean): void {
@@ -438,7 +447,20 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
       if (!active) return;
       sync(ctx);
       reportCurrentSession(undefined, false);
-      scheduleIdle();
+      // A low-level run ending may be followed by automatic retry/compaction.
+      if (eventName === "agent_settled" || safeIdle(ctx) === "true") scheduleIdle();
+    });
+  }
+
+  // Notification-only native waiting spans; deliberately ignore prompt titles.
+  for (const eventName of ["ui_prompt_start", "ui_prompt_end"]) {
+    pi.on(eventName, (_event: unknown, ctx: unknown) => {
+      // Native notifications may precede our session_start handler. Account for
+      // them immediately; publish() alone owns the activation gate.
+      if (disposed || toRecord(ctx).mode !== "tui") return;
+      sync(ctx);
+      uiPromptBalance += eventName === "ui_prompt_start" ? 1 : -1;
+      publish();
     });
   }
 
@@ -462,6 +484,9 @@ export function createReporter(pi: PiApi, transport: RequestTransport = sendRequ
     const wasActive = active;
     clearTimers();
     active = false;
+    uiPromptBalance = 0;
+    blockedCount = 0;
+    blockedMessage = undefined;
     queued = undefined;
     try {
       if (event.reason === "quit" && wasActive) {

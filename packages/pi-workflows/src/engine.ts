@@ -66,6 +66,9 @@ import type { WorkflowStrengthTable } from "./strengths.js";
 export const MAX_ATTEMPTS_PER_NODE = 3;
 
 const BRANCH_QUIESCE_TIMEOUT_MS = 8_000;
+// Internal deadline, longer than exact-owner RPC cleanup. Scripts can await
+// arbitrary promises, so cancellation cannot rely on cooperative JS unwinding.
+export const EXECUTION_DRAIN_TIMEOUT_MS = 10_000;
 const MAX_WAITERS = 256;
 const JOURNAL_RETRY_INITIAL_DELAY_MS = 25;
 const JOURNAL_RETRY_MAX_DELAY_MS = 2_000;
@@ -116,6 +119,7 @@ export interface ScriptStartOptions {
       choices?: string[];
       timeoutMs?: number;
     },
+    signal?: AbortSignal,
   ) => Promise<unknown>;
   /** Resolve a nested `workflow(name)` reference to the script it names. */
   loadSavedWorkflow?: (name: string) => string | undefined;
@@ -754,6 +758,7 @@ export class WorkflowEngine {
     this.setWorkflowStatus(run, "running");
     state.executionGeneration += 1;
     state.execution = this.execute(runId, script, startOptions, undefined, state.executionGeneration, protocol);
+    const execution = state.execution;
     // A run-fatal abort/stop already journals its terminal state; never let a
     // leftover rejection become an unhandled promise rejection.
     void state.execution.catch(() => {});
@@ -771,6 +776,10 @@ export class WorkflowEngine {
       };
     } catch (error: unknown) {
       if (!(error instanceof WorkflowWaitAbortedError)) throw error;
+      // Foreground cancellation owns execution, not just this waiter. Do not
+      // advertise resumability until runtime children and checkpoint UI unwind.
+      state.controller.abort();
+      await this.drainExecution(state, execution);
       const current = this.runs.get(runId)?.run ?? run;
       return { runId: current.runId, status: current.status, background: false, waitAborted: true };
     }
@@ -795,6 +804,7 @@ export class WorkflowEngine {
     if (!state) return undefined;
     if (state.lifecycleSuspended) return undefined;
     const run = state.run;
+    if (run.status === "running" || run.status === "pausing" || run.status === "stopping") return undefined;
     const providerTimer = this.providerResumeTimers.get(runId);
     if (providerTimer) {
       clearTimeout(providerTimer);
@@ -862,13 +872,16 @@ export class WorkflowEngine {
       state.executionGeneration,
       protocol,
     );
-    void state.execution.catch(() => {});
+    const execution = state.execution;
+    void execution.catch(() => {});
     if (options.background) return { runId, status: run.status, background: true };
     try {
       const settled = await this.waitFor(runId, options.signal);
       return { runId, status: settled.status, background: false };
     } catch (error: unknown) {
       if (!(error instanceof WorkflowWaitAbortedError)) throw error;
+      state.controller.abort();
+      await this.drainExecution(state, execution);
       return { runId, status: run.status, background: false, waitAborted: true };
     }
   }
@@ -896,21 +909,7 @@ export class WorkflowEngine {
         // resumed from the journal. The script's in-flight agents are stopped by
         // the runtime's abort signal via the dispatch waiters.
         state.controller.abort();
-        this.persist(runId, "pause-recovery", () =>
-          this.write({
-            kind: "run_recovery",
-            schemaVersion: JOURNAL_SCHEMA_VERSION,
-            runId,
-            status: "interrupted",
-            branchGeneration: this.recoveryBranchGeneration,
-            rotations: [],
-            recoveryId: deriveRecoveryId({ runId, rotations: [], timestamp: Date.now() }),
-            timestamp: Date.now(),
-          }),
-        );
-        run.status = "interrupted";
-        run.updatedAt = Date.now();
-        this.settleWaiters(runId, run);
+        await this.drainExecution(state, state.execution);
       } else if (run.status !== "paused" && run.status !== "interrupted") {
         throw new Error(`cannot pause workflow in state ${run.status}`);
       }
@@ -1017,11 +1016,34 @@ export class WorkflowEngine {
     const state = this.runs.get(runId);
     if (!state) throw new Error(`workflow run not found: ${runId}`);
     const generation = executionGeneration ?? state.executionGeneration;
+    const executionSignal =
+      !options.background && options.signal
+        ? AbortSignal.any([state.controller.signal, options.signal])
+        : state.controller.signal;
 
+    const cleanupTasks = new Set<Promise<void>>();
     const runner: WorkflowAgentRunner = {
       run: async (prompt: string, runOptions: AgentRunOptions = {}) => {
-        return this.dispatchAgent(runId, prompt, runOptions);
+        if (state.executionGeneration !== generation)
+          throw new WorkflowError("stale workflow execution", WorkflowErrorCode.WORKFLOW_ABORTED);
+        const dispatch = this.dispatchAgent(runId, prompt, runOptions);
+        const settled = dispatch.then(
+          () => {},
+          () => {},
+        );
+        const trackCleanup = () => {
+          cleanupTasks.add(settled);
+          void settled.then(() => cleanupTasks.delete(settled));
+        };
+        runOptions.signal?.addEventListener("abort", trackCleanup, { once: true });
+        if (runOptions.signal?.aborted) trackCleanup();
+        try {
+          return await dispatch;
+        } finally {
+          runOptions.signal?.removeEventListener("abort", trackCleanup);
+        }
       },
+      waitForCleanup: () => this.drainExecution(state, Promise.all([...cleanupTasks])),
     };
 
     try {
@@ -1043,7 +1065,7 @@ export class WorkflowEngine {
         agentRetries: options.agentRetries,
         tokenBudget: options.tokenBudget,
         agentTimeoutMs: options.agentTimeoutMs,
-        signal: state.controller.signal,
+        signal: executionSignal,
         maxAgents: options.maxAgents,
         runId,
         executionNonce: `${generation}-${randomUUID()}`,
@@ -1078,6 +1100,12 @@ export class WorkflowEngine {
           }
         },
       });
+      await runner.waitForCleanup?.();
+      if (executionSignal.aborted) {
+        throw new WorkflowError("workflow execution aborted", WorkflowErrorCode.WORKFLOW_ABORTED, {
+          recoverable: true,
+        });
+      }
       const live = this.runs.get(runId);
       const run = live?.run;
       if (run && state.executionGeneration === generation && !isTerminalWorkflow(run.status)) {
@@ -1086,6 +1114,7 @@ export class WorkflowEngine {
       }
       return result;
     } catch (error: unknown) {
+      await runner.waitForCleanup?.();
       const run = this.runs.get(runId)?.run;
       if (run && state.executionGeneration === generation && !isTerminalWorkflow(run.status)) {
         const message = error instanceof Error ? error.message : String(error);
@@ -1094,8 +1123,21 @@ export class WorkflowEngine {
           this.setWorkflowStatus(run, "paused", message);
           this.cleanupAgents(runId);
           this.scheduleProviderResume(runId, workflowError.resetHint);
-        } else if (workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED && state.controller.signal.aborted) {
-          this.setWorkflowStatus(run, "interrupted");
+        } else if (workflowError.code === WorkflowErrorCode.WORKFLOW_ABORTED && executionSignal.aborted) {
+          this.persist(runId, "abort-recovery", () =>
+            this.write({
+              kind: "run_recovery",
+              schemaVersion: JOURNAL_SCHEMA_VERSION,
+              runId,
+              status: "interrupted",
+              branchGeneration: this.recoveryBranchGeneration,
+              rotations: [],
+              recoveryId: deriveRecoveryId({ runId, rotations: [], timestamp: Date.now() }),
+              timestamp: Date.now(),
+            }),
+          );
+          run.status = "interrupted";
+          run.updatedAt = Date.now();
         } else {
           this.setWorkflowStatus(run, "failed", message);
           this.cleanupAgents(runId);
@@ -1119,7 +1161,7 @@ export class WorkflowEngine {
     if (this.disposed) throw new WorkflowEngineDisposedError();
     const state = this.runs.get(runId);
     if (!state) throw new Error(`workflow run not found: ${runId}`);
-    if (state.lifecycleSuspended || state.controller.signal.aborted) {
+    if (state.lifecycleSuspended || state.controller.signal.aborted || runOptions.signal?.aborted) {
       throw new WorkflowError("workflow branch is quiescing", WorkflowErrorCode.WORKFLOW_ABORTED, {
         recoverable: true,
       });
@@ -1220,6 +1262,19 @@ export class WorkflowEngine {
     let response: ManagedSpawnResponse | string;
     try {
       response = await this.client.spawn(task, runId, spawnNodeId, spawnAttemptId, externalSignal);
+    } catch (error: unknown) {
+      if (externalSignal.aborted) {
+        const reconciled = await this.client.reconcileManaged?.(spawnKey, owner).catch(() => undefined);
+        const id = typeof reconciled === "string" ? reconciled : reconciled?.id;
+        await this.stopAndQuiesce(
+          state,
+          id ?? spawnKey,
+          owner,
+          executionGeneration,
+          id ? undefined : "cancelled spawn allocation could not be confirmed",
+        );
+      }
+      throw error;
     } finally {
       externalSignal.removeEventListener("abort", onPendingAbort);
       state.pendingSpawns.delete(spawnKey);
@@ -1231,9 +1286,7 @@ export class WorkflowEngine {
       externalSignal.aborted
     ) {
       state.bufferedTerminals.delete(spawnKey);
-      await this.client
-        .stopOwned?.(responseId, { extension: "pi-workflows", runId, nodeId: spawnNodeId, attemptId: spawnAttemptId })
-        .catch(() => {});
+      await this.stopAndQuiesce(state, responseId, owner, executionGeneration);
       throw new WorkflowError(
         "workflow dispatch became stale during pause/resume",
         WorkflowErrorCode.WORKFLOW_ABORTED,
@@ -1294,15 +1347,12 @@ export class WorkflowEngine {
         waiter.settled = true;
         state.agentWaiters.delete(pendingId);
         state.bufferedTerminals.delete(spawnKey);
-        void this.client
-          .stopOwned?.(pendingId, {
-            extension: "pi-workflows",
-            runId,
-            nodeId: spawnNodeId,
-            attemptId: spawnAttemptId,
-          })
-          .catch(() => {});
-        waiter.reject(new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }));
+        // Stop acknowledges cancellation, not provider/tool finally completion.
+        void this.stopAndQuiesce(state, pendingId, owner, executionGeneration).then(() => {
+          waiter.reject(
+            new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }),
+          );
+        });
       }
     };
 
@@ -1530,6 +1580,99 @@ export class WorkflowEngine {
         })
         .catch(() => {});
     }
+  }
+
+  private async stopAndQuiesce(
+    state: ScriptRunState,
+    agentId: string,
+    owner: WorkflowOwner,
+    executionGeneration: number,
+    unconfirmed?: string,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopError: unknown;
+    try {
+      if (unconfirmed) throw new Error(unconfirmed);
+      await Promise.race([
+        (async () => {
+          try {
+            if (!this.client.stopOwned) throw new Error("owned stop RPC unavailable");
+            await this.client.stopOwned(agentId, owner);
+          } catch (error: unknown) {
+            // Reconciliation may already have stopped the record. Only exact-owner
+            // quiescence confirms that provider/tool cleanup has actually settled.
+            stopError = error;
+          }
+          if (!this.client.quiesceOwned) throw new Error("owned cleanup RPC unavailable");
+          const result = await this.client.quiesceOwned(owner.runId, [agentId], BRANCH_QUIESCE_TIMEOUT_MS, [owner]);
+          if (!result?.settled || result.pending.length !== 0) throw new Error("owned agents are not quiescent");
+        })(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("owned cleanup timed out")), BRANCH_QUIESCE_TIMEOUT_MS + 1_000);
+        }),
+      ]);
+    } catch (error: unknown) {
+      // Never turn uncertain cleanup into a resumable interruption. Existing
+      // terminal recovery facts durably fence this run without a protocol change.
+      if (this.runs.get(owner.runId) !== state || state.executionGeneration !== executionGeneration) return;
+      const stopDiagnostic = stopError === undefined ? "" : `; stop failed: ${String(stopError)}`;
+      const diagnostic = `Owned cleanup unconfirmed for ${agentId}: ${error instanceof Error ? error.message : String(error)}${stopDiagnostic}; run is non-resumable`;
+      this.fenceExecution(state, executionGeneration, diagnostic);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private async drainExecution(state: ScriptRunState, execution?: Promise<unknown>): Promise<void> {
+    if (!execution) return;
+    const generation = state.executionGeneration;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        execution.catch(() => {}),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            this.fenceExecution(state, generation, "Workflow execution cleanup timed out; run is non-resumable");
+            resolve();
+          }, EXECUTION_DRAIN_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private fenceExecution(state: ScriptRunState, generation: number, diagnostic: string): void {
+    const run = state.run;
+    if (this.runs.get(run.runId) !== state || state.executionGeneration !== generation) return;
+    if (run.nonResumable && run.status === "stopped") return;
+    run.nonResumable = true;
+    const blockedNodeIds = Object.keys(run.callStatus).filter((nodeId) => run.callStatus[nodeId] !== "completed");
+    for (const nodeId of blockedNodeIds) run.callStatus[nodeId] = "stopped";
+    run.status = "stopped";
+    run.error = diagnostic;
+    run.terminalIntent = "stop";
+    run.updatedAt = Date.now();
+    const event: TerminalRecoveryEvent = {
+      kind: "terminal_recovery",
+      schemaVersion: JOURNAL_SCHEMA_VERSION,
+      runId: run.runId,
+      status: "stopped",
+      terminalIntent: "stop",
+      branchGeneration: this.recoveryBranchGeneration,
+      terminalResults: [],
+      blockedNodeIds,
+      error: diagnostic,
+      recoveryId: deriveRecoveryId({ runId: run.runId, rotations: [], timestamp: Date.now() }),
+      timestamp: Date.now(),
+    };
+    this.persist(run.runId, "cleanup-unconfirmed", () => this.write(event));
+    // Fence before aborting: synchronous abort handlers may re-enter cleanup.
+    // Exact-owner cleanup continues, but no later result may revive this run.
+    state.executionGeneration += 1;
+    state.controller.abort();
+    this.cleanupAgents(run.runId);
+    this.settleWaiters(run.runId, run);
   }
 
   private async stop(state: ScriptRunState): Promise<void> {

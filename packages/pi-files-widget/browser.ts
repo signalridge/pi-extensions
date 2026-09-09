@@ -1,7 +1,7 @@
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
@@ -171,7 +171,7 @@ function shouldSafeMode(path: string): boolean {
 function collectChangedFiles(node: FileNode, ancestors: FileNode[] = []): ChangedFile[] {
   const results: ChangedFile[] = [];
 
-  if (!node.isDirectory && (node.gitStatus || node.agentModified)) {
+  if (!node.isDirectory && (node.gitStatus || node.agentModified || node.observedChanged)) {
     results.push({ file: node, ancestors: [...ancestors] });
   }
 
@@ -199,6 +199,7 @@ function getTreeStats(root: FileNode | null): BrowserStats {
 function formatNodeStatus(node: FileNode, theme: Theme): string {
   if (isIgnoredStatus(node.gitStatus)) return "";
   if (node.agentModified) return theme.fg("accent", " 🤖");
+  if (node.observedChanged) return theme.fg("dim", " ~");
   if (node.gitStatus === "M" || node.gitStatus === "MM") return theme.fg("warning", " M");
   if (isUntrackedStatus(node.gitStatus)) return theme.fg("dim", " ?");
   if (node.gitStatus === "A") return theme.fg("success", " A");
@@ -274,6 +275,7 @@ export function createFileBrowser(
   requestComment: (payload: CommentPayload, comment: string) => void,
   requestRender: () => void,
   projectCwd: string = initialPath,
+  observedChangedFiles: ReadonlySet<string> = new Set(),
 ): BrowserController {
   const ignored = getIgnoredNames();
 
@@ -430,10 +432,21 @@ export function createFileBrowser(
     return browser.scanState.mode === "safe" ? SCAN_BATCH_DELAY_MS * 4 : SCAN_BATCH_DELAY_MS;
   }
 
+  // Injected children are only partial knowledge, not a completed directory scan.
+  const incompleteDirectories = new WeakSet<FileNode>();
+
+  function ensureChildren(node: FileNode): FileNode[] {
+    if (node.children === undefined) {
+      incompleteDirectories.add(node);
+      node.children = [];
+    }
+    return node.children;
+  }
+
   function enqueueScan(node: FileNode, depth: number, force = false): void {
     if (depth > MAX_TREE_DEPTH) return;
     if (!force && browser.scanState.mode === "safe" && depth > 0) return;
-    if (node.children !== undefined || node.loading) return;
+    if ((node.children !== undefined && !incompleteDirectories.has(node)) || node.loading) return;
     if (scanQueued.has(node.path)) return;
 
     node.loading = true;
@@ -467,11 +480,18 @@ export function createFileBrowser(
         if (ignored.has(entry.name) || entry.name.startsWith(".")) continue;
         const fullPath = join(node.path, entry.name);
         const childDepth = depth + 1;
+        const existing = browser.nodeByPath.get(fullPath);
+        if (existing?.parent === node) {
+          (existing.isDirectory ? dirs : files).push(existing);
+          if (existing.isDirectory && shouldAutoScan(childDepth)) enqueueScan(existing, childDepth);
+          if (!existing.isDirectory) queueLineCount(existing);
+          continue;
+        }
 
         if (entry.isDirectory()) {
           const dirRealPath = await realpath(fullPath).catch(() => resolve(fullPath));
           if (generation !== rootGeneration) return;
-          const dirNode: FileNode = {
+          const dirNode: FileNode = browser.nodeByPath.get(fullPath) ?? {
             name: entry.name,
             path: fullPath,
             isDirectory: true,
@@ -494,7 +514,7 @@ export function createFileBrowser(
           if (generation !== rootGeneration) return;
           if (pathInfo.isDirectory) {
             const isCycle = pathInfo.realPath ? hasAncestorRealPath(node, pathInfo.realPath) : false;
-            const dirNode: FileNode = {
+            const dirNode: FileNode = browser.nodeByPath.get(fullPath) ?? {
               name: entry.name,
               path: fullPath,
               isDirectory: true,
@@ -513,13 +533,14 @@ export function createFileBrowser(
             continue;
           }
 
-          const symlinkFileNode: FileNode = {
+          const symlinkFileNode: FileNode = browser.nodeByPath.get(fullPath) ?? {
             name: entry.name,
             path: fullPath,
             isDirectory: false,
             isSymlink: true,
             parent: node,
             agentModified: agentModifiedFiles.has(fullPath),
+            observedChanged: observedChangedFiles.has(fullPath),
           };
           files.push(symlinkFileNode);
           browser.nodeByPath.set(fullPath, symlinkFileNode);
@@ -533,16 +554,22 @@ export function createFileBrowser(
           isDirectory: false,
           parent: node,
           agentModified: agentModifiedFiles.has(fullPath),
+          observedChanged: observedChangedFiles.has(fullPath),
         };
         files.push(fileNode);
         browser.nodeByPath.set(fullPath, fileNode);
         queueLineCount(fileNode);
       }
 
-      node.children = [...dirs, ...files];
+      // Keep nodes injected while readdir/realpath was in flight, by exact path.
+      node.children = [
+        ...new Map([...dirs, ...files, ...(node.children ?? [])].map((child) => [child.path, child])).values(),
+      ];
+      sortChildren(node);
+      incompleteDirectories.delete(node);
     } catch {
       if (generation === rootGeneration) {
-        node.children = [];
+        node.children ??= [];
       }
     } finally {
       if (generation === rootGeneration) {
@@ -596,6 +623,7 @@ export function createFileBrowser(
     for (const node of browser.nodeByPath.values()) {
       if (!node.isDirectory) {
         node.agentModified = agentModifiedFiles.has(node.path);
+        node.observedChanged = observedChangedFiles.has(node.path);
       }
     }
   }
@@ -608,15 +636,15 @@ export function createFileBrowser(
     }
   }
 
-  function ensureNode(relPath: string): FileNode | null {
+  function ensureNode(relPath: string, filesystem = false): FileNode | null {
     if (!browser.root) return null;
-    let normalized = relPath.trim();
+    let normalized = filesystem ? relPath : relPath.trim();
     if (!normalized) return null;
-    if (normalized.startsWith("./")) {
+    if (!filesystem && normalized.startsWith("./")) {
       normalized = normalized.slice(2);
     }
-    normalized = normalizeGitPath(normalized);
-    const parts = normalized.split("/").filter(Boolean);
+    if (!filesystem) normalized = normalizeGitPath(normalized);
+    const parts = normalized.split(filesystem ? sep : "/").filter(Boolean);
     if (parts.length === 0) return null;
     if (parts.length - 1 > MAX_TREE_DEPTH) return null;
 
@@ -637,12 +665,11 @@ export function createFileBrowser(
           isDirectory: true,
           realPath: safeRealPathSync(dirPath),
           parent: current,
-          children: [],
+          children: filesystem ? undefined : [],
           expanded: depth < 1,
           hasChangedChildren: false,
         };
-        current.children ??= [];
-        current.children.push(dirNode);
+        ensureChildren(current).push(dirNode);
         sortChildren(current);
         browser.nodeByPath.set(dirPath, dirNode);
       }
@@ -666,15 +693,14 @@ export function createFileBrowser(
         isSymlink: pathInfo.isSymlink,
         realPath: pathInfo.realPath ?? safeRealPathSync(filePath),
         parent: current,
-        children: pathInfo.isSymlink && !isCycle ? undefined : [],
+        children: !isCycle && (filesystem || pathInfo.isSymlink) ? undefined : [],
         expanded: false,
         hasChangedChildren: false,
         gitStatus: gitStatus.get(normalized),
         diffStats: diffStats.get(normalized),
       };
 
-      current.children ??= [];
-      current.children.push(dirNode);
+      ensureChildren(current).push(dirNode);
       sortChildren(current);
       browser.nodeByPath.set(filePath, dirNode);
       return dirNode;
@@ -688,11 +714,11 @@ export function createFileBrowser(
       parent: current,
       gitStatus: gitStatus.get(normalized),
       agentModified: agentModifiedFiles.has(filePath),
+      observedChanged: observedChangedFiles.has(filePath),
       diffStats: diffStats.get(normalized),
     };
 
-    current.children ??= [];
-    current.children.push(fileNode);
+    ensureChildren(current).push(fileNode);
     sortChildren(current);
     browser.nodeByPath.set(filePath, fileNode);
     return fileNode;
@@ -726,6 +752,13 @@ export function createFileBrowser(
       addUntrackedNodes();
     }
 
+    // Session-observed writes can create files after a non-Git scan finished.
+    for (const path of new Set([...agentModifiedFiles, ...observedChangedFiles])) {
+      const relPath = relative(rootPath, path);
+      if (relPath && !isAbsolute(relPath) && relPath !== ".." && !relPath.startsWith(`..${sep}`)) {
+        ensureNode(relPath, true);
+      }
+    }
     applyAgentModified();
     updateTreeStats(browser.root);
     browser.stats = getTreeStats(browser.root);
@@ -762,7 +795,15 @@ export function createFileBrowser(
     gitBranch = repo ? getGitBranch(rootPath) : "";
 
     const newRootNode: FileNode = repo
-      ? buildFileTreeFromPaths(rootPath, getGitFileList(rootPath), gitStatus, diffStats, ignored, agentModifiedFiles)
+      ? buildFileTreeFromPaths(
+          rootPath,
+          getGitFileList(rootPath),
+          gitStatus,
+          diffStats,
+          ignored,
+          agentModifiedFiles,
+          observedChangedFiles,
+        )
       : {
           name: ".",
           path: rootPath,
@@ -818,7 +859,11 @@ export function createFileBrowser(
 
     if (browser.showOnlyChanged) {
       list = list.filter(
-        (f) => f.node.gitStatus || f.node.agentModified || (f.node.isDirectory && f.node.hasChangedChildren),
+        (f) =>
+          f.node.gitStatus ||
+          f.node.agentModified ||
+          f.node.observedChanged ||
+          (f.node.isDirectory && f.node.hasChangedChildren),
       );
     }
 
@@ -860,6 +905,7 @@ export function createFileBrowser(
 
     for (const ancestor of target.ancestors) {
       ancestor.expanded = true;
+      enqueueScan(ancestor, getNodeDepth(ancestor, rootPath), true);
     }
 
     browser.flatList = flattenTree(browser.root);
@@ -874,7 +920,7 @@ export function createFileBrowser(
   function toggleDir(node: FileNode): void {
     if (node.isDirectory) {
       node.expanded = !node.expanded;
-      if (node.expanded && node.children === undefined) {
+      if (node.expanded) {
         enqueueScan(node, getNodeDepth(node, rootPath), true);
       }
       refreshLists();
@@ -1126,7 +1172,7 @@ export function createFileBrowser(
   return {
     render(width: number): string[] {
       const now = Date.now();
-      if (repo && now - browser.lastPollTime > POLL_INTERVAL_MS) {
+      if (now - browser.lastPollTime > POLL_INTERVAL_MS) {
         browser.lastPollTime = now;
         refreshMetadata();
       }

@@ -38,7 +38,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 
 ## Install
 
-Requires Pi `0.84.x` — see the `peerDependencies` range. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
+Supports Pi `0.84.x` and `0.85.x`; tested with `0.85.1` — see the `peerDependencies` range. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
 
 ```bash
 pi install npm:@signalridge/pi-goal

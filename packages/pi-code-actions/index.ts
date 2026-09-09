@@ -116,7 +116,11 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
           return;
         }
       } else {
-        if (!ctx.hasUI) return;
+        if (ctx.mode !== "tui") {
+          if (ctx.hasUI)
+            ctx.ui.notify("The /code picker requires TUI mode. Supply an index and action instead.", "warning");
+          return;
+        }
         const result = await pickSnippet(ctx, snippets);
         if (!result) return;
         snippet = result.snippet;

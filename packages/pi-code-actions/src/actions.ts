@@ -86,6 +86,11 @@ export async function runSnippet(pi: ExtensionAPI, ctx: ExtensionCommandContext,
   const result = await pi.exec(command, args, { cwd: ctx.cwd });
   const output = truncateLines(formatOutput(`${command} ${args.join(" ")}`, result), 200);
 
+  if (ctx.mode !== "tui") {
+    if (ctx.hasUI) ctx.ui.notify(output, result.code === 0 ? "info" : "error");
+    return;
+  }
+
   await ctx.ui.custom<void>((_tui, theme, _kb, done) => {
     const container = new Container();
     container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));

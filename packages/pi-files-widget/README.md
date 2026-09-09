@@ -121,4 +121,5 @@ Diff viewing is built into the file viewer: open a changed tracked file and pres
 - Folder LOCs are shown only when the folder is collapsed (expanded folders would duplicate counts).
 - Line counts load asynchronously; the header shows activity while counts are computed.
 - Large non-git folders load progressively and may show `[partial]` while loading in safe mode.
-- Git status refreshes every 3 seconds while `/readfiles` is open.
+- Change metadata refreshes every 3 seconds while `/readfiles` is open, including outside Git repositories.
+- The robot badge marks successful agent write/edit results. A neutral `~` marks changes observed during a failed or cancelled call: these may be an already-written agent change or a concurrent human save, so authorship is unknown. Both appear in changed-only view and next/previous change navigation. A later successful write confirms attribution; session changes clear both sets.

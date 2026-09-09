@@ -1,10 +1,11 @@
+import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 import {
   type ManagedRoutingPolicy,
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   routingPolicyFingerprint,
 } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import piWorkflows from "../src/index.js";
 
 // Deliberately none of the names the built-in workflows use: a host is free to
@@ -92,12 +93,23 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
       lifecycle.set(event, handler);
       return () => lifecycle.delete(event);
     },
-    ui: { setWidget: (_key: string, content: string[] | undefined) => widgetUpdates.push(content) },
   };
   const ctx = {
     hasUI: false,
-    mode: "print" as const,
-    sessionManager: { getBranch: () => entries },
+    mode: "print" as "print" | "rpc" | "tui",
+    ui: {
+      setWidget: (_key: string, content: string[] | undefined) => widgetUpdates.push(content),
+      confirm: vi.fn(async () => true),
+      input: vi.fn(async () => "input"),
+      select: vi.fn(async () => "choice"),
+    },
+    sessionManager: {
+      getBranch: () =>
+        entries.map((entry) => {
+          const shaped = entry as { type?: unknown };
+          return shaped.type ? entry : { type: "custom", customType: "pi-workflows:journal", data: entry };
+        }),
+    },
   };
   return {
     bus,
@@ -114,7 +126,236 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
   };
 }
 
+type WorkflowTool = {
+  execute: (
+    id: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    onUpdate: undefined,
+    ctx: unknown,
+  ) => Promise<{
+    content: Array<{ type: string; text: string }>;
+    details: { runId: string; status: string; result?: string };
+  }>;
+};
+
+function workflowTool(fixture: ReturnType<typeof createPi>): WorkflowTool {
+  return fixture.toolDefinitions.find((tool) => (tool as { name: string }).name === "workflow") as WorkflowTool;
+}
+
 describe("pi-workflows loader context isolation", () => {
+  for (const kind of ["confirm", "input", "select"] as const) {
+    for (const action of ["tool-abort", "pause", "stop", "dispose", "fatal"] as const) {
+      it(`${action} closes an unanswered ${kind} checkpoint and pairs Pi prompt lifecycle`, async () => {
+        const fixture = createPi(false);
+        const controller = new AbortController();
+        let dialogSignal: AbortSignal | undefined;
+        let pendingDialogs = 0;
+        const dialog = vi.fn(async (_title: string, _value: unknown, options?: { signal?: AbortSignal }) => {
+          dialogSignal = options?.signal;
+          pendingDialogs++;
+          try {
+            return await new Promise<false | undefined>((resolve) => {
+              const close = () => {
+                dialogSignal?.removeEventListener("abort", close);
+                resolve(kind === "confirm" ? false : undefined);
+              };
+              dialogSignal?.addEventListener("abort", close, { once: true });
+              if (dialogSignal?.aborted) close();
+            });
+          } finally {
+            pendingDialogs--;
+          }
+        });
+        // Use Pi's real public UI wrapper: lifecycle pairing must happen on
+        // automatic cancellation, without a synthetic/manual UI response.
+        const runner = new ExtensionRunner([], {} as never, ".", {} as never, {} as never);
+        const emitted = vi.spyOn(runner, "emit").mockResolvedValue(undefined);
+        runner.setUIContext({ ...fixture.ctx.ui, [kind]: dialog } as never, "rpc");
+        const ctx = { ...fixture.ctx, mode: "rpc", hasUI: true, ui: runner.getUIContext() };
+        piWorkflows(fixture.pi as never);
+        await fixture.lifecycle.get("session_start")?.({}, ctx);
+        const checkpoint = `checkpoint("wait", { kind: "${kind}", choices: ["yes"], default: "fallback" })`;
+        const body =
+          action === "fatal"
+            ? `return await Promise.all([${checkpoint}, Promise.resolve().then(() => { throw new Error("fatal"); })]);`
+            : `return await ${checkpoint};`;
+        const pending = workflowTool(fixture).execute(
+          "cancel-checkpoint",
+          { script: `export const meta = { name: "cancel-dialog", description: "test" }; ${body}`, background: false },
+          controller.signal,
+          undefined,
+          ctx,
+        );
+        await vi.waitFor(() => expect(dialog).toHaveBeenCalledOnce());
+        const runId = (
+          fixture.entries.find((entry) => (entry as { kind?: string }).kind === "run_created") as { runId: string }
+        ).runId;
+        if (action === "tool-abort") controller.abort();
+        else if (action === "dispose") await fixture.lifecycle.get("session_shutdown")?.({}, ctx);
+        else if (action !== "fatal") {
+          const control = fixture.toolDefinitions.find(
+            (tool) => (tool as { name: string }).name === "workflow_control",
+          ) as WorkflowTool;
+          await control.execute(action, { action, run_id: runId }, undefined, undefined, ctx);
+        }
+        const cancelled = await pending;
+        if (action === "tool-abort") {
+          expect(cancelled.details.status).toBe("interrupted");
+          expect(cancelled.content.map((part) => part.text).join(" ")).not.toContain("run continues");
+          expect(pendingDialogs).toBe(0);
+        }
+        await vi.waitFor(() => {
+          expect(dialogSignal?.aborted).toBe(true);
+          expect(pendingDialogs).toBe(0);
+          expect(emitted.mock.calls.map(([event]) => event.type)).toEqual(["ui_prompt_start", "ui_prompt_end"]);
+        });
+        expect(fixture.entries.some((entry) => (entry as { kind?: string }).kind === "call_result")).toBe(false);
+        if (action === "tool-abort") {
+          const control = fixture.toolDefinitions.find(
+            (tool) => (tool as { name: string }).name === "workflow_control",
+          ) as WorkflowTool;
+          await control.execute(
+            "resume",
+            { action: "resume", run_id: runId },
+            new AbortController().signal,
+            undefined,
+            ctx,
+          );
+          await vi.waitFor(() =>
+            expect(
+              fixture.entries.some((entry) => {
+                const fact = entry as { kind?: string; status?: string };
+                return fact.kind === "workflow_transition" && fact.status === "completed";
+              }),
+            ).toBe(true),
+          );
+        }
+        await fixture.lifecycle.get("session_shutdown")?.({}, ctx);
+      });
+    }
+  }
+
+  for (const mode of ["rpc", "print"] as const) {
+    it(`foreground checkpoints use ${mode === "rpc" ? "RPC dialogs" : "print defaults"}`, async () => {
+      const fixture = createPi(false);
+      fixture.ctx.mode = mode;
+      fixture.ctx.hasUI = mode === "rpc";
+      piWorkflows(fixture.pi as never);
+      await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+      const result = await workflowTool(fixture).execute(
+        "checkpoint",
+        {
+          script:
+            'export const meta = { name: "dialog", description: "test" }; return await checkpoint("proceed?", { default: "fallback" });',
+          background: false,
+        },
+        undefined,
+        undefined,
+        fixture.ctx,
+      );
+      expect(result.details.status).toBe("completed");
+      expect(result.details.result).toContain(mode === "rpc" ? "true" : "fallback");
+      expect(fixture.ctx.ui.confirm).toHaveBeenCalledTimes(mode === "rpc" ? 1 : 0);
+      expect(fixture.widgetUpdates).toEqual([]);
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+    });
+  }
+
+  it("replays checkpoint answers from the executing context's real branch", async () => {
+    const fixture = createPi(false);
+    fixture.ctx.mode = "rpc";
+    fixture.ctx.hasUI = true;
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const tool = workflowTool(fixture);
+    let releaseCheckpoint: (value: boolean) => void = () => {};
+    fixture.ctx.ui.confirm.mockResolvedValueOnce(true).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseCheckpoint = resolve;
+        }),
+    );
+    const firstPending = tool.execute(
+      "first",
+      {
+        script:
+          'export const meta = { name: "replay", description: "test" }; const answer = await checkpoint("proceed?", { default: false }); await checkpoint("wait"); return answer;',
+        background: false,
+      },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    await vi.waitFor(() => expect(fixture.ctx.ui.confirm).toHaveBeenCalledTimes(2));
+    const runId = (
+      fixture.entries.find((entry) => (entry as { kind?: string }).kind === "run_created") as { runId: string }
+    ).runId;
+    const control = fixture.toolDefinitions.find(
+      (tool) => (tool as { name: string }).name === "workflow_control",
+    ) as WorkflowTool;
+    await control.execute("pause", { action: "pause", run_id: runId }, undefined, undefined, fixture.ctx);
+    const first = await firstPending;
+    releaseCheckpoint(false);
+    await new Promise((resolve) => setImmediate(resolve));
+    // Rebind like a restored session, so replay must come from durable entries.
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const getBranch = vi.fn(fixture.ctx.sessionManager.getBranch);
+    const resumed = await tool.execute(
+      "second",
+      {
+        resumeFromRunId: first.details.runId,
+        script:
+          'export const meta = { name: "replay", description: "test" }; const answer = await checkpoint("proceed?", { default: false }); return answer;',
+        background: false,
+      },
+      undefined,
+      undefined,
+      {
+        ...fixture.ctx,
+        sessionManager: { getBranch },
+      },
+    );
+    expect(getBranch).toHaveBeenCalled();
+    expect(resumed.details.status).toBe("completed");
+    expect(first.details.status).toBe("interrupted");
+    expect(fixture.ctx.ui.confirm).toHaveBeenCalledTimes(2);
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
+
+  it("renders a live TUI run through ctx.ui and releases that UI on shutdown", async () => {
+    const fixture = createPi(false);
+    fixture.ctx.mode = "tui";
+    fixture.ctx.hasUI = true;
+    let resolveConfirm: (value: boolean) => void = () => {};
+    fixture.ctx.ui.confirm.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveConfirm = resolve;
+        }),
+    );
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const pending = workflowTool(fixture).execute(
+      "live",
+      {
+        script: 'export const meta = { name: "live", description: "test" }; return await checkpoint("wait");',
+        background: false,
+      },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    await vi.waitFor(() => expect(fixture.widgetUpdates.some((lines) => lines && lines.length > 0)).toBe(true));
+    resolveConfirm(true);
+    await pending;
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+    expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
+    const updates = fixture.widgetUpdates.length;
+    await Promise.resolve();
+    expect(fixture.widgetUpdates).toHaveLength(updates);
+  });
   it("does not register tools, commands, ping, or journal state in a child session", async () => {
     const fixture = createPi(true);
     let pinged = false;
@@ -192,6 +433,8 @@ describe("pi-workflows loader context isolation", () => {
 
   it("refreshes the widget for a replacement session and clears it on shutdown", async () => {
     const fixture = createPi(false);
+    fixture.ctx.mode = "tui";
+    fixture.ctx.hasUI = true;
     piWorkflows(fixture.pi as never);
     const sessionStart = fixture.lifecycle.get("session_start");
     const sessionShutdown = fixture.lifecycle.get("session_shutdown");

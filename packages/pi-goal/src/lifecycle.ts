@@ -205,6 +205,9 @@ export function registerGoalLifecycle(
 
     const wasPiRetry = runtime.isPiOwnedCompactionRetry(event, runtime.activeGoal.id);
     if (wasPiRetry) return;
+    // Between-tool compaction continues the same low-level run. agent_end owns
+    // its iteration and continuation ticket; creating one here skips that count.
+    if (runtime.agentRunGoalId !== undefined) return;
     runtime.clearGoalRecoveryForGoal(runtime.activeGoal.id);
     runtime.requestContinuation(runtime.activeGoal);
     // Pi emits session_compact before it clears its manual-compaction controller,

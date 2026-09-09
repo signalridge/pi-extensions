@@ -14,7 +14,6 @@ import type {
   BeforeAgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
-  SessionBeforeSwitchEvent,
   SessionShutdownEvent,
   SessionStartEvent,
   ToolCallEvent,
@@ -113,7 +112,16 @@ export default function (pi: ExtensionAPI) {
     running: false,
     sawCommit: false,
   };
+  const commitCandidates = new Set<string>();
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let finalStopReason: StopReason | undefined;
+  let settlementTimer: ReturnType<typeof setTimeout> | undefined;
+  let generation = 0;
+  const cancelSettlement = () => {
+    generation++;
+    if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+    settlementTimer = undefined;
+  };
   const nativeClearTimeout = globalThis.clearTimeout;
 
   const setTitle = (ctx: ExtensionContext, next: StatusState): void => {
@@ -146,15 +154,23 @@ export default function (pi: ExtensionAPI) {
   };
 
   const resetState = (ctx: ExtensionContext, next: StatusState): void => {
+    cancelSettlement();
     status.running = false;
+    finalStopReason = undefined;
+    commitCandidates.clear();
     status.sawCommit = false;
     clearTabTimeout();
     setTitle(ctx, next);
   };
 
   const beginRun = (ctx: ExtensionContext): void => {
+    cancelSettlement();
+    if (!status.running) {
+      commitCandidates.clear();
+      status.sawCommit = false;
+    }
+    finalStopReason = undefined;
     status.running = true;
-    status.sawCommit = false;
     setTitle(ctx, "running");
     resetTimeout(ctx);
   };
@@ -172,9 +188,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event: SessionStartEvent, ctx) => {
     resetState(ctx, "new");
   });
-  pi.on("session_before_switch", async (event: SessionBeforeSwitchEvent, ctx) => {
-    resetState(ctx, event.reason === "new" ? "new" : "doneCommitted");
-  });
   pi.on("before_agent_start", async (_event: BeforeAgentStartEvent, ctx) => {
     markActivity(ctx);
   });
@@ -185,26 +198,48 @@ export default function (pi: ExtensionAPI) {
     markActivity(ctx);
   });
   pi.on("tool_call", async (event: ToolCallEvent, ctx) => {
-    if (event.toolName === "bash") {
+    if (event.toolName === "bash" || event.toolName === "powershell") {
       const command = typeof event.input.command === "string" ? event.input.command : "";
-      if (command && GIT_COMMIT_RE.test(command)) status.sawCommit = true;
+      if (command && GIT_COMMIT_RE.test(command)) commitCandidates.add(event.toolCallId);
     }
     markActivity(ctx);
   });
-  pi.on("tool_result", async (_event: ToolResultEvent, ctx) => {
+  pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
+    if (commitCandidates.delete(event.toolCallId) && !event.isError) status.sawCommit = true;
     markActivity(ctx);
   });
-  pi.on("agent_end", async (event: AgentEndEvent, ctx) => {
+  pi.on("agent_end", async (event: AgentEndEvent) => {
+    finalStopReason = getStopReason(event.messages);
+  });
+  const settle = (ctx: ExtensionContext, owner: number): void => {
+    if (owner !== generation) return;
+    // A prior observer can start manual compaction, whose terminal hook runs
+    // before isIdle flips and does not cause another agent_settled event.
+    if (!ctx.isIdle()) {
+      settlementTimer = setTimeout(() => settle(ctx, owner), 25);
+      settlementTimer.unref?.();
+      return;
+    }
+    settlementTimer = undefined;
     status.running = false;
+    commitCandidates.clear();
     clearTabTimeout();
-    const stopReason = getStopReason(event.messages);
-    if (stopReason === "error") {
+    if (finalStopReason === "error") {
       setTitle(ctx, "timeout");
       return;
     }
     setTitle(ctx, status.sawCommit ? "doneCommitted" : "doneNoCommit");
+  };
+  pi.on("agent_settled", async (_event, ctx) => {
+    cancelSettlement();
+    settle(ctx, generation);
   });
   pi.on("session_shutdown", async (_event: SessionShutdownEvent, ctx) => {
+    cancelSettlement();
+    status.running = false;
+    status.sawCommit = false;
+    finalStopReason = undefined;
+    commitCandidates.clear();
     clearTabTimeout();
     if (!ctx.hasUI) return;
     ctx.ui.setTitle(formatIdleTabTitle(ctx.cwd));
