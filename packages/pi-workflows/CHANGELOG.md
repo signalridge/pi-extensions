@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.7.1
+### Patch Changes
+
+- 1f586f8: Preserve resumable cancellation when a workflow pauses during successful timeout cleanup, and retain finalized subagent output alongside observer failures. Avoid retaining descendant-owned mouse gestures in bordered components. Track successful writes using final rewritten paths, and distinguish uncertain changes observed during failed calls from confirmed agent modifications while keeping both discoverable in file browsing. Preserve exact filesystem paths and lazy-directory scan state when discovering session-observed changes, including changes injected during an active scan.
+- 1f586f8: - Bound workflow cancellation drains and durably fence unconfirmed cleanup, aborting sibling agents and releasing foreground callers.
+  - Await managed timeout cleanup before script continuation and terminal publication.
+  - Keep failed retry text and length responses discarded by overflow-compaction retry out of successful subagent fallbacks, while retaining valid pre-compaction and non-retried length output.
+  - Account for native prompts spanning reporter activation without dropping out-of-order wait debt.
+  - Reconcile settlement after observer-triggered manual compaction with run/session ownership.
+  - Preserve clipped overlay hit ranges and native container ancestry for editor autocomplete focus.
+  - Reconcile errored writes and edits against pre/post mutation evidence, retaining invocation cwd and releasing evidence when blocked or aborted preflight bypasses tool results.
+- d9219d4: Correct shipped documentation that contradicted the code or the manifest.
+  
+  - `pi-subagents`: the summary line still advertised protocol-v3 spawning while
+    the feature list and the managed-spawn section described v4.
+  - `pi-worktree`: the workspace-switching section named `/tree`; the registered
+    command is `/worktree`.
+  - `pi-workflows`: removed an orphaned sentence fragment left behind by an edit
+    to the saved-workflow paragraph.
+  - `pi-plan-mode`, `pi-goal`, `pi-usage-extension`: the stated Pi floor
+    (`0.80.6`, `0.42.4+`) contradicted the declared `^0.84.0` peer range, which
+    resolves to `0.84.x`. `pi-usage-extension` also carried a "Last updated"
+    stamp from a version that predates the workspace baseline.
+  - `pi-welcome`: the example card was a real session capture. It is now a
+    generic sample, and Install moved above the configuration sections instead of
+    sitting below them.
+- 1f586f8: Preserve Codex opaque checkpoints across Pi's retry-only assistant-tail removal using optional, fingerprint-verified version-1 proof plus explicit lifecycle provenance. Preserve that provenance across same-runtime reload without confusing a new identical assistant response with the persisted tail; persisted rebuilds reset it and unknown provenance fails closed. Bound BTW context and tool-argument construction, including suffix-key storage for wide JSON-shaped objects (enumeration remains linear). Balance out-of-order native UI waiting notifications without affecting manual blocked ownership. Foreground workflow cancellation waits for exact-owner quiescence even when stop is unavailable or rejects after reconciliation already stopped the child, including cancelled spawn allocation recovery; unconfirmed cleanup becomes durably non-resumable with a diagnostic retaining any stop error. Background execution remains detached.
+  
+  These are corrective changes: existing checkpoint fields, exports, and cross-extension protocols remain compatible, so no protocol or major-version bump is required.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+- 1f586f8: Keep goal iteration and continuation numbering correct when Pi compacts between tool results and the next response within one run. Preserve existing response limits and manual/post-run compaction handling.
+  
+  Capture subagent invocation results from finalized assistant events with bounded message retention so compaction cannot hide a final error or mix in historical output. Recognize explicitly selected PowerShell when the host provides it, without requiring its export on older Pi versions or expanding default wildcard tools.
+  
+  Use real session contexts for workflow replay and live TUI progress, release widget bindings on shutdown, and allow foreground checkpoint dialogs in RPC mode while retaining print-mode defaults. Cancel unanswered dialogs with their owning execution on tool abort, pause, stop, disposal, or fatal failure without journaling cancelled answers.
+
 ## 1.7.0
 ### Minor Changes
 

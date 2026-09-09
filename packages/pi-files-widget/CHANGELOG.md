@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.2.4
+### Patch Changes
+
+- 1f586f8: Preserve resumable cancellation when a workflow pauses during successful timeout cleanup, and retain finalized subagent output alongside observer failures. Avoid retaining descendant-owned mouse gestures in bordered components. Track successful writes using final rewritten paths, and distinguish uncertain changes observed during failed calls from confirmed agent modifications while keeping both discoverable in file browsing. Preserve exact filesystem paths and lazy-directory scan state when discovering session-observed changes, including changes injected during an active scan.
+- 1f586f8: - Bound workflow cancellation drains and durably fence unconfirmed cleanup, aborting sibling agents and releasing foreground callers.
+  - Await managed timeout cleanup before script continuation and terminal publication.
+  - Keep failed retry text and length responses discarded by overflow-compaction retry out of successful subagent fallbacks, while retaining valid pre-compaction and non-retried length output.
+  - Account for native prompts spanning reporter activation without dropping out-of-order wait debt.
+  - Reconcile settlement after observer-triggered manual compaction with run/session ownership.
+  - Preserve clipped overlay hit ranges and native container ancestry for editor autocomplete focus.
+  - Reconcile errored writes and edits against pre/post mutation evidence, retaining invocation cwd and releasing evidence when blocked or aborted preflight bypasses tool results.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+- d9219d4: Converge every README on one house style: plain sentence-case headings, no
+  decorative emoji.
+  
+  Ten packages carried an emoji heading scheme inherited from their upstream
+  forks while the other nineteen used plain headings, so the same monorepo
+  rendered as two unrelated projects on npmjs.com. Headings are now emoji-free
+  and titles are sentence case.
+  
+  Also removes the `Keywords` section from those ten. It duplicated each
+  package's `package.json` `keywords` field, which is what npm actually indexes,
+  and no plain-style README carried one. `Installation` is now `Install`
+  everywhere.
+  
+  Headings that were Title Case are sentence case too, so one convention now
+  covers the whole monorepo. Existing in-page anchor links are unaffected:
+  GitHub lowercases heading slugs already.
+  
+  Documentation only — no runtime change.
+- 1f586f8: Cancel RPC question dialogs at the host, serialize LSP fixes with native file edits when the host provides a mutation queue, resolve workspace paths against session context, track successful shell commits, and report terminal-only commands explicitly over RPC.
+
 ## 1.2.3
 ### Patch Changes
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.3
+### Patch Changes
+
+- 1f586f8: Include real tool-result text in bounded side-question context, select remote checkpoints at Pi's effective compaction boundary, honor the public agent directory, restore branch-owned stamp state on tree navigation, and preserve commit evidence through retries until agent settlement.
+- 1f586f8: - Bound workflow cancellation drains and durably fence unconfirmed cleanup, aborting sibling agents and releasing foreground callers.
+  - Await managed timeout cleanup before script continuation and terminal publication.
+  - Keep failed retry text and length responses discarded by overflow-compaction retry out of successful subagent fallbacks, while retaining valid pre-compaction and non-retried length output.
+  - Account for native prompts spanning reporter activation without dropping out-of-order wait debt.
+  - Reconcile settlement after observer-triggered manual compaction with run/session ownership.
+  - Preserve clipped overlay hit ranges and native container ancestry for editor autocomplete focus.
+  - Reconcile errored writes and edits against pre/post mutation evidence, retaining invocation cwd and releasing evidence when blocked or aborted preflight bypasses tool results.
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+- 1f586f8: Cancel RPC question dialogs at the host, serialize LSP fixes with native file edits when the host provides a mutation queue, resolve workspace paths against session context, track successful shell commits, and report terminal-only commands explicitly over RPC.
+
 ## 1.2.2
 ### Patch Changes
 

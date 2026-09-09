@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.1
+### Patch Changes
+
+- 1f586f8: Expand Pi peer support to `^0.84.0 || ^0.85.0`, retaining 0.84 compatibility while admitting 0.85 releases. The previous zero-major caret range excluded Pi 0.85.1. Update existing Pi development dependency pins to 0.85.1.
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+- Updated dependencies [1f586f8]
+  - @signalridge/pi-ui@1.3.1
+
 ## 1.4.0
 ### Minor Changes
 
