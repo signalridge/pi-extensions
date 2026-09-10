@@ -1606,6 +1606,16 @@ export async function runWorkflow<T = unknown>(
     shared.physicalAgentCount++;
 
     return limiter(async () => {
+      // Keep lexical identity, scope, thread ownership and cap reservations above
+      // synchronous, but leave the timed VM bootstrap before invoking host code.
+      // Even an immediately available limiter slot must yield: synchronous spawn
+      // setup can outlast the script watchdog and interrupt RPC promise creation
+      // before its callers attach rejection/cleanup handlers. The returned call
+      // is now tracked before dispatch, and a bootstrap timeout cancels it here.
+      await Promise.resolve();
+      throwIfAborted();
+      if (batch?.cancelled) throw agentLimitError();
+
       const timeout = agentOptions.timeoutMs !== undefined ? agentOptions.timeoutMs : agentTimeoutMs;
       const retryAttempts = normalizeAgentRetries(agentOptions.retries ?? options.agentRetries ?? 0);
       const maxAttempts = retryAttempts + 1;
