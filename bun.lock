@@ -401,7 +401,7 @@
     },
     "packages/pi-workflows": {
       "name": "@signalridge/pi-workflows",
-      "version": "1.7.1",
+      "version": "1.7.2",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.5.0",
         "@sinclair/typebox": "^0.34.50",
