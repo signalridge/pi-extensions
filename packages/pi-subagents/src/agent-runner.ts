@@ -1126,7 +1126,9 @@ export async function runAgent(
   const supervisorTools =
     ctx.hasUI && !isolated && options.supervisorQuestions !== false
       ? createSupervisorTool({
-          agentLabel: agentConfig?.displayName ?? type,
+          // Use the canonical agent type, not display_name: the question must
+          // identify the actual subagent that requested the decision.
+          agentLabel: agentConfig?.name ?? type,
           ask: {
             input: (title, placeholder) => ctx.ui.input(title, placeholder),
             select: (title, choices) => ctx.ui.select(title, choices),

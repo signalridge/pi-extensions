@@ -59,6 +59,7 @@ describe("asking", () => {
       question: "Which database?",
     });
     expect(asker.input).toHaveBeenCalled();
+    expect(asker.input.mock.calls[0][0]).toContain("Reviewer asks: Which database?");
     expect(textOf(result)).toContain("answered");
   });
 
@@ -67,7 +68,7 @@ describe("asking", () => {
     await run(only(build(asker, "Migration Planner")), {
       question: "Which database?",
     });
-    expect(asker.input.mock.calls[0][0]).toContain("Migration Planner");
+    expect(asker.input.mock.calls[0][0]).toContain("Migration Planner asks: Which database?");
   });
 
   it("uses a picker when the child offers concrete options", async () => {
@@ -156,7 +157,7 @@ describe("untrusted child text", () => {
   it("neutralizes an escape sequence in the question", async () => {
     const asker = ask();
     await run(only(build(asker)), { question: "evil\u001B[31mred" });
-    expect(asker.input.mock.calls[0][1]).not.toContain("\u001B[");
+    expect(asker.input.mock.calls[0][0]).not.toContain("\u001B[");
   });
 
   it("neutralizes an escape sequence in an option label", async () => {
@@ -171,7 +172,7 @@ describe("untrusted child text", () => {
   it("bounds a very long question", async () => {
     const asker = ask();
     await run(only(build(asker)), { question: "x".repeat(10_000) });
-    expect(asker.input.mock.calls[0][1].length).toBeLessThanOrEqual(2_000);
+    expect(asker.input.mock.calls[0][0].length).toBeLessThanOrEqual(2_020);
   });
 
   it("bounds a very long option label", async () => {
