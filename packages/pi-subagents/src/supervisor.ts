@@ -36,7 +36,7 @@ export interface SupervisorAsk {
 export interface SupervisorToolContext {
   /** The parent's UI. Omitted when there is no human to ask. */
   ask?: SupervisorAsk;
-  /** Display name of the asking agent, for the prompt title. */
+  /** Actual type/name of the asking agent, for the prompt title. */
   agentLabel: string;
 }
 
@@ -82,7 +82,10 @@ export function createSupervisorTool(context: SupervisorToolContext) {
         const question = truncateCodePoints(sanitizeDisplayText(params.question), MAX_QUESTION, "…").trim();
         if (!question) return textResult("Ask a non-empty question.", true);
 
-        const title = `${context.agentLabel} asks`;
+        const title = `${sanitizeDisplayText(context.agentLabel)} asks`;
+        // Pi 0.85.1 ignores ui.input()'s placeholder argument. Keep the
+        // question in the title so the human sees it in both old and new hosts.
+        const promptTitle = `${title}: ${question}`;
         const options = (params.options ?? [])
           .map((option) => truncateCodePoints(sanitizeDisplayText(option), MAX_OPTION, "…").trim())
           .filter((option) => option.length > 0)
@@ -92,8 +95,8 @@ export function createSupervisorTool(context: SupervisorToolContext) {
         try {
           answer =
             options.length > 0
-              ? await ask.select(`${title}: ${question}`, options)
-              : await ask.input(title, question);
+              ? await ask.select(promptTitle, options)
+              : await ask.input(promptTitle);
         } catch (error: unknown) {
           // A dialog that cannot open must not fail the child's whole run; it
           // is told nobody answered and carries on under its own judgement.
