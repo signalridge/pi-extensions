@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.2
+### Patch Changes
+
+- 65e2481: Show supervisor questions in subagent input dialogs and identify the asking agent by its actual name.
+
 ## 1.10.1
 ### Patch Changes
 
