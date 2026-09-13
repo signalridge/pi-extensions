@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.7.3
+### Patch Changes
+
+- e04f729: Remove repeated copies of the workflow arming reminder while preserving other input hooks.
+
 ## 1.7.2
 ### Patch Changes
 
