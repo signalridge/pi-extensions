@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
+import {
+  DEFAULT_TRIGGER_WORD,
+  deduplicateWorkflowDirective,
+  hasTriggerWord,
+  WORKFLOW_ARMED_DIRECTIVE,
+} from "../src/arming.js";
 
 describe("hasTriggerWord — what counts as typing the word", () => {
   it("arms on the bare word", () => {
@@ -101,8 +106,11 @@ describe("WORKFLOW_ARMED_DIRECTIVE", () => {
     expect(WORKFLOW_ARMED_DIRECTIVE).toContain("stall");
   });
 
-  it("is detectable in an already-annotated message, so it cannot stack", () => {
-    const armed = `run a workflow\n\n${WORKFLOW_ARMED_DIRECTIVE}`;
-    expect(armed.includes(WORKFLOW_ARMED_DIRECTIVE)).toBe(true);
+  it("keeps one directive when an earlier hook added it more than once", () => {
+    const armed = `run a workflow\n\n${WORKFLOW_ARMED_DIRECTIVE}\nEffort: ULTRA\n\n${WORKFLOW_ARMED_DIRECTIVE}`;
+    const deduplicated = deduplicateWorkflowDirective(armed);
+
+    expect(deduplicated).toBe(`run a workflow\n\n${WORKFLOW_ARMED_DIRECTIVE}\nEffort: ULTRA\n\n`);
+    expect(deduplicated.split(WORKFLOW_ARMED_DIRECTIVE)).toHaveLength(2);
   });
 });

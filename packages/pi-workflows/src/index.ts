@@ -3,7 +3,12 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMED_DIRECTIVE } from "./arming.js";
+import {
+  DEFAULT_TRIGGER_WORD,
+  deduplicateWorkflowDirective,
+  hasTriggerWord,
+  WORKFLOW_ARMED_DIRECTIVE,
+} from "./arming.js";
 import { BUILTIN_WORKFLOWS, validateBuiltinArgs } from "./builtins.js";
 import { type CommandResult, resolveCodeReviewScope } from "./code-review-scope.js";
 import { type ScriptStartOptions, type ScriptStartResult, WorkflowEngine, WorkflowWaitAbortedError } from "./engine.js";
@@ -952,6 +957,14 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // question. Nothing is swallowed and no UI opens.
     pi.on("input", (event) => {
       if (event.source === "extension") return { action: "continue" as const };
+      const deduplicatedText = deduplicateWorkflowDirective(event.text);
+      if (deduplicatedText !== event.text) {
+        return {
+          action: "transform" as const,
+          text: deduplicatedText,
+          ...(event.images ? { images: event.images } : {}),
+        };
+      }
       const explicitTrigger = keywordTriggerEnabled && hasTriggerWord(event.text, triggerKeyword);
       const substantive = effortLevel !== "off" && event.text.trim().length >= 16 && !event.text.trim().startsWith("/");
       if (!explicitTrigger && !substantive) return { action: "continue" as const };
@@ -967,6 +980,29 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         text: `${event.text}\n\n${WORKFLOW_ARMED_DIRECTIVE}${effortDirective ? `\n${effortDirective}` : ""}`,
         ...(event.images ? { images: event.images } : {}),
       };
+    });
+
+    // Input transforms can be chained with handlers loaded after this package.
+    // Normalize only our own repeated marker again at the final context boundary;
+    // unrelated plugin content and hooks remain untouched.
+    pi.on("context", (event) => {
+      type UserMessage = Extract<(typeof event.messages)[number], { role: "user" }>;
+      let lastUserIndex = -1;
+      let lastUserMessage: UserMessage | undefined;
+      for (let index = 0; index < event.messages.length; index += 1) {
+        const message = event.messages[index];
+        if (message && "role" in message && message.role === "user") {
+          lastUserIndex = index;
+          lastUserMessage = message;
+        }
+      }
+      const message = lastUserMessage;
+      if (lastUserIndex < 0 || !message || !("content" in message) || typeof message.content !== "string") return;
+      const deduplicatedText = deduplicateWorkflowDirective(message.content);
+      if (deduplicatedText === message.content) return;
+      const messages = event.messages.slice();
+      messages[lastUserIndex] = { ...message, content: deduplicatedText };
+      return { messages };
     });
 
     // Standing effort mode mirrors the reference: it auto-arms substantive

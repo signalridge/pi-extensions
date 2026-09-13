@@ -6,6 +6,7 @@ import {
   routingPolicyFingerprint,
 } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
+import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
 import piWorkflows from "../src/index.js";
 
 // Deliberately none of the names the built-in workflows use: a host is free to
@@ -380,6 +381,29 @@ describe("pi-workflows loader context isolation", () => {
     expect(fixture.commands).toContain("deep-research");
     expect(fixture.commands).toContain("code-review");
     expect(fixture.commands).toContain("effort");
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
+
+  it("deduplicates the workflow marker at the final context boundary", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+
+    const handler = fixture.lifecycle.get("context");
+    if (!handler) throw new Error("workflow context handler is missing");
+    const duplicate = `keep this\n\n${WORKFLOW_ARMED_DIRECTIVE}\nOther plugin guidance\n\n${WORKFLOW_ARMED_DIRECTIVE}`;
+    const result = (await handler(
+      {
+        messages: [
+          { role: "user", content: duplicate },
+          { role: "assistant", content: [] },
+        ],
+      },
+      fixture.ctx,
+    )) as { messages?: Array<{ content?: unknown }> } | undefined;
+
+    expect(result?.messages?.[0]?.content).toBe(`keep this\n\n${WORKFLOW_ARMED_DIRECTIVE}\nOther plugin guidance\n\n`);
+    expect(result?.messages?.[1]?.content).toEqual([]);
     await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
   });
 
