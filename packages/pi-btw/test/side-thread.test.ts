@@ -179,6 +179,24 @@ test("side thread sends prior successful turns and injects main context only onc
   );
 });
 
+test("side thread applies the auth-resolved endpoint before streaming", async () => {
+  let capturedModel: Model<Api> | undefined;
+  const result = await completeSideThreadTurn({
+    thread: createSideThread("context"),
+    question: "Which endpoint?",
+    model: { provider: "test", id: "side", baseUrl: "https://default.example" } as Model<Api>,
+    auth: { apiKey: "key", baseUrl: "https://enterprise.example" },
+    thinkingLevel: "off",
+    completeSimple: async (model) => {
+      capturedModel = model;
+      return response("enterprise");
+    },
+  });
+
+  assert.equal(result.kind, "answered");
+  assert.equal(capturedModel?.baseUrl, "https://enterprise.example");
+});
+
 test("side thread discards a late successful response after cancellation", async () => {
   const thread = createSideThread("context");
   const controller = new AbortController();

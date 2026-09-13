@@ -314,7 +314,7 @@ export function installExtensionToolScope(
       }
       // Scope first, then approval: a tool this agent may not use at all is
       // refused without troubling the user about it.
-      const gated = await askGate?.(context.toolCall.name, (context.toolCall as { input?: unknown }).input);
+      const gated = await askGate?.(context.toolCall.name, context.args);
       if (gated) return gated;
       return priorBeforeToolCall?.(context, signal);
     };
@@ -1312,7 +1312,7 @@ export async function runAgent(
     const priorBeforeToolCall = session.agent.beforeToolCall;
     session.agent.beforeToolCall = async (context, signal) => {
       const run = async () => {
-        const gated = await askGate(context.toolCall.name, (context.toolCall as { input?: unknown }).input);
+        const gated = await askGate(context.toolCall.name, context.args);
         if (gated) return gated;
         return priorBeforeToolCall?.(context, signal);
       };

@@ -15,6 +15,7 @@ export type BtwThinkingLevel = (typeof BTW_THINKING_LEVELS)[number];
 
 export interface SideQuestionAuth {
   apiKey?: string;
+  baseUrl?: string;
   headers?: ProviderHeaders;
   env?: Record<string, string>;
 }
@@ -93,8 +94,9 @@ export async function completeSideThreadTurn({
 }: CompleteSideThreadTurnOptions): Promise<CompleteSideThreadTurnResult> {
   if (signal?.aborted) return { kind: "aborted" };
   try {
+    const requestModel = withResolvedBaseUrl(model, auth);
     const response = await completeSimple(
-      model,
+      requestModel,
       { systemPrompt: SYSTEM_PROMPT, messages: buildSideThreadMessages(thread, question) },
       buildStreamOptions(auth, thinkingLevel, signal),
     );
@@ -137,8 +139,9 @@ export async function completeSideQuestion({
   signal,
   completeSimple,
 }: CompleteSideQuestionOptions): Promise<AssistantMessage> {
+  const requestModel = withResolvedBaseUrl(model, auth);
   return completeSimple(
-    model,
+    requestModel,
     {
       systemPrompt: SYSTEM_PROMPT,
       messages: [createUserMessage(buildUserPrompt(question, conversationContext))],
@@ -188,6 +191,10 @@ function createUserMessage(text: string): UserMessage {
     content: [{ type: "text", text }],
     timestamp: Date.now(),
   };
+}
+
+function withResolvedBaseUrl<TApi extends Api>(model: Model<TApi>, auth: SideQuestionAuth): Model<TApi> {
+  return auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 }
 
 function buildStreamOptions(

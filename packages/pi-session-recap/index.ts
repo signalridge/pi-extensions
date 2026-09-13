@@ -226,6 +226,10 @@ async function generateRecap(
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth?.ok) return undefined;
 
+  // The compatibility stream functions bypass Pi's request preparation, so preserve
+  // any credential-specific endpoint (for example, GitHub Copilot Enterprise).
+  const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+
   const prompt =
     (recapContext.broaderContext ? `Broader session context:\n${recapContext.broaderContext}\n\n` : "") +
     "The user stepped away and is coming back. Write exactly 1-3 short sentences. " +
@@ -256,13 +260,13 @@ async function generateRecap(
   try {
     // Recaps never need reasoning; keep the common options identical for both
     // completion paths and only add the Codex-specific explicit override.
-    if (model.api === "openai-codex-responses") {
-      response = await complete(model, context, {
+    if (requestModel.api === "openai-codex-responses") {
+      response = await complete(requestModel, context, {
         ...options,
         reasoningEffort: "none",
       });
     } else {
-      response = await completeSimple(model, context, options);
+      response = await completeSimple(requestModel, context, options);
     }
   } catch (err) {
     // completeSimple cannot route custom handlers registered only inside Pi.

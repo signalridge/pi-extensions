@@ -119,7 +119,7 @@ test("resolveBtwModel accepts header-only and environment-only configured auth",
   }
 });
 
-test("resolveBtwModel preserves deletion markers without treating null-only headers as auth", async () => {
+test("resolveBtwModel trusts Pi auth success, including ambient credentials", async () => {
   const configuredModel = { provider: "custom", id: "side" } as Model<Api>;
   const mixedHeaders = { Authorization: null, "X-Provider-Token": "test" };
   const mixed = await resolveBtwModel({
@@ -132,21 +132,55 @@ test("resolveBtwModel preserves deletion markers without treating null-only head
   });
   assert.deepEqual(mixed?.auth.headers, mixedHeaders);
 
-  const warnings: string[] = [];
-  const nullOnly = await resolveBtwModel({
+  const ambient = await resolveBtwModel({
+    settings: { model: "custom/side" },
+    currentModel: undefined,
+    modelRegistry: {
+      find: () => configuredModel,
+      // Pi uses ok:true with no explicit fields for ambient credentials such as
+      // AWS profiles and task roles.
+      getApiKeyAndHeaders: async () => ({ ok: true as const }),
+    } as never,
+  });
+  assert.equal(ambient?.model, configuredModel);
+  assert.equal(ambient?.auth.apiKey, undefined);
+  assert.equal(ambient?.auth.headers, undefined);
+  assert.equal(ambient?.auth.env, undefined);
+});
+
+test("resolveBtwModel applies an auth-resolved endpoint to configured and current models", async () => {
+  const configuredModel = { provider: "custom", id: "side", baseUrl: "https://default.example" } as Model<Api>;
+  const configured = await resolveBtwModel({
     settings: { model: "custom/side" },
     currentModel: undefined,
     modelRegistry: {
       find: () => configuredModel,
       getApiKeyAndHeaders: async () => ({
         ok: true as const,
-        headers: { Authorization: null },
+        apiKey: "token",
+        baseUrl: "https://enterprise.example",
       }),
     } as never,
-    warn: (message) => warnings.push(message),
   });
-  assert.equal(nullOnly, undefined);
-  assert.match(warnings[0] ?? "", /no request credentials/u);
+  assert.notEqual(configured?.model, configuredModel);
+  assert.equal(configured?.model.baseUrl, "https://enterprise.example");
+  assert.equal(configured?.auth.baseUrl, "https://enterprise.example");
+
+  const currentModel = { provider: "current", id: "main", baseUrl: "https://default.example" } as Model<Api>;
+  const current = await resolveBtwModel({
+    settings: {},
+    currentModel,
+    modelRegistry: {
+      find: () => undefined,
+      getApiKeyAndHeaders: async () => ({
+        ok: true as const,
+        apiKey: "token",
+        baseUrl: "https://current-enterprise.example",
+      }),
+    } as never,
+  });
+  assert.notEqual(current?.model, currentModel);
+  assert.equal(current?.model.baseUrl, "https://current-enterprise.example");
 });
 
 test("resolveBtwModel inherits current model when no model is configured", async () => {
@@ -166,10 +200,7 @@ test("resolveBtwModel inherits current model when no model is configured", async
 
 test("resolveBtwModel warns and falls back for unavailable configured models", async () => {
   const currentModel = { provider: "current", id: "main" } as Model<Api>;
-  for (const configuredAuth of [
-    { ok: true as const, apiKey: undefined },
-    { ok: false as const, error: "credential command failed" },
-  ]) {
+  for (const configuredAuth of [{ ok: false as const, error: "credential command failed" }]) {
     const configuredModel = { provider: "other", id: "side" } as Model<Api>;
     const warnings: string[] = [];
     const result = await resolveBtwModel({

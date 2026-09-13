@@ -9,8 +9,8 @@ import sessionRecap from "../index.ts";
 const calls = [];
 
 function stubStream(kind, api) {
-  return (_model, _context, options) => {
-    calls.push({ kind, api, options });
+  return (model, _context, options) => {
+    calls.push({ kind, api, model, options });
     return {
       result: async () => ({
         role: "assistant",
@@ -61,6 +61,7 @@ const auth = {
   apiKey: undefined,
   headers: { "x-test-header": "present" },
   env: { TEST_AUTH_MODE: "ambient" },
+  baseUrl: "https://enterprise.example",
 };
 
 function makeCtx(model) {
@@ -114,10 +115,12 @@ const nonCodex = calls.find((call) => call.api === "anthropic-messages");
 
 assert.ok(codex, "codex recap should have issued a request");
 assert.equal(codex.kind, "stream", "codex recaps must use complete(), not completeSimple()");
+assert.equal(codex.model.baseUrl, auth.baseUrl, "codex recaps must honor the auth-resolved endpoint");
 assert.equal(codex.options.reasoningEffort, "none", "codex recaps must disable reasoning explicitly");
 
 assert.ok(nonCodex, "non-Codex recap should have issued a request");
 assert.equal(nonCodex.kind, "streamSimple", "other apis keep using completeSimple()");
+assert.equal(nonCodex.model.baseUrl, auth.baseUrl, "simple recaps must honor the auth-resolved endpoint");
 assert.equal(nonCodex.options.reasoning, undefined, "non-Codex recaps omit reasoning");
 assert.equal(nonCodex.options.reasoningEffort, undefined, "completeSimple receives no reasoningEffort");
 

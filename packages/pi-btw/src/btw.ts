@@ -1,10 +1,4 @@
-import {
-  type Api,
-  clampThinkingLevel,
-  getSupportedThinkingLevels,
-  type Model,
-  type ProviderHeaders,
-} from "@earendil-works/pi-ai";
+import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import {
   BorderedLoader,
   type ExtensionAPI,
@@ -138,8 +132,8 @@ export async function resolveBtwModel({
       const fallbackAction = sameAsCurrent ? "no distinct current model is available" : `falling back to ${fallback}`;
       try {
         const auth = await modelRegistry.getApiKeyAndHeaders(configuredModel);
-        if (auth.ok && hasRequestAuth(auth)) return { model: configuredModel, auth };
-        const reason = auth.ok ? "has no request credentials" : auth.error;
+        if (auth.ok) return { model: withResolvedBaseUrl(configuredModel, auth), auth };
+        const reason = auth.error;
         reportWarning(`pi-btw model ${settings.model} is unavailable (${reason}); ${fallbackAction}.`);
       } catch (error: unknown) {
         reportWarning(`pi-btw model ${settings.model} credentials failed (${formatError(error)}); ${fallbackAction}.`);
@@ -151,21 +145,15 @@ export async function resolveBtwModel({
   if (!currentModel) return undefined;
   try {
     const auth = await modelRegistry.getApiKeyAndHeaders(currentModel);
-    if (auth.ok && hasRequestAuth(auth)) return { model: currentModel, auth };
+    if (auth.ok) return { model: withResolvedBaseUrl(currentModel, auth), auth };
   } catch {
     // The caller reports the final lack of an available model.
   }
   return undefined;
 }
 
-function hasRequestAuth(auth: SideQuestionAuth): boolean {
-  return Boolean(
-    auth.apiKey || providerHeadersHaveValue(auth.headers) || (auth.env && Object.keys(auth.env).length > 0),
-  );
-}
-
-function providerHeadersHaveValue(headers: ProviderHeaders | undefined): boolean {
-  return headers !== undefined && Object.values(headers).some((value) => value !== null);
+function withResolvedBaseUrl(model: Model<Api>, auth: SideQuestionAuth): Model<Api> {
+  return auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 }
 
 export async function loadBtwThinkingLevel(

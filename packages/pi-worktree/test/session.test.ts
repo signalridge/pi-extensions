@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
-import { switchToWorktree } from "../src/session.js";
+import { sessionCwdMatches, switchToWorktree } from "../src/session.js";
 import { createMockContext } from "./support.js";
 
 function assistant(text: string) {
@@ -26,6 +26,12 @@ function assistant(text: string) {
     timestamp: Date.now(),
   };
 }
+
+test("session cwd comparison accepts equivalent Windows spellings and rejects different paths", () => {
+  const windowsResolve = (value: string) => win32.resolve(value);
+  assert.equal(sessionCwdMatches("C:\\work\\target", "C:/work/target", windowsResolve), true);
+  assert.equal(sessionCwdMatches("C:\\work\\target", "C:/work/other", windowsResolve), false);
+});
 
 test("switchToWorktree forks persisted conversation into a target-cwd session", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-worktree-session-"));
