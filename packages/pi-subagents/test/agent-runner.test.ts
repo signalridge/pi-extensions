@@ -1659,6 +1659,79 @@ describe("agent-runner async extension tool registration", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("passes validated tool arguments to ask_tools approval", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: true, askTools: ["foo_tool"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const confirm = vi.fn(async () => true);
+
+    await runAgent(
+      {
+        ...ctx,
+        hasUI: true,
+        ui: { confirm },
+      },
+      "Explore",
+      "go",
+      { pi, supervisorQuestions: false },
+    );
+
+    await session.agent.beforeToolCall?.({
+      toolCall: {
+        type: "toolCall",
+        id: "call-1",
+        name: "foo_tool",
+        arguments: { command: "raw command" },
+      },
+      args: { command: "validated command" },
+    });
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0]?.[1]).toContain("validated command");
+    expect(confirm.mock.calls[0]?.[1]).not.toContain("raw command");
+  });
+
+  it("passes validated tool arguments to ask_tools in isolated mode", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: false, askTools: ["bash"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["bash"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const confirm = vi.fn(async () => true);
+
+    await runAgent(
+      {
+        ...ctx,
+        hasUI: true,
+        ui: { confirm },
+      },
+      "Explore",
+      "go",
+      { pi, isolated: true, supervisorQuestions: false },
+    );
+
+    await session.agent.beforeToolCall?.({
+      toolCall: {
+        type: "toolCall",
+        id: "call-2",
+        name: "bash",
+        arguments: { command: "raw isolated command" },
+      },
+      args: { command: "validated isolated command" },
+    });
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0]?.[1]).toContain("validated isolated command");
+    expect(confirm.mock.calls[0]?.[1]).not.toContain("raw isolated command");
+  });
+
   it("beforeToolCall preserves a hook pi installed before us", async () => {
     setup();
     withExtensions({ "/ext/foo.ts": ["foo_tool"] });

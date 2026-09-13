@@ -1,4 +1,5 @@
 import { existsSync, writeFileSync } from "node:fs";
+import { resolve as normalizeTargetPath } from "node:path";
 import type { ExtensionCommandContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { stripTerminalControls } from "./git.js";
@@ -67,6 +68,14 @@ export function createTargetSession(ctx: ExtensionCommandContext, targetPath: st
   return writeTargetSession(targetPath, [], undefined, null);
 }
 
+export function sessionCwdMatches(
+  actual: string,
+  expected: string,
+  resolvePath: (path: string) => string = normalizeTargetPath,
+): boolean {
+  return resolvePath(actual) === resolvePath(expected);
+}
+
 function writeTargetSession(
   targetPath: string,
   entries: readonly SessionEntry[],
@@ -84,7 +93,7 @@ function writeTargetSession(
     mode: 0o600,
   });
   const verified = SessionManager.open(targetFile);
-  if (verified.getCwd() !== targetPath || verified.getLeafId() !== expectedLeaf) {
+  if (!sessionCwdMatches(verified.getCwd(), targetPath) || verified.getLeafId() !== expectedLeaf) {
     throw new Error("Pi could not verify the target session cwd and active branch.");
   }
   return targetFile;
