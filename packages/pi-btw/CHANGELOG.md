@@ -1,5 +1,10 @@
 # @signalridge/pi-btw
 
+## 1.3.2
+### Patch Changes
+
+- e939fa0: Fix Pi 0.85.1 tool-approval argument forwarding, ambient-auth and credential-specific model routing, and cross-platform workspace session validation.
+
 ## 1.3.1
 ### Patch Changes
 
