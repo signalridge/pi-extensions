@@ -29,6 +29,16 @@ export const DEFAULT_TRIGGER_WORD = "workflow";
 export const WORKFLOW_ARMED_DIRECTIVE =
   "<system-reminder>You typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration: the `workflow` tool is authorized for this turn. It runs in the background by default — the turn ends and the result is delivered back into the conversation when it finishes, which is expected rather than a stall, so you need not stay and block. Pass background:false only when the user is waiting for the result inline. This is permission, not an instruction: if the request is conversational, trivial, or better answered directly, answer it directly and do not run a workflow.</system-reminder>";
 
+/** Keep one copy when an earlier input transform already added this directive. */
+export function deduplicateWorkflowDirective(text: string): string {
+  let seen = false;
+  return text.replaceAll(WORKFLOW_ARMED_DIRECTIVE, (directive) => {
+    if (seen) return "";
+    seen = true;
+    return directive;
+  });
+}
+
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
