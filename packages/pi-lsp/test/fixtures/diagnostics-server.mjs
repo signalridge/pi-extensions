@@ -1,7 +1,11 @@
+import { existsSync, writeFileSync } from "node:fs";
+import path from "node:path";
+
 const scenario = process.argv[2];
 const expectedFiles = Number(process.argv[3] ?? "0");
 let buffer = Buffer.alloc(0);
 const openedUris = [];
+let firstDiagnosticsRun = false;
 
 function send(message) {
   const body = JSON.stringify(message);
@@ -30,6 +34,46 @@ function publish(uri, diagnostics) {
 
 function handle(message) {
   if (message.method === "initialize") {
+    if (scenario === "large-stderr") {
+      void (async () => {
+        for (let index = 0; index < 32; index++) {
+          await new Promise((resolve) => process.stderr.write(`old-stderr-marker\n${"漢".repeat(16_384)}`, resolve));
+        }
+        // The suffix length makes the retained 16 KiB start inside a UTF-8 character.
+        process.stderr.write("\nrecent-stderr-marker!\n");
+      })();
+      return;
+    }
+    if (scenario === "invalid-stderr") {
+      process.stderr.write(Buffer.alloc(65_536, 0xff));
+      return;
+    }
+    if (scenario === "partial-stderr") {
+      process.stderr.write(Buffer.from([0xe6, 0xb1]));
+      return;
+    }
+    if (scenario === "partial-response-once") {
+      const flag = path.join(process.cwd(), "partial-response-first-run.flag");
+      if (!existsSync(flag)) {
+        writeFileSync(flag, "done");
+        process.stdout.write("Content-Length: 999\r\n\r\n{");
+        return;
+      }
+    }
+    if (scenario === "diagnostic-once") {
+      const flag = path.join(process.cwd(), "diagnostic-first-run.flag");
+      firstDiagnosticsRun = !existsSync(flag);
+      if (firstDiagnosticsRun) writeFileSync(flag, "done");
+    }
+    if (scenario === "stderr-once") {
+      process.on("SIGTERM", () => setTimeout(() => process.exit(0), 300));
+      const flag = path.join(process.cwd(), "stderr-first-run.flag");
+      if (!existsSync(flag)) {
+        writeFileSync(flag, "done");
+        process.stderr.write("first-run-stderr-marker\n");
+      }
+      return;
+    }
     if (scenario === "require-environment" && process.env.PI_LSP_TEST_ENV !== "forwarded") {
       send({
         jsonrpc: "2.0",
@@ -67,6 +111,10 @@ function handle(message) {
   if (message.method === "textDocument/didOpen") {
     const uri = message.params.textDocument.uri;
     openedUris.push(uri);
+    if (scenario === "diagnostic-once") {
+      if (firstDiagnosticsRun) publish(uri, [diagnostic("old server diagnostic")]);
+      return;
+    }
     if (scenario !== "push-silent" && scenario !== "push-silent-then-diagnostic") {
       publish(uri, []);
     }

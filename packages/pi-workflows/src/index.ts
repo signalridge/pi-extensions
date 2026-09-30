@@ -331,8 +331,11 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let active = false;
   let surfaceRegistered = false;
   const registeredWorkflowCommands = new Set<string>();
-  let branchQuiesce: Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> | undefined;
+  let shutdownQuiesce: Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> | undefined;
   let lifecycleGeneration = 0;
+  let deliveryGeneration = 0;
+  let handledTreeEvent: unknown;
+  let journalBranchAnchor: string | null | undefined;
   let protocolAbortController: AbortController | undefined;
   let sessionCwd = process.cwd();
   let workflowSettings = loadWorkflowSettings(sessionCwd);
@@ -355,6 +358,54 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       throw new Error("pi-workflows is not active in this session context");
     return engine;
   };
+
+  // Public bus requests are synchronous snapshots, not a lock across Pi's
+  // later summarization/leaf replacement. Both extensions can veto in any load
+  // order without importing one another's source.
+  pi.events.on("pi:navigation-preflight", (raw: unknown) => {
+    if (!active || !engine?.hasUnsettledWork()) return;
+    const report = (raw as { report?: unknown } | null)?.report;
+    if (typeof report === "function") report("workflows");
+  });
+  const navigationPreflight = (ctx: ExtensionContext): { cancel: true } | undefined => {
+    let busy = false;
+    pi.events.emit("pi:navigation-preflight", {
+      report: () => {
+        busy = true;
+      },
+    });
+    if (!busy) return undefined;
+    const notice =
+      "Navigation blocked while agents or workflows are active or cleaning up. Wait for them to finish, or stop them explicitly and retry.";
+    if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+    else console.warn(`[pi-workflows] ${notice}`);
+    return { cancel: true };
+  };
+  const beginShutdownQuiesce = (): Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> => {
+    if (shutdownQuiesce) return shutdownQuiesce;
+    const closingEngine = engine;
+    if (!closingEngine || closingEngine.isDisposed()) return Promise.resolve({ settled: true, pending: [] });
+    shutdownQuiesce = closingEngine.quiesceForBranchChange().catch((error: unknown) => ({
+      settled: false,
+      pending: [],
+      diagnostic: error instanceof Error ? error.message : String(error),
+    }));
+    return shutdownQuiesce;
+  };
+  // Subagents starts this handshake before retiring the owned-agent RPC. When
+  // workflows shuts down first, its native hook performs the same operation.
+  pi.events.on("pi-workflows:shutdown-quiesce", (raw: unknown) => {
+    if (!active || !engine) return;
+    const respond = (raw as { respond?: unknown } | null)?.respond;
+    if (typeof respond === "function") respond(beginShutdownQuiesce());
+  });
+  pi.events.on("subagents:session_tree_committed", (raw: unknown) => {
+    if (!active || !engine) return;
+    const event = (raw as { event?: unknown } | null)?.event;
+    if (!event || event === handledTreeEvent) return;
+    handledTreeEvent = event;
+    engine.fenceCommittedBranch();
+  });
 
   const clearWidget = (): void => {
     widgetUi?.setWidget("pi-workflows", undefined);
@@ -1098,58 +1149,38 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       registeredWorkflowCommands.add(name);
     }
 
-    // Live progress widget refreshes through the current engine, so its timer
-    // and settlement callback remain safe across session replacement.
-    const beginBranchQuiesce = (): Promise<{ settled: boolean; pending: string[]; diagnostic?: string }> => {
-      if (!branchQuiesce) {
-        let workflowEngine: WorkflowEngine;
-        try {
-          workflowEngine = currentEngine();
-        } catch {
-          return Promise.resolve({ settled: true, pending: [] });
-        }
-        branchQuiesce = workflowEngine.quiesceForBranchChange().then((result) => {
-          if (!result.settled) {
-            console.warn(
-              `[pi-workflows] ${result.diagnostic ?? "branch quiescence did not settle; stale events are quarantined"}`,
-            );
-          }
-          return result;
-        });
-      }
-      return branchQuiesce;
-    };
-
-    pi.events.on("subagents:session_before_tree", () => {
-      void beginBranchQuiesce();
-    });
-
-    pi.on("session_before_tree", async () => {
-      await beginBranchQuiesce();
-    });
-    pi.on("session_tree", (_event, ctx) => {
-      let entries: SessionEntryLike[];
-      try {
-        entries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
-      } catch {
-        return;
-      }
+    // Neither before-event is a commit point. Pi can veto in a later handler,
+    // or summarization may abort after every handler has run.
+    pi.on("session_before_switch", (_event, ctx) => navigationPreflight(ctx));
+    pi.on("session_before_tree", (_event, ctx) => navigationPreflight(ctx));
+    pi.on("session_tree", (event, ctx) => {
       let workflowEngine: WorkflowEngine;
       try {
         workflowEngine = currentEngine();
       } catch {
         return;
       }
-      workflowEngine.suspendLifecycle();
+      if (handledTreeEvent !== event) {
+        // A controller abort can synchronously call stop-owned RPC. Detach the
+        // old subagent records first, regardless of extension load order, so its
+        // managed-stop tombstone cannot be appended on the committed new leaf.
+        pi.events.emit("pi-workflows:session_tree_committed", { event });
+        workflowEngine.fenceCommittedBranch();
+      }
+      handledTreeEvent = event;
+      deliveryGeneration++;
       try {
+        const entries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
+        journalBranchAnchor =
+          ctx.sessionManager.getLeafId?.() ?? (entries.at(-1) as { id?: string } | undefined)?.id ?? null;
         workflowEngine.restore(entries);
+        workflowEngine.resumeLifecycle();
       } catch (error: unknown) {
+        active = false; // never resume an old branch after a failed restore
         console.warn(
           `[pi-workflows] session tree recovery failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       } finally {
-        workflowEngine.resumeLifecycle();
-        branchQuiesce = undefined;
         refreshWidget();
       }
     });
@@ -1170,8 +1201,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
 
   /** Background-run result delivery: fail-closed, session-bound (A10). */
   const deliverBackgroundResult = async (engine: WorkflowEngine, runId: string): Promise<void> => {
+    const generation = deliveryGeneration;
     const run = await engine.waitFor(runId).catch(() => undefined);
-    if (!run) return;
+    if (!run || generation !== deliveryGeneration) return;
     const header = `Workflow ${run.runId} ${run.status}`;
     const state = engine.getState(runId);
     const finalResult = state?.result ?? run.finalResult;
@@ -1283,6 +1315,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       protocolError = `${PROTOCOL_DIAGNOSTIC} Diagnostic: ${detail}`;
     });
 
+    journalBranchAnchor =
+      ctx.sessionManager.getLeafId?.() ?? (initialEntries.at(-1) as { id?: string } | undefined)?.id ?? null;
     let recoveredEngine: WorkflowEngine | undefined;
     let recoveryError: unknown;
     for (let attempt = 0; attempt < 3 && !recoveredEngine; attempt += 1) {
@@ -1291,7 +1325,24 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         client,
         {
           append(event) {
+            if (generation !== lifecycleGeneration) throw new Error("workflow session retired before journal append");
+            // Every append moves Pi's leaf. Remember the new leaf afterwards;
+            // unrelated appends beneath it remain valid, but a navigated-away
+            // branch must never receive an old terminal fact. Only traverse the
+            // branch when the leaf has moved (or the host cannot report it).
+            if (journalBranchAnchor && ctx.sessionManager.getLeafId?.() !== journalBranchAnchor) {
+              const branch = ctx.sessionManager.getBranch() as Array<{ id?: string }>;
+              if (!branch.some((entry) => entry.id === journalBranchAnchor)) {
+                throw new Error("workflow journal branch changed before append");
+              }
+            }
             pi.appendEntry(JOURNAL_ENTRY_TYPE, event);
+            // Some hosts cannot report a leaf ID. Read the new branch tip after
+            // every append rather than retaining the old (now-ancestor) anchor:
+            // a later run on a sibling would otherwise pass the ancestry check.
+            journalBranchAnchor =
+              ctx.sessionManager.getLeafId?.() ?? (ctx.sessionManager.getBranch() as Array<{ id?: string }>).at(-1)?.id;
+            if (!journalBranchAnchor) throw new Error("workflow journal leaf unavailable after append");
             // Journal writes precede some state mutations; refresh once applied.
             queueMicrotask(() => {
               if (generation === lifecycleGeneration) refreshWidget();
@@ -1421,7 +1472,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
-    lifecycleGeneration += 1;
+    deliveryGeneration += 1;
     // Invalidate all long-lived command/tool/widget closures before awaiting
     // engine quiescence; the old session must not accept another run.
     active = false;
@@ -1433,13 +1484,26 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     }
     const closingEngine = engine;
     if (closingEngine) {
-      await closingEngine.quiesceForBranchChange().catch(() => undefined);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        beginShutdownQuiesce(),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 6_000);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!result?.settled) {
+        console.warn(
+          `[pi-workflows] shutdown quiescence timed out or failed; ${result?.diagnostic ?? `pending: ${result?.pending.join(", ") ?? "unknown"}`}; late callbacks fenced`,
+        );
+      }
     }
+    lifecycleGeneration += 1;
     protocolAbortController?.abort();
     protocolAbortController = undefined;
     closingEngine?.dispose();
     engine = undefined;
-    branchQuiesce = undefined;
+    shutdownQuiesce = undefined;
     protocolCheck = undefined;
     protocolProbe = undefined;
     protocolInFlight = undefined;

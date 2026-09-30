@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import sessionRecap, { buildRecapContext } from "../index.ts";
+
+function projected(entries) {
+  return entries.map((sourceEntry) => ({ sourceEntry, messages: sessionEntryToContextMessages(sourceEntry) }));
+}
 
 // A hijacked OSC 8 hyperlink, a title rewrite, a screen clear and a bidi override.
 // Every one of these is a terminal command, not text.
@@ -54,7 +59,7 @@ test("tool output is neutralized before the recap prompt truncates it", () => {
     },
   ];
 
-  const context = buildRecapContext(entries, entries);
+  const context = buildRecapContext(projected(entries), entries);
   const toolResult = context.messages.find((message) => message.role === "toolResult");
   assert.ok(toolResult);
   const text = toolResult.content[0].text;
@@ -70,7 +75,7 @@ test("the initial request is neutralized before its middle is elided", () => {
   const initialEntry = { type: "message", message: { role: "user", content: long, timestamp: 1 } };
   const contextEntries = [{ type: "message", message: { role: "user", content: "carry on", timestamp: 2 } }];
 
-  const context = buildRecapContext(contextEntries, [initialEntry, ...contextEntries]);
+  const context = buildRecapContext(projected(contextEntries), [initialEntry, ...contextEntries]);
   assert.ok(context.broaderContext);
   assert.deepEqual(controlCharacters(context.broaderContext, { allowLineBreaks: true }), []);
   assert.match(context.broaderContext, /^Initial user request:\n/u);
@@ -83,7 +88,7 @@ test("a compaction summary carrying an escape sequence never reaches the prompt 
     { type: "message", message: { role: "user", content: "keep going", timestamp: 1 } },
   ];
 
-  const context = buildRecapContext(entries, entries);
+  const context = buildRecapContext(projected(entries), entries);
   assert.ok(context.broaderContext);
   assert.deepEqual(controlCharacters(context.broaderContext, { allowLineBreaks: true }), []);
   assert.match(context.broaderContext, /Summary/u);
@@ -134,8 +139,7 @@ test("a model recap cannot drive the terminal through the recap widget", async (
       maxTokens: 4096,
     },
     modelRegistry: {
-      find: () => undefined,
-      getAvailable: () => [],
+      find: (provider, id) => (provider === "anthropic" && id === "claude-haiku-4-5" ? ctx.model : undefined),
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
     },
     sessionManager: {
@@ -151,13 +155,16 @@ test("a model recap cannot drive the terminal through the recap widget", async (
   };
 
   const commands = new Map();
+  const flags = new Map();
   const pi = {
     on: () => {},
     registerCommand: (name, command) => commands.set(name, command),
-    registerFlag: () => {},
-    getFlag: () => undefined,
+    registerFlag: (name, options) => flags.set(name, options.default),
+    getFlag: (name) => flags.get(name),
   };
   sessionRecap(pi);
+  flags.set("recap-allow-raw-history", true);
+  flags.set("recap-model", "anthropic/claude-haiku-4-5");
   await commands.get("recap").handler("", ctx);
 
   assert.equal(widgets.length, 1);

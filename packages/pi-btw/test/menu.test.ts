@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionCommandContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { test } from "vitest";
@@ -78,6 +78,56 @@ test("editor preservation finishes safely after its session context is replaced"
   });
 
   assert.deepEqual(result, { kind: "closed", reason: "close" });
+});
+
+test("a completed menu cannot restore its cached old draft after Pi commits a new session", async () => {
+  const session = SessionManager.inMemory();
+  const oldId = session.getSessionId();
+  let cachedEditor = "main draft";
+  let replacementEditor = "";
+  const writes: string[] = [];
+  const ctx = {
+    mode: "tui",
+    hasUI: true,
+    sessionManager: session,
+    ui: {
+      getEditorText: () => cachedEditor,
+      setEditorText: (text: string) => {
+        writes.push(text);
+        replacementEditor = text;
+      },
+      custom: async (factory: (...args: never[]) => unknown) => {
+        let completed: unknown;
+        factory(
+          {} as never,
+          {} as never,
+          {} as never,
+          ((value: unknown) => {
+            cachedEditor = "side draft";
+            completed = value;
+          }) as never,
+        );
+        session.newSession();
+        replacementEditor = "new session editor";
+        cachedEditor = "main draft"; // Pi's old command context still exposes its cached editor.
+        return completed;
+      },
+    },
+  } as never;
+
+  const result = await runBtwMenuPreservingEditor(ctx, async (menuContext) => {
+    const ui = menuContext.ui as ExtensionCommandContext["ui"];
+    await ui.custom((_tui, _theme, _keybindings, done) => {
+      done("selected");
+      return { render: () => [], invalidate() {} };
+    });
+    return { kind: "closed", reason: "close" };
+  });
+
+  assert.notEqual(session.getSessionId(), oldId);
+  assert.deepEqual(result, { kind: "stale" });
+  assert.deepEqual(writes, []);
+  assert.equal(replacementEditor, "new session editor");
 });
 
 test("btw no-argument menu selects Start side thread first and preserves the editor", async () => {

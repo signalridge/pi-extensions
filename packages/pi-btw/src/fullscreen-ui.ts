@@ -18,11 +18,15 @@ export type BtwFullscreenTuiFactory = (parent: TUI) => BtwFullscreenTui;
 export interface BtwFullscreenDependencies {
   createTui?: BtwFullscreenTuiFactory;
   openUrl?: (url: string) => void;
+  isSessionCurrent?: () => boolean;
+  /** Close Pi's custom UI synchronously while the outgoing editor still owns it. */
+  registerClose?: (close: () => void) => () => void;
 }
 
 export type RunBtwFullscreen = <T>(
   ctx: ExtensionCommandContext,
   run: (ctx: ExtensionCommandContext) => Promise<T>,
+  dependencies?: BtwFullscreenDependencies,
 ) => Promise<T>;
 
 type FullscreenOutcome<T> = { kind: "completed"; value: T } | { kind: "failed"; error: unknown };
@@ -42,11 +46,28 @@ export async function runBtwFullscreen<T>(
   const createTui =
     dependencies.createTui ??
     ((parent: TUI) => createBtwFullscreenTui(parent, dependencies.openUrl ?? openUrlInBrowser));
+  const sessionManager = ctx.sessionManager;
+  const sessionId = sessionManager?.getSessionId?.();
+  const ownsSession = () => {
+    try {
+      return (
+        (!dependencies.isSessionCurrent || dependencies.isSessionCurrent()) &&
+        ctx.sessionManager === sessionManager &&
+        sessionManager?.getSessionId?.() === sessionId
+      );
+    } catch {
+      // Pi invalidates captured command contexts after a session replacement.
+      return false;
+    }
+  };
   let liveEditorText = ctx.ui.getEditorText();
   let restoreEditor = false;
-  const outcome = await ctx.ui.custom<FullscreenOutcome<T>>(
-    (parent, theme, keybindings, done) =>
-      new BtwFullscreenHost(
+  let closeAtBoundary: (() => void) | undefined;
+  const unregisterClose = dependencies.registerClose?.(() => closeAtBoundary?.());
+  let outcome: FullscreenOutcome<T>;
+  try {
+    outcome = await ctx.ui.custom<FullscreenOutcome<T>>((parent, theme, keybindings, done) => {
+      const host = new BtwFullscreenHost(
         parent,
         theme,
         keybindings,
@@ -54,19 +75,37 @@ export async function runBtwFullscreen<T>(
         run,
         (value) => {
           try {
-            liveEditorText = ctx.ui.getEditorText();
-            restoreEditor = true;
+            if (ownsSession()) {
+              liveEditorText = ctx.ui.getEditorText();
+              restoreEditor = true;
+            }
           } catch {
             // A replaced session owns a different editor and must not receive stale text.
           }
+          // Pi restores the editor snapshot from when custom UI opened inside
+          // done(). Restore the current text in the same call stack: a committed
+          // session_tree handler may run before this one and populate its editor,
+          // while the generation guard expires before our await resumes.
           done(value);
+          if (restoreEditor && ownsSession()) {
+            try {
+              if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
+            } catch {
+              // A replaced context must not receive the outgoing editor text.
+            }
+          }
         },
         createTui,
-      ),
-  );
-  if (restoreEditor) {
+      );
+      closeAtBoundary = () => host.closeAtBoundary();
+      return host;
+    });
+  } finally {
+    unregisterClose?.();
+  }
+  if (restoreEditor && ownsSession()) {
     try {
-      if (ctx.ui.getEditorText() !== liveEditorText) ctx.ui.setEditorText(liveEditorText);
+      if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
     } catch {
       // A replaced session owns a different editor and must not receive stale restoration.
     }
@@ -101,6 +140,8 @@ class BtwFullscreenHost<T> implements Component {
   private started = false;
   private disposed = false;
   private finished = false;
+  private parentStopped = false;
+  private fullscreenCreated = false;
 
   constructor(
     private readonly parent: TUI,
@@ -126,39 +167,50 @@ class BtwFullscreenHost<T> implements Component {
     this.cancelActiveCustom?.();
   }
 
+  closeAtBoundary(): void {
+    if (this.finished) return;
+    // Pi's done callback restores the text captured when custom UI opened. It
+    // must run before the committed transition populates the next editor.
+    this.disposed = true;
+    this.finish({ kind: "failed", error: new FullscreenUiDisposedError() });
+  }
+
   private async start(): Promise<void> {
     if (this.started || this.finished) return;
     this.started = true;
     let outcome: FullscreenOutcome<T>;
-    let parentStopped = false;
-    let fullscreenCreated = false;
     try {
       if (this.disposed) throw new FullscreenUiDisposedError();
       this.parent.stop({ preserveScreen: true });
-      parentStopped = true;
+      this.parentStopped = true;
       if (this.disposed) throw new FullscreenUiDisposedError();
       this.fullscreen = this.createTui(this.parent);
-      fullscreenCreated = true;
+      this.fullscreenCreated = true;
       this.fullscreen.start();
       outcome = { kind: "completed", value: await this.run(this.createContext()) };
     } catch (error) {
       outcome = { kind: "failed", error };
     }
+    this.finish(outcome);
+  }
 
+  private finish(outcome: FullscreenOutcome<T>): void {
+    if (this.finished) return;
+    this.finished = true;
     let cleanupError: unknown;
     try {
       this.cancelActiveCustom?.();
     } catch (error) {
       cleanupError = error;
     }
-    if (fullscreenCreated) {
+    if (this.fullscreenCreated) {
       try {
         this.fullscreen?.stop({ preserveScreen: true });
       } catch (error) {
         cleanupError ??= error;
       }
     }
-    if (parentStopped) {
+    if (this.parentStopped) {
       try {
         this.parent.start();
         this.parent.renderNow(false);
@@ -167,7 +219,6 @@ class BtwFullscreenHost<T> implements Component {
       }
     }
     if (cleanupError !== undefined) outcome = { kind: "failed", error: cleanupError };
-    this.finished = true;
     this.done(outcome);
   }
 

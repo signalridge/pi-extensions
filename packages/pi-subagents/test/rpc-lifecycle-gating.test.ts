@@ -27,6 +27,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRuntime } from "./helpers/model-runtime.js";
 
 const RPC_CHANNELS = ["subagents:rpc:ping", "subagents:rpc:spawn", "subagents:rpc:stop"] as const;
 
@@ -58,7 +59,7 @@ function ctx() {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), runtime: mockParentRuntime },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -147,6 +148,18 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply, "spawn emitted a reply").toBeTruthy();
     expect(reply![1].success, `spawn succeeded, got: ${JSON.stringify(reply![1])}`).toBe(true);
     expect(reply![1].data.id).toBeTruthy();
+  });
+
+  it("does not broadcast destructive quiescence for cancellable tree attempts", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")({}, ctx());
+
+    await lifecycle.get("session_before_tree")({ signal: new AbortController().signal }, ctx());
+    await lifecycle.get("session_before_tree")({ signal: new AbortController().signal }, ctx());
+
+    expect(pi.events.emit.mock.calls.filter((call: unknown[]) => call[0] === "subagents:session_before_tree")).toEqual([]);
+    expect(pi.events.emit.mock.calls.filter((call: unknown[]) => call[0] === "pi:navigation-preflight")).toHaveLength(2);
   });
 
   it("is idempotent — a second session_start does not re-advertise or double-register", async () => {

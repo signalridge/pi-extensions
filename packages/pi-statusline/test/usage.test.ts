@@ -30,6 +30,7 @@ test("footer usage includes every usage-bearing session entry and uses the lates
     }),
     entry({ type: "compaction", usage: usage(2, 1, 0, 2, 0.03) }),
     entry({ type: "branch_summary", usage: usage(1, 1, 1, 0, 0.04) }),
+    entry({ id: "warm-1", type: "usage", kind: "cache_warm", usage: usage(4, 1, 6, 1, 0.05) }),
     entry({
       type: "message",
       message: { role: "assistant", usage: usage(80, 4, 20, 0, 0.01) },
@@ -40,15 +41,66 @@ test("footer usage includes every usage-bearing session entry and uses the lates
   assert.deepEqual(
     { ...result, cost: undefined },
     {
-      input: 96,
-      output: 9,
-      cacheRead: 55,
-      cacheWrite: 8,
+      input: 100,
+      output: 10,
+      cacheRead: 61,
+      cacheWrite: 9,
       cost: undefined,
       latestCacheHitRate: 20,
     },
   );
-  assert.ok(Math.abs(result.cost - 0.2) < Number.EPSILON);
+  assert.ok(Math.abs(result.cost - 0.25) < Number.EPSILON);
+});
+
+test("standalone usage is picked up once and survives navigation without leaking across restarts", () => {
+  const accumulator = new FooterUsageAccumulator();
+  const assistant = entry({
+    type: "message",
+    message: { role: "assistant", usage: usage(10, 2, 30, 0, 0.1) },
+  });
+  const warm = entry({ id: "warm-1", type: "usage", kind: "cache_warm", usage: usage(1, 1, 5, 2, 0.05) });
+  const other = entry({ id: "other-1", type: "usage", kind: "other", usage: usage(2, 1, 3, 0, 0.02) });
+
+  accumulator.reset([assistant]);
+  assert.equal(accumulator.updateUsageEntries([assistant, warm]), true);
+  assert.equal(accumulator.updateUsageEntries([assistant, warm]), false);
+  assert.deepEqual(accumulator.snapshot(), {
+    input: 11,
+    output: 3,
+    cacheRead: 35,
+    cacheWrite: 2,
+    cost: 0.15000000000000002,
+    latestCacheHitRate: 75,
+  });
+
+  // getEntries includes abandoned branches; a tree rebuild must not count their usage twice.
+  accumulator.reset([assistant, warm, other]);
+  assert.equal(accumulator.updateUsageEntries([assistant, warm, other]), false);
+  assert.equal(accumulator.snapshot().input, 13);
+  assert.equal(accumulator.snapshot().cost, 0.17);
+  assert.equal(accumulator.snapshot().latestCacheHitRate, 75);
+
+  accumulator.reset([]);
+  assert.equal(accumulator.updateUsageEntries([warm]), true);
+  assert.equal(accumulator.snapshot().cost, 0.05);
+});
+
+test("new usage checks inspect only entries appended since the last rebuild", () => {
+  const accumulator = new FooterUsageAccumulator();
+  const old = entry({ id: "old", type: "usage", usage: usage(10, 1, 0, 0, 0.1) });
+  const warm = entry({ id: "new", type: "usage", usage: usage(2, 1, 3, 0, 0.02) });
+  accumulator.reset([old]);
+  const entries = [old, warm];
+  Object.defineProperty(entries, 0, {
+    get() {
+      throw new Error("previously scanned entries should not be visited again");
+    },
+  });
+
+  assert.equal(accumulator.updateUsageEntries(entries), true);
+  assert.equal(accumulator.snapshot().input, 12);
+  assert.equal(accumulator.updateUsageEntries(entries), false);
+  assert.equal(accumulator.snapshot().cost, 0.12000000000000001);
 });
 
 test("a latest zero-prompt assistant clears the rate without clearing cumulative cache totals", () => {

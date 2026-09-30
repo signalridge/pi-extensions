@@ -311,6 +311,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
       getSessionName: () => undefined,
       getBranch: () => [],
       getEntries: () => [],
+      getLeafId: () => null,
     },
     modelRegistry: overrides.modelRegistry ?? {
       getApiKeyAndHeaders: async () => ({ ok: false, error: "missing" }),

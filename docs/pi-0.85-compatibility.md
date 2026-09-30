@@ -1,5 +1,7 @@
 # Pi 0.85.1 compatibility audit
 
+Historical snapshot. For the current released host, see the [Pi 0.99.1 compatibility review](pi-0.99-compatibility.md); the [Pi 0.87.1 review](pi-0.87-compatibility.md) retains the intervening upstream comparison.
+
 ## Scope
 
 This audit covers all **29 workspace packages**: 27 extensions (24 stable and three experimental) and two shared libraries. It does not audit third-party packages outside this repository, publish releases, or modify an existing global installation.

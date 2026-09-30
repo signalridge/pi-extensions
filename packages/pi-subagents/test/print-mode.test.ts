@@ -10,6 +10,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -53,6 +54,7 @@ function makeHeadlessCtx() {
     cwd: "/tmp",
     model: undefined,
     modelRegistry: {
+      ...mockParentRegistry,
       find: vi.fn(),
       getAvailable: vi.fn(() => []),
     },

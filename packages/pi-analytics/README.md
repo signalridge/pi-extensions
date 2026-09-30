@@ -74,7 +74,7 @@ Use the menu to change the time range or browse Skills, Tools, Provider reliabil
 
 A **response cycle** starts when Pi begins agent work and ends at `agent_settled`. Automatic retries, overflow-compaction recovery, tool follow-ups, and queued continuations before settlement stay in that cycle.
 
-An **LLM call** is one logical provider generation. A provider may make several HTTP attempts inside it, so `429 → 429 → 200` is one LLM call, three observed HTTP responses, two provider errors, and a recovered generation.
+An **LLM call** is one logical provider generation. Providers may retry HTTP internally; Pi's provider hooks do not necessarily expose every attempt. The response and error counts reflect only the hook events the extension receives, not a complete network-attempt log.
 
 ### Skills
 
@@ -147,7 +147,7 @@ If legacy history matters, stop every old Pi process first and preserve both fil
 - Analytics are best-effort derived metadata. A failed or interrupted local write may be omitted.
 - Large all-time histories require scanning the active JSONL generation when the dashboard opens.
 - Prometheus, JSON/CSV export, cloud sync, browser dashboards, token/cost reporting, and project attribution are not included.
-- Statistics cover only events visible through Pi's public extension API.
+- Statistics cover only events visible through Pi's public extension API. Cache-warming usage recorded outside normal assistant turns is not imported into this event-based store.
 
 ## Package layout
 

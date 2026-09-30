@@ -33,6 +33,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -58,7 +59,7 @@ function ctx() {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -213,6 +214,11 @@ describe("issue #174: foreground agent that hits max_turns", () => {
     // so clearCompleted(true)'s #108 preservation deliberately does not cover
     // them. This is the ONLY path that makes a foreground id stop resolving.
     await lifecycle.get("session_before_switch")?.();
+    // Before-switch can still be cancelled by a later handler; eviction happens
+    // only once the replacement actually starts.
+    const stillThere = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
+    expect(textOf(stillThere)).not.toContain("Agent not found");
+    await lifecycle.get("session_start")?.({}, ctx());
 
     const read = await tools.get("get_subagent_result").execute("tc-read", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(read)).toContain("Agent not found");

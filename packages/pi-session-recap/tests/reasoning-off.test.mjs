@@ -33,6 +33,7 @@ function makePi() {
   const flags = new Map();
   return {
     commands,
+    flags,
     on() {},
     registerCommand(name, command) {
       commands.set(name, command);
@@ -70,8 +71,7 @@ function makeCtx(model) {
     hasUI: true,
     model,
     modelRegistry: {
-      find: () => undefined,
-      getAvailable: () => [],
+      find: (provider, id) => (provider === model.provider && id === model.id ? model : undefined),
       getApiKeyAndHeaders: async () => ({ ok: true, ...auth }),
     },
     sessionManager: {
@@ -94,7 +94,7 @@ function makeModel(api, id) {
     name: id,
     api,
     provider: api === "anthropic-messages" ? "anthropic" : "openai-codex",
-    baseUrl: "http://localhost.invalid",
+    baseUrl: auth.baseUrl,
     reasoning: true,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -105,22 +105,39 @@ function makeModel(api, id) {
 
 const pi = makePi();
 sessionRecap(pi);
+pi.flags.set("recap-allow-raw-history", true);
 const recap = pi.commands.get("recap").handler;
 
+pi.flags.set("recap-model", "openai-codex/gpt-5.6-luna");
 await recap("", makeCtx(makeModel("openai-codex-responses", "gpt-5.6-luna")));
+pi.flags.set("recap-model", "anthropic/claude-haiku-4-5");
 await recap("", makeCtx(makeModel("anthropic-messages", "claude-haiku-4-5")));
 
-const codex = calls.find((call) => call.api === "openai-codex-responses");
+const physicalCodex = makeModel("openai-codex-responses", "gpt-5.6-luna");
+const virtualPi = makePi();
+sessionRecap(virtualPi);
+virtualPi.flags.set("recap-allow-raw-history", true);
+virtualPi.flags.set("recap-model", "openai-codex/gpt-5.6-luna");
+const virtualCtx = makeCtx({ ...physicalCodex, api: "pi-virtual", provider: "router", id: "auto" });
+virtualCtx.modelRegistry.find = (provider, id) =>
+  provider === physicalCodex.provider && id === physicalCodex.id ? physicalCodex : undefined;
+await virtualPi.commands.get("recap").handler("", virtualCtx);
+
+const codexCalls = calls.filter((call) => call.api === "openai-codex-responses");
+assert.equal(codexCalls.length, 2, "a physical Codex override from a virtual selection must issue a recap");
+assert.equal(codexCalls[1].kind, "stream");
+assert.equal(codexCalls[1].options.reasoningEffort, "none");
+const codex = codexCalls[0];
 const nonCodex = calls.find((call) => call.api === "anthropic-messages");
 
 assert.ok(codex, "codex recap should have issued a request");
 assert.equal(codex.kind, "stream", "codex recaps must use complete(), not completeSimple()");
-assert.equal(codex.model.baseUrl, auth.baseUrl, "codex recaps must honor the auth-resolved endpoint");
+assert.equal(codex.model.baseUrl, auth.baseUrl, "codex recaps must retain their named endpoint");
 assert.equal(codex.options.reasoningEffort, "none", "codex recaps must disable reasoning explicitly");
 
 assert.ok(nonCodex, "non-Codex recap should have issued a request");
 assert.equal(nonCodex.kind, "streamSimple", "other apis keep using completeSimple()");
-assert.equal(nonCodex.model.baseUrl, auth.baseUrl, "simple recaps must honor the auth-resolved endpoint");
+assert.equal(nonCodex.model.baseUrl, auth.baseUrl, "simple recaps must retain their named endpoint");
 assert.equal(nonCodex.options.reasoning, undefined, "non-Codex recaps omit reasoning");
 assert.equal(nonCodex.options.reasoningEffort, undefined, "completeSimple receives no reasoningEffort");
 

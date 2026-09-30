@@ -198,6 +198,10 @@ tell the model the `workflow` tool is authorized for this turn.
 Arming **authorizes; it does not compel**. The annotation says the model may run
 a workflow and may still decline, so "how do workflows work?" stays an ordinary
 question with an ordinary answer. Nothing is swallowed and no UI opens.
+This is **model guidance, not an execution permission gate**: the extension does
+not enforce the keyword inside `workflow.execute`. Direct tool calls remain
+subject to Pi's ordinary tool permissions; do not use the trigger as a security
+boundary.
 
 Only a standalone word arms. A workflow is also a thing people write code about,
 so none of `myworkflow`, `workflow_name`, `WorkflowEngine`, `--workflow-id`,
@@ -392,4 +396,4 @@ used it.
 - **Agent registry and tier catalogue ownership.** `agentType` and the tier catalogue resolve in pi-subagents; the workflow package supplies only a tier key its own `strengths` table chose, avoiding a second model/thinking policy.
 - **Schema validation is client-side.** The managed request does not assume a structured-output tool; the runtime asks for JSON, parses, validates (including `additionalProperties`), and repairs across bounded attempts.
 
-State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters.
+State is persisted as `pi.appendEntry("pi-workflows:journal", ...)` custom entries (schema v4), including frozen invocation args, resolved tier identity, terminal result previews, script revisions, named nested-workflow result boundaries, and durable removals. Interrupted/provider-limited runs replay from the journal; pre-schema-v4 journals are quarantined rather than replayed. Foreground `AbortSignal`s stop owned children through explicit owner-scoped stop/quiescence, and dispose/branch replacement reject stale waiters. For tree navigation, bus and native pre-tree notifications share quiescence within one host signal; a later attempt rechecks runs started since a veto, after any earlier cleanup settles. This only prevents reuse of stale quiescence: Pi does not provide a post-veto, precommit hook, so the initial canceled attempt can still interrupt active runs. Hosts without a pre-tree signal retain legacy deduplication.

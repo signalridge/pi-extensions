@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { afterAll, test } from "vitest";
+import { afterAll, test, vi } from "vitest";
 import { consumeStatuslineSettingsNotice } from "../src/settings.js";
 import type { ExtensionStatusIconAliasMap } from "../src/statusline.js";
 import statusline, {
@@ -129,6 +129,7 @@ test("statusline renders an incremental usage snapshot without rescanning histor
         return entries;
       },
       getBranch: () => entries,
+      getLeafId: () => (entries.at(-1) as { id?: string } | undefined)?.id ?? null,
     },
   });
   await emit(mock.events, "session_start", {}, context.ctx);
@@ -194,6 +195,184 @@ test("statusline renders an incremental usage snapshot without rescanning histor
     footer.render(200);
   } finally {
     footer.dispose();
+  }
+});
+
+test("long idle periods and no-usage presets avoid full history copies without losing live usage", async () => {
+  const settingsPath = join(suiteAgentDir, "pi-statusline.json");
+  writeFileSync(settingsPath, JSON.stringify({ segments: ["model", "context"] }));
+  vi.useFakeTimers();
+  const mock = createMockPi();
+  (mock.rawPi as typeof mock.rawPi & { exec: () => Promise<ExecResult> }).exec = async () => ({
+    stdout: "",
+    stderr: "",
+    code: 0,
+    killed: false,
+  });
+  statusline(mock.pi);
+  const entries: Array<{ id: string; type: string; usage?: unknown }> = Array.from({ length: 2_000 }, (_, index) => ({
+    id: `existing-${index}`,
+    type: "custom",
+  }));
+  let scans = 0;
+  const current = createMockContext({
+    mode: "tui",
+    sessionManager: {
+      getEntries: () => {
+        scans += 1;
+        return entries;
+      },
+      getLeafId: () => entries.at(-1)?.id ?? null,
+    },
+  });
+  const footerData = {
+    getGitBranch: () => null,
+    getExtensionStatuses: () => new Map(),
+    onBranchChange: () => () => undefined,
+  };
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  type FooterFactory = (
+    tui: { requestRender(): void },
+    theme: typeof theme,
+    footerData: typeof footerData,
+  ) => { render(width: number): string[]; dispose(): void };
+  let renders = 0;
+  const tui = {
+    requestRender: () => {
+      renders += 1;
+    },
+  };
+  let footer: ReturnType<FooterFactory> | undefined;
+  try {
+    await emit(mock.events, "session_start", {}, current.ctx);
+    footer = (current.footer as FooterFactory)(tui, theme, footerData);
+    assert.equal(scans, 1);
+    entries.push({ id: "warm-hidden", type: "usage", usage: { input: 2, cost: { total: 0.02 } } });
+    vi.advanceTimersByTime(60 * 60_000);
+    assert.equal(scans, 1, "hidden usage never polls session history");
+    footer.dispose();
+    footer = undefined;
+
+    writeFileSync(settingsPath, JSON.stringify({ segments: ["tokens", "cost"] }));
+    await emit(mock.events, "session_start", {}, current.ctx);
+    footer = (current.footer as FooterFactory)(tui, theme, footerData);
+    assert.equal(scans, 2);
+    assert.match(footer.render(200).join(" "), /↑2.*\$0\.020/);
+    vi.advanceTimersByTime(60 * 60_000);
+    assert.equal(scans, 2, "an unchanged leaf never recopies history");
+    const idleRenders = renders;
+
+    entries.push({ id: "warm-live", type: "usage", usage: { input: 3, cost: { total: 0.03 } } });
+    entries.push({ id: "later-entry", type: "custom" });
+    vi.advanceTimersByTime(5_000);
+    assert.equal(scans, 3, "a new leaf checks entries even when usage is not the leaf");
+    assert.match(footer.render(200).join(" "), /↑5.*\$0\.050/);
+    assert.equal(renders, idleRenders + 1);
+  } finally {
+    footer?.dispose();
+    vi.useRealTimers();
+    unlinkSync(settingsPath);
+  }
+});
+
+test("idle standalone usage updates the footer once across tree navigation and session restart", async () => {
+  const settingsPath = join(suiteAgentDir, "pi-statusline.json");
+  writeFileSync(settingsPath, JSON.stringify({ segments: ["tokens", "cache", "cost", "context"] }));
+  vi.useFakeTimers();
+  const mock = createMockPi();
+  (mock.rawPi as typeof mock.rawPi & { exec: () => Promise<ExecResult> }).exec = async () => ({
+    stdout: "",
+    stderr: "",
+    code: 0,
+    killed: false,
+  });
+  statusline(mock.pi);
+  const entries: unknown[] = [
+    {
+      type: "message",
+      message: { role: "assistant", usage: { input: 10, output: 2, cacheRead: 30, cost: { total: 0.1 } } },
+    },
+  ];
+  const warm = {
+    id: "warm-1",
+    type: "usage",
+    kind: "cache_warm",
+    usage: { input: 1, output: 1, cacheRead: 5, cacheWrite: 2, cost: { total: 0.05 } },
+  };
+  const current = createMockContext({
+    mode: "tui",
+    model: { contextWindow: 200_000 },
+    getContextUsage: () => ({ percent: 2.4, tokens: 4800, contextWindow: 200_000 }),
+    sessionManager: {
+      getEntries: () => entries,
+      getBranch: () => entries,
+      getLeafId: () => (entries.at(-1) as { id?: string } | undefined)?.id ?? "initial",
+    },
+  });
+  const footerData = {
+    getGitBranch: () => null,
+    getExtensionStatuses: () => new Map(),
+    onBranchChange: () => () => undefined,
+  };
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const footerFactory = (ctx: typeof current) =>
+    ctx.footer as (
+      tui: { requestRender(): void },
+      theme: typeof theme,
+      footerData: typeof footerData,
+    ) => { render(width: number): string[]; dispose(): void };
+  let renders = 0;
+  const tui = {
+    requestRender() {
+      renders += 1;
+    },
+  };
+  let footer: ReturnType<ReturnType<typeof footerFactory>> | undefined;
+  let nextFooter: ReturnType<ReturnType<typeof footerFactory>> | undefined;
+  try {
+    await emit(mock.events, "session_start", {}, current.ctx);
+    footer = footerFactory(current)(tui, theme, footerData);
+    assert.match(footer.render(200).join(" "), /↑10 ↓2.*ctx 2%/);
+
+    entries.push(warm);
+    vi.advanceTimersByTime(5_000);
+    const warmedLine = footer.render(200).join(" ");
+    assert.match(warmedLine, /↑11 ↓3/);
+    assert.match(warmedLine, /R35 W2 CH75\.0%/);
+    assert.match(warmedLine, /\$0\.150/);
+    assert.match(warmedLine, /ctx 2%/);
+    const rendersAfterWarm = renders;
+    vi.advanceTimersByTime(5_000);
+    assert.equal(renders, rendersAfterWarm, "repeated polls do not count the same entry");
+
+    await emit(mock.events, "session_tree", { type: "session_tree" }, current.ctx);
+    nextFooter = footerFactory(current)(tui, theme, footerData);
+    footer.dispose();
+    footer = undefined;
+    assert.match(nextFooter.render(200).join(" "), /↑11 ↓3/);
+    vi.advanceTimersByTime(5_000);
+    assert.match(nextFooter.render(200).join(" "), /↑11 ↓3/);
+
+    await emit(mock.events, "session_shutdown", {}, current.ctx);
+    nextFooter.dispose();
+    nextFooter = undefined;
+    const restarted = createMockContext({
+      mode: "tui",
+      sessionManager: {
+        getEntries: () => [{ ...warm, usage: { ...warm.usage, input: 7 } }],
+        getLeafId: () => warm.id,
+      },
+    });
+    await emit(mock.events, "session_start", {}, restarted.ctx);
+    nextFooter = footerFactory(restarted)(tui, theme, footerData);
+    assert.match(nextFooter.render(200).join(" "), /↑7 ↓1/);
+    vi.advanceTimersByTime(5_000);
+    assert.match(nextFooter.render(200).join(" "), /↑7 ↓1/);
+  } finally {
+    footer?.dispose();
+    nextFooter?.dispose();
+    vi.useRealTimers();
+    unlinkSync(settingsPath);
   }
 });
 

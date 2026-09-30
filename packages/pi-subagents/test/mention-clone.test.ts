@@ -1,5 +1,5 @@
 /**
- * mention-clone.test.ts — the off-screen conversation clone that starts a
+ * mention-clone.test.ts — the off-screen mention-only turn that starts a
  * mentioned agent.
  *
  * Everything here guards one property: the clone is a throwaway, but the agent
@@ -17,50 +17,58 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts.
-const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
-  buildSessionContext: vi.fn(),
+const { createAgentSession, inMemory, loaderOptions, loaderReload } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   inMemory: vi.fn(),
+  loaderOptions: vi.fn(),
+  loaderReload: vi.fn(),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async () => {
   const actual = await vi.importActual<any>("@earendil-works/pi-coding-agent");
   return {
     ...actual,
-    buildSessionContext,
     createAgentSession,
+    DefaultResourceLoader: class {
+      constructor(options: unknown) { loaderOptions(options); }
+      reload() { return loaderReload(); }
+    },
     SessionManager: { ...actual.SessionManager, inMemory },
   };
 });
 
-import { agentMentionReminder } from "../src/mention.js";
-import { runMentionClone } from "../src/mention-clone.js";
+import { MENTION_SPAWNED, runMentionClone } from "../src/mention-clone.js";
 
-/** One user turn and its reply, as buildSessionContext resolves them. */
-const CONVERSATION = [
-  { role: "user", content: [{ type: "text", text: "hi" }] },
-  { role: "assistant", content: [{ type: "text", text: "hello" }] },
-] as any[];
+const BRANCH = [{
+  type: "message", id: "entry-0", parentId: null,
+  message: { role: "user", content: [{ type: "text", text: "PRIVATE_PARENT_SECRET" }] },
+}];
 
 beforeEach(() => {
   createAgentSession.mockReset();
   inMemory.mockReset();
-  inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
-  buildSessionContext.mockReset();
-  buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
+  inMemory.mockImplementation(() => ({ getEntries: () => [] }));
+  loaderOptions.mockReset();
+  loaderReload.mockReset();
 });
 
 /** The main session's context — the one the spawn must be attributed to. */
 function mainCtx(overrides: Record<string, unknown> = {}) {
   return {
     cwd: "/repo",
-    model: { id: "main-model" },
+    model: { provider: "custom", id: "main-model" },
     thinkingLevel: "high",
-    modelRegistry: { runtime: { kind: "runtime" } },
+    modelRegistry: { runtime: {
+      getAuth: vi.fn(), stream: vi.fn(), streamSimple: vi.fn(), resolveModel: vi.fn(),
+      getModel: vi.fn((provider: string, id: string) => provider === "custom" && id === "main-model"
+        ? { provider, id } : undefined),
+    } },
     getSystemPrompt: vi.fn(() => "the live system prompt"),
     sessionManager: {
-      getEntries: vi.fn(() => [{ type: "message" }] as any[]),
-      getLeafId: vi.fn(() => "leaf-1"),
+      getEntries: vi.fn(() => BRANCH),
+      getBranch: vi.fn(() => BRANCH),
+      getLeafId: vi.fn(() => "entry-1"),
+      getSessionId: vi.fn(() => "session-1"),
     },
     ...overrides,
   } as any;
@@ -70,7 +78,10 @@ function mainCtx(overrides: Record<string, unknown> = {}) {
 function agentTool() {
   return {
     name: "Agent",
-    execute: vi.fn(async () => ({ content: [{ type: "text", text: "Agent ID: a1" }], details: {} })),
+    execute: vi.fn(async () => ({
+      content: [{ type: "text", text: "Agent ID: a1" }],
+      details: { agentId: "a1", status: "background" },
+    })),
   } as any;
 }
 
@@ -119,7 +130,11 @@ function cloneSession(turn?: (tool: any) => Promise<void> | void) {
 /** What the model does when it plays along: one Agent call. */
 const callsAgent = (params: Record<string, unknown> = { subagent_type: "Explore", prompt: "go" }) =>
   async (tool: any) => {
-    await tool.execute("clone-tool-call-1", params, undefined, undefined, { cwd: "/fork" });
+    await tool.execute("clone-tool-call-1", params, undefined, undefined, {
+      cwd: "/fork",
+      tools: [tool],
+      executeTool: vi.fn(),
+    });
   };
 
 const opts = (over: Record<string, unknown> = {}) => ({
@@ -127,35 +142,35 @@ const opts = (over: Record<string, unknown> = {}) => ({
   type: "Explore",
   message: "find the flaky test",
   agentTool: agentTool(),
+  isOriginCurrent: () => true,
   ...over,
 }) as any;
 
-describe("cloning the conversation", () => {
-  it("carries the conversation's own messages, not a rendering of them", async () => {
-    // The whole point: the copy reasons over what the main model can see.
-    const session = cloneSession(callsAgent());
+describe("isolating the mention turn", () => {
+  it("starts an empty session and passes the current mention to Agent", async () => {
+    const o = opts();
+    const session = cloneSession(callsAgent({ subagent_type: "Explore", prompt: "find the flaky test" }));
 
-    await runMentionClone(opts());
+    expect(await runMentionClone(o)).toEqual({ spawned: true });
 
-    expect(session.agent.state.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hi" }] },
-      { role: "assistant", content: [{ type: "text", text: "hello" }] },
-    ]);
+    expect(inMemory).toHaveBeenCalledWith("/repo");
+    expect(session.createdWith.sessionManager.getEntries()).toEqual([]);
+    expect(session.agent.state.messages).toEqual([]);
+    expect(session.prompt).toHaveBeenCalledWith("find the flaky test");
+    expect(o.agentTool.execute.mock.calls[0][1]).toMatchObject({
+      subagent_type: "Explore", prompt: "find the flaky test", run_in_background: true,
+    });
+    expect(o.ctx.sessionManager.getBranch).not.toHaveBeenCalled();
+    expect(o.ctx.sessionManager.getEntries).not.toHaveBeenCalled();
   });
 
-  it("takes the conversation from memory, never from the session file", async () => {
-    // SessionManager withholds every write until the first assistant message,
-    // so a file-based copy is empty for the whole of the first turn — which is
-    // exactly when someone types their first mention.
+  it("delivers the current mention even when the model returns an empty task", async () => {
     const o = opts();
-    cloneSession(callsAgent());
+    const session = cloneSession(callsAgent({ subagent_type: "Explore", prompt: "   " }));
 
-    await runMentionClone(o);
-
-    expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
-    expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
-      kind: "in-memory-session-manager",
-    });
+    expect(await runMentionClone(o)).toEqual({ spawned: true });
+    expect(session.createdWith.sessionManager.getEntries()).toEqual([]);
+    expect(o.agentTool.execute.mock.calls[0][1].prompt).toBe("find the flaky test");
   });
 
   it("thinks at the level the session is really on", async () => {
@@ -166,13 +181,8 @@ describe("cloning the conversation", () => {
     expect(createAgentSession.mock.calls[0][0].thinkingLevel).toBe("high");
   });
 
-  it("omits the level rather than taking buildSessionContext's, which lies", async () => {
-    // getSessionContextSettings starts at "off" and moves only on an explicit
-    // thinking_level_change entry, so a session where nobody ran /think reports
-    // "off". Passing that would silently think less than the user asked for;
-    // omitting it lets createAgentSession resolve the real level from settings.
-    // Also the Pi <0.82.0 path, where ctx has no thinkingLevel at all.
-    buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "off", model: null } as any);
+  it("omits the level when older Pi hosts do not expose it", async () => {
+    // Pi <0.82.0 has no ctx.thinkingLevel; session creation resolves settings.
     const o = opts({ ctx: mainCtx({ thinkingLevel: undefined }) });
     cloneSession(callsAgent());
 
@@ -181,40 +191,57 @@ describe("cloning the conversation", () => {
     expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("thinkingLevel");
   });
 
-  it("clones a conversation that has not started yet", async () => {
-    // First input of a fresh session. There is no history to carry, which is an
-    // answer and not a failure — the copy still runs on the main model and
-    // system prompt, and still makes the call.
-    buildSessionContext.mockReturnValue({ messages: [], thinkingLevel: "medium", model: null } as any);
+  it("delivers a first mention even with no parent history", async () => {
+    const o = opts({ ctx: mainCtx({ sessionManager: { getBranch: () => [] } }) });
+    const session = cloneSession(callsAgent({ prompt: "find the flaky test" }));
+
+    expect(await runMentionClone(o)).toEqual({ spawned: true });
+    expect(session.createdWith.sessionManager.getEntries()).toEqual([]);
+    expect(o.agentTool.execute.mock.calls[0][1].prompt).toBe("find the flaky test");
+  });
+
+  it("uses a static, narrow prompt and loads no parent extensions or context files", async () => {
     const o = opts();
     const session = cloneSession(callsAgent());
 
-    const result = await runMentionClone(o);
+    expect(await runMentionClone(o)).toEqual({ spawned: true });
 
-    expect(result).toEqual({ spawned: true });
-    expect(session.agent.state.messages).toEqual([]);
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
-  });
-
-  it("carries the live system prompt rather than the one it rebuilt", async () => {
-    // createAgentSession derives a prompt from cwd and agentDir. Close, but not
-    // what the user's model is working under — extensions add to it per turn.
-    const session = cloneSession(callsAgent());
-
-    await runMentionClone(opts());
-
-    expect(session.agent.state.systemPrompt).toBe("the live system prompt");
+    expect(session.createdWith.resourceLoader).toBeDefined();
+    expect(loaderOptions).toHaveBeenCalledWith(expect.objectContaining({
+      noExtensions: true,
+      noSkills: true,
+      noContextFiles: true,
+      appendSystemPromptOverride: expect.any(Function),
+      systemPromptOverride: expect.any(Function),
+    }));
+    expect(loaderOptions.mock.calls[0][0].systemPromptOverride()).toContain("only the user's current message");
+    expect(loaderOptions.mock.calls[0][0].appendSystemPromptOverride()).toEqual([]);
+    expect(o.ctx.getSystemPrompt).not.toHaveBeenCalled();
+    expect(loaderReload).toHaveBeenCalledOnce();
+    expect(session.agent.state.systemPrompt).toBe("rebuilt-from-cwd"); // no unsupported state mutation
   });
 
   it("inherits the parent's model, thinking level and providers", async () => {
+    const o = opts();
     cloneSession(callsAgent());
 
-    await runMentionClone(opts());
+    await runMentionClone(o);
 
     const built = createAgentSession.mock.calls[0][0];
-    expect(built.model).toEqual({ id: "main-model" });
+    expect(built.model).toEqual({ provider: "custom", id: "main-model" });
     expect(built.thinkingLevel).toBe("high");
-    expect(built.modelRuntime).toEqual({ kind: "runtime" });
+    expect(built.modelRuntime).toBe(o.ctx.modelRegistry.runtime);
+  });
+
+  it.each(["missing", "incompatible"])("refuses a %s runtime without a hidden provider request", async (condition) => {
+    const o = opts();
+    if (condition === "missing") delete o.ctx.modelRegistry.runtime;
+    else o.ctx.modelRegistry.runtime = { getAuth: vi.fn() };
+    const result = await runMentionClone(o);
+    expect(result).toMatchObject({ spawned: false, error: expect.stringContaining("parent's model runtime") });
+    expect(createAgentSession).not.toHaveBeenCalled();
+    expect(loaderReload).not.toHaveBeenCalled();
+    expect(o.agentTool.execute).not.toHaveBeenCalled();
   });
 
   it("gives the clone the Agent tool and nothing else", async () => {
@@ -247,14 +274,11 @@ describe("cloning the conversation", () => {
     expect(result).toEqual({ spawned: true });
   });
 
-  it("prompts it with the message, then the reminder", async () => {
-    const session = cloneSession(callsAgent());
+  it("prompts it with the message alone", async () => {
+    const session = cloneSession(callsAgent({ prompt: "find the flaky test" }));
 
-    await runMentionClone(opts());
-
-    expect(session.prompt).toHaveBeenCalledWith(
-      `find the flaky test\n\n${agentMentionReminder("Explore")}`,
-    );
+    expect(await runMentionClone(opts())).toEqual({ spawned: true });
+    expect(session.prompt).toHaveBeenCalledWith("find the flaky test");
   });
 });
 
@@ -270,7 +294,15 @@ describe("attributing the spawn to the real session", () => {
     await runMentionClone(o);
 
     expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(tool.execute.mock.calls[0][4]).toBe(o.ctx);
+    const invokedCtx = tool.execute.mock.calls[0][4];
+    expect(invokedCtx).not.toBe(o.ctx);
+    expect(invokedCtx.sessionManager).toBe(o.ctx.sessionManager);
+    expect(invokedCtx.modelRegistry).toBe(o.ctx.modelRegistry);
+    expect(invokedCtx.model).toBe(o.ctx.model);
+    expect(invokedCtx.cwd).toBe(o.ctx.cwd);
+    expect(invokedCtx.getSystemPrompt).toBe(o.ctx.getSystemPrompt);
+    expect(invokedCtx.tools).toEqual([expect.objectContaining({ name: "Agent" })]);
+    expect(invokedCtx.executeTool).toEqual(expect.any(Function));
   });
 
   it("passes no tool-call id, since the real session issued none", async () => {
@@ -284,17 +316,24 @@ describe("attributing the spawn to the real session", () => {
     expect(tool.execute.mock.calls[0][0]).toBeUndefined();
   });
 
-  it("forwards the parameters the clone chose", async () => {
+  it("uses the mentioned type and only the model's prompt, not other hidden choices", async () => {
     const tool = agentTool();
-    cloneSession(callsAgent({ subagent_type: "Plan", prompt: "sketch the migration" }));
+    cloneSession(callsAgent({
+      subagent_type: "Plan",
+      prompt: "sketch the migration",
+      schedule: "every day",
+      resume: "another-agent",
+      tier: "expensive",
+    }));
 
     await runMentionClone(opts({ agentTool: tool }));
 
-    expect(tool.execute.mock.calls[0][1]).toEqual({
-      subagent_type: "Plan",
+    expect(tool.execute.mock.calls[0][1]).toMatchObject({
+      subagent_type: "Explore",
       prompt: "sketch the migration",
       run_in_background: true,
     });
+    expect(tool.execute.mock.calls[0][1][MENTION_SPAWNED]).toEqual(expect.any(Function));
   });
 
   it("forces the spawn into the background — a foreground result goes nowhere", async () => {
@@ -350,7 +389,7 @@ describe("attributing the spawn to the real session", () => {
     await runMentionClone(opts());
 
     expect(captured[0].isError).toBe(true);
-    expect(captured[0].content[0].text).toContain("Already started an agent");
+    expect(captured[0].content[0].text).toContain("Already attempted an agent");
   });
 });
 
@@ -364,6 +403,17 @@ describe("when the clone cannot deliver", () => {
 
     expect(result.spawned).toBe(false);
     expect(result.error).toContain("did not start it");
+  });
+
+  it("reports an Agent policy refusal without authorizing direct fallback", async () => {
+    const tool = agentTool();
+    tool.execute.mockResolvedValue({ content: [{ type: "text", text: "Model not in scope" }], details: undefined });
+    cloneSession(callsAgent({ subagent_type: "Explore", prompt: "go" }));
+
+    const result = await runMentionClone(opts({ agentTool: tool }));
+
+    expect(tool.execute).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ spawned: false, refused: true, error: "the Agent tool refused this mention" });
   });
 
   it("returns a thrown error rather than rejecting", async () => {
@@ -387,6 +437,71 @@ describe("when the clone cannot deliver", () => {
     const result = await runMentionClone(opts());
 
     expect(result).toEqual({ spawned: true, error: "turn aborted" });
+  });
+
+  it("does not prompt the provider after a switch during resource loading", async () => {
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    let current = true;
+    loaderReload.mockReturnValue(waiting);
+    const session = cloneSession(callsAgent());
+    const tool = agentTool();
+
+    const resultPromise = runMentionClone(opts({ agentTool: tool, isOriginCurrent: () => current }));
+    await vi.waitFor(() => expect(loaderReload).toHaveBeenCalledOnce());
+    current = false;
+    release();
+
+    expect(await resultPromise).toMatchObject({ spawned: false, error: "the original session changed" });
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(tool.execute).not.toHaveBeenCalled();
+    expect(session.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("refuses a hidden Agent call after the originating session changed", async () => {
+    let current = true;
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const tool = agentTool();
+    cloneSession(async (cloneTool) => {
+      await waiting;
+      await callsAgent()(cloneTool);
+    });
+
+    const resultPromise = runMentionClone(opts({ agentTool: tool, isOriginCurrent: () => current }));
+    // Let the clone reach its deferred turn before replacing the parent.
+    await vi.waitFor(() => expect(createAgentSession).toHaveBeenCalledOnce());
+    current = false;
+    release();
+
+    expect(await resultPromise).toMatchObject({ spawned: false });
+    expect(tool.execute).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back if Agent throws after confirming a background spawn", async () => {
+    const tool = agentTool();
+    tool.execute.mockImplementation(async (_id: unknown, params: any) => {
+      params[MENTION_SPAWNED]("a1");
+      throw new Error("fleet update failed");
+    });
+    cloneSession(callsAgent());
+
+    expect(await runMentionClone(opts({ agentTool: tool }))).toEqual({
+      spawned: true,
+      error: "fleet update failed",
+    });
+    expect(tool.execute).toHaveBeenCalledOnce();
+  });
+
+  it("permits a direct fallback when Agent throws before confirming a spawn", async () => {
+    const tool = agentTool();
+    tool.execute.mockRejectedValue(new Error("spawn refused"));
+    cloneSession(callsAgent());
+
+    expect(await runMentionClone(opts({ agentTool: tool }))).toEqual({
+      spawned: false,
+      error: "spawn refused",
+    });
   });
 
   it("disposes the clone even when the turn throws", async () => {

@@ -16,7 +16,7 @@ Use it when you want to ask a temporary question, inspect context, or get a shor
 - Supports follow-up questions in the same ephemeral side thread.
 - Queues Pi-style `Steering` questions while an answer is running and processes them one at a time.
 - Optionally brings the latest answer, a question-to-end suffix, an exact line range, or the entire side thread into the main editor.
-- Uses the current session branch as context.
+- Sends only the side question and this side thread's own messages by default; parent history is never included implicitly.
 - Uses Pi's current model or an independent model selected in `pi-btw.json`.
 - Uses a pi-btw thinking level that can be changed with Pi's configured thinking shortcut and remembered for next time.
 - Does not append the side question or answer to the main conversation.
@@ -58,6 +58,12 @@ Examples:
 /btw is this API name idiomatic?
 ```
 
+**Privacy behavior change:** `/btw` no longer forwards the parent session transcript or parent
+system prompt to its independent provider by default. A side question without an opt-in sees only
+that question and the side thread's previous questions and answers. Questions such as “summarize the
+current implementation” now need details in the question itself or an explicit, destination-bound
+parent-history opt-in (see [Parent history and privacy](#parent-history-and-privacy)).
+
 Running `/btw` alone opens a menu. **Start side thread** is selected first, so pressing `Enter`
 opens an empty ephemeral side thread. If titled, non-empty threads exist, **Resume side thread**
 opens a bounded searchable picker showing each first question and question count; rows retain raw
@@ -77,7 +83,11 @@ workspace remains recognizable while scrolling. Messages use Pi's normal
 user and assistant presentation without numbered turns or role labels. Type each question and press
 `Enter`; no follow-up shortcut is required.
 Previous side questions and answers remain available to the model and visible whenever that
-side thread is resumed. The side-thread header shows its current thinking level. Press Pi's configured
+side thread is resumed. An opted-in parent-history request can cause an answer to repeat private
+details. From that point, the side thread is bound to the same physical model and effective endpoint:
+a provider, model, or endpoint switch requires a **fresh side thread** so those previous answers
+cannot be relayed by a later default request. Threads that never opted in can still switch models.
+The side-thread header shows its current thinking level. Press Pi's configured
 `app.thinking.cycle` shortcut (`Shift+Tab` by default) in the composer to cycle the levels
 supported by the side-thread model; every later question uses the displayed level until it is
 changed again. By default, each shortcut change is also written to `pi-btw.json` for the next
@@ -115,11 +125,50 @@ into Pi's main editor. It never sends the draft automatically. If the main edito
 draft, append is the recommended default. Replace is labeled as destructive and requires a second
 confirmation; Cancel returns to the side thread without changing either draft. Concurrent editor
 updates made while these menus are open are preserved. A success message reports whether context
-was loaded, appended, or replaced and its approximate size. Without an explicit bring-to-main
-action, closing `/btw` never adds the side thread to the main conversation. Completed questions,
+was loaded, appended, or replaced and its approximate size. If a committed session switch or
+tree navigation closes `/btw`, it preserves the editor text already written by another extension,
+regardless of handler order; a canceled switch leaves an open side thread running and its
+current main-editor draft unchanged.
+Without an explicit bring-to-main action, closing `/btw` never adds the side thread to the main
+conversation. Completed questions,
 answers, and visibly rendered errors remain only in memory for Resume during the current extension
 instance; empty drafts, cancelled answers, steering queues, credentials, reloads, session changes,
 and process restarts are not persisted.
+
+## Parent history and privacy
+
+Pi's parent `context` hooks can redact messages before the parent provider request, but Pi does not
+expose that post-hook provider-visible snapshot to `/btw`. Even Pi's session projection can contain
+material removed by a parent hook. **By default, `/btw` does not read or send the parent transcript
+or system prompt**; this applies to direct questions, the empty composer, steering, Resume, and
+virtual routing. The side provider receives only the current side question and successful messages
+in this side thread.
+
+To knowingly include **unfiltered** parent history in **one request**, prefix that question with the
+exact selected physical `provider/model-id`:
+
+```text
+/btw --with-parent=anthropic/claude-sonnet-4-5 What did the previous tool output mean?
+```
+
+In the `/btw` composer, use the same prefix without `/btw`; each follow-up or queued steering
+question needs its **own** prefix. For an authorized request, the prefix is stripped from the
+question and side transcript. An invalid prefix can appear in a local error turn. The parent snapshot
+is taken immediately before that request, capped at about 40,000 characters, and is not stored for
+later side requests. It may contain raw user and assistant messages, tool calls and results, Bash
+output, and summaries **without the parent `context` hook's redactions**. Do not opt in for a
+destination you do not trust.
+
+The prefix must match the model actually selected after credential fallback, not merely the model
+written in `pi-btw.json`. A mismatch or malformed prefix fails that side turn **without a provider
+request**; retry with the selected model. A virtual model cannot opt in because its physical
+destination is chosen only at dispatch. An auth-resolved endpoint override also cannot opt in: a model
+name alone does not authorize sharing with a changed endpoint. There is no persistent parent-history
+setting or blanket grant. After any opted-in parent-history question, that side thread is bound to
+the physical model and effective endpoint that received it. Later questions to a different model,
+provider, or endpoint fail locally even with a new opt-in; start a fresh `/btw` thread instead. This
+prevents a previous *side-thread answer* that echoed private context from reaching a different
+provider. Same-destination follow-ups remain available without sharing the parent transcript again.
 
 ## Model and thinking level
 
@@ -143,10 +192,14 @@ setting; pi-btw does not add any environment variables.
 
 The `model` value uses `provider/model-id` format. Only the first `/` is the separator, so
 model IDs may contain additional slashes, such as `openrouter/anthropic/claude-sonnet`.
-The configured model must exist in Pi's model registry and have usable credentials. If it
-cannot be found or authenticated, pi-btw warns and falls back to the current session model.
-If neither model is available, `/btw` reports an error and stops. This selection affects only
-`/btw`; it does not change the main session model.
+The configured model must exist in Pi's model registry. Physical models need usable
+credentials; if one cannot be found or authenticated, pi-btw warns and falls back to the
+current session model. On Pi 0.99.1+, opt-in virtual models route side questions through
+Pi's model registry, which selects a physical model and resolves its credentials when each
+request starts. Routing or target-provider auth failures appear as side-thread errors rather
+than triggering model fallback. Older Pi hosts cannot route a virtual model and report an
+explicit error instead. If neither physical model is available, `/btw` reports an error and
+stops. This selection affects only `/btw`; it does not change the main session model.
 
 Pi calls its reasoning setting the **thinking level**. `thinkingLevel` sets pi-btw's starting
 level; accepted values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. When the

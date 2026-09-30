@@ -24,7 +24,7 @@ If the target is already known, use a direct tool — `read` for a known path, `
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use tier to pick the model profile for this spawn, by name. A tier overrides the agent's own default tier. Model and thinking are not callable parameters — they are what a tier resolves to.
-- Use inherit_context if the agent needs the parent conversation history.
+- Raw inherit_context is unavailable: put only an explicitly sanitized summary in the task prompt, or persist a context_edit before starting a new agent.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.{{scheduleGuideline}}
 
 ## Writing the prompt

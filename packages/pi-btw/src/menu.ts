@@ -35,6 +35,9 @@ export interface ShowBtwCommandMenuOptions {
     patch: Partial<Pick<BtwSettings, "thinkingLevel" | "rememberThinkingLevelChanges">>,
     options: UpdateBtwSettingsOptions,
   ) => Promise<BtwSettings>;
+  isSessionCurrent?: () => boolean;
+  /** Close the host custom UI while the outgoing editor still owns it. */
+  registerClose?: (close: () => void) => () => void;
 }
 
 export type BtwCommandMenuResult = "start" | "closed" | { kind: "resume"; threadId: string };
@@ -56,7 +59,7 @@ export async function showBtwCommandMenu(
 ): Promise<BtwCommandMenuResult> {
   if (ctx.mode !== "tui") return "closed";
   const { defineMenu, runMenu } = await import("@narumitw/pi-tui-kit");
-  if (ctx.signal?.aborted) return "closed";
+  if (ctx.signal?.aborted || (options.isSessionCurrent && !options.isSessionCurrent())) return "closed";
   const settingsPath = options.settingsPath ?? btwSettingsPath();
   const readSettings = options.readSettings ?? readBtwSettings;
   const updateSettings = options.updateSettings ?? updateBtwSettings;
@@ -202,18 +205,51 @@ export async function showBtwCommandMenu(
     },
   });
 
-  const result = await runBtwMenuPreservingEditor(ctx, (menuContext) =>
-    runMenu(menuContext, menu, { getState: loadState }),
-  );
-  if (result.kind !== "closed" || result.reason !== "close") return "closed";
-  if (resumedThreadId !== undefined) return { kind: "resume", threadId: resumedThreadId };
-  return startSelected ? "start" : "closed";
+  const menuController = new AbortController();
+  // Aborting the menu invokes its active screen's done callback synchronously,
+  // so Pi restores the outgoing editor before a session boundary commits.
+  const unregisterClose = options.registerClose?.(() => menuController.abort());
+  try {
+    const result = await runBtwMenuPreservingEditor(
+      ctx,
+      (menuContext) => runMenu(menuContext, menu, { getState: loadState, signal: menuController.signal }),
+      options.isSessionCurrent,
+    );
+    if (
+      menuController.signal.aborted ||
+      (options.isSessionCurrent && !options.isSessionCurrent()) ||
+      result.kind !== "closed" ||
+      result.reason !== "close"
+    ) {
+      return "closed";
+    }
+    if (resumedThreadId !== undefined) return { kind: "resume", threadId: resumedThreadId };
+    return startSelected ? "start" : "closed";
+  } finally {
+    unregisterClose?.();
+  }
 }
 
 export async function runBtwMenuPreservingEditor(
   ctx: ExtensionCommandContext,
   run: (menuContext: MenuContext) => Promise<RunMenuResult>,
+  isSessionCurrent?: () => boolean,
 ): Promise<RunMenuResult> {
+  const sessionManager = ctx.sessionManager;
+  const sessionId = sessionManager?.getSessionId?.();
+  const ownsSession = () => {
+    try {
+      return (
+        (!isSessionCurrent || isSessionCurrent()) &&
+        ctx.sessionManager === sessionManager &&
+        sessionManager?.getSessionId?.() === sessionId
+      );
+    } catch {
+      // Pi invalidates captured command contexts after a session replacement.
+      return false;
+    }
+  };
+  if (!ownsSession()) return { kind: "stale" };
   let liveEditorText = ctx.ui.getEditorText();
   let completed = false;
   const ui = new Proxy(wrapCustomUi(ctx.ui), {
@@ -224,7 +260,7 @@ export async function runBtwMenuPreservingEditor(
             (tui, theme, keybindings, done) =>
               factory(tui, theme, keybindings, (value) => {
                 try {
-                  liveEditorText = target.getEditorText();
+                  if (ownsSession()) liveEditorText = target.getEditorText();
                 } catch {
                   // Keep completion finite if session replacement invalidates the editor context.
                 }
@@ -239,14 +275,14 @@ export async function runBtwMenuPreservingEditor(
     },
   });
   const result = await run({ mode: ctx.mode, hasUI: ctx.hasUI, ui });
-  if (result.kind !== "stale" && completed) {
+  if (completed && ownsSession()) {
     try {
-      if (ctx.ui.getEditorText() !== liveEditorText) ctx.ui.setEditorText(liveEditorText);
+      if (ctx.ui.getEditorText() !== liveEditorText && ownsSession()) ctx.ui.setEditorText(liveEditorText);
     } catch {
       // A replaced context owns a different editor and must not receive stale restoration.
     }
   }
-  return result;
+  return ownsSession() ? result : { kind: "stale" };
 }
 
 function clampToAvailableThinkingLevel(

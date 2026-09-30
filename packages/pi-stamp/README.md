@@ -211,10 +211,12 @@ state; it is not inferred from tool text. Tool arguments, output, result details
 shown. Because Pi's public API cannot decorate built-in tool rows, stamps appear as separate rows
 after the complete tool block.
 
-The tracker owns at most 256 observations in one turn. Duplicate, unmatched, malformed, backwards,
-or excess observations are ignored. Pending state is cleared on a new turn, agent cancellation/end,
-session replacement, reload, and shutdown. Tools that were not observed while tool stamps were
-enabled are not backfilled.
+The tracker owns at most 256 top-level observations in one turn. Pi 0.99 nested tool calls
+(`parentToolCallId` set) do not appear in `turn_end.toolResults`, so they are not stamped or counted
+against that limit; their parent tool can still receive a stamp. Duplicate, unmatched, malformed,
+backwards, or excess observations are ignored. Pending state is cleared on a new turn, agent
+cancellation/end, session replacement, reload, and shutdown. Tools that were not observed while
+tool stamps were enabled are not backfilled.
 
 ## Context and persistence
 

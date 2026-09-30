@@ -2,8 +2,24 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import {
+  type Api,
+  type AssistantMessage,
+  type Context,
+  fauxAssistantMessage,
+  fauxProvider,
+  type Model,
+  normalizeContext,
+  type SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  initTheme,
+  ModelRegistry,
+  ModelRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
 import { createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { test } from "vitest";
@@ -15,15 +31,25 @@ import {
   segmentsFromLineRange,
   segmentsFromTextRange,
 } from "../src/bring-to-main.js";
-import { chooseBringToMain, loadBringToMainDraft, type ResolvedBtwModel, runBtwThread } from "../src/btw.js";
+import btw, {
+  chooseBringToMain,
+  createModelRegistryCompleteSimple,
+  loadBringToMainDraft,
+  type ResolvedBtwModel,
+  resolveBtwModel,
+  runBtwThread,
+} from "../src/btw.js";
 import {
+  buildFollowUpPrompt,
   buildSideThreadMessages,
+  buildUserPrompt,
   completeSideThreadTurn,
   createSideThread,
   extractAssistantText,
   type SideThread,
 } from "../src/side-thread.js";
 import { BtwAnsweringView, BtwTranscriptPager, formatSideTranscript } from "../src/transcript-pager.js";
+import { createMockContext, createMockPi } from "./support.js";
 
 function response(text: string): AssistantMessage {
   return {
@@ -125,8 +151,55 @@ function messageText(context: Context): string {
     .join("\n");
 }
 
-test("side thread sends prior successful turns and injects main context only once", async () => {
-  const thread = createSideThread("MAIN-CONTEXT");
+function requestUserPrompts(context: Context): string[] {
+  return context.messages
+    .filter((message) => message.role === "user")
+    .map((message) =>
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .filter((part): part is { type: "text"; text: string } => part.type === "text")
+            .map((part) => part.text)
+            .join("\n"),
+    );
+}
+
+async function captureOptedInRequest(sessionManager: unknown): Promise<string> {
+  initTheme("dark");
+  const received: Context[] = [];
+  const interactive = createMockContext({
+    sessionManager,
+    modelRegistry: {
+      getProvider: () => ({
+        streamSimple(_model: Model<Api>, context: Context) {
+          received.push(context);
+          return { result: async () => response("answer") };
+        },
+      }),
+    },
+    custom: async (factory: (...args: never[]) => unknown) =>
+      new Promise((resolve) => {
+        factory(
+          { terminal: { rows: 24 }, requestRender() {} } as never,
+          { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+          {} as never,
+          resolve as never,
+        );
+      }),
+  });
+  await runBtwThread({
+    initialQuestion: "--with-parent=synthetic-provider/side Inspect",
+    selected: { model: { provider: "synthetic-provider", id: "side" } as Model<Api>, auth: {} },
+    thinkingLevel: "off",
+    ctx: interactive.ctx,
+    dependencies: { interact: async () => ({ kind: "close" }) },
+  });
+  assert.equal(received.length, 1);
+  return messageText(received[0]);
+}
+
+test("side thread shares parent history only in individually authorized requests", async () => {
+  const thread = createSideThread();
   const calls: Array<{ model: Model<Api>; context: Context; options?: SimpleStreamOptions }> = [];
   const replies = [response("A1"), response("A2"), response("A3")];
   const model = { provider: "test", id: "side" } as Model<Api>;
@@ -145,6 +218,7 @@ test("side thread sends prior successful turns and injects main context only onc
       auth: { apiKey: "key", headers: { test: "yes" }, env: { TEST: "yes" } },
       thinkingLevel: "low",
       completeSimple,
+      prepareContext: () => (question === "Q2" ? "" : "MAIN-CONTEXT"),
     });
     assert.equal(result.kind, "answered");
   }
@@ -159,8 +233,12 @@ test("side thread sends prior successful turns and injects main context only onc
   assert.ok(secondCall);
   assert.ok(thirdCall);
   assert.equal((messageText(firstCall.context).match(/MAIN-CONTEXT/g) ?? []).length, 1);
-  assert.equal((messageText(secondCall.context).match(/MAIN-CONTEXT/g) ?? []).length, 1);
+  assert.doesNotMatch(messageText(secondCall.context), /MAIN-CONTEXT/);
   assert.equal((messageText(thirdCall.context).match(/MAIN-CONTEXT/g) ?? []).length, 1);
+  assert.equal(
+    thread.turns.some((turn) => turn.question.includes("MAIN-CONTEXT")),
+    false,
+  );
   assert.deepEqual(
     calls.map((call) => call.model),
     [model, model, model],
@@ -182,7 +260,7 @@ test("side thread sends prior successful turns and injects main context only onc
 test("side thread applies the auth-resolved endpoint before streaming", async () => {
   let capturedModel: Model<Api> | undefined;
   const result = await completeSideThreadTurn({
-    thread: createSideThread("context"),
+    thread: createSideThread(),
     question: "Which endpoint?",
     model: { provider: "test", id: "side", baseUrl: "https://default.example" } as Model<Api>,
     auth: { apiKey: "key", baseUrl: "https://enterprise.example" },
@@ -198,7 +276,7 @@ test("side thread applies the auth-resolved endpoint before streaming", async ()
 });
 
 test("side thread discards a late successful response after cancellation", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   const controller = new AbortController();
   let release: ((value: AssistantMessage) => void) | undefined;
   const pending = completeSideThreadTurn({
@@ -223,7 +301,7 @@ test("side thread discards a late successful response after cancellation", async
 
 test("side thread turns malformed provider responses into visible errors", async () => {
   for (const malformed of [null, { ...response("answer"), content: undefined }]) {
-    const thread = createSideThread("context");
+    const thread = createSideThread();
     const result = await completeSideThreadTurn({
       thread,
       question: "handle malformed response",
@@ -250,7 +328,7 @@ test("assistant text extraction ignores malformed content blocks", () => {
 });
 
 test("side thread does not record aborted completions", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   const result = await completeSideThreadTurn({
     thread,
     question: "cancel me",
@@ -265,7 +343,7 @@ test("side thread does not record aborted completions", async () => {
 });
 
 test("buildSideThreadMessages keeps failed display turns out of provider context", () => {
-  const thread: SideThread = createSideThread("context");
+  const thread: SideThread = createSideThread();
   thread.turns.push({ question: "failed", answer: "Error: boom", kind: "error" });
   const messages = buildSideThreadMessages(thread, "retry");
   assert.equal(messages.length, 1);
@@ -392,7 +470,7 @@ test("the specialized exact-text selector keeps one content row visible in five-
 });
 
 test("bring-to-main scope menu offers the approved choices and selects a question-to-end suffix", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   for (const [question, answer] of [
     ["Q1", "A1"],
     ["Q2", "A2"],
@@ -427,8 +505,64 @@ test("bring-to-main scope menu offers the approved choices and selects a questio
   assert.match(result.kind === "bringToMain" ? result.draft : "", /Q2[\s\S]*A2/);
 });
 
+test.each(["scope", "question", "preview"] as const)(
+  "a deferred bring-to-main %s result cannot advance after navigating the Pi tree",
+  async (stage) => {
+    const session = SessionManager.inMemory();
+    const earlier = session.appendMessage({ role: "user", content: "Earlier", timestamp: 1 });
+    session.appendMessage({ role: "user", content: "Later", timestamp: 2 });
+    const sessionId = session.getSessionId();
+    const thread = createSideThread();
+    thread.turns.push({ kind: "answered", question: "Q1", answer: "A1", response: response("A1") });
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let generation = 0;
+    const menus: string[] = [];
+    let previews = 0;
+    const running = chooseBringToMain(
+      thread,
+      { sessionManager: session } as never,
+      {
+        showMenu: async (_ctx, title, options) => {
+          menus.push(title);
+          if (stage === "scope" || (stage === "question" && title.startsWith("Start from"))) {
+            entered();
+            await deferred;
+          }
+          const prefix = stage === "question" ? "From a question" : "Entire side thread";
+          const value = options.find((option) => option.startsWith(prefix)) ?? options[0];
+          return value ? { kind: "select", value } : { kind: "close" };
+        },
+        showPreview: async () => {
+          previews += 1;
+          if (stage === "preview") {
+            entered();
+            await deferred;
+          }
+          return { kind: "back" };
+        },
+      },
+      () => generation === 0,
+    );
+    await waiting;
+    session.branch(earlier);
+    generation += 1;
+    assert.equal(session.getSessionId(), sessionId);
+    release();
+    assert.deepEqual(await running, { kind: "closed" });
+    assert.equal(menus.length, stage === "question" ? 2 : 1);
+    assert.equal(previews, stage === "preview" ? 1 : 0);
+  },
+);
+
 test("question-suffix preview returns to the previously selected question", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   for (const [question, answer] of [
     ["Q1", "A1"],
     ["Q2", "A2"],
@@ -464,7 +598,7 @@ test("question-suffix preview returns to the previously selected question", asyn
 });
 
 test("Kit-backed question menus restore the selected question after preview Back", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   for (const [question, answer] of [
     ["Q1", "A1"],
     ["Q2", "A2"],
@@ -489,7 +623,7 @@ test("Kit-backed question menus restore the selected question after preview Back
 });
 
 test("large bring-to-main scopes preview the exact draft and support Back", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   for (const [question, answer] of [
     ["Q1", "A1"],
     ["Q2", "A2"],
@@ -523,7 +657,7 @@ test("large bring-to-main scopes preview the exact draft and support Back", asyn
 });
 
 test("custom text ranges pass their exact formatted draft through preview", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   thread.turns.push({ kind: "answered", question: "Q", answer: "A", response: response("A") });
   const exactDraft = formatBtwBringToMain([{ role: "assistant", text: "exact excerpt" }]);
   let previewDraft = "";
@@ -567,7 +701,7 @@ test("custom text ranges pass their exact formatted draft through preview", asyn
 });
 
 test("exact text selection survives returning from preview", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   thread.turns.push({
     kind: "answered",
     question: "abcd",
@@ -632,7 +766,7 @@ test("exact text selection survives returning from preview", async () => {
 });
 
 test("adaptive bring-to-main preview preserves content, bounds, resize, Back state, and Close", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   const answer = Array.from({ length: 12 }, (_, index) => `answer line ${index + 1}`).join("\n");
   thread.turns.push({ kind: "answered", question: "Q", answer, response: response(answer) });
   const host = createStandardMenuContext("main draft", 9);
@@ -668,7 +802,7 @@ test("adaptive bring-to-main preview preserves content, bounds, resize, Back sta
 });
 
 test("adaptive bring-to-main preview confirms the exact draft and preserves editor changes", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   thread.turns.push({ kind: "answered", question: "Q", answer: "A", response: response("A") });
   const host = createStandardMenuContext("main draft");
   const running = chooseBringToMain(thread, host.ctx);
@@ -692,7 +826,7 @@ test("adaptive bring-to-main preview confirms the exact draft and preserves edit
 });
 
 test("disposing the specialized exact-text selector closes without obsolete editor writes", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   thread.turns.push({ kind: "answered", question: "Q", answer: "A", response: response("A") });
   const host = createStandardMenuContext("main draft");
   const running = chooseBringToMain(thread, host.ctx);
@@ -710,7 +844,7 @@ test("disposing the specialized exact-text selector closes without obsolete edit
 });
 
 test("bring-to-main scope menu propagates Ctrl+C as a side-thread close", async () => {
-  const thread = createSideThread("context");
+  const thread = createSideThread();
   thread.turns.push({ kind: "answered", question: "Q", answer: "A", response: response("A") });
 
   const result = await chooseBringToMain(thread, { ui: {} } as never, {
@@ -718,6 +852,876 @@ test("bring-to-main scope menu propagates Ctrl+C as a side-thread close", async 
   });
 
   assert.deepEqual(result, { kind: "closed" });
+});
+
+test("Pi 0.99 virtual side question routes through the real registry to a faux physical provider", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-btw-virtual-"));
+  try {
+    const runtime = await ModelRuntime.create({
+      authPath: join(directory, "auth.json"),
+      modelsPath: null,
+      refreshOnCreate: false,
+    });
+    const registry = new ModelRegistry(runtime);
+    const faux = fauxProvider({ provider: "btw-faux", models: [{ id: "physical", reasoning: true }] });
+    registry.registerProvider({
+      ...faux.provider,
+      auth: {
+        apiKey: {
+          name: "Faux",
+          resolve: async () => ({
+            auth: {
+              apiKey: "resolved-on-request",
+              baseUrl: "https://resolved.example",
+              headers: { "x-routed": "yes" },
+            },
+          }),
+        },
+      },
+    });
+    const routes: Array<{ reason: string; thinkingLevel: string; messages: string }> = [];
+    registry.registerVirtualModel({
+      provider: "btw-router",
+      id: "auto",
+      name: "Side router",
+      thinkingLevels: ["off", "high"],
+      route(request) {
+        routes.push({
+          reason: request.reason,
+          thinkingLevel: request.thinkingLevel,
+          messages: JSON.stringify(request.messages),
+        });
+        return { model: faux.getModel(), thinkingLevel: "low" };
+      },
+    });
+    await registry.refresh({ allowNetwork: false });
+    const virtual = registry.find("btw-router", "auto");
+    assert.equal(virtual?.api, "pi-virtual");
+    const selected = await resolveBtwModel({
+      settings: { model: "btw-router/auto" },
+      currentModel: faux.getModel(),
+      modelRegistry: registry,
+    });
+    assert.equal(selected?.model, virtual);
+    assert.deepEqual(selected?.auth, {});
+
+    const requests: Array<{ model: Model<Api>; context: Context; options?: SimpleStreamOptions }> = [];
+    faux.setResponses([
+      (context, options, _state, model) => {
+        requests.push({ model, context, options });
+        return fauxAssistantMessage("routed answer");
+      },
+    ]);
+    const thread = createSideThread();
+    const result = await completeSideThreadTurn({
+      thread,
+      question: "Explain the side question",
+      model: selected.model,
+      auth: selected.auth,
+      thinkingLevel: "high",
+      completeSimple: createModelRegistryCompleteSimple(registry),
+    });
+    assert.equal(result.kind, "answered");
+    assert.equal(result.kind === "answered" ? result.answer : "", "routed answer");
+    assert.equal(faux.state.callCount, 1);
+    assert.equal(routes.length, 1);
+    assert.equal(routes[0]?.reason, "direct");
+    assert.equal(routes[0]?.thinkingLevel, "high");
+    assert.doesNotMatch(routes[0]?.messages ?? "", /<conversation_context>/);
+    assert.equal(requests[0]?.model.id, "physical");
+    assert.equal(requests[0]?.model.baseUrl, "https://resolved.example");
+    assert.equal(requests[0]?.options?.apiKey, "resolved-on-request");
+    assert.equal(requests[0]?.options?.headers?.["x-routed"], "yes");
+    assert.equal(requests[0]?.context.messages[0]?.role, "system");
+    assert.match(JSON.stringify(requests[0]?.context.messages), /Explain the side question/);
+    assert.equal(requests[0]?.options?.reasoning, "low");
+    assert.equal(thread.turns.length, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("older Pi hosts report a clear error rather than directly streaming a virtual model", async () => {
+  let providerCalls = 0;
+  const completeSimple = createModelRegistryCompleteSimple({
+    getProvider() {
+      providerCalls++;
+      throw new Error("Virtual models must not reach getProvider");
+    },
+  } as never);
+  const result = await completeSideThreadTurn({
+    thread: createSideThread(),
+    question: "Can this route?",
+    model: { api: "pi-virtual", provider: "btw-router", id: "auto" } as Model<Api>,
+    auth: {},
+    thinkingLevel: "off",
+    completeSimple,
+  });
+  assert.equal(result.kind, "error");
+  assert.match(result.kind === "error" ? result.message : "", /ModelRegistry\.streamSimple.*Pi 0\.99\.1/);
+  assert.equal(providerCalls, 0);
+});
+
+test("provider bridge sends normalized prompt and tools to Pi 0.87 providers without re-resolving auth", async () => {
+  const model = {
+    provider: "synthetic-provider",
+    id: "side",
+    baseUrl: "https://resolved.example",
+  } as Model<Api>;
+  const tool = { name: "lookup", description: "Look up an item", parameters: { type: "object" } as never };
+  const context: Context = {
+    systemPrompt: "Side instructions",
+    tools: [tool],
+    messages: [{ role: "user", content: "A side question", timestamp: 1 }],
+  };
+  const controller = new AbortController();
+  const options: SimpleStreamOptions = {
+    apiKey: "resolved-key",
+    headers: { "x-auth": "resolved" },
+    signal: controller.signal,
+  };
+  let received: { model: Model<Api>; context: Context; options?: SimpleStreamOptions } | undefined;
+  const complete = createModelRegistryCompleteSimple({
+    streamSimple() {
+      throw new Error("Do not re-resolve the already-authenticated request");
+    },
+    getProvider(providerId: string) {
+      assert.equal(providerId, "synthetic-provider");
+      return {
+        streamSimple(requestModel: Model<Api>, requestContext: Context, requestOptions?: SimpleStreamOptions) {
+          received = { model: requestModel, context: requestContext, options: requestOptions };
+          return { result: async () => response("answer") };
+        },
+      };
+    },
+  } as never);
+
+  assert.equal(extractAssistantText(await complete(model, context, options)), "answer");
+  assert.ok(received);
+  assert.equal(received.model, model);
+  assert.equal(received.model.baseUrl, "https://resolved.example");
+  assert.equal(received.options, options);
+  assert.deepEqual(received.context.messages, [
+    { role: "system", content: "Side instructions", toolsAdded: [tool], timestamp: 0 },
+    ...context.messages,
+  ]);
+  assert.equal(received.context.systemPrompt, undefined);
+  assert.equal(received.context.tools, undefined);
+  assert.deepEqual(context.messages, [{ role: "user", content: "A side question", timestamp: 1 }]);
+});
+
+test("provider bridge keeps legacy Context on Pi hosts without transcript normalization", async () => {
+  const model = { provider: "legacy-provider", id: "side", baseUrl: "https://resolved.example" } as Model<Api>;
+  const context: Context = {
+    systemPrompt: "Side instructions",
+    messages: [{ role: "user", content: "A side question", timestamp: 1 }],
+  };
+  const options: SimpleStreamOptions = { apiKey: "legacy-key", signal: new AbortController().signal };
+  let received: { model: Model<Api>; context: Context; options?: SimpleStreamOptions } | undefined;
+  const complete = createModelRegistryCompleteSimple(
+    {
+      getProvider() {
+        return {
+          streamSimple(requestModel: Model<Api>, requestContext: Context, requestOptions?: SimpleStreamOptions) {
+            received = { model: requestModel, context: requestContext, options: requestOptions };
+            return { result: async () => response("legacy answer") };
+          },
+        };
+      },
+    } as never,
+    {},
+  );
+
+  await complete(model, context, options);
+  assert.ok(received);
+  assert.equal(received.model, model);
+  assert.equal(received.context, context);
+  assert.equal(received.options, options);
+});
+
+test("real Pi parent redactor and faux providers enforce per-request, per-destination sharing", async () => {
+  initTheme("dark");
+  const directory = await mkdtemp(join(tmpdir(), "pi-btw-parent-hook-"));
+  const parentProvider = fauxProvider({ provider: "btw-parent-a", models: [{ id: "side-a" }] });
+  const switchedProvider = fauxProvider({ provider: "btw-parent-b", models: [{ id: "side-b" }] });
+  let parentSession: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  try {
+    const parent = SessionManager.inMemory(directory);
+    parent.appendMessage({ role: "user", content: "PRIVATE_PARENT_SECRET", timestamp: 1 });
+    const loader = new DefaultResourceLoader({
+      cwd: directory,
+      agentDir: directory,
+      noExtensions: true,
+      noContextFiles: true,
+      systemPromptOverride: () => "PRIVATE_PARENT_SYSTEM_PROMPT",
+      extensionFactories: [
+        {
+          name: "inline-parent-redactor",
+          factory: (pi) => {
+            pi.on("context", (event) => ({
+              messages: event.messages.map((message) =>
+                message.role === "user" ? { ...message, content: "REDACTED_BY_PARENT_HOOK" } : message,
+              ),
+            }));
+          },
+        },
+      ],
+    });
+    await loader.reload();
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const parentRuntime = {
+      streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) =>
+        parentProvider.provider.streamSimple(model, normalizeContext(context), options),
+      hasConfiguredAuth: () => true,
+      isUsingOAuth: () => false,
+    } as ModelRuntime;
+    const created = await createAgentSession({
+      cwd: directory,
+      model: parentProvider.getModel() as Model<Api>,
+      modelRuntime: parentRuntime,
+      resourceLoader: loader,
+      sessionManager: parent,
+      noTools: "all",
+    });
+    parentSession = created.session;
+
+    const parentRequests: Context[] = [];
+    const sideARequests: Context[] = [];
+    const sideBRequests: Context[] = [];
+    parentProvider.setResponses([
+      (context) => {
+        parentRequests.push(context);
+        return fauxAssistantMessage("parent ready");
+      },
+      (context) => {
+        sideARequests.push(context);
+        return fauxAssistantMessage("default answer");
+      },
+      (context) => {
+        sideARequests.push(context);
+        return fauxAssistantMessage("I saw PRIVATE_PARENT_SECRET");
+      },
+      (context) => {
+        sideARequests.push(context);
+        return fauxAssistantMessage("same destination follow-up");
+      },
+      (context) => {
+        sideARequests.push(context);
+        return fauxAssistantMessage("clean thread answer");
+      },
+    ]);
+    switchedProvider.setResponses([
+      (context) => {
+        sideBRequests.push(context);
+        return fauxAssistantMessage("switched answer");
+      },
+    ]);
+    await parentSession.prompt("Confirm policy");
+    assert.equal(parentRequests.length, 1);
+    assert.match(JSON.stringify(parentRequests[0]), /REDACTED_BY_PARENT_HOOK/);
+    assert.doesNotMatch(JSON.stringify(parentRequests[0]), /PRIVATE_PARENT_SECRET/);
+    assert.match(JSON.stringify(parent.buildSessionProjection().messages), /PRIVATE_PARENT_SECRET/);
+
+    const sideRuntime = await ModelRuntime.create({
+      authPath: join(directory, "auth.json"),
+      modelsPath: null,
+      refreshOnCreate: false,
+    });
+    const registry = new ModelRegistry(sideRuntime);
+    registry.registerProvider(parentProvider.provider);
+    registry.registerProvider(switchedProvider.provider);
+    await registry.refresh({ allowNetwork: false });
+    let capturedState: Parameters<typeof runBtwThread>[0]["state"];
+    const interactive = createMockContext({
+      mode: "tui",
+      hasUI: true,
+      sessionManager: parent,
+      modelRegistry: registry,
+      custom: async (factory: (...args: never[]) => unknown) =>
+        new Promise((resolve) => {
+          factory(
+            { terminal: { rows: 24 }, requestRender() {} } as never,
+            { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+            {} as never,
+            resolve as never,
+          );
+        }),
+    });
+    const commandHost = createMockPi();
+    btw(commandHost.pi, {
+      loadSettings: async () => ({}),
+      resolveModel: async () => ({
+        kind: "selected",
+        selected: { model: parentProvider.getModel() as Model<Api>, auth: {} },
+      }),
+      runFullscreen: async (ctx, run) => run(ctx),
+      runThread: (options) => {
+        capturedState = options.state;
+        return runBtwThread({ ...options, dependencies: { interact: async () => ({ kind: "close" }) } });
+      },
+    });
+    const command = commandHost.commands.get("btw");
+    assert.ok(command);
+    await command.handler("Default question", interactive.ctx);
+    const state = capturedState;
+    assert.ok(state);
+    const ask = (initialQuestion: string, model: Model<Api>, threadState = state) =>
+      runBtwThread({
+        initialQuestion,
+        selected: { model, auth: {} },
+        thinkingLevel: "off",
+        state: threadState,
+        ctx: interactive.ctx,
+        dependencies: { interact: async () => ({ kind: "close" }) },
+      });
+    const modelA = registry.find("btw-parent-a", "side-a");
+    const modelB = registry.find("btw-parent-b", "side-b");
+    assert.ok(modelA);
+    assert.ok(modelB);
+
+    assert.equal(sideARequests.length, 1);
+    assert.deepEqual(
+      sideARequests[0]?.messages.map((message) => message.role),
+      ["system", "user"],
+    );
+    assert.deepEqual(requestUserPrompts(sideARequests[0]), [buildUserPrompt("Default question")]);
+    assert.doesNotMatch(
+      JSON.stringify(sideARequests[0]),
+      /PRIVATE_PARENT_SECRET|REDACTED_BY_PARENT_HOOK|PRIVATE_PARENT_SYSTEM_PROMPT|<conversation_context>/,
+    );
+
+    await ask("--with-parent=btw-parent-a/side-a Share this time", modelA);
+    assert.equal(sideARequests.length, 2);
+    assert.deepEqual(requestUserPrompts(sideARequests[1]), [
+      buildUserPrompt("Default question"),
+      buildFollowUpPrompt(
+        "Share this time",
+        "User: PRIVATE_PARENT_SECRET\n\nUser: Confirm policy\n\nAssistant: parent ready",
+      ),
+    ]);
+    assert.equal((messageText(sideARequests[1]).match(/PRIVATE_PARENT_SECRET/g) ?? []).length, 1);
+    assert.doesNotMatch(
+      JSON.stringify(sideARequests[1]),
+      /REDACTED_BY_PARENT_HOOK|PRIVATE_PARENT_SYSTEM_PROMPT|--with-parent=/,
+    );
+
+    await ask("--with-parent=btw-parent-a/side-a Stale permission", modelB);
+    assert.equal(sideBRequests.length, 0);
+    assert.match(state.thread.turns.at(-1)?.answer ?? "", /Start a fresh \/btw side thread/);
+    await ask("Switched question", modelB);
+    assert.equal(sideBRequests.length, 0);
+    assert.match(state.thread.turns.at(-1)?.answer ?? "", /Start a fresh \/btw side thread/);
+    await ask("--with-parent=btw-parent-b/side-b Even with new consent", modelB);
+    assert.equal(sideBRequests.length, 0);
+
+    await ask("Same recipient follow-up", modelA);
+    assert.equal(sideARequests.length, 3);
+    assert.deepEqual(requestUserPrompts(sideARequests[2]), [
+      buildUserPrompt("Default question"),
+      buildFollowUpPrompt("Share this time"),
+      buildFollowUpPrompt("Same recipient follow-up"),
+    ]);
+    assert.match(JSON.stringify(sideARequests[2]), /I saw PRIVATE_PARENT_SECRET/);
+    assert.doesNotMatch(JSON.stringify(sideARequests[2]), /<conversation_context>/);
+
+    const cleanState = {
+      id: "btw-clean",
+      thread: createSideThread(),
+      thinkingLevel: "off" as const,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    await ask("Clean A question", modelA, cleanState);
+    await ask("Clean B question", modelB, cleanState);
+    assert.equal(sideBRequests.length, 1);
+    assert.deepEqual(
+      sideBRequests[0]?.messages.map((message) => message.role),
+      ["system", "user", "assistant", "user"],
+    );
+    assert.deepEqual(requestUserPrompts(sideBRequests[0]), [
+      buildUserPrompt("Clean A question"),
+      buildFollowUpPrompt("Clean B question"),
+    ]);
+    assert.doesNotMatch(
+      JSON.stringify(sideBRequests[0]),
+      /PRIVATE_PARENT_SECRET|REDACTED_BY_PARENT_HOOK|PRIVATE_PARENT_SYSTEM_PROMPT|<conversation_context>|--with-parent=/,
+    );
+  } finally {
+    parentSession?.dispose();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an opted-in side thread rejects the same model after its effective endpoint changes", async () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage({ role: "user", content: "PRIVATE_PARENT_SECRET", timestamp: 1 });
+  const state = {
+    id: "btw-endpoint",
+    thread: createSideThread(),
+    thinkingLevel: "off" as const,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const model = (baseUrl: string) => ({ provider: "test", id: "side", api: "faux", baseUrl }) as Model<Api>;
+  const original = model("https://first.example");
+  const changed = model("https://second.example");
+  const ctx = { ui: { notify() {} }, sessionManager: session } as never;
+  await runBtwThread({
+    initialQuestion: "--with-parent=test/side Inspect",
+    selected: { model: original, auth: {} },
+    thinkingLevel: "off",
+    state,
+    ctx,
+    dependencies: {
+      ask: (thread, question, selected, thinkingLevel, _ctx, steering) =>
+        completeSideThreadTurn({
+          thread,
+          question,
+          model: selected.model,
+          thinkingLevel,
+          auth: selected.auth,
+          prepareContext: steering.prepareContext,
+          completeSimple: async () => response("I saw PRIVATE_PARENT_SECRET"),
+        }),
+      interact: async () => ({ kind: "close" }),
+    },
+  });
+  assert.equal(state.thread.parentHistoryRecipient?.baseUrl, original.baseUrl);
+  await runBtwThread({
+    initialQuestion: "Default question after endpoint change",
+    selected: { model: changed, auth: {} },
+    thinkingLevel: "off",
+    state,
+    ctx,
+    dependencies: {
+      ask: async () => assert.fail("changed endpoint must not receive the prior assistant answer"),
+      interact: async () => ({ kind: "close" }),
+    },
+  });
+  assert.equal(state.thread.turns.length, 2);
+  assert.match(state.thread.turns[1]?.answer ?? "", /Start a fresh \/btw side thread/);
+});
+
+test.each([
+  {
+    name: "virtual route",
+    model: { api: "pi-virtual", provider: "router", id: "auto" } as Model<Api>,
+    question: "--with-parent=router/auto Where?",
+    error: /physical destination is unknown/,
+    endpointOverridden: false,
+  },
+  {
+    name: "auth-resolved endpoint change",
+    model: { api: "faux", provider: "test", id: "side", baseUrl: "https://registered.example" } as Model<Api>,
+    question: "--with-parent=test/side Where?",
+    error: /credentials changed its endpoint/,
+    endpointOverridden: true,
+  },
+  {
+    name: "wrong model",
+    model: { api: "faux", provider: "test", id: "side" } as Model<Api>,
+    question: "--with-parent=other/side Where?",
+    error: /selected model is test\/side, not other\/side/,
+    endpointOverridden: false,
+  },
+] as const)("explicit parent sharing rejects a $name before reading parent or calling a provider", async (scenario) => {
+  const state = {
+    id: "btw-rejected",
+    thread: createSideThread(),
+    thinkingLevel: "off" as const,
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  const selected: ResolvedBtwModel | undefined = scenario.endpointOverridden
+    ? await resolveBtwModel({
+        settings: {},
+        currentModel: scenario.model,
+        modelRegistry: {
+          find: () => undefined,
+          getApiKeyAndHeaders: async () => ({ ok: true as const, baseUrl: "https://different.example" }),
+        } as never,
+      })
+    : { model: scenario.model, auth: {} };
+  assert.ok(selected);
+  if (scenario.endpointOverridden) {
+    assert.equal(selected.endpointOverridden, true);
+    assert.equal(selected.model.baseUrl, "https://different.example");
+  }
+  await runBtwThread({
+    initialQuestion: scenario.question,
+    selected,
+    thinkingLevel: "off",
+    state,
+    ctx: {
+      ui: { notify() {} },
+      sessionManager: {
+        getBranch: () => assert.fail("parent branch must not be read"),
+        buildSessionProjection: () => assert.fail("parent projection must not be read"),
+      },
+    } as never,
+    dependencies: {
+      ask: async () => assert.fail("provider must not be called"),
+      interact: async () => ({ kind: "close" }),
+    },
+  });
+  assert.equal(state.thread.turns.length, 1);
+  assert.match(state.thread.turns[0]?.answer ?? "", scenario.error);
+});
+
+test.each(["fullscreen command", "direct runner"] as const)(
+  "%s uses Pi's edited projection only on an explicitly opted-in request",
+  async (entryPoint) => {
+    initTheme("dark");
+    const session = SessionManager.inMemory();
+    const omittedUser = session.appendMessage({ role: "user", content: "OMITTED_USER_SECRET", timestamp: 1 });
+    const replacedAssistant = session.appendMessage(response("REPLACED_ASSISTANT_SECRET"));
+    const replacedUser = session.appendMessage({ role: "user", content: "REPLACED_USER_SECRET", timestamp: 2 });
+    const omittedAssistant = session.appendMessage(response("OMITTED_ASSISTANT_SECRET"));
+    session.appendContextEdit(omittedUser, null);
+    session.appendContextEdit(replacedAssistant, { content: [{ type: "text", text: "Edited assistant context" }] });
+    session.appendContextEdit(replacedUser, { content: "Edited user context" });
+    session.appendContextEdit(omittedAssistant, null);
+    assert.match(JSON.stringify(session.getBranch()), /OMITTED_USER_SECRET/);
+    assert.match(JSON.stringify(session.getBranch()), /REPLACED_ASSISTANT_SECRET/);
+
+    const received: Context[] = [];
+    const selected: ResolvedBtwModel = {
+      model: { provider: "synthetic-provider", id: "side", reasoning: false } as Model<Api>,
+      auth: { apiKey: "resolved-key" },
+    };
+    const interactive = createMockContext({
+      mode: "tui",
+      hasUI: true,
+      sessionManager: session,
+      modelRegistry: {
+        getProvider() {
+          return {
+            streamSimple(_model: Model<Api>, context: Context) {
+              received.push(context);
+              return { result: async () => response("side answer") };
+            },
+          };
+        },
+      },
+      custom: async (factory: (...args: never[]) => unknown) =>
+        new Promise((resolve) => {
+          factory(
+            { terminal: { rows: 24 }, requestRender() {} } as never,
+            { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+            {} as never,
+            resolve as never,
+          );
+        }),
+    });
+    const runThread = (options: Parameters<typeof runBtwThread>[0]) =>
+      runBtwThread({
+        ...options,
+        dependencies: { interact: async () => ({ kind: "close" }) },
+      });
+
+    if (entryPoint === "fullscreen command") {
+      const mock = createMockPi();
+      btw(mock.pi, {
+        loadSettings: async () => ({}),
+        resolveModel: async () => ({ kind: "selected", selected }),
+        runFullscreen: async (ctx, run) => run(ctx),
+        runThread,
+      });
+      const command = mock.commands.get("btw");
+      assert.ok(command);
+      await command.handler("--with-parent=synthetic-provider/side Fresh side question", interactive.ctx);
+    } else {
+      await runThread({
+        initialQuestion: "--with-parent=synthetic-provider/side Fresh side question",
+        selected,
+        thinkingLevel: "off",
+        ctx: interactive.ctx,
+      });
+    }
+
+    assert.equal(received.length, 1);
+    const request = messageText(received[0]);
+    assert.match(request, /Assistant: Edited assistant context/);
+    assert.match(request, /User: Edited user context/);
+    assert.match(request, /<side_question>\nFresh side question/);
+    assert.doesNotMatch(request, /(?:OMITTED|REPLACED)_(?:USER|ASSISTANT)_SECRET/);
+  },
+);
+
+test("an explicit request reads parent edits at send time without retaining history for the next question", async () => {
+  initTheme("dark");
+  const session = SessionManager.inMemory();
+  const omitted = session.appendMessage({ role: "user", content: "OMITTED_SECRET", timestamp: 1 });
+  const replaced = session.appendMessage({ role: "user", content: "REPLACED_SECRET", timestamp: 2 });
+  const visible = session.appendMessage({ role: "user", content: "Original visible context", timestamp: 3 });
+  const received: Context[] = [];
+  let customCalls = 0;
+  const interactive = createMockContext({
+    mode: "tui",
+    hasUI: true,
+    sessionManager: session,
+    modelRegistry: {
+      getProvider() {
+        return {
+          streamSimple(_model: Model<Api>, context: Context) {
+            received.push(context);
+            return { result: async () => response(`side answer ${received.length}`) };
+          },
+        };
+      },
+    },
+    custom: async (factory: (...args: never[]) => unknown) => {
+      customCalls += 1;
+      if (customCalls === 1) {
+        // The first composer is already open; these are actual SessionManager edits,
+        // not an edited projection injected before the command starts.
+        session.appendContextEdit(omitted, null);
+        session.appendContextEdit(replaced, { content: "Updated before asking" });
+        return { kind: "submit", question: "--with-parent=synthetic-provider/side First question" };
+      }
+      if (customCalls === 3) {
+        session.appendContextEdit(visible, null);
+        session.appendMessage({ role: "user", content: "Later main context", timestamp: 4 });
+        return { kind: "submit", question: "Follow-up" };
+      }
+      if (customCalls === 5) return { kind: "close" };
+      return new Promise((resolve) => {
+        factory(
+          { terminal: { rows: 24 }, requestRender() {} } as never,
+          { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+          {} as never,
+          resolve as never,
+        );
+      });
+    },
+  });
+  const mock = createMockPi();
+  btw(mock.pi, {
+    showCommandMenu: async () => "start",
+    loadSettings: async () => ({}),
+    resolveModel: async () => ({
+      kind: "selected",
+      selected: {
+        model: { provider: "synthetic-provider", id: "side", reasoning: false } as Model<Api>,
+        auth: { apiKey: "resolved-key" },
+      },
+    }),
+    runFullscreen: async (ctx, run) => run(ctx),
+  });
+  const command = mock.commands.get("btw");
+  assert.ok(command);
+  await command.handler("", interactive.ctx);
+
+  assert.equal(customCalls, 5);
+  assert.equal(received.length, 2);
+  const first = messageText(received[0]);
+  const second = messageText(received[1]);
+  assert.match(first, /User: Updated before asking/);
+  assert.match(first, /User: Original visible context/);
+  assert.doesNotMatch(first, /OMITTED_SECRET|REPLACED_SECRET/);
+  assert.doesNotMatch(
+    second,
+    /User: Updated before asking|User: Original visible context|OMITTED_SECRET|REPLACED_SECRET|Later main context/,
+  );
+  assert.match(second, /<side_question>\nFirst question/);
+  assert.match(second, /<side_question>\nFollow-up/);
+  assert.doesNotMatch(second, /<conversation_context>/);
+});
+
+test.each(["session tree change", "session id change"] as const)(
+  "a %s while the empty composer is open fences the provider request",
+  async (change) => {
+    initTheme("dark");
+    const session = SessionManager.inMemory();
+    session.appendMessage({ role: "user", content: "Old branch context", timestamp: 1 });
+    const mock = createMockPi();
+    let providerCalls = 0;
+    let customCalls = 0;
+    const interactive = createMockContext({
+      mode: "tui",
+      hasUI: true,
+      sessionManager: session,
+      modelRegistry: {
+        getProvider() {
+          return {
+            streamSimple() {
+              providerCalls += 1;
+              return { result: async () => response("not sent") };
+            },
+          };
+        },
+      },
+      custom: async (factory: (...args: never[]) => unknown) => {
+        customCalls += 1;
+        if (customCalls === 1) {
+          if (change === "session tree change") {
+            for (const handler of mock.events.get("session_tree") ?? []) await handler({}, interactive.ctx);
+          } else {
+            session.newSession();
+            session.appendMessage({ role: "user", content: "New session context", timestamp: 2 });
+          }
+          return { kind: "submit", question: "Do not send" };
+        }
+        return new Promise((resolve) => {
+          factory(
+            { terminal: { rows: 24 }, requestRender() {} } as never,
+            { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+            {} as never,
+            resolve as never,
+          );
+        });
+      },
+    });
+    btw(mock.pi, {
+      showCommandMenu: async () => "start",
+      loadSettings: async () => ({}),
+      resolveModel: async () => ({
+        kind: "selected",
+        selected: { model: { provider: "synthetic-provider", id: "side" } as Model<Api>, auth: {} },
+      }),
+      runFullscreen: async (ctx, run) => run(ctx),
+    });
+    const command = mock.commands.get("btw");
+    assert.ok(command);
+    await command.handler("", interactive.ctx);
+    assert.equal(customCalls, 1);
+    assert.equal(providerCalls, 0);
+  },
+);
+
+test("a deferred answer after Pi tree navigation cannot record an error or reopen the old composer", async () => {
+  const mock = createMockPi();
+  const session = SessionManager.inMemory();
+  const earlier = session.appendMessage({ role: "user", content: "Earlier branch", timestamp: 1 });
+  session.appendMessage({ role: "user", content: "Later branch", timestamp: 2 });
+  const sessionId = session.getSessionId();
+  const interactive = createMockContext({ mode: "tui", hasUI: true, sessionManager: session });
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let release!: (result: { kind: "error"; message: string }) => void;
+  const deferred = new Promise<{ kind: "error"; message: string }>((resolve) => {
+    release = resolve;
+  });
+  let composerOpens = 0;
+  let turns: SideThread["turns"] | undefined;
+  btw(mock.pi, {
+    loadSettings: async () => ({}),
+    resolveModel: async () => ({
+      kind: "selected",
+      selected: { model: { provider: "test", id: "side" } as Model<Api>, auth: {} },
+    }),
+    runFullscreen: async (ctx, run) => run(ctx),
+    runThread: (options) => {
+      turns = options.state?.thread.turns;
+      return runBtwThread({
+        ...options,
+        dependencies: {
+          ask: async () => {
+            entered();
+            return deferred;
+          },
+          interact: async () => {
+            composerOpens += 1;
+            return { kind: "close" };
+          },
+        },
+      });
+    },
+  });
+  const command = mock.commands.get("btw");
+  assert.ok(command);
+  const running = command.handler("Old side question", interactive.ctx);
+  await waiting;
+  session.branch(earlier);
+  for (const handler of mock.events.get("session_tree") ?? []) await handler({}, interactive.ctx);
+  assert.equal(session.getSessionId(), sessionId);
+  release({ kind: "error", message: "Old error" });
+  await running;
+  assert.deepEqual(turns, []);
+  assert.equal(composerOpens, 0);
+  assert.deepEqual(interactive.notifications, []);
+});
+
+test("explicit parent sharing falls back to the raw branch on pre-projection Pi hosts", async () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage({ role: "user", content: "Legacy context", timestamp: 1 });
+  let branchReads = 0;
+  const request = await captureOptedInRequest({
+    getBranch: () => {
+      branchReads++;
+      return session.getBranch();
+    },
+  });
+  assert.match(request, /User: Legacy context/);
+  assert.equal(branchReads, 1);
+});
+
+test("explicitly shared projected context still respects the 40k character budget", async () => {
+  const session = SessionManager.inMemory();
+  const target = session.appendMessage({ role: "user", content: "OLD_SECRET", timestamp: 1 });
+  session.appendContextEdit(target, { content: `Visible start${"x".repeat(100_000)}visible end` });
+
+  const request = await captureOptedInRequest(session);
+  const context = request.split("<conversation_context>\n")[1]?.split("\n</conversation_context>")[0] ?? "";
+  assert.match(context, /^\[Earlier context omitted;/);
+  assert.ok(context.length < 41_000);
+  assert.ok(context.endsWith("visible end"));
+  assert.doesNotMatch(context, /OLD_SECRET|Visible start/);
+});
+
+test("explicitly shared compaction and branch summaries survive in order within the context budget", async () => {
+  const session = SessionManager.inMemory();
+  session.appendMessage({ role: "user", content: "OLD_SECRET", timestamp: 1 });
+  session.appendCompaction("Compacted parent context", null, 100);
+  session.branchWithSummary(session.getLeafId(), "Branched parent context");
+  session.appendMessage({ role: "user", content: "New visible question", timestamp: 2 });
+
+  const request = await captureOptedInRequest(session);
+  assert.match(
+    request,
+    /Compaction summary: Compacted parent context\n\nBranch summary: Branched parent context\n\nUser: New visible question/,
+  );
+  assert.doesNotMatch(request, /OLD_SECRET/);
+
+  const summaryOnly = SessionManager.inMemory();
+  summaryOnly.appendMessage({ role: "user", content: "OMITTED_SECRET", timestamp: 1 });
+  summaryOnly.appendCompaction(`Old prefix${"x".repeat(100_000)}latest summary`, null, 100);
+  const summaryRequest = await captureOptedInRequest(summaryOnly);
+  const context = summaryRequest.split("<conversation_context>\n")[1]?.split("\n</conversation_context>")[0] ?? "";
+  assert.match(context, /^\[Earlier context omitted;/);
+  assert.ok(context.length < 41_000);
+  assert.ok(context.endsWith("latest summary"));
+  assert.doesNotMatch(context, /OMITTED_SECRET|Old prefix/);
+});
+
+test("projected custom and visible Bash messages reach only explicitly shared side context", async () => {
+  const session = SessionManager.inMemory();
+  session.appendCustomMessageEntry("memo", "MODEL_VISIBLE_CUSTOM", false);
+  session.appendMessage({
+    role: "bashExecution",
+    command: "pwd",
+    output: "MODEL_VISIBLE_BASH",
+    exitCode: 0,
+    cancelled: false,
+    truncated: false,
+    timestamp: Date.now(),
+  });
+  session.appendMessage({
+    role: "bashExecution",
+    command: "private",
+    output: "EXCLUDED_BASH_OUTPUT",
+    exitCode: 0,
+    cancelled: false,
+    truncated: false,
+    excludeFromContext: true,
+    timestamp: Date.now(),
+  });
+
+  const request = await captureOptedInRequest(session);
+  assert.match(request, /Context: MODEL_VISIBLE_CUSTOM\n\nBash pwd: MODEL_VISIBLE_BASH/);
+  assert.doesNotMatch(request, /EXCLUDED_BASH_OUTPUT/);
 });
 
 test("side-thread sends custom APIs through Pi core's effective provider", async () => {
@@ -828,7 +1832,7 @@ test("side-thread command loop updates resumable title, activity, and local thin
   const state = {
     id: "btw-1",
     title: undefined,
-    thread: createSideThread("main context"),
+    thread: createSideThread(),
     thinkingLevel: "low" as const,
     createdAt: 10,
     updatedAt: 10,
@@ -878,7 +1882,7 @@ test("side-thread command loop retains a visible error as resumable activity", a
   const state = {
     id: "btw-error",
     title: undefined,
-    thread: createSideThread("main context"),
+    thread: createSideThread(),
     thinkingLevel: "off" as const,
     createdAt: 5,
     updatedAt: 5,
@@ -1363,6 +2367,38 @@ test("cancelled main-editor loading returns to the side composer with its draft"
   assert.deepEqual(result, { kind: "closed" });
 });
 
+test("a replaced main session cannot receive a side thread's bring-to-main draft", async () => {
+  const sessionManager = { getBranch: () => [], getSessionId: () => "original" };
+  const ctx = { ui: { notify() {} }, sessionManager } as never;
+  let deliveries = 0;
+  let active = true;
+  const result = await runBtwThread({
+    initialQuestion: "Q1",
+    selected: { model: { provider: "test", id: "side" } as Model<Api>, auth: { apiKey: "key" } },
+    thinkingLevel: "off",
+    ctx,
+    isSessionCurrent: () => active,
+    dependencies: {
+      ask: async (thread) => {
+        const assistant = response("A1");
+        thread.turns.push({ kind: "answered", question: "Q1", answer: "A1", response: assistant });
+        return { kind: "answered", response: assistant, answer: "A1" };
+      },
+      interact: async () => ({ kind: "bringToMain", questionDraft: "" }),
+      chooseBringToMain: async () => {
+        active = false; // Session changes while the selection menu is open.
+        return { kind: "bringToMain", draft: "old branch answer", summary: { lines: 1, messages: 1, tokens: 4 } };
+      },
+      deliverBringToMain: async () => {
+        deliveries++;
+        return "loaded";
+      },
+    },
+  });
+  assert.deepEqual(result, { kind: "closed" });
+  assert.equal(deliveries, 0);
+});
+
 test("side-thread command loop loads an explicit bring-to-main draft without mutating the session", async () => {
   const branch = [{ type: "message", message: { role: "user", content: "main" } }];
   const ctx = {
@@ -1406,6 +2442,59 @@ test("side-thread command loop loads an explicit bring-to-main draft without mut
   ]);
   assert.equal(branch.length, 1);
 });
+
+test.each(["append", "replace confirmation"] as const)(
+  "a stale %s menu cannot write a draft into a new Pi tree branch",
+  async (stage) => {
+    const session = SessionManager.inMemory();
+    const earlier = session.appendMessage({ role: "user", content: "Earlier", timestamp: 1 });
+    session.appendMessage({ role: "user", content: "Later", timestamp: 2 });
+    const sessionId = session.getSessionId();
+    const tui = createTuiHarness({ width: 100, rows: 24 });
+    let editor = "old editor";
+    const writes: string[] = [];
+    let generation = 0;
+    const ctx = {
+      mode: "tui",
+      hasUI: true,
+      sessionManager: session,
+      ui: {
+        custom: tui.custom,
+        getEditorText: () => editor,
+        setEditorText: (text: string) => {
+          writes.push(text);
+          editor = text;
+        },
+        notify() {},
+      },
+    } as never;
+    try {
+      const running = loadBringToMainDraft(
+        "obsolete draft",
+        ctx,
+        { lines: 1, messages: 1, tokens: 2 },
+        () => generation === 0,
+      );
+      await tui.waitForOpen();
+      if (stage === "replace confirmation") {
+        tui.press("tui.select.down");
+        tui.press("tui.select.confirm");
+        await tui.waitForOpen();
+      }
+      session.branch(earlier);
+      generation += 1;
+      assert.equal(session.getSessionId(), sessionId);
+      editor = "replacement branch editor";
+      if (stage === "replace confirmation") tui.press("tui.select.down");
+      tui.press("tui.select.confirm");
+      assert.equal(await running, "closed");
+      assert.equal(editor, "replacement branch editor");
+      assert.deepEqual(writes, []);
+    } finally {
+      tui.dispose();
+    }
+  },
+);
 
 test("appending a bring-to-main draft is recommended and reports the concrete outcome", async () => {
   const host = createStandardMenuContext("original editor");
@@ -1520,6 +2609,33 @@ test("disposing a bring-to-main standard menu closes without writing through its
   assert.equal(await running, "closed");
   assert.deepEqual(editorWrites, []);
   assert.equal(editor, "original editor");
+});
+
+test("committed Pi newSession during a cached editor read cannot receive the old side draft", async () => {
+  const session = SessionManager.inMemory();
+  const oldId = session.getSessionId();
+  let editor = "";
+  const writes: string[] = [];
+  const ctx = {
+    sessionManager: session,
+    ui: {
+      getEditorText: () => {
+        session.newSession();
+        editor = "new session draft";
+        return ""; // The old UI proxy still returns its cached editor text.
+      },
+      setEditorText: (text: string) => {
+        writes.push(text);
+        editor = text;
+      },
+      notify() {},
+    },
+  } as never;
+
+  assert.equal(await loadBringToMainDraft("obsolete draft", ctx, { lines: 1, messages: 1, tokens: 2 }), "closed");
+  assert.notEqual(session.getSessionId(), oldId);
+  assert.equal(editor, "new session draft");
+  assert.deepEqual(writes, []);
 });
 
 test("empty main editor receives an editable draft with a concrete success message", async () => {
@@ -2156,7 +3272,7 @@ test("side-thread header is presentation-only", () => {
       return text;
     },
   };
-  const thread = createSideThread("main context");
+  const thread = createSideThread();
   thread.turns.push({
     question: "previous question",
     answer: "previous answer",

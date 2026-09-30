@@ -815,10 +815,13 @@ try {
   else process.env.HOME = previousHome;
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-  rmSync(temp, { recursive: true, force: true });
+  // Background session_start work may still be winding down after SDK dispose
+  // (which does not emit session_shutdown). Retry ENOTEMPTY while it releases
+  // its temporary resources instead of treating a cleanup race as a loader failure.
+  rmSync(temp, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
 }
 
-// Pi 0.85's public AgentSession.dispose invalidates extension contexts but does
+// Pi's public AgentSession.dispose invalidates extension contexts but does
 // not emit session_shutdown; terminate only after every smoke assertion and
 // cleanup above so extension-owned unref timers cannot outlive the temp tree.
 process.exit(0);

@@ -2,20 +2,21 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { performance } from "node:perf_hooks";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { Extension, ExtensionContext, InlineExtension, LoadExtensionsResult, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  DefaultPackageManager,
   DefaultResourceLoader,
   type ExtensionAPI,
   getAgentDir,
-  type ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -23,7 +24,8 @@ import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tier
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
 import { runInChildSessionContext } from "./child-context.js";
-import { buildParentContext, extractText } from "./context.js";
+import { extractText } from "./context.js";
+import { assertNoRawInheritance, assertSafeChildSession } from "./context-boundary.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from "./gate.js";
@@ -35,6 +37,7 @@ import {
 } from "./internal-run.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resolver.js";
+import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
@@ -57,6 +60,7 @@ export const SUBAGENT_TOOL_NAMES = {
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+const TOOL_POLICY_EXTENSION = "pi-subagents-tool-policy";
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -66,6 +70,7 @@ const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
  * single-file extensions to the basename minus `.ts`/`.js`.
  */
 export function extensionCanonicalName(extPath: string): string {
+  if (extPath.startsWith("builtin:")) return extPath.slice("builtin:".length).toLowerCase();
   const base = basename(extPath);
   const name = base === "index.ts" || base === "index.js"
     ? basename(dirname(extPath))
@@ -219,118 +224,103 @@ export function parseExtSelectors(entries: string[]): {
  *
  * Extensions may call `registerTool` long after load — pi-mcp from `session_start`,
  * context-mode from `before_agent_start` — so scope has to be re-derived rather than
- * snapshotted. `registerTool` writes into the very `extension.tools` maps this reads,
- * so `inScope()` sees late arrivals on the next call.
+ * snapshotted. Pi's public `getAllTools()` includes each live effective tool and
+ * its source, so `inScope()` sees late arrivals and resolves name collisions.
  *
- * Two enforcement points, because neither covers the whole picture:
- *
- *   - `turn_end` re-narrows the ACTIVE set. pi emits `turn_end` immediately before
- *     `prepareNextTurn` re-snapshots `agent.state.tools`, and session listeners run
- *     synchronously, so the narrow lands in time for turns 2..N.
- *   - `beforeToolCall` blocks out-of-scope calls. Turn 1 cannot be narrowed at all:
- *     `before_agent_start` fires INSIDE `prompt()` and may widen the tool set, but
- *     `createContextSnapshot()` freezes that turn's tools immediately after — there
- *     is no hook in between. A call-time check is the only correct guard there.
- *
- * Both are installed on the session and deliberately NOT unsubscribed: they must
- * outlive the `runAgent` call so resumed/steered turns stay scoped. pi's `dispose()`
- * clears `_eventListeners`, so they die with the session rather than leaking.
- *
- * Only meaningful when extensions are loaded — under `noExtensions`/`isolated` the
- * static `allowedToolNames` allowlist already gates the registry itself.
+ * The session's active set is re-narrowed at `turn_end`, before the next turn
+ * snapshots its tools. A separate, hidden extension's public `tool_call` handler
+ * enforces this same live scope at execution time. That handler also sees calls
+ * made through `ctx.executeTool()` (codemode and MCP), which do not pass through
+ * the Agent's model-call hook. Both outlive runAgent for resumed/steered turns.
  */
-export function installExtensionToolScope(
-  session: AgentSession,
-  ctx: {
-    loader: DefaultResourceLoader;
-    toolNames: string[];
-    disallowedSet: Set<string> | undefined;
-    extNames: Set<string>;
-    narrowing: Map<string, Set<string>>;
-    /** Opt-in nested-delegation tool names to keep active despite the EXCLUDED strip. */
-    nestedToolNames: Set<string>;
-    /** Per-call approval gate from `ask_tools:`, when the agent declares any. */
-    askGate?: (toolName: string, input: unknown) => Promise<{ block: true; reason: string } | undefined>;
-  },
-): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, askGate } = ctx;
-
-  // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
-  // selector is present, extension tools become an explicit allowlist — a loaded
-  // extension not named by a selector contributes nothing (its handlers still ran),
-  // and `ext:foo/bar` narrows `foo` to just `bar`.
-  const inScope = (): Set<string> => {
-    const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
+function extensionToolNamesInScope(session: AgentSession, ctx: {
+  loader: DefaultResourceLoader;
+  toolNames: string[];
+  disallowedSet: Set<string> | undefined;
+  extNames: Set<string>;
+  narrowing: Map<string, Set<string>>;
+  nestedToolNames: Set<string>;
+}): () => Set<string> {
+  const { loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames } = ctx;
+  const builtins = new Set(toolNames);
+  return () => {
+    const keep = new Set<string>();
+    const extensionsByPath = new Map(loader.getExtensions().extensions.map((e) => [e.path, e]));
     const optInActive = extNames.size > 0;
-    for (const extension of loader.getExtensions().extensions) {
-      const canons = extensionCanonicalNames(extension.path);
-      if (optInActive && !canons.some((c) => extNames.has(c))) continue;
-      // First alias that carries a narrowing set — a user won't narrow one
-      // extension under two different names, so first-match is correct.
-      const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
-      for (const name of extension.tools.keys()) {
+    // Pi's public registry reports the EFFECTIVE tool definition, after its
+    // first-registration-wins collision handling. A union of extension.tools
+    // would mistakenly approve a disallowed tool shadowed by an allowed one.
+    for (const tool of session.getAllTools()) {
+      const { name } = tool;
+      if (disallowedSet?.has(name)) continue;
+      if (EXCLUDED_TOOL_NAMES.includes(name) && !nestedToolNames.has(name)) continue;
+      const path = tool.sourceInfo.path;
+      const extension = extensionsByPath.get(path);
+      if (extension) {
+        const canons = extensionCanonicalNames(extension.path);
+        if (optInActive && !canons.some((c) => extNames.has(c))) continue;
+        // First alias that carries a narrowing set — a user won't narrow one
+        // extension under two different names, so first-match is correct.
+        const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
         if (narrowed && !narrowed.has(name)) continue;
-        if (disallowedSet?.has(name)) continue;
+        keep.add(name);
+      } else if (builtins.has(name) && (path === `builtin:${name}` || path === `<builtin:${name}>`)) {
+        // Pi 0.84–0.87 used angle-bracket source paths for core tools; 0.99
+        // uses builtin:<name>. Match the actual tool name, never a loose prefix.
+        keep.add(name);
+      } else if (path === `<sdk:${name}>` && nestedToolNames.has(name)) {
         keep.add(name);
       }
-    }
-    for (const name of EXCLUDED_TOOL_NAMES) keep.delete(name);
-    // Opt-in nested delegation tools share EXCLUDED_TOOL_NAMES' names but are
-    // legitimately active for this agent — re-admit them so the renarrow keeps
-    // them in the active set and beforeToolCall doesn't block them.
-    for (const name of nestedToolNames) {
-      if (!disallowedSet?.has(name)) keep.add(name);
+      // An unrecognized source cannot inherit another extension's permission.
     }
     return keep;
   };
+}
 
+/** Only needed with extensions; `extensions: false` has a static registry allowlist. */
+export function installExtensionToolScope(session: AgentSession, inScope: () => Set<string>): void {
+  // Remember the effective registry winner, not just the name. If Pi or another
+  // extension deliberately deactivates a tool, a later turn must not undo that
+  // decision; a different source winning the same name is a new registration.
+  const seenSources = new Map<string, string>();
   const renarrow = () => {
     const allowed = inScope();
-    const next = session.getAllTools().map((t) => t.name).filter((n) => allowed.has(n));
+    const tools = session.getAllTools();
+    const registered = new Set(tools.map((tool) => tool.name));
+    for (const name of seenSources.keys()) {
+      if (!registered.has(name)) seenSources.delete(name);
+    }
     const current = session.getActiveToolNames();
+    const next = current.filter((name) => allowed.has(name) && registered.has(name));
+    const active = new Set(next);
+    for (const tool of tools) {
+      const { name } = tool;
+      const source = tool.sourceInfo.path;
+      const newSource = seenSources.get(name) !== source;
+      seenSources.set(name, source);
+      if (!newSource || !allowed.has(name) || active.has(name)) continue;
+      // Pi 0.99 deliberately leaves deferred/codemode/hidden tools and
+      // defaultActive:false tools inactive. Older hosts expose neither setting
+      // and auto-activate every newly registered extension tool.
+      const exposure = tool.exposure ?? "direct";
+      if ((exposure === "direct" || exposure === "model-only") &&
+          session.getToolDefinition?.(name)?.defaultActive !== false) {
+        next.push(name);
+        active.add(name);
+      }
+    }
     // setActiveToolsByName unconditionally rebuilds the system prompt, so skip
     // the no-op that steady-state turns would otherwise pay for every turn.
-    if (next.length !== current.length || next.some((n, i) => n !== current[i])) {
+    if (next.length !== current.length || next.some((name, i) => name !== current[i])) {
       session.setActiveToolsByName(next);
     }
   };
 
-  // Activate what registered during session_start (eager MCP servers); pi would
-  // otherwise leave only its four default built-ins active at turn 1.
+  // Reconcile tools registered during session_start before the first turn.
   renarrow();
-
   session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") renarrow();
   });
-
-  const priorBeforeToolCall = session.agent.beforeToolCall;
-  session.agent.beforeToolCall = async (context, signal) => {
-    const run = async () => {
-      if (!inScope().has(context.toolCall.name)) {
-        return {
-          block: true,
-          reason: `Tool "${context.toolCall.name}" is not available to this subagent.`,
-        } as const;
-      }
-      // Scope first, then approval: a tool this agent may not use at all is
-      // refused without troubling the user about it.
-      const gated = await askGate?.(context.toolCall.name, context.args);
-      if (gated) return gated;
-      return priorBeforeToolCall?.(context, signal);
-    };
-    // Default per-tool timeout prevents a hung beforeToolCall (slow extension,
-    // stuck LLM arbitrator) from stalling the subagent forever. Approval
-    // dialogs are wrapped too — a tool that cannot be approved in time is
-    // blocked fail-closed rather than left hanging.
-    if (defaultToolTimeoutMs > 0) {
-      try {
-        return await withTimeout(run(), defaultToolTimeoutMs, `beforeToolCall for "${context.toolCall.name}"`);
-      } catch (err) {
-        return { block: true, reason: (err as Error).message };
-      }
-    }
-    return run();
-  };
 }
 
 /**
@@ -391,6 +381,17 @@ export function setDefaultMaxToolCalls(n: number): void { defaultMaxToolCalls = 
 /** Default per-tool timeout; `0` disables (no timeout). Mirrors tintinweb — no per-tool timeout by default; hung tools are reclaimed via session abort/quiescence, not a hard tool cut. Set via settings defaultToolTimeoutMs when needed. */
 const DEFAULT_TOOL_TIMEOUT_MS = 0;
 const TOOL_TIMEOUT_CEILING_MS = 600_000;
+// Pi emits tool_execution_start before invoking the public tool_call hooks.
+// Let their shared deadline return a block before the fallback session.abort()
+// timer can turn that result into an unhelpful "Operation aborted".
+const TOOL_CALL_ABORT_GRACE_MS = 25;
+interface ApprovalTimer {
+  isInteractiveAsk: (name: string) => boolean;
+  armApproved: (toolCallId: string, toolName: string) => void;
+}
+// The policy survives runAgent for resumed turns; the current prompt owns its
+// abort timers, so resume replaces armApproved instead of arming a stale timer.
+const approvalTimers = new WeakMap<AgentSession, ApprovalTimer>();
 let defaultToolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS;
 export function getDefaultToolTimeoutMs(): number { return defaultToolTimeoutMs; }
 export function setDefaultToolTimeoutMs(n: number): void {
@@ -407,6 +408,79 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
   return Promise.race([promise, timeout]).finally(() => {
     if (handle) clearTimeout(handle);
   });
+}
+
+/**
+ * The execution fallback begins before Pi's tool_call chain. Its small grace
+ * lets a timed-out hook return a block before aborting the session; while a
+ * parent waits on ctx.executeTool, only the nested call's own budget advances.
+ * Interactive approval is excluded until the policy handler has a decision.
+ */
+function createToolTimeouts(session: AgentSession, grace: number, isInteractiveAsk: (name: string) => boolean) {
+  const pending = new Map<string, ReturnType<typeof setTimeout>>();
+  const due = new Map<string, number>();
+  const paused = new Map<string, { remaining: number; children: Set<string> }>();
+  const clear = (id: string): void => {
+    const handle = pending.get(id);
+    if (handle) clearTimeout(handle);
+    pending.delete(id);
+    due.delete(id);
+    paused.delete(id);
+  };
+  const arm = (id: string, name: string, delay = defaultToolTimeoutMs + grace): void => {
+    if (defaultToolTimeoutMs <= 0 || name === "contact_supervisor") return;
+    due.set(id, performance.now() + delay);
+    const handle = setTimeout(() => {
+      pending.delete(id);
+      due.delete(id);
+      try {
+        session.abort();
+      } catch {
+        // The session may already have been torn down.
+      }
+    }, delay);
+    handle.unref?.();
+    pending.set(id, handle);
+  };
+  return {
+    armApproved: (id: string, name: string): void => arm(id, name),
+    start: (event: { toolCallId: string; toolName: string; parentToolCallId?: string }): void => {
+      if (event.parentToolCallId) {
+        const parent = paused.get(event.parentToolCallId);
+        if (parent) parent.children.add(event.toolCallId);
+        else {
+          const handle = pending.get(event.parentToolCallId);
+          const deadline = due.get(event.parentToolCallId);
+          if (handle && deadline !== undefined) {
+            clearTimeout(handle);
+            pending.delete(event.parentToolCallId);
+            due.delete(event.parentToolCallId);
+            paused.set(event.parentToolCallId, {
+              remaining: Math.max(0, deadline - performance.now()),
+              children: new Set([event.toolCallId]),
+            });
+          }
+        }
+      }
+      if (!isInteractiveAsk(event.toolName)) arm(event.toolCallId, event.toolName);
+    },
+    end: (event: { toolCallId: string; parentToolCallId?: string }): void => {
+      clear(event.toolCallId);
+      if (!event.parentToolCallId) return;
+      const parent = paused.get(event.parentToolCallId);
+      if (!parent) return;
+      parent.children.delete(event.toolCallId);
+      if (parent.children.size > 0) return;
+      paused.delete(event.parentToolCallId);
+      arm(event.parentToolCallId, "", parent.remaining);
+    },
+    dispose: (): void => {
+      for (const handle of pending.values()) clearTimeout(handle);
+      pending.clear();
+      due.clear();
+      paused.clear();
+    },
+  };
 }
 
 let graceTurns = 5;
@@ -752,6 +826,68 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
+/**
+ * Give Pi a live, guarded view of an extension's tool_call handlers. Pi's
+ * public loader returns Extension objects whose handlers map is also the target
+ * of later pi.on() registrations. Copying that map once misses late handlers;
+ * replacing its raw arrays breaks pi.on()'s unsubscribe closure. Intercept
+ * reads instead, leaving registration/unsubscription and all metadata intact.
+ * Each read wraps the CURRENT callbacks before Pi takes its event snapshot.
+ */
+function guardExtensionToolCalls(
+  extension: Extension,
+  deadlines: WeakMap<object, number>,
+): Extension {
+  type Handler = NonNullable<ReturnType<Extension["handlers"]["get"]>>[number];
+  const guarded = new WeakMap<Handler, Handler>();
+  const handlers = new Proxy(extension.handlers, {
+    get(target, key) {
+      if (key === "get") return (event: string) => {
+        const raw = target.get(event);
+        if (event !== "tool_call" || !raw) return raw;
+        return raw.map((handler) => {
+          let wrapper = guarded.get(handler);
+          if (!wrapper) {
+            wrapper = async (...args: unknown[]) => {
+              const call = args[0];
+              if (!call || typeof call !== "object") {
+                return { block: true, reason: "Invalid subagent tool_call event." };
+              }
+              const deadline = deadlines.get(call);
+              if (deadline === undefined) {
+                return { block: true, reason: "Subagent tool policy was bypassed." };
+              }
+              if (deadline === Infinity) return handler(...args);
+              const toolName = Reflect.get(call, "toolName");
+              const label = `tool_call for "${typeof toolName === "string" ? toolName : "unknown"}"`;
+              const remaining = Math.ceil(deadline - performance.now());
+              if (remaining <= 0) return { block: true, reason: `${label} timed out before the extension handler.` };
+              try {
+                // This race blocks the call; it cannot cancel side effects of
+                // a handler that keeps running after its Promise loses.
+                return await withTimeout(Promise.resolve().then(() => handler(...args)), remaining, label);
+              } catch (error) {
+                // Pi does not catch tool_call handler failures. A timeout must
+                // block the tool, not leave a rejected event or an awaited hook.
+                return { block: true, reason: error instanceof Error ? error.message : String(error) };
+              }
+            };
+            guarded.set(handler, wrapper);
+          }
+          return wrapper;
+        });
+      };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return new Proxy(extension, {
+    get(target, key, receiver) {
+      return key === "handlers" ? handlers : Reflect.get(target, key, receiver);
+    },
+  });
+}
+
 export async function runAgent(
   ctx: ExtensionContext,
   type: SubagentType,
@@ -796,6 +932,12 @@ export async function runAgent(
         inheritContext: internalOverride.inheritContext,
       }
     : loadedAgentConfig;
+  // Reject raw parent-history inheritance before building context, loading
+  // extensions, creating a session, or dispatching a provider request.
+  assertNoRawInheritance(internalOverride?.inheritContext ?? options.inheritContext ?? agentConfig?.inheritContext);
+  // A missing parent bridge must fail before child resource discovery or session
+  // allocation. Re-check the selected model below once tier resolution finishes.
+  parentModelSessionOptions(ctx);
   const parentPolicySnapshot = options[INTERNAL_PARENT_POLICY_SNAPSHOT];
   const parentModel = parentPolicySnapshot ? parentPolicySnapshot.model : ctx.model;
   const parentThinking = parentPolicySnapshot
@@ -913,8 +1055,9 @@ export async function runAgent(
     systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
   }
 
-  // When skills is string[], we've already preloaded them into the prompt.
-  // Still pass noSkills: true since we don't need the skill loader to load them again.
+  // Named skills are preloaded into the prompt, not exposed through Pi's skill catalog.
+  // noSkills only skips initial discovery; resources_discover can add extension
+  // skills later, so the loader override must enforce this policy on every update.
   const noSkills = skills === false || Array.isArray(skills);
 
   const agentDir = getAgentDir();
@@ -922,16 +1065,16 @@ export async function runAgent(
   // Extension loading:
   // - true  → all default-discovered extensions
   // - false → none (noExtensions)
-  // - string[] → loader-level allowlist. Bare names keep the matching
-  //   default-discovered extension; path entries load that extension fresh;
-  //   "*" keeps all default-discovered extensions. Excluded extensions never
-  //   bind handlers or register tools (their factory still runs once).
+  // - string[] → allowlist. Bare names keep matching default-discovered
+  //   extensions; path entries load explicitly; "*" keeps all defaults.
+  //   On Pi with replaceable built-ins, restrictive policies resolve paths
+  //   before loading, so excluded factories cannot replace a selected built-in.
   //
   // Suppress AGENTS.md/CLAUDE.md and APPEND_SYSTEM.md — upstream's
   // buildSystemPrompt() re-appends both AFTER systemPromptOverride, which
   // would defeat prompt_mode: replace and isolated: true. Parent context, if
-  // wanted, reaches the subagent via prompt_mode: append (parentSystemPrompt
-  // is embedded in systemPromptOverride) or inherit_context (conversation).
+  // append-mode agents receive system instructions through systemPromptOverride;
+  // raw parent conversation inheritance is unavailable on these Pi hosts.
   // `ext:` selectors from the `tools:` CSV narrow which extension tools surface to
   // the LLM. They do NOT control loading — `extensions:` is the sole authority for
   // which extensions load. `ext:foo` against an extension that `extensions:` excluded
@@ -946,42 +1089,176 @@ export async function runAgent(
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
   // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
-  // Plain canonical names only (case-insensitive). Note: excluded extensions'
-  // factories still run once during reload() (see comment above) — exclusion
-  // suppresses handler binding and tool registration; it is not a sandbox.
+  // Plain canonical names only (case-insensitive). On older hosts filtering is
+  // post-factory; this is not a sandbox for extensions that already loaded.
   const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
   const hasExcludes = excludeNames.size > 0;
-  // The override filters loaded extensions down to `keepNames` minus `excludeNames`.
-  // It's only needed when we're neither loading everything without excludes
-  // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
+  // The override filters on older hosts, validates preselection on new hosts,
+  // and ALWAYS puts our tool policy first. Pi passes one mutable
+  // tool_call event through handlers in extension order; if an earlier extension
+  // changes event.toolName, a later gate would inspect a different name from the
+  // one Pi actually executes. Ordering before untrusted handlers is essential.
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
-  const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
-  // Pre-filter discovered set, captured by the override — the exclude-typo warning
-  // must compare against this, not the surviving set (absence from survivors is
-  // an exclude *succeeding*).
+  const bareNames = new Set(Array.isArray(extensions)
+    ? extensions.filter((entry) => entry !== "*" && !entry.includes("/") && !entry.includes("\\") && !entry.startsWith("~"))
+        .map((entry) => entry.toLowerCase())
+    : []);
+  // Pre-filter discovered set, captured by the override (or the resolver) — the
+  // exclude-typo warning must compare against this, not the surviving set.
   let discoveredNames: Set<string> | undefined;
-  const extensionsOverride: ((base: LoadExtensionsResult) => LoadExtensionsResult) | undefined =
-    noExtensions || (loadAll && !hasExcludes)
-      ? undefined
-      : (base) => {
-          discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
-          return {
-            ...base,
-            extensions: base.extensions.filter((e) => {
-              const canons = extensionCanonicalNames(e.path);
-              if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
-              return loadAll || canons.some((n) => keepNames.has(n));
-            }),
-          };
-        };
+  let prefilteredExtensionPaths: Set<string> | undefined;
+  const resolvedExplicitNames = new Set<string>();
+  const interactiveAskNames = new Set(ctx.hasUI ? (agentConfig?.askTools ?? []).map((name) => name.toLowerCase()) : []);
+  const approvalTimer: ApprovalTimer = {
+    isInteractiveAsk: (name) => interactiveAskNames.has(name.toLowerCase()),
+    armApproved: () => {},
+  };
+  // The policy starts a single monotonic deadline for each public tool_call
+  // event. All subsequently selected extension handlers share its remainder,
+  // including calls initiated by another tool through ctx.executeTool().
+  const toolCallDeadlines = new WeakMap<object, number>();
+  const extensionsOverride = (base: LoadExtensionsResult): LoadExtensionsResult => {
+    const policy = base.extensions.find((e) => e.path === `<inline:${TOOL_POLICY_EXTENSION}>`);
+    if (!policy) throw new Error("Subagent tool policy extension failed to load.");
+    let selected = base.extensions;
+    if (prefilteredExtensionPaths) {
+      // Fail closed if a host loads anything outside the pre-resolved policy.
+      // Filtering it now would be too late to undo its factory side effects.
+      const allowedPaths = prefilteredExtensionPaths;
+      const unexpected = base.extensions.find((e) => e !== policy && !allowedPaths.has(e.path));
+      if (unexpected) throw new Error(`Pi loaded unselected extension "${unexpected.path}" for agent "${type}".`);
+    } else if (!noExtensions && (!loadAll || hasExcludes)) {
+      discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
+      selected = base.extensions.filter((e) => {
+        if (e === policy) return true; // never filter the child policy itself
+        const canons = extensionCanonicalNames(e.path);
+        if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
+        return loadAll || canons.some((n) => keepNames.has(n));
+      });
+    }
+    return {
+      ...base,
+      extensions: [policy, ...selected.filter((e) => e !== policy)
+        .map((extension) => guardExtensionToolCalls(extension, toolCallDeadlines))],
+    };
+  };
+
+  // The public extension `tool_call` event covers BOTH model calls and nested
+  // ctx.executeTool calls. A policy factory also loads with noExtensions: true,
+  // without loading any discovered extension. Deny until the child policy is
+  // installed, including calls an extension might make during session_start.
+  let checkToolCall: (name: string, input: unknown, deadline: number) => Promise<ToolCallEventResult | undefined> =
+    async () => ({ block: true, reason: "Subagent tool policy is not ready." });
+  const extensionFactories: InlineExtension[] = [{
+    name: TOOL_POLICY_EXTENSION,
+    hidden: true,
+    factory: (pi) => {
+      pi.on("tool_call", async (event, hookCtx) => {
+        if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
+        const waitingForHuman = approvalTimer.isInteractiveAsk(event.toolName);
+        // Human decision time is not tool execution time. The public event
+        // arrives after tool_execution_start, so the normal abort timer also
+        // waits until approval; only then do later handlers get a deadline.
+        const deadline = !waitingForHuman && defaultToolTimeoutMs > 0
+          ? performance.now() + defaultToolTimeoutMs
+          : Infinity;
+        toolCallDeadlines.set(event, deadline);
+        const decision = await checkToolCall(event.toolName, event.input, deadline);
+        // Abort cannot interrupt an already-open human dialog on these hosts.
+        // Do not execute a tool if that dialog eventually approves a stopped run.
+        if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
+        if (waitingForHuman && !decision?.block) {
+          toolCallDeadlines.set(event, defaultToolTimeoutMs > 0
+            ? performance.now() + defaultToolTimeoutMs
+            : Infinity);
+          approvalTimer.armApproved(event.toolCallId, event.toolName);
+        }
+        return decision;
+      });
+    },
+  }];
+  // Pi 0.99 exposes these as public SDK factories. Earlier supported hosts do
+  // not export them, so capability-check the namespace instead of importing a
+  // missing named export (which would prevent the whole extension from loading).
+  if ("createCodemodeExtension" in PiCodingAgent && typeof PiCodingAgent.createCodemodeExtension === "function") {
+    extensionFactories.push({ name: "codemode", builtin: true, replaceable: true, factory: PiCodingAgent.createCodemodeExtension() });
+  }
+  if ("createToolSearchExtension" in PiCodingAgent && typeof PiCodingAgent.createToolSearchExtension === "function") {
+    extensionFactories.push({ name: "tool-search", builtin: true, replaceable: true, factory: PiCodingAgent.createToolSearchExtension() });
+  }
+  if ("createMcpExtension" in PiCodingAgent && typeof PiCodingAgent.createMcpExtension === "function") {
+    extensionFactories.push({ name: "mcp", builtin: true, replaceable: true, factory: PiCodingAgent.createMcpExtension() });
+  }
+
+  const settingsManager = SettingsManager.create(configCwd, agentDir);
+  let additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  let settingsBeforeLoad: string | undefined;
+  // Pi 0.99 resolves replacement conflicts BEFORE extensionsOverride. A rogue
+  // discovered extension can register /mcp, replace builtin:mcp, and only then
+  // get filtered out by our allowlist. Resolve configured resources through the
+  // public package API first and feed only the selected paths into a loader with
+  // discovery off. Older Pi hosts have no replaceable built-ins; keep their
+  // existing post-load filter instead of relying on new host behavior.
+  const builtinNames = extensionFactories.filter((factory) => typeof factory !== "function" && factory.builtin)
+    .map((factory) => factory.name);
+  const prefilter = !noExtensions && (!loadAll || hasExcludes) && builtinNames.length > 0;
+  if (prefilter) {
+    await settingsManager.reload();
+    throwIfAborted(options.signal);
+    const packages = new DefaultPackageManager({ cwd: configCwd, agentDir, settingsManager, builtinExtensions: builtinNames });
+    // As with the normal loader, resolve() may install configured packages, and
+    // temporary sources may install a requested package. Do not read private Pi
+    // state or replace its source-resolution rules with path heuristics.
+    const configured = await packages.resolve();
+    throwIfAborted(options.signal);
+    const explicit = await packages.resolveExtensionSources(extensionsSpec?.paths ?? [], { temporary: true });
+    throwIfAborted(options.signal);
+    for (const source of extensionsSpec?.paths ?? []) {
+      if (!existsSync(source) || !explicit.extensions.some((resource) => resource.enabled && resource.metadata.source === source)) {
+        throw new Error(`Extension source "${source}" requested by agent "${type}" was not found or has no enabled extensions.`);
+      }
+    }
+    settingsBeforeLoad = JSON.stringify([settingsManager.getGlobalSettings(), settingsManager.getProjectSettings()]);
+    const enabledConfigured = configured.extensions.filter((resource) => resource.enabled).map((resource) => resource.path);
+    const enabledExplicit = explicit.extensions.filter((resource) => resource.enabled);
+    discoveredNames = new Set([...enabledConfigured, ...enabledExplicit.map((resource) => resource.path)].flatMap(extensionCanonicalNames));
+    const selectedExplicit = enabledExplicit.filter((resource) =>
+      !extensionCanonicalNames(resource.path).some((name) => excludeNames.has(name)));
+    const explicitPaths = new Set(selectedExplicit.map((resource) => resource.path));
+    // For priority, use the package's declared name rather than a generic entry
+    // alias like "src"; unrelated packages often have src/index.ts too.
+    const explicitNames = new Set(selectedExplicit.map((resource) =>
+      extensionPackageName(resource.path) ?? extensionCanonicalName(resource.path)));
+    for (const source of extensionsSpec?.paths ?? []) {
+      if (selectedExplicit.some((resource) => resource.metadata.source === source)) {
+        resolvedExplicitNames.add(extensionCanonicalName(source));
+      }
+    }
+    const selectedPaths = [
+      // The loader normally loads temporary paths before discovered paths. Keep
+      // that priority (including for directory/package paths with many entries).
+      ...selectedExplicit.map((resource) => resource.path),
+      ...enabledConfigured.filter((path) => {
+        const names = extensionCanonicalNames(path);
+        if (names.some((name) => excludeNames.has(name))) return false;
+        if (explicitPaths.has(path) || explicitNames.has(extensionPackageName(path) ?? extensionCanonicalName(path))) return false;
+        return loadAll || names.some((name) => bareNames.has(name));
+      }),
+    ];
+    prefilteredExtensionPaths = new Set(selectedPaths);
+    additionalExtensionPaths = [...prefilteredExtensionPaths];
+  }
 
   const loader = new DefaultResourceLoader({
     cwd: configCwd,
     agentDir,
-    noExtensions,
+    settingsManager,
+    noExtensions: noExtensions || prefilter,
     additionalExtensionPaths,
     extensionsOverride,
+    extensionFactories,
     noSkills,
+    skillsOverride: noSkills ? () => ({ skills: [], diagnostics: [] }) : undefined,
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -990,6 +1267,18 @@ export async function runAgent(
   });
   await runInChildSessionContext(() => loader.reload());
   throwIfAborted(options.signal);
+  if (prefilteredExtensionPaths) {
+    if (settingsBeforeLoad !== JSON.stringify([settingsManager.getGlobalSettings(), settingsManager.getProjectSettings()])) {
+      throw new Error(`Pi extension settings changed while loading agent "${type}"; retry with the current settings.`);
+    }
+    const loadedPaths = new Set(loader.getExtensions().extensions.map((extension) => extension.path));
+    for (const path of prefilteredExtensionPaths) {
+      if (!loadedPaths.has(path)) {
+        const diagnostic = loader.getExtensions().errors.find((error) => error.path === path);
+        throw new Error(`Selected extension "${path}" was not loaded for agent "${type}"${diagnostic ? `: ${diagnostic.error}` : " (possibly replaced by another extension)"}.`);
+      }
+    }
+  }
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -1011,11 +1300,13 @@ export async function runAgent(
     }
   }
 
-  // A subagent spawns mid-task, so a bad `extensions:`/`ext:` entry warns rather
-  // than aborts. Two distinct misconfigurations to catch:
-  //   - `extensions: [foo]` but no extension named foo was discovered (typo or
-  //     path that failed to load — path entries fold their canonical name into
-  //     `keepNames`, so this covers them too).
+  // Bare `extensions:` names and `ext:` tool selectors warn when unmatched.
+  // On prefiltered hosts, missing explicit paths and failed selected factories
+  // already raised above instead of silently losing a requested capability.
+  // Two remaining misconfigurations to catch:
+  //   - `extensions: [foo]` but no extension named foo was discovered (typo;
+  //     on older hosts path entries also fold their canonical name into
+  //     `keepNames`, so a failed path load is warned here).
   //   - `tools: ext:foo` but foo isn't in the loaded set (because `extensions:`
   //     didn't include it). Since v0.9, `ext:` no longer pulls extensions in;
   //     loading is `extensions:`-authoritative.
@@ -1045,6 +1336,10 @@ export async function runAgent(
       loader.getExtensions().extensions.flatMap((e) => extensionCanonicalNames(e.path)),
     );
     for (const name of keepNames) {
+      // A directory/package source can resolve to entries with different
+      // canonical names; its resolved paths were checked above, not by the
+      // basename of the requested directory.
+      if (prefilteredExtensionPaths && resolvedExplicitNames.has(name) && !bareNames.has(name)) continue;
       if (!survivingNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
@@ -1089,6 +1384,7 @@ export async function runAgent(
     if (scopeVerdict.kind === "error") throw new Error(scopeVerdict.message);
     if (scopeVerdict.kind === "warn" && ctx.hasUI) ctx.ui.notify(scopeVerdict.message, "warning");
   }
+  const parentModels = parentModelSessionOptions(ctx, model);
   const disallowedSet = (() => {
     const names = [...(agentConfig?.disallowedTools ?? []), ...(options.excludeTools ?? [])];
     return names.length > 0 ? new Set(names) : undefined;
@@ -1139,6 +1435,11 @@ export async function runAgent(
   // the scoping pass below keeps exactly the names it is given.
   const injectedTools = [...nestedTools, ...supervisorTools];
   const nestedToolNames = new Set(injectedTools.map(tool => tool.name));
+  const askGate = createAskGate({
+    askTools: agentConfig?.askTools ?? [],
+    agentLabel: agentConfig?.displayName ?? type,
+    ...(ctx.hasUI ? { confirm: (title: string, message: string) => ctx.ui.confirm(title, message) } : {}),
+  });
 
   // ─── Tool scoping ───────────────────────────────────────────────────────
   //
@@ -1203,7 +1504,6 @@ export async function runAgent(
     // allowlist. Concrete tool availability remains owned by the agent config.
   }
 
-  const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
   // Frontmatter wins when it says anything; otherwise the project default,
@@ -1226,21 +1526,18 @@ export async function runAgent(
         ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir, { parentSession })
         : SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
       : SessionManager.inMemory(effectiveCwd);
+  if (options.resumeSessionFile) {
+    assertSafeChildSession({ messages: [], sessionManager });
+  }
 
-  // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
-  // modelRuntime, but ExtensionContext still exposes only the registry facade.
-  // Pass both so the full supported Pi range retains the parent's providers.
-  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime }).runtime;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
-    modelRuntime?: ModelRuntime;
   } = {
     cwd: effectiveCwd,
     agentDir,
     sessionManager,
     settingsManager,
-    modelRegistry: ctx.modelRegistry,
-    ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime }),
+    ...parentModels,
     model,
     tools: sessionTools,
     customTools: injectedTools,
@@ -1254,6 +1551,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  approvalTimers.set(session, approvalTimer);
   // Install the forwarding listener immediately after session creation, before
   // bindExtensions/session_start can do asynchronous work. The old placement
   // just before prompt missed an abort during extension activation.
@@ -1262,6 +1560,27 @@ export async function runAgent(
   let completed = false;
   try {
     throwIfAborted(options.signal);
+
+  const inScope = noExtensions ? undefined : extensionToolNamesInScope(session, {
+    loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames,
+  });
+  checkToolCall = async (name, input, deadline) => {
+    const run = async (): Promise<ToolCallEventResult | undefined> => {
+      // Scope first, then approval: never prompt for a tool this child cannot use.
+      if (inScope && !inScope().has(name)) {
+        return { block: true, reason: `Tool "${name}" is not available to this subagent.` };
+      }
+      return askGate?.(name, input);
+    };
+    if (deadline === Infinity) return run();
+    const remaining = deadline - performance.now();
+    if (remaining <= 0) return { block: true, reason: `tool_call for "${name}" timed out` };
+    try {
+      return await withTimeout(run(), remaining, `tool_call for "${name}"`);
+    } catch (err) {
+      return { block: true, reason: (err as Error).message };
+    }
+  };
 
   const baseSessionName = options.thread ? `workflow-thread:${options.thread}` : (agentConfig?.name ?? type);
   session.setSessionName(
@@ -1282,50 +1601,13 @@ export async function runAgent(
   });
   throwIfAborted(options.signal);
 
-  // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
-  // the ACTIVE set still needs managing: pi activates only its four default
-  // built-ins at turn 1, and `ext:` narrowing has no registry-level expression
-  // (we can't deny the name of a tool that hasn't registered yet). Both are
-  // handled below by re-deriving scope from the loader's live extension maps —
-  // `registerTool` writes into those same maps, so late arrivals are judged too.
-  // `ask_tools:` gates individual CALLS, which is orthogonal to which tools
-  // exist — so it applies to isolated agents too, where the scope installer
-  // below never runs because the registry is already statically allowlisted.
-  const askGate = createAskGate({
-    askTools: agentConfig?.askTools ?? [],
-    agentLabel: agentConfig?.displayName ?? type,
-    ...(ctx.hasUI ? { confirm: (title: string, message: string) => ctx.ui.confirm(title, message) } : {}),
-  });
-
-  if (!noExtensions) {
-    installExtensionToolScope(session, {
-      loader,
-      toolNames,
-      disallowedSet,
-      extNames,
-      narrowing,
-      nestedToolNames,
-      ...(askGate ? { askGate } : {}),
-    });
-  } else if (askGate) {
-    // Same hook, without the scope check the allowlist already performed.
-    const priorBeforeToolCall = session.agent.beforeToolCall;
-    session.agent.beforeToolCall = async (context, signal) => {
-      const run = async () => {
-        const gated = await askGate(context.toolCall.name, context.args);
-        if (gated) return gated;
-        return priorBeforeToolCall?.(context, signal);
-      };
-      if (defaultToolTimeoutMs > 0) {
-        try {
-          return await withTimeout(run(), defaultToolTimeoutMs, `beforeToolCall for "${context.toolCall.name}"`);
-        } catch (err) {
-          return { block: true, reason: (err as Error).message };
-        }
-      }
-      return run();
-    };
-  }
+  // With `allowedToolNames` unset, the ACTIVE set still needs managing: Pi
+  // activates default built-ins and eligible extension tools at registration.
+  // The same live inScope
+  // predicate drives the public tool_call handler (also for nested calls) and
+  // active-set narrowing. Under extensions: false the static registry allowlist
+  // handles scope; the tool_call handler still enforces ask_tools.
+  if (inScope) installExtensionToolScope(session, inScope);
 
   if (options.onSessionCreated) {
     // Mark ownership before invoking the callback: manager wrappers assign the
@@ -1391,30 +1673,8 @@ export async function runAgent(
   // timeout the session is aborted — which propagates via the tool's
   // AbortSignal into the hanging execute() and surfaces as an error result.
   // `contact_supervisor` is excluded: it intentionally waits for a human.
-  const pendingToolTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
-  const clearToolTimeout = (toolCallId: string): void => {
-    const handle = pendingToolTimeouts.get(toolCallId);
-    if (handle) {
-      clearTimeout(handle);
-      pendingToolTimeouts.delete(toolCallId);
-    }
-  };
-  const armToolTimeout = (toolCallId: string, toolName: string): void => {
-    if (defaultToolTimeoutMs <= 0) return;
-    if (toolName === "contact_supervisor") return;
-    const handle = setTimeout(() => {
-      pendingToolTimeouts.delete(toolCallId);
-      try {
-        session.abort();
-      } catch {
-        // The session may already be torn down by the time this fires; the
-        // timeout's only job is to stop a hung tool, and there is nothing
-        // left to stop.
-      }
-    }, defaultToolTimeoutMs);
-    handle.unref?.();
-    pendingToolTimeouts.set(toolCallId, handle);
-  };
+  const toolTimeouts = createToolTimeouts(session, noExtensions ? 0 : TOOL_CALL_ABORT_GRACE_MS, approvalTimer.isInteractiveAsk);
+  approvalTimer.armApproved = toolTimeouts.armApproved;
   // Own finalized output before observer dispatch: a synchronous callback
   // failure must remain visible without erasing the answer it interrupted.
   const collector = collectResponseText(session);
@@ -1441,10 +1701,10 @@ export async function runAgent(
     }
     if (event.type === "tool_execution_start") {
       options.onToolActivity?.({ type: "start", toolName: event.toolName });
-      armToolTimeout((event as { toolCallId: string }).toolCallId, event.toolName);
+      toolTimeouts.start(event);
     }
     if (event.type === "tool_execution_end") {
-      clearToolTimeout((event as { toolCallId: string }).toolCallId);
+      toolTimeouts.end(event);
       options.onToolActivity?.({ type: "end", toolName: event.toolName });
       budgetToolCalls++;
       toolSoftReached = applyBudget(budgetToolCalls, toolCallBudget, toolSoftReached, "tool call");
@@ -1468,24 +1728,14 @@ export async function runAgent(
     }
   });
 
-  // Build the effective prompt: optionally prepend parent context
-  let effectivePrompt = prompt;
-  const inheritContext = internalOverride?.inheritContext ?? options.inheritContext;
-  if (inheritContext) {
-    const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
-  }
-
   try {
     throwIfAborted(options.signal);
-    await session.prompt(effectivePrompt);
+    await session.prompt(prompt);
   } finally {
+    approvalTimer.armApproved = () => {};
     unsubTurns();
     collector.unsubscribe();
-    for (const handle of pendingToolTimeouts.values()) clearTimeout(handle);
-    pendingToolTimeouts.clear();
+    toolTimeouts.dispose();
   }
 
   const baseText = collector.getText();
@@ -1527,6 +1777,7 @@ export async function resumeAgent(
   } = {},
 ): Promise<{ text: string; failure?: string }> {
   throwIfAborted(options.signal);
+  assertSafeChildSession(session);
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
@@ -1547,46 +1798,27 @@ export async function resumeAgent(
         }
       })
     : () => {};
-  // Per-tool timeout for resume as well — same stuck-command fix as runAgent.
-  const resumePendingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
-  const unsubResumeTimeout =
-    defaultToolTimeoutMs > 0
-      ? session.subscribe((event: AgentSessionEvent) => {
-          if (event.type === "tool_execution_start") {
-            const id = (event as { toolCallId: string }).toolCallId;
-            if (event.toolName === "contact_supervisor") return;
-            const handle = setTimeout(() => {
-              resumePendingTimeouts.delete(id);
-              try {
-                session.abort();
-              } catch {
-                // The session may already be torn down by the time this fires; the
-                // timeout's only job is to stop a hung tool, and there is nothing
-                // left to stop.
-              }
-            }, defaultToolTimeoutMs);
-            handle.unref?.();
-            resumePendingTimeouts.set(id, handle);
-          } else if (event.type === "tool_execution_end") {
-            const id = (event as { toolCallId: string }).toolCallId;
-            const handle = resumePendingTimeouts.get(id);
-            if (handle) {
-              clearTimeout(handle);
-              resumePendingTimeouts.delete(id);
-            }
-          }
-        })
-      : () => {};
+  // The child policy and its consent gate survive resumed turns. Replace the
+  // original prompt's timer callback so a delayed approval cannot arm a stale
+  // timer that the first prompt no longer clears.
+  const approvalTimer = approvalTimers.get(session);
+  const toolTimeouts = createToolTimeouts(session, TOOL_CALL_ABORT_GRACE_MS,
+    approvalTimer?.isInteractiveAsk ?? (() => false));
+  if (approvalTimer) approvalTimer.armApproved = toolTimeouts.armApproved;
+  const unsubResumeTimeout = session.subscribe((event: AgentSessionEvent) => {
+    if (event.type === "tool_execution_start") toolTimeouts.start(event);
+    else if (event.type === "tool_execution_end") toolTimeouts.end(event);
+  });
 
   try {
     throwIfAborted(options.signal);
     await session.prompt(prompt);
   } finally {
+    if (approvalTimer) approvalTimer.armApproved = () => {};
     collector.unsubscribe();
     unsubEvents();
     unsubResumeTimeout();
-    for (const handle of resumePendingTimeouts.values()) clearTimeout(handle);
-    resumePendingTimeouts.clear();
+    toolTimeouts.dispose();
     cleanupAbort();
   }
 

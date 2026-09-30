@@ -225,6 +225,13 @@ function loadFromDir(
 
     const { builtinToolNames, extSelectors } = parseToolsField(fm.tools);
     warnLegacyModelFields(fm, path, warn);
+    if (fm.inherit_context === true) {
+      warn(
+        `Agent file ${path} sets inherit_context: true, which is unavailable on current Pi hosts; ` +
+          "spawns will be refused. Remove it and pass an explicitly sanitized summary in the Agent task.",
+        `inherit-context:${warningIdentity(path)}`,
+      );
+    }
 
     agents.set(name, {
       name,

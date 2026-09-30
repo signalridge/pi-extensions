@@ -1,6 +1,6 @@
 /**
- * mention-clone.ts — start a mentioned agent through a clone of this
- * conversation, without putting anything in the chat.
+ * mention-clone.ts — start a mentioned agent through a hidden, mention-only
+ * session without putting anything in the chat.
  *
  * Claude Code routes `@agent-<type>` through the main model: the mention
  * becomes a `<system-reminder>` appended to the prompt and the model makes the
@@ -9,27 +9,13 @@
  * reasoning and its tool block land in the transcript, for a decision the user
  * already made when they typed the handle.
  *
- * So the turn happens somewhere else. The conversation is cloned into a
- * throwaway in-memory session — same messages, same system prompt, same model —
- * and that copy takes the turn off-screen. A literal clone: the session's own
- * entries, projected by pi's own `sessionEntryToContextMessages`, not
- * `inherit_context`'s text rendering of them.
- *
- * Cloned from memory rather than from the session file, which cannot be relied
- * on: `SessionManager._persist` withholds every write until the first assistant
- * message lands, so a fork taken before then reads an empty file and throws.
- * `buildSessionContext()` has no such timing, and is compaction-aware — it walks
- * the leaf path and substitutes the summary for entries folded into it, so a
- * long conversation clones as what the main model is actually working from. A
- * conversation with nothing in it yet clones to nothing in it yet, which is the
- * correct answer rather than a failure.
- *
- * It is also the oldest of the equivalent Pi APIs — `buildContextEntries` on
- * ReadonlySessionManager and the `sessionEntryToContextMessages` export both
- * arrived in 0.80.5 — where this one has been exported unchanged from before
- * the declared peer floor, and is the same code path (`byId` is only an index
- * cache, so passing it or not cannot change the result). Keeping the floor
- * honest costs nothing here: see the `compat-floor-pi` job.
+ * So the turn happens somewhere else. A throwaway in-memory session takes it
+ * off-screen on the parent's model, but receives only this mention's text.
+ * Pi's public ExtensionContext exposes a pre-hook SessionManager projection,
+ * not the parent's request-local context hooks (including programmatic hooks).
+ * Copying even a compacted or edited branch could send private parent content
+ * to the clone's provider before its redaction runs. The clone must start empty:
+ * no parent branch, system prompt, tool declarations, or summaries.
  *
  * Its `thinkingLevel` is NOT used, and is the one place the newer API would be
  * better. `getSessionContextSettings` starts at "off" and moves only on an
@@ -63,19 +49,28 @@
 
 import type { Model } from "@earendil-works/pi-ai";
 import {
-  buildSessionContext,
   createAgentSession,
+  DefaultResourceLoader,
   type ExtensionContext,
+  getAgentDir,
   SessionManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { runInChildSessionContext } from "./child-context.js";
-import { agentMentionReminder } from "./mention.js";
+import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
 
+const MENTION_SYSTEM_PROMPT =
+  "You write a task prompt for the Agent tool using only the user's current message. " +
+  "Call Agent once to start the requested task. You have no prior conversation context; " +
+  "do not invent or request inherited context. If details are missing, pass the user's words through.";
+
+/** Internal acknowledgement: the real Agent handler has returned from manager.spawn. */
+export const MENTION_SPAWNED = Symbol("pi-subagents:mention-spawned");
+
 export interface MentionCloneOptions {
-  /** The MAIN session's context — what the spawn is attributed to, and the
-   * source of both the conversation and the live system prompt. */
+  /** The MAIN session's context — what the spawn is attributed to, not a
+   * source of provider history or instructions for the hidden turn. */
   ctx: ExtensionContext;
   /** Agent type the handle resolved to. */
   type: SubagentType;
@@ -83,79 +78,120 @@ export interface MentionCloneOptions {
   message: string;
   /** The registered `Agent` tool, reused so the spawn is an ordinary one. */
   agentTool: ToolDefinition;
+  /** False once the originating session or branch has been replaced. */
+  isOriginCurrent: () => boolean;
 }
 
 export interface MentionCloneResult {
-  /** True once the clone actually called `Agent`. */
+  /** True once the registered Agent handler confirmed a child was started. */
   spawned: boolean;
+  /** The Agent handler ran but refused the spawn; direct fallback must not bypass its policy. */
+  refused?: boolean;
   /** Why not, when it didn't. Absent on success. */
   error?: string;
 }
 
 /**
- * Fork the conversation, let the copy make the tool call, throw the copy away.
+ * Let a mention-only throwaway session make the tool call, then discard it.
  * Never rejects: a clone that cannot run is reported so the caller can fall
  * back to starting the agent directly.
  */
 export async function runMentionClone(opts: MentionCloneOptions): Promise<MentionCloneResult> {
-  const { ctx, type, message, agentTool } = opts;
+  const { ctx, type, message, agentTool, isOriginCurrent } = opts;
 
   let spawned = false;
+  let refused = false;
+  let attempted = false;
   const cloneAgentTool: ToolDefinition = {
     ...agentTool,
-    execute: (_cloneToolCallId, params, signal, onUpdate, _cloneCtx) => {
-      // One spawn per mention. The clone has a single tool and every reason to
-      // stop after using it, but a model that decides to "also" launch a second
-      // agent would do it where nobody can see and nobody asked.
-      if (spawned) {
-        return Promise.resolve({
-          content: [{ type: "text" as const, text: "Already started an agent for this mention. Stop here." }],
+    execute: async (_cloneToolCallId, params, signal, onUpdate, _cloneCtx) => {
+      // The model may ask for another type or a schedule, but the user chose
+      // exactly one agent by typing its handle. Never let the hidden turn widen
+      // that decision or attempt another spawn after a failed call.
+      if (attempted) {
+        return {
+          content: [{ type: "text" as const, text: "Already attempted an agent for this mention. Stop here." }],
           details: undefined,
           isError: true,
-        });
+        };
       }
-      spawned = true;
-      // undefined tool-call id + the main ctx: see the header. Background is
-      // forced rather than left to the clone: `run_in_background` defaults to
-      // false, and a foreground agent answers through its TOOL RESULT — which
-      // here is delivered into a session that is disposed moments later, so the
-      // agent would run, appear in the widget and the fleet, and reach nobody.
-      return agentTool.execute(
-        undefined as never,
-        { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
-        signal,
-        onUpdate,
-        ctx,
-      );
+      attempted = true;
+      if (!isOriginCurrent()) {
+        return {
+          content: [{ type: "text" as const, text: "The original session changed. Do not start this agent." }],
+          details: undefined,
+          isError: true,
+        };
+      }
+      const choice = params as Record<string, unknown>;
+      const selected = {
+        subagent_type: type,
+        prompt: typeof choice.prompt === "string" && choice.prompt.trim() ? choice.prompt : message,
+        ...(typeof choice.description === "string" && { description: choice.description }),
+        run_in_background: true,
+        // The handler acknowledges immediately after manager.spawn returns,
+        // before UI/event side effects can throw. A tool result alone cannot
+        // distinguish a pre-spawn rejection from a post-spawn exception.
+        [MENTION_SPAWNED]: () => { spawned = true; },
+      } as typeof params;
+      // A foreground result would be delivered only into the discarded clone.
+      // Attribute the background spawn to the real session, with no dangling
+      // tool-call id. A plain text rejection is not a successful spawn.
+      // Pi 0.99 tool handlers require a tool context, not the event-handler
+      // context captured from the parent. Keep every session-bound field from
+      // the parent, and supply the real clone call's nested-tool capabilities;
+      // Agent itself does not use those capabilities. Never pretend the parent
+      // has executeTool(), which only exists during an actual tool invocation.
+      const mainToolCtx = { ...ctx, tools: _cloneCtx.tools, executeTool: _cloneCtx.executeTool };
+      const result = await agentTool.execute(undefined as never, selected, signal, onUpdate, mainToolCtx);
+      const details = result.details as { agentId?: unknown; status?: unknown } | undefined;
+      spawned ||= typeof details?.agentId === "string" &&
+        (details.status === "background" || details.status === "queued");
+      refused = !spawned;
+      return result;
     },
   };
 
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   try {
-    // Pi 0.80.8 moved createAgentSession from modelRegistry to modelRuntime;
-    // agent-runner.ts carries the same shim for the same reason — pass both so
-    // the clone keeps the parent's providers across the supported range.
-    const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
-    // The conversation as the main session resolves it: compaction applied,
-    // branch summaries substituted.
-    const conversation = buildSessionContext(
-      ctx.sessionManager.getEntries(),
-      ctx.sessionManager.getLeafId(),
-    );
+    // Refuse before loading or prompting when a modern host cannot bridge the
+    // parent's providers/virtual routes into this throwaway session.
+    // The hidden clone inherits exactly this model; unlike an explicit child
+    // selection, a stale parent model cannot be replaced before its request.
+    const parentModels = parentModelSessionOptions(ctx, ctx.model);
+    // An empty manager works on both old Pi hosts (which read agent state) and
+    // new ones (which project the manager). Never inspect the parent's branch:
+    // its pre-hook content cannot safely seed a separate provider request.
+    const cloneManager = SessionManager.inMemory(ctx.cwd);
     // Pi 0.82.0 added this; below it the field is absent and the clone takes
     // the settings level instead, which is what a session that never ran
     // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
-    const created = await runInChildSessionContext(() =>
-      createAgentSession({
+    // No project or inline extensions run in the hidden session. The parent's
+    // programmatic context hooks cannot be enumerated from ExtensionContext,
+    // so replaying only file-backed hooks would be an unsafe partial policy.
+    const loader = new DefaultResourceLoader({
+      cwd: ctx.cwd,
+      agentDir: getAgentDir(),
+      noExtensions: true,
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      noContextFiles: true,
+      systemPromptOverride: () => MENTION_SYSTEM_PROMPT,
+      appendSystemPromptOverride: () => [],
+    });
+    const created = await runInChildSessionContext(async () => {
+      await loader.reload();
+      return createAgentSession({
         cwd: ctx.cwd,
         // Nothing about the copy is worth persisting, and an in-memory manager
         // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager: cloneManager,
+        resourceLoader: loader,
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
-        modelRegistry: ctx.modelRegistry,
-        ...(parentModelRuntime !== undefined && { modelRuntime: parentModelRuntime as never }),
+        ...parentModels,
         // An allowlist naming exactly the clone's own tool. NOT `noTools:
         // "all"`, whose doc comment ("start with no tools enabled") reads like
         // it spares custom tools and does not: it resolves to an EMPTY
@@ -166,24 +202,32 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         // agent-runner's `tools: sessionTools` beside its nested `customTools`.
         tools: [cloneAgentTool.name],
         customTools: [cloneAgentTool],
-      } as Parameters<typeof createAgentSession>[0]),
-    );
+      } as Parameters<typeof createAgentSession>[0]);
+    });
     session = created.session;
+    // Loading resources and creating the session both yield. If the parent was
+    // replaced during either step, never make a provider request for a stale
+    // mention. The tool-level check below still fences a switch during streaming.
+    if (!isOriginCurrent()) return { spawned: false, error: "the original session changed" };
 
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
-    const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
-
-    // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
-
-    // User text first, reminder after — the order Claude Code's attachment
-    // renderer produces, where the reminder trails the message it is about.
-    await session.prompt(`${message}\n\n${agentMentionReminder(type)}`);
+    // A session switch during a slow provider stream may produce no tool call
+    // for minutes. The tool fence below prevents a stale spawn, but without
+    // cancelling the clone that hidden request keeps running after its parent
+    // is gone. Check while the prompt is pending and abort the throwaway turn.
+    const clone = session;
+    let abortRequested = false;
+    const staleCheck = setInterval(() => {
+      if (abortRequested || isOriginCurrent()) return;
+      abortRequested = true;
+      void clone.abort().catch(() => {});
+    }, 100);
+    try {
+      // Only the current mention text reaches the hidden provider request.
+      // The selected type is enforced by the Agent wrapper, not extra history.
+      await clone.prompt(message);
+    } finally {
+      clearInterval(staleCheck);
+    }
   } catch (err) {
     return { spawned, error: err instanceof Error ? err.message : String(err) };
   } finally {
@@ -192,5 +236,7 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
 
   return spawned
     ? { spawned: true }
-    : { spawned: false, error: "the conversation clone did not start it" };
+    : refused
+      ? { spawned: false, refused: true, error: "the Agent tool refused this mention" }
+      : { spawned: false, error: "the conversation clone did not start it" };
 }

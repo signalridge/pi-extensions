@@ -12,6 +12,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import { NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 class Bus {
   private readonly listeners = new Map<string, Set<(data: unknown) => void>>();
@@ -34,7 +35,7 @@ function context(cwd: string) {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getEntries: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as never;
@@ -107,7 +108,8 @@ describe("managed spawn fallback and reload wiring", () => {
     await expect(disabledReply).resolves.toEqual(expect.objectContaining({ success: false, error: expect.stringContaining("Unknown or disabled") }));
     expect(runAgent).not.toHaveBeenCalled();
 
-    vi.mocked(runAgent).mockReturnValue(new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(((_ctx: unknown, _type: unknown, _prompt: unknown, options: any) =>
+      new Promise((resolve) => options.signal.addEventListener("abort", () => resolve({ responseText: "", aborted: true, steered: false }), { once: true }))) as never);
     setFallbackSubagent("general-purpose");
     const fallbackReply = reply("managed-fallback");
     bus.emit("subagents:rpc:spawn-managed", {

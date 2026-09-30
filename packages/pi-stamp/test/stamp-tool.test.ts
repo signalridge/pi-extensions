@@ -162,6 +162,81 @@ test("tool observation state is bounded and disabled stamps do not read the cloc
   assert.equal(last.data.toolCallId, `call-${MAX_TOOL_STAMP_OBSERVATIONS - 1}`);
 });
 
+test("Pi 0.99 nested codemode calls cannot consume the observation budget for a sibling tool", async () => {
+  const mock = createMockPi();
+  let now = USER_TIMESTAMP;
+  stamp(mock.pi, { settingsRuntime: settingsRuntimeWithToolStamps(), now: () => now });
+  const { ctx } = createMockContext({ mode: "tui" });
+  const parentId = "call-codemode";
+  const siblingId = "call-sibling";
+  await emit(mock, "session_start", { reason: "startup" }, ctx);
+  await emit(mock, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: ASSISTANT_TIMESTAMP }, ctx);
+  await emit(
+    mock,
+    "tool_execution_start",
+    { type: "tool_execution_start", toolCallId: parentId, toolName: "codemode", args: {} },
+    ctx,
+  );
+  for (let index = 1; index < MAX_TOOL_STAMP_OBSERVATIONS; index += 1) {
+    const nested = {
+      toolCallId: `${parentId}/${index}`,
+      toolName: "read",
+      parentToolCallId: parentId,
+    };
+    await emit(
+      mock,
+      "tool_execution_start",
+      { type: "tool_execution_start", ...nested, args: { path: `file-${index}` } },
+      ctx,
+    );
+    await emit(
+      mock,
+      "tool_execution_end",
+      { type: "tool_execution_end", ...nested, result: { content: [] }, isError: false },
+      ctx,
+    );
+  }
+  now = USER_TIMESTAMP + 2_000;
+  await emit(
+    mock,
+    "tool_execution_start",
+    { type: "tool_execution_start", toolCallId: siblingId, toolName: "bash", args: {} },
+    ctx,
+  );
+  now = USER_TIMESTAMP + 4_000;
+  await emit(
+    mock,
+    "tool_execution_end",
+    { type: "tool_execution_end", toolCallId: parentId, toolName: "codemode", result: {}, isError: false },
+    ctx,
+  );
+  now = USER_TIMESTAMP + 4_500;
+  await emit(
+    mock,
+    "tool_execution_end",
+    { type: "tool_execution_end", toolCallId: siblingId, toolName: "bash", result: {}, isError: true },
+    ctx,
+  );
+  await emit(
+    mock,
+    "turn_end",
+    {
+      type: "turn_end",
+      message: assistantMessage(ASSISTANT_TIMESTAMP, "toolUse"),
+      toolResults: [toolResultMessage(parentId, "codemode", false), toolResultMessage(siblingId, "bash", true)],
+      turnIndex: 0,
+      messageEntryId: "assistant-entry",
+      toolResultEntryIds: ["parent-result-entry", "sibling-result-entry"],
+    },
+    ctx,
+  );
+  assert.deepEqual(mock.entries, [
+    stampEntry("assistant", ASSISTANT_TIMESTAMP),
+    toolStampEntry(parentId, "codemode", USER_TIMESTAMP, USER_TIMESTAMP + 4_000, "success"),
+    toolStampEntry(siblingId, "bash", USER_TIMESTAMP + 2_000, USER_TIMESTAMP + 4_500, "error"),
+  ]);
+});
+
 test("turn replacement, cancellation, session replacement, and shutdown clear pending tools", async () => {
   const terminals = ["turn_start", "agent_end", "session_start", "session_shutdown"] as const;
   for (const terminal of terminals) {

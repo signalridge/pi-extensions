@@ -85,8 +85,7 @@ const ctx = {
     maxTokens: 4096,
   },
   modelRegistry: {
-    find: () => undefined,
-    getAvailable: () => [],
+    find: (provider, id) => (provider === "anthropic" && id === "claude-haiku-4-5" ? ctx.model : undefined),
     getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
   },
   sessionManager: {
@@ -98,6 +97,8 @@ const ctx = {
 
 const pi = makePi();
 sessionRecap(pi);
+pi.flags.set("recap-allow-raw-history", true);
+pi.flags.set("recap-model", "anthropic/claude-haiku-4-5");
 await pi.commands.get("recap").handler("", ctx);
 
 assert.deepEqual(
@@ -142,18 +143,18 @@ test("RPC resume and fork sessions automatically show recaps", async (t) => {
   }
 });
 
-test("RPC turn_end automatically shows an idle recap", async (t) => {
+test("RPC agent settlement automatically shows an idle recap", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   pi.flags.set("recap-idle-seconds", "5");
   calls.length = 0;
 
   const sessionStart = pi.handlers.get("session_start");
-  const turnEnd = pi.handlers.get("turn_end");
+  const agentSettled = pi.handlers.get("agent_settled");
   assert.equal(typeof sessionStart, "function");
-  assert.equal(typeof turnEnd, "function");
+  assert.equal(typeof agentSettled, "function");
   await sessionStart({ reason: "startup" }, ctx);
   calls.length = 0;
-  await turnEnd({}, ctx);
+  await agentSettled({}, ctx);
 
   t.mock.timers.tick(4999);
   await flushRecap();

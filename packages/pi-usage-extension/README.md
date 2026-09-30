@@ -6,9 +6,9 @@ A Pi extension that displays aggregated usage statistics across all sessions.
 
 ## Compatibility
 
-- **Pi version:** `0.84.x` and `0.85.x`; tested with `0.85.1` — see the `peerDependencies` range.
+- **Pi version:** `0.84.x`–`0.87.x`; tested with `0.87.1` — see the `peerDependencies` range.
 
-Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped; otherwise the report is counted. Sessions recorded by older Pi versions still parse; they simply carry no auxiliary usage.
+Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped; otherwise the report is counted. Pi 0.87+ also records standalone model-attributed usage (such as cache warming); `/usage` counts it under its actual provider and model without adding a fictitious assistant message. A context edit explains the first request on its own branch only when its target was already in the previous assistant's model-visible context and remains in context after compaction; editing a newly appended user message does not mask a genuine cache-prefix miss. A `cache_warm` call refreshes the cache TTL only for its provider/model on that branch. Parent-linked journal entries also keep sibling compactions and assistant history separate. Sessions recorded by older Pi versions still parse; they simply carry no newer entry types.
 
 ## Install
 
@@ -138,7 +138,7 @@ The **Graphs** view plots usage over time for the active period as a braille lin
 - **Buckets**: hourly for Today / This Week / Last Week, daily for Last 30 Days / All Time.
 - **Line clipping**: every series (provider, model, thinking level, `other`, Total) is drawn only between its first and last bucket with usage, so late-starting or retired series don't drag a flat zero/flat tail across the whole period.
 
-Thinking levels are replayed from `thinking_level_change` entries in each session file; messages before the first recorded change appear as `unknown`. Auxiliary usage has no reliable thinking-level attribution and appears as `Tools/summaries` in that grouping. Reasoning token counts come from `usage.reasoning` where providers report them; pi only records this field since **pi 0.80.3 (30 June 2026)**, so earlier sessions show zero reasoning tokens even though thinking models were in use.
+Thinking levels are replayed along each session branch from `thinking_level_change` entries; messages with no recorded change in their ancestry (including a fresh root fork) appear as `unknown`. Imported entries without parent links use append order. Auxiliary usage has no reliable thinking-level attribution and appears as `Tools/summaries` in that grouping. Reasoning token counts come from `usage.reasoning` where providers report them; pi only records this field since **pi 0.80.3 (30 June 2026)**, so earlier sessions show zero reasoning tokens even though thinking models were in use.
 
 ### Time periods
 
@@ -162,8 +162,8 @@ Time periods are calculated in the local timezone where Pi runs. If you want to 
 |--------|-------------|
 | **Provider / Model** | Provider name, expandable to show models |
 | **Sessions** | Number of unique sessions |
-| **Msgs** | Number of assistant messages; auxiliary `Tools / summaries` usage does not inflate this count |
-| **Cost** | Total cost in USD (from API response), including usage reported by tools and summaries |
+| **Msgs** | Number of assistant messages; standalone usage and auxiliary `Tools / summaries` usage do not inflate this count |
+| **Cost** | Total cost in USD (from API response), including standalone usage and reports from tools and summaries |
 | **Tokens** | Fresh tokens for the turn: input + output + cache write |
 | **↑In** | Fresh input tokens: input + cache write *(dimmed)* |
 | **↓Out** | Output tokens *(dimmed)* |
@@ -195,9 +195,9 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 `/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`. To keep opens fast on large histories (multi-GB, thousands of files):
 
 - **On-disk cache.** Per-file extraction results are cached in `<agentDir>/usage-extension-cache.json` (respects `PI_CODING_AGENT_DIR`), keyed by file size + mtime. Warm opens only re-parse session files that changed since the last run — on a 5.2 GB / 3,310-file corpus that takes the open from ~17 s to ~0.3 s.
-- **First open** after install (or after deleting the cache) does a one-off full build, showing the usual cancellable loader. Cancelling saves partial progress, so the next open resumes where it left off.
-- The cache is safe to delete at any time; it is rebuilt automatically. Corrupt or version-mismatched caches are ignored and rebuilt rather than trusted.
-- **0.9.4 bumps the cache format to v7** to retain `parentSession` lineage and prevent stable entry IDs from merging independent sessions; v6 added stable entry IDs and v5 retained child-session linkage. The first open after upgrading does a one-off full rebuild (with a progress message and live file counter), then warm opens are fast again.
+- **First open** after install (or after deleting the cache) does a one-off full build, showing the usual cancellable loader. Cancelling skips unfinished cache writes; the next open reparses any files not already in a previous completed cache. Cache reads and tuple decoding check for cancellation, but an already-running synchronous `JSON.parse` cannot be interrupted until it completes.
+- Cache writes use an exclusive lock; a long-running writer's lock is never stolen based on file age. If an orphaned `<agentDir>/usage-extension-cache.json.lock` blocks cache updates, first confirm no `/usage` writer is active, then remove **only the `.lock` file** manually and retry. The dashboard can still calculate usage without a cache update. The cache itself is safe to delete at any time; it is rebuilt automatically. Corrupt or version-mismatched caches are ignored and rebuilt rather than trusted.
+- **The cache format is v11.** v11 retains concrete response-model metadata and successful zero-usage cache-warm timestamps; v10 retained assistant ancestry and branch-specific cache-warm timestamps, v9 retained cache-warming kinds and branch-aware context-edit boundaries, v8 added standalone usage and context edits, v7 retained `parentSession` lineage, v6 added stable entry IDs, and v5 retained child-session linkage. The first open after upgrading does a one-off full rebuild (with a progress message and live file counter), then warm opens are fast again.
 - Large nested-agent tool results use an allocation-safe metadata parser: multi-megabyte output bodies are scanned as bytes rather than decoded and JSON-parsed in full.
 
 ## Provider notes

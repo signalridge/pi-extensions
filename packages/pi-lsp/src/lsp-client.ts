@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
+import { StringDecoder } from "node:string_decoder";
 import { commandPathValue, mergeEnvironment, resolveCommandPath } from "./command.js";
 import { directoryUri } from "./files.js";
 import { positionAt } from "./text-edits.js";
@@ -20,6 +21,7 @@ export function resolveSpawnCommand(
 
 // Quiet period (ms) after each publish before treating push diagnostics as settled.
 const PUBLISHED_DIAGNOSTICS_SETTLE_MS = 800;
+const STDERR_TAIL_BYTES = 16 * 1024;
 
 export class LspClient {
   #child?: ChildProcessWithoutNullStreams;
@@ -42,7 +44,9 @@ export class LspClient {
       dispose: () => void;
     }>
   >();
-  #stderr = "";
+  #stderr = Buffer.alloc(STDERR_TAIL_BYTES);
+  #stderrSize = 0;
+  #stderrEnd = 0;
   #serverCapabilities: Record<string, unknown> = {};
   #adapter: LspServerAdapter;
   #command: ServerCommand;
@@ -57,6 +61,7 @@ export class LspClient {
   }
 
   async start() {
+    if (this.#child) throw new Error(`${this.#adapter.name} LSP client is already started`);
     const commandPath = resolveCommandPath(
       this.#command.command,
       this.#cwd,
@@ -69,6 +74,12 @@ export class LspClient {
       );
     }
 
+    this.#stderrSize = 0;
+    this.#stderrEnd = 0;
+    this.#buffer = Buffer.alloc(0);
+    this.#publishedDiagnostics.clear();
+    this.#serverCapabilities = {};
+    this.#nextId = 1;
     const spawnCommand = resolveSpawnCommand({ ...this.#command, command: commandPath });
     const child = spawn(spawnCommand.command, spawnCommand.args, {
       cwd: this.#cwd,
@@ -77,6 +88,7 @@ export class LspClient {
     });
     this.#child = child;
     child.stdout.on("data", (chunk) => {
+      if (this.#child !== child) return;
       try {
         this.#onData(chunk);
       } catch (error) {
@@ -85,14 +97,28 @@ export class LspClient {
         );
       }
     });
-    child.stderr.on("data", (chunk) => {
-      this.#stderr += chunk.toString();
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (this.#child !== child) return;
+      const tail = chunk.subarray(-STDERR_TAIL_BYTES);
+      if (tail.length === STDERR_TAIL_BYTES) {
+        tail.copy(this.#stderr);
+        this.#stderrSize = STDERR_TAIL_BYTES;
+        this.#stderrEnd = 0;
+        return;
+      }
+      const first = Math.min(tail.length, STDERR_TAIL_BYTES - this.#stderrEnd);
+      tail.copy(this.#stderr, this.#stderrEnd, 0, first);
+      if (first < tail.length) tail.copy(this.#stderr, 0, first);
+      this.#stderrEnd = (this.#stderrEnd + tail.length) % STDERR_TAIL_BYTES;
+      this.#stderrSize = Math.min(STDERR_TAIL_BYTES, this.#stderrSize + tail.length);
     });
     child.stdin.on("error", (error) => {
+      if (this.#child !== child) return;
       this.#fail(`${this.#adapter.name} LSP stdin write failed: ${formatErrorMessage(error)}.${this.#formatStderr()}`);
     });
     child.once("exit", (code, signal) => {
-      if (this.#child === child) this.#child = undefined;
+      if (this.#child !== child) return;
+      this.#child = undefined;
       const reason = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
       this.#rejectPending(
         (id) => `${this.#adapter.name} LSP server exited before response ${id} (${reason}).${this.#formatStderr()}`,
@@ -103,8 +129,10 @@ export class LspClient {
       child.once("spawn", resolve);
       child.once("error", (error) => {
         const message = `${this.#adapter.name} LSP process failed to start: ${error.message}.${this.#formatStderr()}`;
-        this.#rejectPending(message);
-        if (this.#child === child) this.#child = undefined;
+        if (this.#child === child) {
+          this.#rejectPending(message);
+          this.#child = undefined;
+        }
         reject(new Error(message));
       });
     });
@@ -465,7 +493,21 @@ export class LspClient {
   }
 
   #formatStderr() {
-    const stderr = this.#stderr.trim();
+    const bytes = Buffer.allocUnsafe(this.#stderrSize);
+    const start = (this.#stderrEnd - this.#stderrSize + STDERR_TAIL_BYTES) % STDERR_TAIL_BYTES;
+    const first = Math.min(this.#stderrSize, STDERR_TAIL_BYTES - start);
+    this.#stderr.copy(bytes, 0, start, start + first);
+    if (first < this.#stderrSize) this.#stderr.copy(bytes, first, 0, this.#stderrSize - first);
+
+    // Drop an incomplete character at either end of the retained byte tail.
+    let offset = 0;
+    while (offset < bytes.length && (bytes[offset] & 0xc0) === 0x80) offset++;
+    const decoded = new StringDecoder("utf8").write(bytes.subarray(offset)).trim();
+    const encoded = Buffer.from(decoded);
+    const bounded = encoded.subarray(-STDERR_TAIL_BYTES);
+    offset = 0;
+    while (offset < bounded.length && (bounded[offset] & 0xc0) === 0x80) offset++;
+    const stderr = new StringDecoder("utf8").write(bounded.subarray(offset)).trim();
     return stderr ? `\nServer stderr:\n${stderr}` : "";
   }
 }

@@ -9,6 +9,9 @@ interface UsageLike {
   cost?: { total?: number };
 }
 
+// Older supported Pi hosts do not include standalone usage in SessionEntry.
+type UsageSessionEntry = SessionEntry | { type: "usage"; id: string; usage: UsageLike };
+
 export interface FooterUsageSummary {
   input: number;
   output: number;
@@ -28,13 +31,14 @@ export function emptyFooterUsageSummary(): FooterUsageSummary {
   };
 }
 
-function usageForEntry(entry: SessionEntry): { usage: UsageLike; assistant: boolean } | undefined {
+function usageForEntry(entry: UsageSessionEntry): { usage: UsageLike; assistant: boolean } | undefined {
   if (entry.type === "message" && entry.message.role === "assistant" && entry.message.usage) {
     return { usage: entry.message.usage, assistant: true };
   }
   if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
     return { usage: entry.message.usage, assistant: false };
   }
+  if (entry.type === "usage") return { usage: entry.usage, assistant: false };
   if ((entry.type === "compaction" || entry.type === "branch_summary") && entry.usage) {
     return { usage: entry.usage, assistant: false };
   }
@@ -84,15 +88,19 @@ function addContribution(target: FooterUsageSummary, value: Contribution, direct
 export class FooterUsageAccumulator {
   private summary: FooterUsageSummary = emptyFooterUsageSummary();
   private readonly messageContributions = new Map<string, Contribution>();
+  private readonly usageEntryIds = new Set<string>();
+  private scannedEntryCount = 0;
   private readonly objectKeys = new WeakMap<object, string>();
   private nextObjectKey = 0;
   private anonymousAssistantKey = "assistant:anonymous:0";
   private turnKey = "turn:0";
   private nextTurn = 0;
 
-  reset(entries: readonly SessionEntry[]): void {
+  reset(entries: readonly UsageSessionEntry[]): void {
     this.summary = emptyFooterUsageSummary();
     this.messageContributions.clear();
+    this.usageEntryIds.clear();
+    this.scannedEntryCount = entries.length;
     this.anonymousAssistantKey = "assistant:anonymous:0";
     this.nextObjectKey = 0;
     this.turnKey = "turn:0";
@@ -110,10 +118,32 @@ export class FooterUsageAccumulator {
         sessionMessageIndex += 1;
         continue;
       }
+      if (entry.type === "usage") {
+        this.addUsageEntry(entry);
+        continue;
+      }
       const value = usageForEntry(entry);
       if (value) addContribution(this.summary, contribution(value.usage, value.assistant), 1);
     }
     if (lastAnonymousAssistantKey) this.anonymousAssistantKey = lastAnonymousAssistantKey;
+  }
+
+  /** Pick up usage appended outside message/turn events (for example, idle cache warming). */
+  updateUsageEntries(entries: readonly UsageSessionEntry[]): boolean {
+    let changed = false;
+    for (let index = this.scannedEntryCount; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry?.type === "usage" && this.addUsageEntry(entry)) changed = true;
+    }
+    this.scannedEntryCount = entries.length;
+    return changed;
+  }
+
+  private addUsageEntry(entry: { id: string; usage: UsageLike }): boolean {
+    if (this.usageEntryIds.has(entry.id)) return false;
+    this.usageEntryIds.add(entry.id);
+    addContribution(this.summary, contribution(entry.usage, false), 1);
+    return true;
   }
 
   /** Start a stable fallback identity for an assistant turn without responseId. */
@@ -169,7 +199,7 @@ export class FooterUsageAccumulator {
   }
 }
 
-export function summarizeFooterUsage(entries: readonly SessionEntry[]): FooterUsageSummary {
+export function summarizeFooterUsage(entries: readonly UsageSessionEntry[]): FooterUsageSummary {
   const totals = emptyFooterUsageSummary();
 
   for (const entry of entries) {

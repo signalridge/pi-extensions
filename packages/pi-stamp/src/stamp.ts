@@ -406,6 +406,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
 
   pi.on("tool_execution_start", (event) => {
     if (
+      event.parentToolCallId !== undefined ||
       !tuiSessionActive ||
       !acceptingTurnEvents ||
       !settingsRuntime.get().settings.toolStamps ||
@@ -427,6 +428,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   });
 
   pi.on("tool_execution_end", (event) => {
+    if (event.parentToolCallId !== undefined) return;
     const timing = activeToolTimings.get(event.toolCallId);
     if (!tuiSessionActive || !timing || timing.completedAt !== undefined) return;
     const completedAt = now();

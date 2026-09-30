@@ -15,13 +15,14 @@ const {
   sessionManagerCreate,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
+  toolCallHandlers,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
-  hostCapabilities: { powershell: false },
+  hostCapabilities: { powershell: false, legacyBuiltinSources: false, modernRuntime: false },
   defaultResourceLoaderCtor: vi.fn(),
   loaderExtensionsRef: {
     current: { extensions: [], errors: [], runtime: {} } as {
-      extensions: Array<{ path: string; tools: Map<string, unknown> }>;
+      extensions: Array<{ path: string; tools: Map<string, unknown>; handlers: Map<string, Array<(...args: unknown[]) => Promise<unknown>>> }>;
       errors: Array<{ path: string; error: string }>;
       runtime: Record<string, unknown>;
     },
@@ -31,10 +32,12 @@ const {
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  toolCallHandlers: [] as Array<(event: { toolName: string; input: unknown }) => Promise<unknown>>,
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession,
+  get ModelRuntime() { return hostCapabilities.modernRuntime ? { create: vi.fn() } : undefined; },
   get createPowerShellTool() { return hostCapabilities.powershell ? () => ({ name: "powershell" }) : undefined; },
   // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
   // (an unknown path becomes an error row, mirroring a failed load) and then
@@ -47,12 +50,17 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     }
 
     async reload() {
-      // Mirror the real loader: `noExtensions: true` zeros out the discovered set
-      // entirely. Otherwise tests pre-register the extensions a path should
-      // resolve to; an unregistered path simply yields no extension (a failed load).
+      // Mirror Pi's real loader: noExtensions drops discovered paths but still
+      // loads SDK inline factories, including the hidden policy hook.
       if (this.opts.noExtensions) {
         loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
-        return;
+      }
+      for (const factory of this.opts.extensionFactories ?? []) {
+        if (factory.builtin) continue; // older hosts do not export these factories
+        factory.factory({ on: (event: string, handler: (event: { toolName: string; input: unknown }) => Promise<unknown>) => {
+          if (event === "tool_call") toolCallHandlers.push(handler);
+        } });
+        loaderExtensionsRef.current.extensions.push({ path: `<inline:${factory.name}>`, tools: new Map(), handlers: new Map() });
       }
       if (this.opts.extensionsOverride) {
         loaderExtensionsRef.current = this.opts.extensionsOverride(loaderExtensionsRef.current);
@@ -146,9 +154,10 @@ let lastSession: ReturnType<typeof createSession>["session"] | undefined;
 
 function createSession(finalText: string) {
   const listeners: Array<(event: any) => void> = [];
-  // pi activates only these four by default when no allowlist is given
-  // (agent-session.js `defaultActiveToolNames`).
-  let activeToolNames: string[] = ["read", "bash", "edit", "write"];
+  // Pi starts with four built-ins and auto-activates direct extension tools
+  // registered at construction (late tools are reconciled after registration).
+  let activeToolNames: string[] = ["read", "bash", "edit", "write",
+    ...loaderExtensionsRef.current.extensions.flatMap((ext) => [...ext.tools.keys()])];
   const messages: unknown[] = [];
   messages.push = (...items: unknown[]) => {
     const length = Array.prototype.push.apply(messages, items);
@@ -182,13 +191,8 @@ function createSession(finalText: string) {
     // extension registering after bind by mutating `loaderExtensionsRef`.
     getAllTools: vi.fn(() => {
       const opts = createAgentSession.mock.calls[0]?.[0];
-      return opts ? mockRegistry(opts).map((name) => ({ name })) : [];
+      return opts ? mockRegistry(opts) : [];
     }),
-    // pi's Agent; `beforeToolCall` is an optional, assignable hook the scope
-    // installer wraps to block out-of-scope calls on turn 1.
-    agent: { beforeToolCall: undefined } as {
-      beforeToolCall?: (context: any, signal?: any) => Promise<any>;
-    },
     setSessionName: vi.fn(),
     bindExtensions: vi.fn(async () => {}),
   };
@@ -209,6 +213,8 @@ const pi = {} as any;
 beforeEach(() => {
   setAgentTiersSettings({});
   hostCapabilities.powershell = false;
+  hostCapabilities.legacyBuiltinSources = false;
+  hostCapabilities.modernRuntime = false;
   createAgentSession.mockReset();
   defaultResourceLoaderCtor.mockClear();
   getAgentDir.mockClear();
@@ -218,9 +224,17 @@ beforeEach(() => {
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
   vi.mocked(createNestedSubagentTools).mockClear();
+  vi.mocked(preloadSkills).mockClear();
   loaderExtensionsRef.current = { extensions: [], errors: [], runtime: {} };
+  toolCallHandlers.length = 0;
   lastSession = undefined;
 });
+
+async function policyCall(name: string, input: unknown = {}): Promise<unknown> {
+  expect(toolCallHandlers).toHaveLength(1);
+  expect(loaderExtensionsRef.current.extensions.some((e) => e.path === "<inline:pi-subagents-tool-policy>")).toBe(true);
+  return toolCallHandlers[0]({ toolName: name, input });
+}
 
 describe("agent-runner tier policy", () => {
   const fastModel = { id: "fast", name: "Fast", provider: "test", reasoning: true } as any;
@@ -657,7 +671,10 @@ describe("agent-runner final output capture", () => {
   it("passes the parent model runtime while retaining the legacy model registry", async () => {
     const { session } = createSession("AUTHENTICATED");
     createAgentSession.mockResolvedValue({ session });
-    const modelRuntime = { getAuth: vi.fn(), hasConfiguredAuth: vi.fn() };
+    const modelRuntime = {
+      getAuth: vi.fn(), stream: vi.fn(), streamSimple: vi.fn(), getModel: vi.fn(),
+      // Pi 0.84/0.87 did not yet implement virtual routing.
+    };
     const context = {
       ...ctx,
       modelRegistry: { ...ctx.modelRegistry, runtime: modelRuntime },
@@ -671,13 +688,47 @@ describe("agent-runner final output capture", () => {
     }));
   });
 
-  it("omits modelRuntime when the legacy registry does not expose one", async () => {
+  it.each(["0.84", "0.87"])("preserves the legacy modelRegistry option on Pi %s", async () => {
     const { session } = createSession("LEGACY");
     createAgentSession.mockResolvedValue({ session });
-
     await runAgent(ctx, "Explore", "Say LEGACY", { pi });
-
+    expect(createAgentSession.mock.calls[0][0]).toHaveProperty("modelRegistry", ctx.modelRegistry);
     expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("modelRuntime");
+  });
+
+  it.each(["custom provider", "virtual route"])("passes the Pi 0.99 parent runtime for %s", async (label) => {
+    hostCapabilities.modernRuntime = true;
+    const model = { provider: label === "virtual route" ? "virtual" : "custom", id: "selected", name: "Selected" };
+    const runtime = {
+      getAuth: vi.fn(), stream: vi.fn(), streamSimple: vi.fn(), resolveModel: vi.fn(),
+      getModel: vi.fn((provider: string, id: string) =>
+        provider === model.provider && id === model.id ? model : undefined),
+    };
+    const context = { ...ctx, model, modelRegistry: { ...ctx.modelRegistry, runtime } };
+    const { session } = createSession("ROUTED");
+    createAgentSession.mockResolvedValue({ session });
+    await runAgent(context, "Explore", "Sanitized task only", { pi });
+    expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      model, modelRuntime: runtime, modelRegistry: context.modelRegistry,
+    }));
+    expect(session.prompt).toHaveBeenCalledWith("Sanitized task only");
+    expect(runtime.stream).not.toHaveBeenCalled(); // the mock session owns dispatch
+  });
+
+  it.each(["missing", "incompatible", "different model"])("refuses a Pi 0.99 %s parent runtime before child create", async (condition) => {
+    hostCapabilities.modernRuntime = true;
+    const model = { provider: "virtual", id: "route", name: "Route" };
+    const runtime = condition === "missing" ? undefined : condition === "incompatible"
+      ? { getAuth: vi.fn() }
+      : {
+          getAuth: vi.fn(), stream: vi.fn(), streamSimple: vi.fn(), resolveModel: vi.fn(),
+          getModel: vi.fn(() => undefined),
+        };
+    const context = { ...ctx, model, modelRegistry: { ...ctx.modelRegistry, runtime } };
+    await expect(runAgent(context, "Explore", "NO_PROVIDER_REQUEST", { pi }))
+      .rejects.toThrow(/parent's model runtime is unavailable or incompatible/);
+    expect(createAgentSession).not.toHaveBeenCalled();
+    expect(runtime && "stream" in runtime ? runtime.stream : vi.fn()).not.toHaveBeenCalled();
   });
 
   it("suppresses AGENTS.md/CLAUDE.md/APPEND_SYSTEM.md for subagents", async () => {
@@ -1104,6 +1155,7 @@ import {
   getToolNamesForType,
 } from "../src/agent-types.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
+import { preloadSkills } from "../src/skill-loader.js";
 
 const BUILTINS_7 = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
@@ -1141,6 +1193,7 @@ function withExtensions(spec: Record<string, string[]>) {
     extensions: Object.entries(spec).map(([path, tools]) => ({
       path,
       tools: new Map(tools.map((n) => [n, {}])),
+      handlers: new Map(),
     })),
     errors: [],
     runtime: {},
@@ -1155,19 +1208,25 @@ function withExtensions(spec: Record<string, string[]>) {
  *     `excludeTools`, and it keeps growing as extensions register later.
  * Read live from `loaderExtensionsRef`, so a test can simulate late registration.
  */
-function mockRegistry(opts: Record<string, any>): string[] {
+function mockRegistry(opts: Record<string, any>): Array<{ name: string; sourceInfo: { path: string } }> {
   const excluded = new Set<string>(opts.excludeTools ?? []);
-  // pi registers customTools into the same registry, subject to the same gate.
-  const customNames: string[] = (opts.customTools ?? []).map((t: any) => t.name);
-  const all: string[] = opts.tools
-    ? [...opts.tools, ...customNames]
-    : [
-        ...BUILTINS_7,
-        ...(hostCapabilities.powershell ? ["powershell"] : []),
-        ...loaderExtensionsRef.current.extensions.flatMap((e) => [...e.tools.keys()]),
-        ...customNames,
-      ];
-  return [...new Set(all)].filter((t) => !excluded.has(t));
+  const allowed = opts.tools ? new Set<string>(opts.tools) : undefined;
+  const effective = new Map<string, string>();
+  for (const name of [...BUILTINS_7, ...(hostCapabilities.powershell ? ["powershell"] : [])]) {
+    effective.set(name, hostCapabilities.legacyBuiltinSources ? `<builtin:${name}>` : `builtin:${name}`);
+  }
+  // Pi's extension runner keeps the first extension definition per name,
+  // overriding built-ins but not another extension's earlier registration.
+  const extensions = new Map<string, string>();
+  for (const ext of loaderExtensionsRef.current.extensions) {
+    for (const name of ext.tools.keys()) {
+      if (!extensions.has(name)) extensions.set(name, ext.path);
+    }
+  }
+  for (const [name, path] of extensions) effective.set(name, path);
+  for (const tool of opts.customTools ?? []) effective.set(tool.name, `<sdk:${tool.name}>`);
+  return [...effective].filter(([name]) => !excluded.has(name) && (!allowed || allowed.has(name)))
+    .map(([name, path]) => ({ name, sourceInfo: { path } }));
 }
 
 /**
@@ -1188,6 +1247,47 @@ function lastToolsPassed(): string[] {
 function lastLoaderOpts(): Record<string, unknown> {
   return defaultResourceLoaderCtor.mock.calls[0][0];
 }
+
+describe("agent-runner skill scope", () => {
+  const extensionSkills = {
+    skills: [{ name: "extension-skill", filePath: "/ext/extension-skill/SKILL.md" }],
+    diagnostics: [],
+  };
+
+  for (const skills of [false, ["selected-skill"]] as const) {
+    it(`filters extension-contributed skills with skills: ${JSON.stringify(skills)}`, async () => {
+      vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true, skills }));
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true, skills }));
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      const { noSkills, skillsOverride } = lastLoaderOpts();
+      expect(noSkills).toBe(true);
+      expect(skillsOverride).toEqual(expect.any(Function));
+      expect((skillsOverride as (base: typeof extensionSkills) => typeof extensionSkills)(extensionSkills))
+        .toEqual({ skills: [], diagnostics: [] });
+      if (Array.isArray(skills)) {
+        expect(preloadSkills).toHaveBeenCalledWith(["selected-skill"], "/tmp");
+      } else {
+        expect(preloadSkills).not.toHaveBeenCalled();
+      }
+    });
+  }
+
+  it("keeps normal Pi skill discovery with skills: true", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true, skills: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true, skills: true }));
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(lastLoaderOpts()).toMatchObject({ noSkills: false, skillsOverride: undefined });
+    expect(preloadSkills).not.toHaveBeenCalled();
+  });
+});
 
 describe("agent-runner session persistence", () => {
   it("uses an in-memory session by default", async () => {
@@ -1640,10 +1740,8 @@ describe("agent-runner async extension tool registration", () => {
     expect(session.getActiveToolNames()).not.toContain("drop_me");
   });
 
-  it("beforeToolCall blocks an out-of-scope tool and delegates otherwise", async () => {
-    // Turn 1 cannot be narrowed — before_agent_start fires inside prompt() and
-    // may widen the set after the turn's tools are snapshotted — so a call-time
-    // guard is the only correct enforcement there.
+  it("public tool_call hook blocks out-of-scope calls and admits selected tools", async () => {
+    // Nested calls and turn-1 calls both pass through Pi's extension event.
     setup({ extSelectors: ["ext:foo"] });
     withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/bar.ts": ["bar_tool"] });
     const { session } = createSession("OK");
@@ -1651,12 +1749,8 @@ describe("agent-runner async extension tool registration", () => {
 
     await runAgent(ctx, "Explore", "go", { pi });
 
-    await expect(
-      session.agent.beforeToolCall?.({ toolCall: { name: "bar_tool" } }),
-    ).resolves.toMatchObject({ block: true });
-    await expect(
-      session.agent.beforeToolCall?.({ toolCall: { name: "foo_tool" } }),
-    ).resolves.toBeUndefined();
+    await expect(policyCall("bar_tool")).resolves.toMatchObject({ block: true });
+    await expect(policyCall("foo_tool")).resolves.toBeUndefined();
   });
 
   it("passes validated tool arguments to ask_tools approval", async () => {
@@ -1681,19 +1775,10 @@ describe("agent-runner async extension tool registration", () => {
       { pi, supervisorQuestions: false },
     );
 
-    await session.agent.beforeToolCall?.({
-      toolCall: {
-        type: "toolCall",
-        id: "call-1",
-        name: "foo_tool",
-        arguments: { command: "raw command" },
-      },
-      args: { command: "validated command" },
-    });
+    await policyCall("foo_tool", { command: "validated command" });
 
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(confirm.mock.calls[0]?.[1]).toContain("validated command");
-    expect(confirm.mock.calls[0]?.[1]).not.toContain("raw command");
   });
 
   it("passes validated tool arguments to ask_tools in isolated mode", async () => {
@@ -1717,33 +1802,26 @@ describe("agent-runner async extension tool registration", () => {
       { pi, isolated: true, supervisorQuestions: false },
     );
 
-    await session.agent.beforeToolCall?.({
-      toolCall: {
-        type: "toolCall",
-        id: "call-2",
-        name: "bash",
-        arguments: { command: "raw isolated command" },
-      },
-      args: { command: "validated isolated command" },
-    });
+    await policyCall("bash", { command: "validated isolated command" });
 
     expect(confirm).toHaveBeenCalledTimes(1);
     expect(confirm.mock.calls[0]?.[1]).toContain("validated isolated command");
-    expect(confirm.mock.calls[0]?.[1]).not.toContain("raw isolated command");
   });
 
-  it("beforeToolCall preserves a hook pi installed before us", async () => {
-    setup();
-    withExtensions({ "/ext/foo.ts": ["foo_tool"] });
+  it("retains the hidden policy extension under a restrictive extensions allowlist", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: ["foo"] }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: ["foo"], extSelectors: ["ext:foo"] }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/bar.ts": ["bar_tool"] });
     const { session } = createSession("OK");
-    const prior = vi.fn(async () => undefined);
-    session.agent.beforeToolCall = prior;
     createAgentSession.mockResolvedValue({ session });
 
     await runAgent(ctx, "Explore", "go", { pi });
-    await session.agent.beforeToolCall?.({ toolCall: { name: "foo_tool" } });
 
-    expect(prior).toHaveBeenCalledTimes(1);
+    expect(loaderExtensionsRef.current.extensions.map((e) => e.path)).toEqual([
+      "<inline:pi-subagents-tool-policy>", "/ext/foo.ts",
+    ]);
+    await expect(policyCall("bar_tool")).resolves.toMatchObject({ block: true });
   });
 
   it("scope outlives runAgent so resumed turns stay narrowed", async () => {
@@ -1763,9 +1841,38 @@ describe("agent-runner async extension tool registration", () => {
 
     expect(session.getActiveToolNames()).toContain("foo_late");
     expect(session.getActiveToolNames()).not.toContain("bar_late");
-    await expect(
-      session.agent.beforeToolCall?.({ toolCall: { name: "bar_late" } }),
-    ).resolves.toMatchObject({ block: true });
+    await expect(policyCall("bar_late")).resolves.toMatchObject({ block: true });
+  });
+
+  it("keeps the public tool_call policy on older hosts without Pi 0.99 built-in factories", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: false }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: false, askTools: ["read"] }));
+    vi.mocked(getToolNamesForType).mockReturnValueOnce(["read"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(lastLoaderOpts().extensionFactories).toEqual([
+      expect.objectContaining({ name: "pi-subagents-tool-policy", hidden: true, factory: expect.any(Function) }),
+    ]);
+    await expect(policyCall("read")).resolves.toMatchObject({ block: true, reason: expect.stringContaining("no interactive session") });
+  });
+
+  it("allows core tools from older Pi <builtin:name> sources while keeping ext selectors narrow", async () => {
+    hostCapabilities.legacyBuiltinSources = true;
+    setup({ builtinToolNames: ["read", "bash"], extSelectors: ["ext:foo"] });
+    withExtensions({ "/ext/foo.ts": ["foo_tool"], "/ext/bar.ts": ["bar_tool"] });
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+
+    await runAgent(ctx, "Explore", "go", { pi });
+
+    expect(session.getAllTools().find((tool) => tool.name === "read")?.sourceInfo.path).toBe("<builtin:read>");
+    expect(session.getActiveToolNames()).toEqual(["read", "bash", "foo_tool"]);
+    await expect(policyCall("read")).resolves.toBeUndefined();
+    await expect(policyCall("bash")).resolves.toBeUndefined();
+    await expect(policyCall("bar_tool")).resolves.toMatchObject({ block: true });
   });
 
   it("isolated keeps the static allowlist — no live scoping installed", async () => {
@@ -1782,7 +1889,7 @@ describe("agent-runner async extension tool registration", () => {
     // asynchronously, so there is no active-set narrowing to maintain.
     expect(createAgentSession.mock.calls[0][0].tools).toEqual(["read"]);
     expect(session.setActiveToolsByName).not.toHaveBeenCalled();
-    expect(session.agent.beforeToolCall).toBeUndefined();
+    expect(toolCallHandlers).toHaveLength(1); // ask_tools still needs the public hook
   });
 });
 
@@ -1920,7 +2027,7 @@ describe("agent-runner extension allowlist", () => {
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
   }
 
-  it("['*'] short-circuits — no extensionsOverride, behaves like extensions: true", async () => {
+  it("['*'] keeps default extensions while putting the policy hook first", async () => {
     setupArrayAgent(["*"]);
     withExtensions({ "/ext/a.ts": ["tool_a"] });
     const { session } = createSession("OK");
@@ -1929,8 +2036,11 @@ describe("agent-runner extension allowlist", () => {
     await runAgent(ctx, "Explore", "go", { pi });
 
     const opts = lastLoaderOpts();
-    expect(opts.extensionsOverride).toBeUndefined();
+    expect(opts.extensionsOverride).toEqual(expect.any(Function));
     expect(opts.additionalExtensionPaths).toBeUndefined();
+    expect(loaderExtensionsRef.current.extensions.map((e) => e.path)).toEqual([
+      "<inline:pi-subagents-tool-policy>", "/ext/a.ts",
+    ]);
     expect(lastToolsPassed()).toContain("tool_a");
   });
 
@@ -2186,7 +2296,7 @@ describe("agent-runner exclude_extensions", () => {
     ]);
   });
 
-  it("extensions: false + exclude — orphan warning, no override", async () => {
+  it("extensions: false + exclude — orphan warning, policy still installed", async () => {
     setupAgent({ extensions: false, excludeExtensions: ["notify"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -2194,7 +2304,7 @@ describe("agent-runner exclude_extensions", () => {
 
     await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
 
-    expect(lastLoaderOpts().extensionsOverride).toBeUndefined();
+    expect(lastLoaderOpts().extensionsOverride).toEqual(expect.any(Function));
     expect(extensionErrors(onToolActivity)).toEqual([
       expect.stringContaining("exclude_extensions has no effect"),
     ]);
@@ -2389,8 +2499,8 @@ describe("agent-runner ext: tool selectors", () => {
     expect(tools).toContain("foo_tool");
     expect(tools).not.toContain("other_tool"); // loaded but muted
     expect(tools).not.toContain("read"); // tools: ext:foo → no built-ins
-    // both extensions still load — no loader override needed under extensions: true
-    expect(lastLoaderOpts().extensionsOverride).toBeUndefined();
+    // Both extensions still load; the override only puts the policy hook first.
+    expect(lastLoaderOpts().extensionsOverride).toEqual(expect.any(Function));
   });
 
   it("'*' alongside ext: keeps all built-ins while the flip still applies", async () => {
@@ -2474,7 +2584,7 @@ describe("agent-runner ext: tool selectors", () => {
 
     await runAgent(ctx, "Explore", "go", { pi });
 
-    expect(lastLoaderOpts().extensionsOverride).toBeUndefined(); // pure-["*"] short-circuit holds
+    expect(lastLoaderOpts().extensionsOverride).toEqual(expect.any(Function)); // policy still runs first
     const tools = lastToolsPassed();
     expect(tools).toContain("bar");
     expect(tools).not.toContain("baz");

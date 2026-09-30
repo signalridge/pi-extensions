@@ -1,6 +1,6 @@
 # Upstream refresh and Pi compatibility
 
-Snapshot: 2026-09-13.
+Snapshot: 2026-09-13. This is a historical review; see the [Pi 0.99.1 compatibility review](pi-0.99-compatibility.md) for the latest verified host and the [0.87.1 upstream snapshot](pi-0.87-compatibility.md) for the later extension references.
 
 ## Synced upstreams
 

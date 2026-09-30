@@ -1,5 +1,5 @@
 /**
- * ask-tools.test.ts — `ask_tools:`, the per-call approval gate.
+ * ask-tools.test.ts — `ask_tools:`, the session-scoped approval gate.
  *
  * The gate exists to make an unsafe-sometimes tool usable, so the properties
  * that matter are the ones that decide whether it is a real control:
@@ -94,13 +94,47 @@ describe("approving and declining", () => {
     expect(decision?.reason).toMatch(/do not retry/i);
   });
 
-  it("asks once and remembers an approval for the rest of the run", async () => {
+  it("asks once and remembers an approval for the child session", async () => {
     const confirm = vi.fn(async () => true);
     const check = gate(["bash"], confirm);
-    await check?.("bash", {});
-    await check?.("bash", {});
-    await check?.("bash", {});
+    await check?.("bash", { command: "ls" });
+    await check?.("bash", { command: "different command after resume" });
     expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirm.mock.calls[0][1]).toContain("including resumed turns");
+    expect(confirm.mock.calls[0][1]).toContain("Later calls in this session will not ask again");
+    expect(confirm.mock.calls[0][1]).toContain("Reopening the child from disk or restarting Pi will ask again");
+  });
+
+  it("shares one session-wide decision between parallel first calls", async () => {
+    let decide!: (approved: boolean) => void;
+    const confirm = vi.fn(() => new Promise<boolean>((resolve) => { decide = resolve; }));
+    const check = gate(["bash"], confirm);
+    const first = check?.("bash", { command: "ls" });
+    const second = check?.("bash", { command: "different command" });
+    await Promise.resolve();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    decide(true);
+    expect(await Promise.all([first, second])).toEqual([undefined, undefined]);
+    expect(await check?.("bash", { command: "later" })).toBeUndefined();
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares a parallel decline but asks again on a later call", async () => {
+    let decide!: (approved: boolean) => void;
+    const confirm = vi.fn(() => new Promise<boolean>((resolve) => { decide = resolve; }));
+    const check = gate(["bash"], confirm);
+    const first = check?.("bash", { command: "ls" });
+    const second = check?.("bash", { command: "different command" });
+    await Promise.resolve();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    decide(false);
+    const decisions = await Promise.all([first, second]);
+    expect(decisions.map((decision) => decision?.block)).toEqual([true, true]);
+    const later = check?.("bash", { command: "later" });
+    await Promise.resolve();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    decide(true);
+    expect(await later).toBeUndefined();
   });
 
   it("does not remember a decline — the next call asks again", async () => {
@@ -108,6 +142,13 @@ describe("approving and declining", () => {
     const check = gate(["bash"], confirm);
     await check?.("bash", {});
     await check?.("bash", {});
+    expect(confirm).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires fresh approval for a reopened child with a new gate", async () => {
+    const confirm = vi.fn(async () => true);
+    await gate(["bash"], confirm)?.("bash", {});
+    await gate(["bash"], confirm)?.("bash", {});
     expect(confirm).toHaveBeenCalledTimes(2);
   });
 
@@ -150,7 +191,7 @@ describe("what the user is shown", () => {
     expect(confirm.mock.calls[0][0]).toContain("bash");
   });
 
-  // The arguments are the thing being approved, so they have to be visible.
+  // The initiating call's arguments provide context for the session-wide grant.
   it("shows the call's arguments", async () => {
     const confirm = vi.fn(async () => true);
     await gate(["bash"], confirm)?.("bash", { command: "rm -rf /tmp/x" });

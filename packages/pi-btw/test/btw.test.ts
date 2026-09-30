@@ -165,6 +165,7 @@ test("resolveBtwModel applies an auth-resolved endpoint to configured and curren
   assert.notEqual(configured?.model, configuredModel);
   assert.equal(configured?.model.baseUrl, "https://enterprise.example");
   assert.equal(configured?.auth.baseUrl, "https://enterprise.example");
+  assert.equal(configured?.endpointOverridden, true);
 
   const currentModel = { provider: "current", id: "main", baseUrl: "https://default.example" } as Model<Api>;
   const current = await resolveBtwModel({
@@ -181,6 +182,35 @@ test("resolveBtwModel applies an auth-resolved endpoint to configured and curren
   });
   assert.notEqual(current?.model, currentModel);
   assert.equal(current?.model.baseUrl, "https://current-enterprise.example");
+  assert.equal(current?.endpointOverridden, true);
+});
+
+test("resolveBtwModel defers virtual-model credentials until the routed request", async () => {
+  const virtual = { provider: "router", id: "auto", api: "pi-virtual" } as Model<Api>;
+  let credentialReads = 0;
+  const modelRegistry = {
+    find: () => virtual,
+    getApiKeyAndHeaders: async () => {
+      credentialReads++;
+      return { ok: false as const, error: "The virtual provider has no credentials" };
+    },
+  } as never;
+
+  const configured = await resolveBtwModel({
+    settings: { model: "router/auto" },
+    currentModel: undefined,
+    modelRegistry,
+  });
+  const inherited = await resolveBtwModel({
+    settings: {},
+    currentModel: virtual,
+    modelRegistry,
+  });
+  assert.equal(configured?.model, virtual);
+  assert.equal(inherited?.model, virtual);
+  assert.deepEqual(configured?.auth, {});
+  assert.deepEqual(inherited?.auth, {});
+  assert.equal(credentialReads, 0);
 });
 
 test("resolveBtwModel inherits current model when no model is configured", async () => {
@@ -1063,6 +1093,64 @@ test("factory activity ordering survives repeated and backward wall-clock timest
   }
 });
 
+test.each(["menu", "settings", "model"] as const)(
+  "a Pi tree navigation during deferred %s setup does not open an obsolete side thread",
+  async (stage) => {
+    const mock = createMockPi();
+    const session = SessionManager.inMemory();
+    const earlier = session.appendMessage({ role: "user", content: "Earlier branch", timestamp: 1 });
+    session.appendMessage({ role: "user", content: "Later branch", timestamp: 2 });
+    const sessionId = session.getSessionId();
+    const interactive = createMockContext({ mode: "tui", hasUI: true, sessionManager: session });
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const deferred = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls: string[] = [];
+    const pause = async (name: typeof stage) => {
+      calls.push(name);
+      if (stage !== name) return;
+      entered();
+      await deferred;
+    };
+    btw(mock.pi, {
+      showCommandMenu: async () => {
+        await pause("menu");
+        return "start";
+      },
+      loadSettings: async () => {
+        await pause("settings");
+        return {};
+      },
+      resolveModel: async () => {
+        await pause("model");
+        return {
+          kind: "selected",
+          selected: { model: { provider: "test", id: "side" } as Model<Api>, auth: {} },
+        };
+      },
+      runFullscreen: async (ctx, run) => {
+        calls.push("fullscreen");
+        return run(ctx);
+      },
+    });
+    const command = mock.commands.get("btw");
+    assert.ok(command);
+    const running = command.handler(stage === "menu" ? "" : "direct question", interactive.ctx);
+    await waiting;
+    session.branch(earlier);
+    for (const handler of mock.events.get("session_tree") ?? []) await handler({}, interactive.ctx);
+    assert.equal(session.getSessionId(), sessionId);
+    release();
+    await running;
+    assert.deepEqual(calls, stage === "menu" ? ["menu"] : stage === "settings" ? ["settings"] : ["settings", "model"]);
+  },
+);
+
 test("btw command cancellation at the no-argument menu does not resolve a model", async () => {
   const mock = createMockPi();
   let modelResolutions = 0;
@@ -1179,11 +1267,12 @@ test("buildConversationContext bounds large tool output and keeps the newest dia
   assert.doesNotMatch(context, /old diagnostic/);
 });
 
-test("buildUserPrompt falls back when no conversation context exists", () => {
+test("buildUserPrompt omits parent context unless explicitly supplied", () => {
   const prompt = buildUserPrompt("What now?", "");
 
   assert.match(prompt, /<side_question>\nWhat now\?\n<\/side_question>/);
-  assert.match(prompt, /No prior conversation context was available/);
+  assert.doesNotMatch(prompt, /<conversation_context>|No prior conversation context/);
+  assert.match(buildUserPrompt("What now?", "User: shared"), /<conversation_context>\nUser: shared/);
 });
 
 test("sanitizeSingleLine removes controls and collapses whitespace", () => {

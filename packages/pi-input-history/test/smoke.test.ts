@@ -16,6 +16,6 @@ test("registers session loading and Ctrl+R history handlers", () => {
 
   history(pi as never);
 
-  assert.deepEqual([...events], ["session_start", "session_shutdown"]);
+  assert.deepEqual([...events], ["session_start", "session_tree", "session_shutdown"]);
   assert.equal(shortcut, "ctrl+r");
 });

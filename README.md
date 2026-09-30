@@ -84,7 +84,8 @@ Full detail lives in each package's README —
 [`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling.
+FleetView, and scheduling. For the released Pi host compatibility matrix and
+current upstream extension references, see [the Pi 0.99.1 compatibility review](docs/pi-0.99-compatibility.md) and its [0.87.1 baseline](docs/pi-0.87-compatibility.md).
 
 ---
 
@@ -133,7 +134,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | `pi-github-pr` | GitHub pull request review, checks, and comment status |
 | `pi-code-actions` | Pick code blocks from recent assistant messages to copy or insert |
 | `pi-files-widget` | In-terminal file browser and viewer |
-| `pi-btw` | `/btw` side-question command |
+| `pi-btw` | `/btw` side-question command; parent-history sharing is per-question opt-in |
 | `pi-stamp` | Transcript timestamps, assistant metadata, and tool timing |
 
 ### Session and interface
@@ -144,7 +145,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | `pi-input-prefix` | Theme-aware rounded input editor and prompt token |
 | `pi-input-history` | Cross-session prompt history with an fzf/atuin-style `Ctrl+R` picker |
 | `pi-welcome` | Startup resource and repository summary card |
-| `pi-session-recap` | While-you-were-away recap above the editor |
+| `pi-session-recap` | While-you-were-away recap above the editor; raw-history requests require explicit model and consent flags |
 | `pi-tab-status` | Terminal tab status indicators |
 | `pi-usage-extension` | Usage statistics dashboard |
 

@@ -108,6 +108,15 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
       getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }),
       registerProvider: () => {},
       unregisterProvider: () => {},
+      runtime: {
+        getModel: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+        getAuth: async () => ({ apiKey: "faux" }),
+        stream: () => { throw new Error("fixture has no provider dispatch"); },
+        streamSimple: () => { throw new Error("fixture has no provider dispatch"); },
+        getModels: () => [model],
+        getAvailable: async () => [model],
+        hasConfiguredAuth: () => true,
+      },
     };
     // cwd = fixtures dir so the templates' relative extensions: paths resolve.
     // getSystemPrompt returns a distinctive marker so prompt_mode: append can be

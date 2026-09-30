@@ -22,7 +22,7 @@ export function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
 export function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
 
 export type ModelScopeVerdict =
-  /** In scope, or nothing to validate against (feature off / no allowlist). */
+  /** In scope, or nothing to validate against (feature off / no configured allowlist). */
   | { kind: "ok" }
   /** Caller-supplied out-of-scope choice — refuse the spawn with this message. */
   | { kind: "error"; message: string }
@@ -60,7 +60,9 @@ export function checkModelScope(args: {
   // `Model not in scope: "undefined"`, which tells the caller nothing it can act on.
   const modelLabel = modelInput ?? `${model.provider}/${model.id}`;
   if (callerSupplied) {
-    const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
+    const list = allowed.size > 0
+      ? [...allowed].sort().map(m => `  ${m}`).join("\n")
+      : "  (no configured models are currently available or supported)";
     return {
       kind: "error",
       message: `Model not in scope: "${modelLabel}".\n\nAllowed models (from enabledModels):\n${list}`,

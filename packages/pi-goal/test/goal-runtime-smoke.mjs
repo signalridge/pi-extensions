@@ -164,7 +164,15 @@ async function createHarness(responses, fauxOptions = {}, prepareSession, goalSe
 }
 
 function completionResponse(context) {
-  const goalId = /<goal_id>\s*([^<\s]+)\s*<\/goal_id>/.exec(context.systemPrompt ?? "")?.[1];
+  const system = context.systemPrompt ?? context.messages.find((message) => message.role === "system")?.content;
+  const systemText =
+    typeof system === "string"
+      ? system
+      : (system ?? [])
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n");
+  const goalId = /<goal_id>\s*([^<\s]+)\s*<\/goal_id>/.exec(systemText)?.[1];
   assert.ok(goalId, "expected goal id in continuation system prompt");
   return fauxAssistantMessage(
     fauxToolCall("goal_complete", {

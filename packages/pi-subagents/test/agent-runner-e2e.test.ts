@@ -98,6 +98,13 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
       getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }),
       registerProvider: () => {},
       unregisterProvider: () => {},
+      runtime: {
+        getModel: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+        getAuth: async () => ({ apiKey: "faux" }),
+        stream: () => { throw new Error("fixture has no provider dispatch"); },
+        streamSimple: () => { throw new Error("fixture has no provider dispatch"); },
+        hasConfiguredAuth: () => true,
+      },
     };
     const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
 

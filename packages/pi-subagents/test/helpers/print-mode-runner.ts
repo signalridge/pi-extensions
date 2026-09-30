@@ -86,13 +86,54 @@ export type FauxReply = string | FauxContentBlock | FauxContentBlock[] | Assista
 
 /**
  * A context-branching responder. Invoked once per model call (parent OR child)
- * with that call's own `Context`, so it can decide what to emit from the prompt
- * it sees — order-independent, unlike a flat FIFO `steps` list.
+ * with that call's own context, so it can decide what to emit from the prompt
+ * it sees — order-independent, unlike a flat FIFO `steps` list. Pi 0.84/0.85
+ * passes a raw Context; Pi 0.87 passes a normalized TranscriptContext whose
+ * system messages carry the prompt and tool declarations.
  */
 export type FauxResponder = (
   context: Context,
   state: { callCount: number },
 ) => FauxReply | Promise<FauxReply>;
+
+/** Names of the tools currently offered to a faux provider, on either Pi context shape. */
+export function offeredToolNames(context: Context): string[] {
+  if ("tools" in context) return (context.tools ?? []).map((tool) => tool.name);
+
+  const names = new Set<string>();
+  for (const message of context.messages) {
+    const system = message as { role: string; toolsAdded?: Array<{ name: string }>; toolsRemoved?: Array<{ name: string }> };
+    if (system.role !== "system") continue;
+    for (const tool of system.toolsRemoved ?? []) names.delete(tool.name);
+    for (const tool of system.toolsAdded ?? []) names.add(tool.name);
+  }
+  return [...names];
+}
+
+/** The effective prompt after replaying system-message section updates. */
+export function offeredSystemPrompt(context: Context): string {
+  if ("systemPrompt" in context) return context.systemPrompt ?? "";
+
+  const content: string[] = [];
+  const sections = new Map<string, string>();
+  for (const message of context.messages) {
+    const system = message as {
+      role: string;
+      content?: string | Array<{ type: string; text?: string }>;
+      sections?: Record<string, string | null>;
+    };
+    if (system.role !== "system") continue;
+    const text = typeof system.content === "string"
+      ? system.content
+      : (system.content ?? []).filter((block) => block.type === "text").map((block) => block.text ?? "").join("\n");
+    if (text) content.push(text);
+    for (const [name, value] of Object.entries(system.sections ?? {})) {
+      if (value === null) sections.delete(name);
+      else sections.set(name, value);
+    }
+  }
+  return [...content, ...sections.values()].join("\n\n");
+}
 
 export interface RunPrintModeOptions {
   /** The user prompt that kicks off the parent turn. */
@@ -192,7 +233,7 @@ function resolveReply(
 /**
  * The common single-spawn flow as a responder. Routes by inspecting the calling
  * session's own context:
- *   - PARENT  (its tool set includes `Agent`):
+ *   - PARENT  (its offered tool set includes `Agent`):
  *       · `parentInitial` until an `Agent` tool result is in history (the spawn),
  *       · then `parentFinal` (the answer after the child reports back).
  *   - SUBAGENT (no `Agent` tool): `subagent`.
@@ -204,7 +245,7 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
+    const isParent = offeredToolNames(context).includes("Agent");
     if (!isParent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
@@ -301,6 +342,8 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     // compat registry and supplying the test credential directly.
     modelRuntime = {
       getAuth: async () => ({ ok: true, apiKey: "faux", headers: {} }),
+      stream: (fauxModel, context, streamOptions) =>
+        compatStreamSimple(fauxModel, context, { ...streamOptions, apiKey: "faux" }),
       streamSimple: (fauxModel, context, streamOptions) =>
         compatStreamSimple(fauxModel, context, { ...streamOptions, apiKey: "faux" }),
       getModel: () => model,

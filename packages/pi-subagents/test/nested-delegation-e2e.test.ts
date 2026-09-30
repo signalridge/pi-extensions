@@ -26,6 +26,7 @@ import { encodeCwd } from "../src/output-file.js";
 import {
   agentCall,
   type FauxReply,
+  offeredToolNames,
   type PrintModeRun,
   runPrintMode,
 } from "./helpers/print-mode-runner.js";
@@ -100,7 +101,7 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
 
     const respond = (context: Context): FauxReply => {
       const text = firstUserText(context);
-      const names = (context.tools ?? []).map((t) => t.name);
+      const names = offeredToolNames(context);
 
       // Leaf: no nested tools (it never opted in) — just answer.
       if (text.includes("Do the leaf work")) {
@@ -172,6 +173,37 @@ describe("nested delegation e2e (real pi-mono, faux model)", () => {
 
     // Two hops home: worker → orchestrator → parent.
     expect(run.responseText).toContain(WORKER_MARKER);
+  });
+
+  it("refuses nested raw inheritance before starting a grandchild", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "nested-inheritance-boundary-"));
+    tmpDirs.push(cwd);
+    writeAgents(cwd);
+    let workerRequests = 0;
+    run = await runPrintMode({
+      prompt: "Delegate the work.", cwd,
+      beforeRun: () => { registerAgents(loadCustomAgents(cwd)); },
+      respond: (context): FauxReply => {
+        const text = firstUserText(context);
+        if (text.includes("Do the leaf work")) {
+          workerRequests++;
+          return WORKER_MARKER;
+        }
+        const results = toolResultTexts(context);
+        if (text.includes("Delegate this downward")) {
+          const refusal = results.find((result) => result.name === "Agent");
+          return refusal
+            ? `orchestrator saw: ${refusal.text}`
+            : agentCall({ subagent_type: "worker", description: "leaf work", prompt: "Do the leaf work", inherit_context: true });
+        }
+        const outer = results.find((result) => result.name === "Agent");
+        return outer ? `parent saw: ${outer.text}`
+          : agentCall({ subagent_type: "orchestrator", description: "delegate", prompt: "Delegate this downward" });
+      },
+    });
+    expect(workerRequests).toBe(0);
+    expect(run.responseText).toContain("inherit_context: true");
+    expect(run.responseText).toContain("explicitly sanitized summary");
   });
 
   it("backgrounds a nested child, polls it by id, and streams its transcript", async () => {

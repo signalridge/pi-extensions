@@ -9,26 +9,21 @@
  * project file has `enabledModels` set, it wholly replaces global's
  * (array fields are replaced, not concatenated).
  *
- * **Limited subset of upstream's resolveModelScope.** We support exact
- * `provider/modelId` matching only. Upstream (pi-coding-agent's
- * `core/model-resolver.ts`) additionally supports glob patterns
- * (`*sonnet*`, `anthropic/*`), bare model IDs without provider, and
- * thinking-level suffixes (`provider/*:high`). Those forms are silently
- * ignored here.
- *
- * In practice, pi's `/scoped-models` picker writes exact `provider/modelId`
- * entries, so the limitation is invisible for users who configure scope
- * through pi's UI. Hand-edited settings using globs or bare IDs will
- * produce an empty allowed set (scope check becomes a no-op).
+ * Resolve exact `provider/modelId` entries, unambiguous bare IDs, and Pi's
+ * glob patterns (`*sonnet*`, `anthropic/*`) with optional thinking suffixes.
+ * The suffix selects a thinking level in Pi; this guard checks only model
+ * membership. A configured pattern with no available match must not disable
+ * the opt-in scope check.
  *
  * Example:
  *   enabledModels = ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-6"]
  *   → resolves to { "anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-6" }
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { minimatch } from "minimatch";
 import type { ModelEntry } from "./model-resolver.js";
 
 /** Minimal registry shape — only the methods resolveEnabledModels actually calls. */
@@ -50,7 +45,12 @@ function readField(path: string): string[] | undefined {
   if (!existsSync(path)) return undefined;
   try {
     const raw = JSON.parse(readFileSync(path, "utf-8"));
-    if (Array.isArray(raw?.enabledModels)) return raw.enabledModels as string[];
+    if (Array.isArray(raw?.enabledModels)) {
+      // Keep the configured list present even if every item is malformed: an
+      // invalid project allowlist must not fall back to a broader global list
+      // or silently disable the opt-in scope check.
+      return raw.enabledModels.map((pattern: unknown) => typeof pattern === "string" ? pattern : "");
+    }
   } catch {
     /* corrupt file — silent */
   }
@@ -71,54 +71,25 @@ export function readEnabledModels(cwd: string): string[] | undefined {
 /**
  * Resolve enabledModels patterns → Set<"provider/modelId"> (lowercase keys).
  *
- * Only exact `provider/modelId` patterns are matched (case-insensitive).
- * Patterns without a slash, with glob characters, or with a `:thinking`
- * suffix are silently dropped. See module-level docstring for rationale.
+ * Matches exact references, unambiguous bare IDs, and case-insensitive glob
+ * patterns against the full `provider/modelId` or bare ID. A recognized
+ * `:thinking` suffix is ignored for this model-only policy.
  *
- * Cache: keyed on JSON.stringify(patterns) + mtime/size of *both*
- * project and global settings.json files. Re-resolves when either file
- * changes or the patterns argument differs.
+ * Resolves against the current registry on every call. Availability can
+ * change without a settings-file edit (or even a new registry instance).
+ * The optional cwd is retained for callers that pass it alongside patterns
+ * read from that project's settings.
  *
- * Returns undefined when no patterns are provided or no patterns match
- * (scope check becomes a no-op at the call site).
+ * Returns undefined only when there is no configured allowlist. A configured
+ * list with no available exact matches returns an empty set so caller-supplied
+ * models cannot bypass the scope check.
  */
-
-// Module-level cache — invalidated when either settings.json changes or patterns differ.
-let cachedAllowed: Set<string> | undefined;
-let cachedHash = "";
-let cachedPatternsKey = "";
-
-/** mtime+size hash of one file, or "missing" if absent. */
-function hashOf(path: string): string {
-  try {
-    const s = statSync(path);
-    return `${s.mtimeMs}-${s.size}`;
-  } catch {
-    return "missing";
-  }
-}
-
 export function resolveEnabledModels(
   patterns: string[] | undefined,
   registry: ModelRegistryRef,
-  cwd: string = process.cwd(),
+  _cwd: string = process.cwd(),
 ): Set<string> | undefined {
-  // Fast path: check cache (stat both project and global settings.json files)
-  const patternsKey = JSON.stringify(patterns);
-  const [project, global] = settingsPaths(cwd);
-  const fileHash = `${hashOf(project)};${hashOf(global)}`;
-
-  if (fileHash === cachedHash && patternsKey === cachedPatternsKey) {
-    return cachedAllowed;
-  }
-
-  // Cache miss — resolve
-  if (!patterns || patterns.length === 0) {
-    cachedHash = fileHash;
-    cachedPatternsKey = patternsKey;
-    cachedAllowed = undefined;
-    return undefined;
-  }
+  if (!patterns || patterns.length === 0) return undefined;
 
   const available = (registry.getAvailable?.() ?? registry.getAll()) as ModelEntry[];
   const allowed = new Set<string>();
@@ -126,14 +97,10 @@ export function resolveEnabledModels(
   for (const pattern of patterns) {
     const trimmed = pattern.trim();
     if (!trimmed) continue;  // skip empty/whitespace
-    resolveExact(trimmed, available, allowed);
+    resolvePattern(trimmed, available, allowed);
   }
 
-  const result = allowed.size > 0 ? allowed : undefined;
-  cachedHash = fileHash;
-  cachedPatternsKey = patternsKey;
-  cachedAllowed = result;
-  return result;
+  return allowed;
 }
 
 
@@ -155,26 +122,53 @@ function modelKey(model: { provider: string; id: string }): string {
   return `${model.provider}/${model.id}`.toLowerCase();
 }
 
-/**
- * Resolve exact model pattern. Example: "google/gemma-4-31b-it".
- */
-function resolveExact(
-  pattern: string,
-  available: ModelEntry[],
-  allowed: Set<string>,
-): void {
-  // "provider/modelId" — exact (colon is part of id, not split)
-  const slashIdx = pattern.indexOf("/");
-  if (slashIdx === -1) return; // bare modelId not supported
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-  const provider = pattern.slice(0, slashIdx).toLowerCase();
-  const modelId = pattern.slice(slashIdx + 1).toLowerCase();
-  const exact = available.find(
-    m => m.provider.toLowerCase() === provider && m.id.toLowerCase() === modelId,
-  );
-  if (exact) {
-    allowed.add(modelKey(exact));
+function resolvePattern(pattern: string, available: ModelEntry[], allowed: Set<string>): void {
+  const colon = pattern.lastIndexOf(":");
+  if (/[*?[]/.test(pattern)) {
+    // Pi strips a recognized thinking level from globs before matching. Trying
+    // the full glob first would select only colon-suffixed model IDs and miss
+    // their base models (e.g. custom/*:high).
+    const reference = colon >= 0 && THINKING_LEVELS.has(pattern.slice(colon + 1))
+      ? pattern.slice(0, colon) : pattern;
+    for (const model of available) {
+      if (minimatch(modelKey(model), reference, { nocase: true }) || minimatch(model.id, reference, { nocase: true })) {
+        allowed.add(modelKey(model));
+      }
+    }
+    return;
   }
+
+  // Pi tries the complete reference before treating a colon as a thinking
+  // suffix: a model ID itself may contain ":high" or ":high-speed".
+  if (matchReference(pattern, available, allowed)) return;
+  // Invalid thinking suffixes on non-globs fall back to the prefix in scope
+  // mode, just as Pi does (though it reports a warning to its own UI).
+  if (colon >= 0) matchReference(pattern.slice(0, colon), available, allowed);
 }
 
+function matchReference(reference: string, available: ModelEntry[], allowed: Set<string>): boolean {
+  const exact = available.find((model) => modelKey(model) === reference.toLowerCase());
+  if (exact) {
+    allowed.add(modelKey(exact));
+    return true;
+  }
+  const bare = available.filter((model) => model.id.toLowerCase() === reference.toLowerCase());
+  if (bare.length === 1) {
+    allowed.add(modelKey(bare[0]));
+    return true;
+  }
+
+  // Pi's non-glob partial picker searches model IDs and names, not canonical
+  // provider/model keys. A provider-qualified partial is not an exact reference.
+  const query = reference.toLowerCase();
+  const matches = available.filter((model) =>
+    model.id.toLowerCase().includes(query) || model.name?.toLowerCase().includes(query)
+  );
+  const aliases = matches.filter((model) => model.id.endsWith("-latest") || !/-\d{8}$/.test(model.id));
+  const selected = (aliases.length > 0 ? aliases : matches).sort((a, b) => b.id.localeCompare(a.id))[0];
+  if (selected) allowed.add(modelKey(selected));
+  return selected !== undefined;
+}
 

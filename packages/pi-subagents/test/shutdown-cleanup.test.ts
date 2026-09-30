@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager, type ManagedSpawnPolicy } from "../src/agent-manager.js";
-import { type RunOptions, type RunResult, runAgent } from "../src/agent-runner.js";
+import {
+  type RunOptions,
+  type RunResult,
+  runAgent,
+} from "../src/agent-runner.js";
+import { setAgentTiersSettings } from "../src/agent-tiers.js";
 import subagentsExtension from "../src/index.js";
 import type { AgentRecord } from "../src/types.js";
 import {
@@ -13,6 +18,7 @@ import {
   pruneWorktrees,
   type WorktreeInfo,
 } from "../src/worktree.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -46,27 +52,42 @@ vi.mock("../src/worktree.js", () => {
     isWorktreeIsolationEnabled: vi.fn(() => true),
     setWorktreeIsolationEnabled: vi.fn(),
     cleanupWorktree,
-    cleanupWorktreeAsync: vi.fn(async (...args: Parameters<typeof cleanupWorktree>) => cleanupWorktree(...args)),
-    pruneWorktreesAsync: vi.fn(async (...args: Parameters<typeof pruneWorktrees>) => pruneWorktrees(...args)),
+    cleanupWorktreeAsync: vi.fn(
+      async (...args: Parameters<typeof cleanupWorktree>) =>
+        cleanupWorktree(...args),
+    ),
+    pruneWorktreesAsync: vi.fn(
+      async (...args: Parameters<typeof pruneWorktrees>) =>
+        pruneWorktrees(...args),
+    ),
     pruneWorktrees,
   };
 });
 
 const mockPi = {} as never;
 
-function worktree(path: string, repoRoot: string, branch: string): WorktreeInfo {
+function worktree(
+  path: string,
+  repoRoot: string,
+  branch: string,
+): WorktreeInfo {
   return { path, branch, baseSha: `${branch}-sha`, repoRoot, workPath: path };
 }
 
-
-function abortResponsiveRun(_ctx: unknown, _type: string, _prompt: string, options: RunOptions): Promise<RunResult> {
+function abortResponsiveRun(
+  _ctx: unknown,
+  _type: string,
+  _prompt: string,
+  options: RunOptions,
+): Promise<RunResult> {
   return new Promise((resolve) => {
-    const finish = () => resolve({
-      responseText: "stopped",
-      session: { dispose: vi.fn() } as never,
-      aborted: true,
-      steered: false,
-    });
+    const finish = () =>
+      resolve({
+        responseText: "stopped",
+        session: { dispose: vi.fn() } as never,
+        aborted: true,
+        steered: false,
+      });
     if (options.signal?.aborted) finish();
     else options.signal?.addEventListener("abort", finish, { once: true });
   });
@@ -111,7 +132,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       .mockReturnValueOnce(worktree(rootPath, baseRepo, "root"))
       .mockReturnValueOnce(worktree(childPath, rootPath, "child"))
       .mockReturnValueOnce(worktree(grandchildPath, childPath, "grandchild"));
-    vi.mocked(runAgent).mockImplementation(abortResponsiveRun as typeof runAgent);
+    vi.mocked(runAgent).mockImplementation(
+      abortResponsiveRun as typeof runAgent,
+    );
     vi.mocked(cleanupWorktree).mockImplementation((_repoRoot, attached) => {
       events.push(`cleanup:${attached.path}`);
       cleanupOrder.push(attached.path);
@@ -127,23 +150,41 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
     try {
       manager = new AgentManager();
-      const rootId = manager.spawn(mockPi, { cwd: baseRepo } as never, "R", "root", {
-        description: "root",
-        isBackground: true,
-        isolation: "worktree",
-      });
-      const childId = manager.spawn(mockPi, { cwd: rootPath } as never, "C", "child", {
-        description: "child",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
-      const grandchildId = manager.spawn(mockPi, { cwd: childPath } as never, "G", "grandchild", {
-        description: "grandchild",
-        isBackground: true,
-        parentAgentId: childId,
-        isolation: "worktree",
-      });
+      const rootId = manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "R",
+        "root",
+        {
+          description: "root",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
+      const childId = manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "C",
+        "child",
+        {
+          description: "child",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
+      const grandchildId = manager.spawn(
+        mockPi,
+        { cwd: childPath, modelRegistry: mockParentRegistry } as never,
+        "G",
+        "grandchild",
+        {
+          description: "grandchild",
+          isBackground: true,
+          parentAgentId: childId,
+          isolation: "worktree",
+        },
+      );
       const records = [
         manager.getRecordMutable(rootId)!,
         manager.getRecordMutable(childId)!,
@@ -158,11 +199,15 @@ describe("AgentManager synchronous shutdown cleanup", () => {
         `cleanup:${childPath}`,
         `cleanup:${rootPath}`,
       ]);
-      expect(events.slice(3).every((event) => event.startsWith("prune:"))).toBe(true);
-      expect(vi.mocked(pruneWorktrees).mock.calls.map(([repo]) => repo)).toEqual(
-        expect.arrayContaining([baseRepo, rootPath, childPath]),
+      expect(events.slice(3).every((event) => event.startsWith("prune:"))).toBe(
+        true,
       );
-      expect(records.every((record) => record.worktree === undefined)).toBe(true);
+      expect(
+        vi.mocked(pruneWorktrees).mock.calls.map(([repo]) => repo),
+      ).toEqual(expect.arrayContaining([baseRepo, rootPath, childPath]));
+      expect(records.every((record) => record.worktree === undefined)).toBe(
+        true,
+      );
       expect(existsSync(rootPath)).toBe(false);
       expect(manager.listAgents()).toEqual([]);
       expect(internals(manager).agents.size).toBe(0);
@@ -173,7 +218,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
   });
 
   it("continues through a failed child cleanup and still cleans siblings and ancestors", async () => {
-    const baseRepo = mkdtempSync(join(tmpdir(), "pi-subagents-dispose-failure-"));
+    const baseRepo = mkdtempSync(
+      join(tmpdir(), "pi-subagents-dispose-failure-"),
+    );
     const rootPath = join(baseRepo, "root");
     const childPath = join(rootPath, "child");
     const siblingPath = join(rootPath, "sibling");
@@ -187,7 +234,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       .mockReturnValueOnce(worktree(childPath, rootPath, "child"))
       .mockReturnValueOnce(worktree(siblingPath, rootPath, "sibling"))
       .mockReturnValueOnce(worktree(grandchildPath, childPath, "grandchild"));
-    vi.mocked(runAgent).mockImplementation(abortResponsiveRun as typeof runAgent);
+    vi.mocked(runAgent).mockImplementation(
+      abortResponsiveRun as typeof runAgent,
+    );
     let childCleanupAttempts = 0;
     vi.mocked(cleanupWorktree).mockImplementation((_repoRoot, attached) => {
       cleanupOrder.push(attached.path);
@@ -206,33 +255,63 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
     try {
       manager = new AgentManager();
-      const rootId = manager.spawn(mockPi, { cwd: baseRepo } as never, "R", "root", {
-        description: "root",
-        isBackground: true,
-        isolation: "worktree",
-      });
-      const childId = manager.spawn(mockPi, { cwd: rootPath } as never, "C", "child", {
-        description: "child",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
-      manager.spawn(mockPi, { cwd: rootPath } as never, "S", "sibling", {
-        description: "sibling",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
-      manager.spawn(mockPi, { cwd: childPath } as never, "G", "grandchild", {
-        description: "grandchild",
-        isBackground: true,
-        parentAgentId: childId,
-        isolation: "worktree",
-      });
+      const rootId = manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "R",
+        "root",
+        {
+          description: "root",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
+      const childId = manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "C",
+        "child",
+        {
+          description: "child",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
+      manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "S",
+        "sibling",
+        {
+          description: "sibling",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
+      manager.spawn(
+        mockPi,
+        { cwd: childPath, modelRegistry: mockParentRegistry } as never,
+        "G",
+        "grandchild",
+        {
+          description: "grandchild",
+          isBackground: true,
+          parentAgentId: childId,
+          isolation: "worktree",
+        },
+      );
 
       await manager.dispose();
 
-      expect(cleanupOrder).toEqual([grandchildPath, childPath, siblingPath, childPath, rootPath]);
+      expect(cleanupOrder).toEqual([
+        grandchildPath,
+        childPath,
+        siblingPath,
+        childPath,
+        rootPath,
+      ]);
       expect(existsSync(rootPath)).toBe(false);
       expect(manager.listAgents()).toEqual([]);
     } finally {
@@ -241,7 +320,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
   });
 
   it("retains immutable path-rich diagnostics when a worktree remains after retry", async () => {
-    const baseRepo = mkdtempSync(join(tmpdir(), "pi-subagents-dispose-diagnostic-"));
+    const baseRepo = mkdtempSync(
+      join(tmpdir(), "pi-subagents-dispose-diagnostic-"),
+    );
     const rootPath = join(baseRepo, "root");
     const childPath = join(rootPath, "child");
     const siblingPath = join(rootPath, "sibling");
@@ -253,7 +334,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       .mockReturnValueOnce(worktree(rootPath, baseRepo, "root"))
       .mockReturnValueOnce(worktree(childPath, rootPath, "child"))
       .mockReturnValueOnce(worktree(siblingPath, rootPath, "sibling"));
-    vi.mocked(runAgent).mockImplementation(abortResponsiveRun as typeof runAgent);
+    vi.mocked(runAgent).mockImplementation(
+      abortResponsiveRun as typeof runAgent,
+    );
     vi.mocked(cleanupWorktree).mockImplementation((_repoRoot, attached) => {
       cleanupOrder.push(attached.path);
       if (attached.path === childPath) {
@@ -271,23 +354,41 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
     try {
       manager = new AgentManager();
-      const rootId = manager.spawn(mockPi, { cwd: baseRepo } as never, "R", "root", {
-        description: "root",
-        isBackground: true,
-        isolation: "worktree",
-      });
-      const childId = manager.spawn(mockPi, { cwd: rootPath } as never, "C", "child", {
-        description: "child",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
-      manager.spawn(mockPi, { cwd: rootPath } as never, "S", "sibling", {
-        description: "sibling",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
+      const rootId = manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "R",
+        "root",
+        {
+          description: "root",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
+      const childId = manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "C",
+        "child",
+        {
+          description: "child",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
+      manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "S",
+        "sibling",
+        {
+          description: "sibling",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
       const childRecord = manager.getRecordMutable(childId)!;
 
       const failures = await manager.dispose();
@@ -316,7 +417,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
       const callsAfterDispose = vi.mocked(cleanupWorktree).mock.calls.length;
       expect(await manager.dispose()).toBe(failures);
-      expect(vi.mocked(cleanupWorktree).mock.calls.length).toBe(callsAfterDispose);
+      expect(vi.mocked(cleanupWorktree).mock.calls.length).toBe(
+        callsAfterDispose,
+      );
     } finally {
       warning.mockRestore();
       rmSync(baseRepo, { recursive: true, force: true });
@@ -330,7 +433,10 @@ describe("AgentManager synchronous shutdown cleanup", () => {
     const grandchildPath = join(childPath, "grandchild");
     mkdirSync(grandchildPath, { recursive: true });
     const cleanupOrder: string[] = [];
-    const deferred: Array<{ resolve: (result: RunResult) => void; options: RunOptions }> = [];
+    const deferred: Array<{
+      resolve: (result: RunResult) => void;
+      options: RunOptions;
+    }> = [];
     const completed = vi.fn();
     const persisted = vi.fn();
     const activity = vi.fn();
@@ -344,10 +450,11 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       .mockReturnValueOnce(worktree(rootPath, baseRepo, "root"))
       .mockReturnValueOnce(worktree(childPath, rootPath, "child"))
       .mockReturnValueOnce(worktree(grandchildPath, childPath, "grandchild"));
-    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) =>
-      new Promise<RunResult>((resolve) => {
-        deferred.push({ resolve, options });
-      }),
+    vi.mocked(runAgent).mockImplementation(
+      (_ctx, _type, _prompt, options) =>
+        new Promise<RunResult>((resolve) => {
+          deferred.push({ resolve, options });
+        }),
     );
     vi.mocked(cleanupWorktree).mockImplementation((_repoRoot, attached) => {
       cleanupOrder.push(attached.path);
@@ -357,10 +464,18 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
     try {
       const policy: ManagedSpawnPolicy = { isolation: "worktree" };
-      manager = new AgentManager(completed, 1, undefined, undefined, undefined, { append: persisted });
+      manager = new AgentManager(
+        completed,
+        1,
+        undefined,
+        undefined,
+        undefined,
+        { append: persisted },
+      );
+      setAgentTiersSettings({});
       const rootId = manager.spawnManaged(
         mockPi,
-        { cwd: baseRepo } as never,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
         {
           requestId: "shutdown-request",
           spawnKey: "shutdown-root",
@@ -384,30 +499,56 @@ describe("AgentManager synchronous shutdown cleanup", () => {
           onCompaction: compaction,
         },
       ).id;
-      const childId = manager.spawn(mockPi, { cwd: rootPath } as never, "C", "child", {
-        description: "child",
-        isBackground: true,
-        parentAgentId: rootId,
-        isolation: "worktree",
-      });
-      manager.spawn(mockPi, { cwd: childPath } as never, "G", "grandchild", {
-        description: "grandchild",
-        isBackground: true,
-        parentAgentId: childId,
-        isolation: "worktree",
-      });
-      const queuedId = manager.spawn(mockPi, { cwd: baseRepo } as never, "queued", "queued", {
-        description: "queued",
-        isBackground: true,
-      });
+      const childId = manager.spawn(
+        mockPi,
+        { cwd: rootPath, modelRegistry: mockParentRegistry } as never,
+        "C",
+        "child",
+        {
+          description: "child",
+          isBackground: true,
+          parentAgentId: rootId,
+          isolation: "worktree",
+        },
+      );
+      manager.spawn(
+        mockPi,
+        { cwd: childPath, modelRegistry: mockParentRegistry } as never,
+        "G",
+        "grandchild",
+        {
+          description: "grandchild",
+          isBackground: true,
+          parentAgentId: childId,
+          isolation: "worktree",
+        },
+      );
+      const queuedId = manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "queued",
+        "queued",
+        {
+          description: "queued",
+          isBackground: true,
+        },
+      );
       expect(manager.getRecord(queuedId)?.status).toBe("queued");
       expect(deferred).toHaveLength(3);
       const persistedBeforeDispose = persisted.mock.calls.length;
 
       const failures = await manager.dispose();
       expect(cleanupOrder).toEqual([]);
-      expect(failures.map((failure) => failure.path)).toEqual([grandchildPath, childPath, rootPath]);
-      expect(failures.every((failure) => failure.reason.includes("provider settlement"))).toBe(true);
+      expect(failures.map((failure) => failure.path)).toEqual([
+        grandchildPath,
+        childPath,
+        rootPath,
+      ]);
+      expect(
+        failures.every((failure) =>
+          failure.reason.includes("provider settlement"),
+        ),
+      ).toBe(true);
       expect(existsSync(grandchildPath)).toBe(true);
       expect(manager.listAgents()).toEqual([]);
       expect(manager.getRecord(rootId)).toBeUndefined();
@@ -419,16 +560,23 @@ describe("AgentManager synchronous shutdown cleanup", () => {
         options.onAssistantUsage?.({ input: 1, output: 1, cacheWrite: 0 });
         options.onCompaction?.({ reason: "manual", tokensBefore: 1 });
         options.onSessionCreated?.({ dispose: vi.fn() } as never);
-        expect(() => options.nestedRuntime?.manager.spawn(
-          mockPi,
-          { cwd: baseRepo } as never,
-          "late",
-          "late",
-          { description: "late", parentAgentId: rootId },
-        )).toThrow("disposed");
+        expect(() =>
+          options.nestedRuntime?.manager.spawn(
+            mockPi,
+            { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+            "late",
+            "late",
+            { description: "late", parentAgentId: rootId },
+          ),
+        ).toThrow("disposed");
       }
       for (const entry of deferred) {
-        entry.resolve({ responseText: "late", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+        entry.resolve({
+          responseText: "late",
+          session: { dispose: vi.fn() } as never,
+          aborted: false,
+          steered: false,
+        });
       }
       for (let i = 0; i < 5; i++) await Promise.resolve();
 
@@ -458,10 +606,16 @@ describe("AgentManager synchronous shutdown cleanup", () => {
     vi.mocked(cleanupWorktree).mockClear();
 
     manager = new AgentManager();
-    const id = manager.spawn(mockPi, { cwd: "/tmp" } as never, "ordinary", "ordinary", {
-      description: "ordinary",
-      isBackground: true,
-    });
+    const id = manager.spawn(
+      mockPi,
+      { cwd: "/tmp", modelRegistry: mockParentRegistry } as never,
+      "ordinary",
+      "ordinary",
+      {
+        description: "ordinary",
+        isBackground: true,
+      },
+    );
     await manager.getRecordMutable(id)!.promise;
     await manager.dispose();
 
@@ -471,14 +625,20 @@ describe("AgentManager synchronous shutdown cleanup", () => {
   });
 
   it("waits for child session shutdown before branch worktree cleanup", async () => {
-    const baseRepo = mkdtempSync(join(tmpdir(), "pi-subagents-quiesce-session-"));
+    const baseRepo = mkdtempSync(
+      join(tmpdir(), "pi-subagents-quiesce-session-"),
+    );
     const rootPath = join(baseRepo, "root");
     mkdirSync(rootPath, { recursive: true });
     let releaseShutdown!: () => void;
     let finishProvider!: (result: RunResult) => void;
     let markShutdownStarted!: () => void;
-    const shutdownStarted = new Promise<void>((resolve) => { markShutdownStarted = resolve; });
-    const shutdownGate = new Promise<void>((resolve) => { releaseShutdown = resolve; });
+    const shutdownStarted = new Promise<void>((resolve) => {
+      markShutdownStarted = resolve;
+    });
+    const shutdownGate = new Promise<void>((resolve) => {
+      releaseShutdown = resolve;
+    });
     const session = {
       extensionRunner: {
         emit: vi.fn(async () => {
@@ -489,11 +649,17 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       dispose: vi.fn(),
     };
 
-    vi.mocked(createWorktree).mockReturnValue(worktree(rootPath, baseRepo, "root"));
-    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options: RunOptions) => {
-      options.onSessionCreated?.(session as never);
-      return new Promise<RunResult>((resolve) => { finishProvider = resolve; });
-    });
+    vi.mocked(createWorktree).mockReturnValue(
+      worktree(rootPath, baseRepo, "root"),
+    );
+    vi.mocked(runAgent).mockImplementation(
+      (_ctx, _type, _prompt, options: RunOptions) => {
+        options.onSessionCreated?.(session as never);
+        return new Promise<RunResult>((resolve) => {
+          finishProvider = resolve;
+        });
+      },
+    );
     vi.mocked(cleanupWorktree).mockImplementation((_repoRoot, attached) => {
       expect(session.dispose).toHaveBeenCalledOnce();
       rmSync(attached.path, { recursive: true, force: true });
@@ -502,23 +668,37 @@ describe("AgentManager synchronous shutdown cleanup", () => {
 
     try {
       manager = new AgentManager();
-      const id = manager.spawn(mockPi, { cwd: baseRepo } as never, "root", "root", {
-        description: "root",
-        isBackground: true,
-        isolation: "worktree",
-      });
+      const id = manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "root",
+        "root",
+        {
+          description: "root",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
 
       const quiesced = manager.quiesceAll(25);
       await shutdownStarted;
       expect(cleanupWorktree).not.toHaveBeenCalled();
       releaseShutdown();
 
-      await expect(quiesced).resolves.toMatchObject({ settled: false, pending: [id] });
+      await expect(quiesced).resolves.toMatchObject({
+        settled: false,
+        pending: [id],
+      });
       expect(cleanupWorktree).not.toHaveBeenCalled();
       expect(existsSync(rootPath)).toBe(true);
 
       const providerSettled = manager.getRecordMutable(id)?.promise;
-      finishProvider({ responseText: "stopped", session: session as never, aborted: true, steered: false });
+      finishProvider({
+        responseText: "stopped",
+        session: session as never,
+        aborted: true,
+        steered: false,
+      });
       await providerSettled;
       expect(cleanupWorktree).toHaveBeenCalledOnce();
       expect(existsSync(rootPath)).toBe(false);
@@ -539,7 +719,9 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       registerMessageRenderer: vi.fn(),
       registerTool: vi.fn(),
       registerCommand: vi.fn(),
-      on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => lifecycle.set(event, handler)),
+      on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) =>
+        lifecycle.set(event, handler),
+      ),
       events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
       appendEntry: vi.fn(),
       sendMessage: vi.fn(),
@@ -549,21 +731,34 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       hasUI: false,
       ui: { notify: vi.fn(), setStatus: vi.fn(), setWidget: vi.fn() },
       model: undefined,
-      modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-      sessionManager: { getSessionId: vi.fn(() => "shutdown-session"), getBranch: vi.fn(() => []) },
+      modelRegistry: {
+        ...mockParentRegistry,
+        find: vi.fn(),
+        getAvailable: vi.fn(() => []),
+      },
+      sessionManager: {
+        getSessionId: vi.fn(() => "shutdown-session"),
+        getBranch: vi.fn(() => []),
+      },
       getSystemPrompt: vi.fn(() => "parent"),
     };
     const managerKey = Symbol.for("pi-subagents:manager");
     const activeKey = Symbol.for("pi-subagents:manager-active");
     const rpcOwnerKey = Symbol.for("pi-subagents:rpc-owner");
 
-    vi.mocked(createWorktree).mockReturnValueOnce(worktree(rootPath, baseRepo, "root"));
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    vi.mocked(cleanupWorktreeAsync).mockImplementation(async (_repoRoot, attached) => {
-      cleanupOrder.push(attached.path);
-      rmSync(attached.path, { recursive: true, force: true });
-      return { hasChanges: false, cleanupSucceeded: true };
-    });
+    vi.mocked(createWorktree).mockReturnValueOnce(
+      worktree(rootPath, baseRepo, "root"),
+    );
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    vi.mocked(cleanupWorktreeAsync).mockImplementation(
+      async (_repoRoot, attached) => {
+        cleanupOrder.push(attached.path);
+        rmSync(attached.path, { recursive: true, force: true });
+        return { hasChanges: false, cleanupSucceeded: true };
+      },
+    );
 
     try {
       delete (globalThis as Record<symbol, unknown>)[managerKey];
@@ -571,14 +766,22 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       delete (globalThis as Record<symbol, unknown>)[rpcOwnerKey];
       subagentsExtension(pi as never);
       await lifecycle.get("session_start")?.({}, ctx);
-      const rootManager = (globalThis as Record<symbol, unknown>)[managerKey] as Pick<AgentManager, "spawn"> & {
+      const rootManager = (globalThis as Record<symbol, unknown>)[
+        managerKey
+      ] as Pick<AgentManager, "spawn"> & {
         getRecord: (id: string) => unknown;
       };
-      const rootId = rootManager.spawn(pi as never, ctx as never, "general-purpose", "root", {
-        description: "root",
-        isBackground: true,
-        isolation: "worktree",
-      });
+      const rootId = rootManager.spawn(
+        pi as never,
+        ctx as never,
+        "general-purpose",
+        "root",
+        {
+          description: "root",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
 
       await lifecycle.get("session_shutdown")?.({}, ctx);
 
@@ -587,12 +790,103 @@ describe("AgentManager synchronous shutdown cleanup", () => {
       expect(cleanupWorktreeAsync).not.toHaveBeenCalled();
       expect(existsSync(rootPath)).toBe(true);
       expect(rootManager.getRecord(rootId)).toBeUndefined();
-      expect(warning).toHaveBeenCalledWith(expect.stringContaining("provider settlement"));
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("provider settlement"),
+      );
     } finally {
       warning.mockRestore();
       delete (globalThis as Record<symbol, unknown>)[managerKey];
       delete (globalThis as Record<symbol, unknown>)[activeKey];
       delete (globalThis as Record<symbol, unknown>)[rpcOwnerKey];
+      rmSync(baseRepo, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("bounds a stalled child shutdown and cleans its pinned worktree after late settlement", async () => {
+    const baseRepo = mkdtempSync(join(tmpdir(), "pi-subagents-late-shutdown-"));
+    const childPath = join(baseRepo, "child");
+    mkdirSync(childPath, { recursive: true });
+    let releaseShutdown!: () => void;
+    let finishProvider!: (result: RunResult) => void;
+    let markShutdownStarted!: () => void;
+    const shutdownStarted = new Promise<void>((resolve) => {
+      markShutdownStarted = resolve;
+    });
+    const shutdownGate = new Promise<void>((resolve) => {
+      releaseShutdown = resolve;
+    });
+    const session = {
+      extensionRunner: {
+        emit: vi.fn(async () => {
+          markShutdownStarted();
+          await shutdownGate;
+        }),
+      },
+      dispose: vi.fn(),
+    };
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.mocked(createWorktree).mockReturnValue(
+      worktree(childPath, baseRepo, "child"),
+    );
+    vi.mocked(runAgent).mockImplementation(
+      (_ctx, _type, _prompt, options: RunOptions) => {
+        options.onSessionCreated?.(session as never);
+        return new Promise<RunResult>((resolve) => {
+          finishProvider = resolve;
+        });
+      },
+    );
+    vi.mocked(cleanupWorktreeAsync).mockImplementation(
+      async (_root, attached) => {
+        expect(session.dispose).toHaveBeenCalledOnce();
+        rmSync(attached.path, { recursive: true, force: true });
+        return { hasChanges: false, cleanupSucceeded: true };
+      },
+    );
+
+    let manager: AgentManager | undefined;
+    try {
+      manager = new AgentManager();
+      manager.spawn(
+        mockPi,
+        { cwd: baseRepo, modelRegistry: mockParentRegistry } as never,
+        "child",
+        "work",
+        {
+          description: "child",
+          isBackground: true,
+          isolation: "worktree",
+        },
+      );
+      vi.useFakeTimers();
+      const disposing = manager.dispose();
+      await shutdownStarted;
+      await vi.advanceTimersByTimeAsync(2_050);
+      await disposing;
+      expect(existsSync(childPath)).toBe(true);
+      expect(cleanupWorktreeAsync).not.toHaveBeenCalled();
+      expect(
+        warning.mock.calls.map(([message]) => String(message)).join(" "),
+      ).toMatch(/child session shutdown timed out/);
+
+      finishProvider({
+        responseText: "late",
+        session: session as never,
+        aborted: true,
+        steered: false,
+      });
+      releaseShutdown();
+      vi.useRealTimers();
+      await vi.waitFor(() =>
+        expect(cleanupWorktreeAsync).toHaveBeenCalledOnce(),
+      );
+      expect(existsSync(childPath)).toBe(false);
+      expect(manager.getCleanupFailures()).toEqual([]);
+    } finally {
+      releaseShutdown();
+      vi.useRealTimers();
+      warning.mockRestore();
+      await manager?.dispose();
       rmSync(baseRepo, { recursive: true, force: true });
     }
   });

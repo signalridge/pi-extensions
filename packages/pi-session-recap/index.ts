@@ -6,9 +6,11 @@
 import type { Message } from "@earendil-works/pi-ai";
 import { complete, completeSimple } from "@earendil-works/pi-ai/compat";
 import {
+  type ContextEditEntry,
   convertToLlm,
   type ExtensionAPI,
   type ExtensionContext,
+  type ProjectedSessionEntry,
   type SessionEntry,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
@@ -21,19 +23,16 @@ type RecapContext = {
   broaderContext?: string;
 };
 
+type RecapGeneration = { kind: "recap"; text: string } | { kind: "endpoint-mismatch" };
+
 type RecapReason = "idle" | "manual" | "resume" | "focus";
 
 const RECAP_KEY = "session-recap";
 
 const DEFAULT_AWAY_SECONDS = 90;
 const DEFAULT_IDLE_SECONDS = 120;
-const ANTHROPIC_RECAP_MODEL = "claude-haiku-4-5";
-const GPT_MODEL_ID = /(?:^|\/)gpt-/;
-const LUNA_RECAP_MODEL = /(?:^|\/)gpt-5[.-]6-luna(?:$|[@:])/;
-
-// Debounce after a turn ends while blurred, so mid-loop turn_ends (which are
-// immediately followed by the next turn_start) don't trigger drafts.
-const POST_TURN_DEBOUNCE_MS = 3000;
+// Give the UI a moment after final agent settlement while blurred before drafting.
+const POST_SETTLE_DEBOUNCE_MS = 3000;
 
 // `completeSimple` cannot express "reasoning off": omitting `reasoning` is
 // sufficient for every other API, but openai-codex-responses then inherits the
@@ -89,56 +88,145 @@ function isUnsafeTerminalCodePoint(codePoint: number): boolean {
   );
 }
 
-function extractText(content: Message["content"]): string {
+function extractText(content: Message["content"] | null | undefined): string {
   if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
   return content
     .filter((block) => block.type === "text")
     .map((block) => block.text)
     .join("\n");
 }
 
-export function buildRecapContext(contextEntries: SessionEntry[], branchEntries: SessionEntry[]): RecapContext {
+function findInitialTask(entries: SessionEntry[]): string | undefined {
+  // The original request can predate compaction, so look on the active branch,
+  // applying its latest edit rather than recovering discarded prompt text.
+  const edits = new Map<string, ContextEditEntry["replacement"]>();
+  for (const entry of entries) {
+    if (entry.type === "context_edit") edits.set(entry.targetId, entry.replacement);
+  }
+
+  for (const entry of entries) {
+    if (entry.type !== "message" || entry.message.role !== "user") continue;
+    const replacement = edits.get(entry.id);
+    if (replacement === null) continue;
+    const task = extractText(replacement?.content ?? entry.message.content).trim();
+    if (task) return task;
+  }
+  return undefined;
+}
+
+/** Pi 0.84–0.86 do not expose projections; those hosts have no context edits. */
+function projectedEntries(manager: ExtensionContext["sessionManager"]): ProjectedSessionEntry[] {
+  if (typeof manager.buildSessionProjection === "function") return manager.buildSessionProjection().entries;
+  return manager.buildContextEntries().map((sourceEntry) => ({
+    sourceEntry,
+    messages: sessionEntryToContextMessages(sourceEntry),
+  }));
+}
+
+export function buildRecapContext(entries: ProjectedSessionEntry[], branchEntries: SessionEntry[]): RecapContext {
   let summary: string | undefined;
-  for (let i = contextEntries.length - 1; i >= 0; i--) {
-    const entry = contextEntries[i];
-    const candidate = entry.type === "compaction" || entry.type === "branch_summary" ? entry.summary.trim() : undefined;
-    if (candidate) {
-      summary = candidate;
-      break;
+  // Pi places the active compaction first; an older checkpoint may also be
+  // retained after it on legacy hosts, but must not replace its summary.
+  const activeCompactionId = entries.find(({ sourceEntry }) => sourceEntry.type === "compaction")?.sourceEntry.id;
+  // Keep first positions: findIndex also selects the first occurrence when a
+  // malformed/legacy branch repeats an ID. Missing IDs retain -1 semantics.
+  const branchPositions = new Map<string, number>();
+  branchEntries.forEach((entry, index) => {
+    if (!branchPositions.has(entry.id)) branchPositions.set(entry.id, index);
+  });
+  const activeCompactionPosition =
+    activeCompactionId === undefined ? -1 : (branchPositions.get(activeCompactionId) ?? -1);
+  for (const { sourceEntry, messages } of entries) {
+    if (sourceEntry.type !== "compaction" && sourceEntry.type !== "branch_summary") continue;
+    if (sourceEntry.type === "compaction" && sourceEntry.id !== activeCompactionId) continue;
+    // A newer checkpoint may retain an older branch summary after it in Pi's
+    // projected order. Only summaries following that checkpoint may override it.
+    if (
+      sourceEntry.type === "branch_summary" &&
+      activeCompactionPosition >= 0 &&
+      (branchPositions.get(sourceEntry.id) ?? -1) < activeCompactionPosition
+    )
+      continue;
+    if (messages.length > 0) summary = sourceEntry.summary.trim() || summary;
+  }
+
+  const initialTask = findInitialTask(branchEntries);
+  const messages = convertToLlm(
+    entries
+      .filter(({ sourceEntry }) => sourceEntry.type !== "compaction" && sourceEntry.type !== "branch_summary")
+      .flatMap(({ messages }) => messages),
+  )
+    // Projected system messages carry the parent prompt and tool declarations.
+    // The recap is an independent provider request, not a continuation of that agent.
+    .filter((message) => message.role !== "system")
+    .map((message) => {
+      if (message.role !== "toolResult") return message;
+      return {
+        ...message,
+        content: message.content.map((block) => {
+          if (block.type !== "text") return block;
+          // Sanitize before slicing, never after: a cut through an escape sequence
+          // would leave the model a half-sequence to complete on its own.
+          const text = sanitizeTerminalText(block.text, true);
+          if (text.length <= TOOL_RESULT_EDGE_CHARS * 2) return { ...block, text };
+          return {
+            ...block,
+            text: `${text.slice(0, TOOL_RESULT_EDGE_CHARS)}\n… [tool result truncated for recap] …\n${text.slice(-TOOL_RESULT_EDGE_CHARS)}`,
+          };
+        }),
+      };
+    });
+  // Filter before taking the window: Pi's provider transform drops incomplete
+  // assistants, and their raw entries should not displace earlier completed work.
+  // A context edit may also leave a result without its call. Only keep the first
+  // result for each call, as additional results would be invalid OpenAI `tool`
+  // messages even when Pi's projection retains them.
+  const pendingToolCalls = new Set<string>();
+  const visibleMessages = messages.filter((message) => {
+    if (message.role === "user") {
+      pendingToolCalls.clear();
+    } else if (message.role === "assistant") {
+      pendingToolCalls.clear();
+      if (message.stopReason === "aborted" || message.stopReason === "error") return false;
+      for (const block of message.content) {
+        if (block.type === "toolCall") pendingToolCalls.add(block.id);
+      }
+    } else if (message.role === "toolResult") {
+      if (!pendingToolCalls.delete(message.toolCallId)) return false;
+    }
+    return true;
+  });
+  const start = Math.max(0, visibleMessages.length - RECENT_MESSAGE_WINDOW);
+  let recentMessages = visibleMessages.slice(start);
+  if (recentMessages[0]?.role === "toolResult") {
+    // The suffix begins inside a result run. Reach back to its assistant, but
+    // replace one result rather than widening the message window arbitrarily.
+    let callIndex = start - 1;
+    while (callIndex >= 0 && visibleMessages[callIndex].role === "toolResult") callIndex--;
+    const call = visibleMessages[callIndex];
+    if (call?.role === "assistant") {
+      const results = recentMessages.slice(1);
+      const selectedIds = new Set<string>();
+      for (const message of results) {
+        if (message.role !== "toolResult") break;
+        selectedIds.add(message.toolCallId);
+      }
+      // Without this trim, Pi would synthesize results for omitted calls on the
+      // provider wire, defeating the bound (and obscuring the retained results).
+      // If only one result from this run was in the suffix, dropping it leaves
+      // no call to anchor; keep the later messages without an empty assistant.
+      recentMessages = selectedIds.size
+        ? [
+            {
+              ...call,
+              content: call.content.filter((block) => block.type !== "toolCall" || selectedIds.has(block.id)),
+            },
+            ...results,
+          ]
+        : results;
     }
   }
-
-  let initialTask: string | undefined;
-  for (const entry of branchEntries) {
-    if (entry.type !== "message" || entry.message.role !== "user") continue;
-    initialTask = extractText(entry.message.content).trim() || undefined;
-    break;
-  }
-
-  const messages = convertToLlm(
-    contextEntries
-      .filter((entry) => entry.type !== "compaction" && entry.type !== "branch_summary")
-      .flatMap(sessionEntryToContextMessages),
-  ).map((message) => {
-    if (message.role !== "toolResult") return message;
-    return {
-      ...message,
-      content: message.content.map((block) => {
-        if (block.type !== "text") return block;
-        // Sanitize before slicing, never after: a cut through an escape sequence
-        // would leave the model a half-sequence to complete on its own.
-        const text = sanitizeTerminalText(block.text, true);
-        if (text.length <= TOOL_RESULT_EDGE_CHARS * 2) return { ...block, text };
-        return {
-          ...block,
-          text: `${text.slice(0, TOOL_RESULT_EDGE_CHARS)}\n… [tool result truncated for recap] …\n${text.slice(-TOOL_RESULT_EDGE_CHARS)}`,
-        };
-      }),
-    };
-  });
-  let start = Math.max(0, messages.length - RECENT_MESSAGE_WINDOW);
-  while (start > 0 && messages[start].role === "toolResult") start--;
-  let recentMessages = messages.slice(start);
   if (recentMessages[0]?.role === "assistant") {
     recentMessages = [
       {
@@ -173,62 +261,77 @@ export function buildRecapContext(contextEntries: SessionEntry[], branchEntries:
   };
 }
 
-function hasMeaningfulActivity(entries: SessionEntry[]): boolean {
+export function hasMeaningfulActivity(entries: ProjectedSessionEntry[]): boolean {
+  // Conversion makes custom messages and summaries look like user turns. Only an
+  // actual, model-visible user request starts a new activity window.
   let lastUserIdx = -1;
   for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i];
-    if (e.type === "message" && e.message.role === "user") {
+    const { sourceEntry, messages } = entries[i];
+    if (
+      sourceEntry.type === "message" &&
+      sourceEntry.message.role === "user" &&
+      messages.some((m) => m.role === "user")
+    ) {
       lastUserIdx = i;
       break;
     }
   }
-  const tail = lastUserIdx >= 0 ? entries.slice(lastUserIdx + 1) : entries;
+
   let assistantWords = 0;
-  let toolCalls = 0;
-  for (const e of tail) {
-    if (e.type !== "message" || e.message.role !== "assistant") continue;
-    assistantWords += extractText(e.message.content).split(/\s+/).filter(Boolean).length;
-    toolCalls += e.message.content.filter((block) => block.type === "toolCall").length;
+  for (const { sourceEntry, messages } of entries.slice(lastUserIdx + 1)) {
+    // Only model-visible summaries count; older retained compactions and
+    // context-edited omissions project no messages.
+    if (
+      (sourceEntry.type === "compaction" || sourceEntry.type === "branch_summary") &&
+      messages.length > 0 &&
+      sourceEntry.summary.trim()
+    )
+      return true;
+    // Pi's provider transform discards incomplete assistant turns altogether;
+    // their partial words and tool calls are not model-visible work.
+    if (
+      sourceEntry.type === "message" &&
+      sourceEntry.message.role === "assistant" &&
+      (sourceEntry.message.stopReason === "aborted" || sourceEntry.message.stopReason === "error")
+    )
+      continue;
+    for (const message of messages) {
+      if (message.role !== "assistant") continue;
+      if (message.content.some((block) => block.type === "toolCall")) return true;
+      assistantWords += extractText(message.content).split(/\s+/).filter(Boolean).length;
+    }
   }
-  return toolCalls > 0 || assistantWords >= MIN_ASSISTANT_WORDS;
+  return assistantWords >= MIN_ASSISTANT_WORDS;
 }
 
 export function selectRecapModel(
-  activeModel: Model | undefined,
-  overrideSpec: string | undefined,
-  registry: Pick<ExtensionContext["modelRegistry"], "find" | "getAvailable">,
+  target: string | undefined,
+  registry: Pick<ExtensionContext["modelRegistry"], "find">,
 ): Model | undefined {
-  if (overrideSpec) {
-    const slash = overrideSpec.indexOf("/");
-    if (slash <= 0) return activeModel;
-    return registry.find(overrideSpec.slice(0, slash), overrideSpec.slice(slash + 1)) ?? activeModel;
-  }
-  if (!activeModel) return undefined;
-
-  const available = registry.getAvailable().filter((model) => model.provider === activeModel.provider);
-  if (activeModel.provider === "anthropic") {
-    return available.find((model) => model.id === ANTHROPIC_RECAP_MODEL) ?? activeModel;
-  }
-  if (!GPT_MODEL_ID.test(activeModel.id)) return activeModel;
-  return available.find((model) => LUNA_RECAP_MODEL.test(model.id)) ?? activeModel;
+  // Consent must name the actual physical destination. Never fall back to the
+  // active model (or a cheaper model) if the target is absent or unavailable.
+  const slash = target?.indexOf("/") ?? -1;
+  if (!target || slash <= 0 || slash === target.length - 1) return undefined;
+  const selected = registry.find(target.slice(0, slash), target.slice(slash + 1));
+  // Pi can route virtual models only within its own request runtime.
+  return selected?.api === "pi-virtual" ? undefined : selected;
 }
 
 async function generateRecap(
   recapContext: RecapContext,
   ctx: ExtensionContext,
-  overrideSpec: string | undefined,
+  model: Model,
   signal: AbortSignal | undefined,
-): Promise<string | undefined> {
-  const model = selectRecapModel(ctx.model, overrideSpec, ctx.modelRegistry);
-  if (!model) return undefined;
-
+  isCurrent: () => boolean,
+): Promise<RecapGeneration | undefined> {
   // Ambient-auth providers can succeed without returning an API key.
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth?.ok) return undefined;
+  if (signal?.aborted || !isCurrent() || !auth?.ok) return undefined;
 
-  // The compatibility stream functions bypass Pi's request preparation, so preserve
-  // any credential-specific endpoint (for example, GitHub Copilot Enterprise).
-  const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+  // Auth can redirect a registered model to a different physical endpoint.
+  // Naming provider/model-id does not consent to that destination, and this
+  // independent request cannot use the parent's post-hook redacted context.
+  if (auth.baseUrl && auth.baseUrl !== model.baseUrl) return { kind: "endpoint-mismatch" };
 
   const prompt =
     (recapContext.broaderContext ? `Broader session context:\n${recapContext.broaderContext}\n\n` : "") +
@@ -256,17 +359,21 @@ async function generateRecap(
     maxTokens: 256,
   };
 
+  // Auth may have resolved after input, a session transition, or a context edit.
+  // Reproject before either completion path can dispatch the original context.
+  if (signal?.aborted || !isCurrent()) return undefined;
+
   let response: Awaited<ReturnType<typeof completeSimple>>;
   try {
     // Recaps never need reasoning; keep the common options identical for both
     // completion paths and only add the Codex-specific explicit override.
-    if (requestModel.api === "openai-codex-responses") {
-      response = await complete(requestModel, context, {
+    if (model.api === "openai-codex-responses") {
+      response = await complete(model, context, {
         ...options,
         reasoningEffort: "none",
       });
     } else {
-      response = await completeSimple(requestModel, context, options);
+      response = await completeSimple(model, context, options);
     }
   } catch (err) {
     // completeSimple cannot route custom handlers registered only inside Pi.
@@ -283,7 +390,7 @@ async function generateRecap(
     .replace(/\s+/g, " ")
     .trim();
 
-  return text || undefined;
+  return text ? { kind: "recap", text } : undefined;
 }
 
 function hasInteractiveUi(ctx: ExtensionContext): boolean {
@@ -490,7 +597,7 @@ export default function (pi: ExtensionAPI) {
     default: String(DEFAULT_AWAY_SECONDS),
   });
   pi.registerFlag("recap-idle-seconds", {
-    description: "Idle-fallback: seconds after turn_end before a recap when the terminal doesn't report focus",
+    description: "Idle-fallback: seconds after agent_settled before a recap when the terminal doesn't report focus",
     type: "string",
     default: String(DEFAULT_IDLE_SECONDS),
   });
@@ -510,18 +617,22 @@ export default function (pi: ExtensionAPI) {
     default: false,
   });
   pi.registerFlag("recap-model", {
-    description: "Override automatic model selection, e.g. anthropic/claude-sonnet-4-6",
+    description: "Physical destination for recap history, e.g. anthropic/claude-sonnet-4-6",
     type: "string",
     default: "",
+  });
+  pi.registerFlag("recap-allow-raw-history", {
+    description: "Allow sending unredacted session history to --recap-model (required for all recaps)",
+    type: "boolean",
+    default: false,
   });
 
   let idleTimer: NodeJS.Timeout | undefined;
   let awayTimer: NodeJS.Timeout | undefined;
-  let postTurnTimer: NodeJS.Timeout | undefined;
+  let postSettleTimer: NodeJS.Timeout | undefined;
   let resumeTimer: NodeJS.Timeout | undefined;
   let activeController: AbortController | undefined;
   let agentActive = false;
-  let awayRecapPending = false;
   let focusListener: ((chunk: Buffer) => void) | undefined;
   let focusEnabled = false;
   let isBlurred = false;
@@ -536,6 +647,9 @@ export default function (pi: ExtensionAPI) {
     return Math.max(5, Number.isFinite(seconds) ? seconds : fallback) * 1000;
   };
   const isDisabled = (): boolean => Boolean(pi.getFlag("recap-disable"));
+  const hasRawHistoryConsent = (): boolean => pi.getFlag("recap-allow-raw-history") === true;
+  const recapTarget = (): string => String(pi.getFlag("recap-model") ?? "").trim();
+  const automaticEnabled = (): boolean => !isDisabled() && hasRawHistoryConsent() && Boolean(recapTarget());
 
   const clearIdleTimer = () => {
     if (idleTimer) {
@@ -549,10 +663,10 @@ export default function (pi: ExtensionAPI) {
       awayTimer = undefined;
     }
   };
-  const clearPostTurnTimer = () => {
-    if (postTurnTimer) {
-      clearTimeout(postTurnTimer);
-      postTurnTimer = undefined;
+  const clearPostSettleTimer = () => {
+    if (postSettleTimer) {
+      clearTimeout(postSettleTimer);
+      postSettleTimer = undefined;
     }
   };
   const clearResumeTimer = () => {
@@ -577,10 +691,48 @@ export default function (pi: ExtensionAPI) {
     const sessionManager = ctx.sessionManager;
     if (!isCurrentIdentity(generation, sessionManager)) return;
 
-    const entries = sessionManager.getBranch();
+    // A context hook can redact only the parent request, not this independent
+    // completion. Projected SessionManager entries are pre-hook, unredacted history.
+    const target = recapTarget();
+    const consent = hasRawHistoryConsent();
+    const model = consent ? selectRecapModel(target, ctx.modelRegistry) : undefined;
+    if (!model) {
+      if (reason === "manual") {
+        try {
+          ctx.ui.notify(
+            !consent || !target
+              ? 'Recap sends raw session history. To enable it, set --recap-allow-raw-history and --recap-model "provider/model-id" to a physical destination.'
+              : 'Recap target is unavailable or virtual. Set --recap-model "provider/model-id" to an available physical model.',
+            "warning",
+          );
+        } catch {
+          // The UI may have closed before the command could report the skip.
+        }
+      }
+      return;
+    }
+    const activeModel = ctx.model;
+    const stillAuthorized = () => {
+      // Real ModelRegistry.find returns a fresh object on each lookup; compare the
+      // actual wire destination rather than object identity after async auth.
+      const currentTarget = selectRecapModel(target, ctx.modelRegistry);
+      return (
+        hasRawHistoryConsent() &&
+        recapTarget() === target &&
+        currentTarget?.provider === model.provider &&
+        currentTarget?.id === model.id &&
+        currentTarget?.api === model.api &&
+        currentTarget?.baseUrl === model.baseUrl &&
+        ctx.model?.provider === activeModel?.provider &&
+        ctx.model?.id === activeModel?.id &&
+        ctx.model?.api === activeModel?.api
+      );
+    };
+
+    const entries = projectedEntries(sessionManager);
     if (reason !== "manual" && !hasMeaningfulActivity(entries)) return;
 
-    const recapContext = buildRecapContext(sessionManager.buildContextEntries(), entries);
+    const recapContext = buildRecapContext(entries, sessionManager.getBranch());
     if (recapContext.messages.length === 0 && !recapContext.broaderContext) return;
 
     const startContext = JSON.stringify(recapContext);
@@ -594,17 +746,37 @@ export default function (pi: ExtensionAPI) {
     if (showStatus) setRecapStatus(ctx, "✦ drafting recap…");
 
     try {
-      const override = String(pi.getFlag("recap-model") ?? "").trim() || undefined;
-      const recap = await generateRecap(recapContext, ctx, override, controller.signal);
-      if (!isCurrentIdentity(generation, sessionManager) || !recap || controller.signal.aborted) return;
+      const result = await generateRecap(recapContext, ctx, model, controller.signal, () => {
+        if (!isCurrentIdentity(generation, sessionManager) || !stillAuthorized()) return false;
+        const currentEntries = projectedEntries(sessionManager);
+        if (reason !== "manual" && !hasMeaningfulActivity(currentEntries)) return false;
+        return JSON.stringify(buildRecapContext(currentEntries, sessionManager.getBranch())) === startContext;
+      });
+      if (!isCurrentIdentity(generation, sessionManager) || !stillAuthorized() || controller.signal.aborted) return;
+      if (result?.kind === "endpoint-mismatch") {
+        if (reason === "manual") {
+          try {
+            ctx.ui.notify(
+              "Recap skipped: authentication resolved a different endpoint than the named model's registered base URL. No history was sent; choose a physical model whose endpoints match.",
+              "warning",
+            );
+          } catch {
+            // The UI may have closed before the command could report the skip.
+          }
+        }
+        return;
+      }
+      if (!result) return;
 
-      const currentContext = buildRecapContext(sessionManager.buildContextEntries(), sessionManager.getBranch());
+      const currentEntries = projectedEntries(sessionManager);
+      if (reason !== "manual" && !hasMeaningfulActivity(currentEntries)) return;
+      const currentContext = buildRecapContext(currentEntries, sessionManager.getBranch());
       if (!isCurrentIdentity(generation, sessionManager) || JSON.stringify(currentContext) !== startContext) return;
 
       lastDraftedContext = startContext;
       clearIdleTimer();
-      clearPostTurnTimer();
-      showRecap(ctx, recap);
+      clearPostSettleTimer();
+      showRecap(ctx, result.text);
     } catch (err) {
       if (!controller.signal.aborted) console.error("[session-recap] failed:", err);
     } finally {
@@ -633,9 +805,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   const tryAwayRecap = (ctx: ExtensionContext) => {
-    if (isDisabled() || !hasInteractiveUi(ctx) || !isBlurred || !ownsSession(ctx)) return;
+    if (!automaticEnabled() || !hasInteractiveUi(ctx) || !isBlurred || !ownsSession(ctx)) return;
     if (agentActive && !pi.getFlag("recap-during-active")) {
-      awayRecapPending = true;
       return;
     }
     if (!activeController) {
@@ -650,7 +821,7 @@ export default function (pi: ExtensionAPI) {
     focusEventsSeen = true;
     isBlurred = true;
     clearIdleTimer();
-    if (isDisabled()) return;
+    if (!automaticEnabled()) return;
     clearAwayTimer();
 
     const generation = sessionGeneration;
@@ -669,9 +840,8 @@ export default function (pi: ExtensionAPI) {
   const handleFocusIn = () => {
     focusEventsSeen = true;
     isBlurred = false;
-    awayRecapPending = false;
     clearAwayTimer();
-    clearPostTurnTimer();
+    clearPostSettleTimer();
     clearIdleTimer();
     // Leave an in-flight recap to land as the user returns.
   };
@@ -722,23 +892,56 @@ export default function (pi: ExtensionAPI) {
       focusEnabled = false;
     }
     isBlurred = false;
-    awayRecapPending = false;
   };
 
-  pi.on("turn_end", (_event, ctx) => {
-    if (isDisabled() || !hasRecapUi(ctx) || !ownsSession(ctx)) return;
+  pi.on("turn_start", (_event, ctx) => {
+    if (!ownsSession(ctx)) return;
+    clearIdleTimer();
+    clearPostSettleTimer();
+    cancelActive();
+  });
 
-    // Debounce mid-loop turn_end → turn_start pairs.
+  pi.on("input", (_event, ctx) => {
+    if (!ownsSession(ctx)) return;
+    clearIdleTimer();
+    clearPostSettleTimer();
+    clearAwayTimer();
+    cancelActive();
+    clearRecap(ctx);
+  });
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (!ownsSession(ctx)) return;
+    agentActive = true;
+    clearIdleTimer();
+    clearPostSettleTimer();
+    cancelActive();
+    clearRecap(ctx);
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!ownsSession(ctx)) return;
+    agentActive = false;
+    // A later agent_settled handler may queue another turn. Do not start a
+    // provider request in the middle of the notification dispatch; the blurred
+    // post-settlement timer below gives that continuation time to begin.
+    if (!automaticEnabled() || !hasRecapUi(ctx)) return;
+
+    // Unlike agent_end / turn_end, settlement follows retries, compaction and
+    // queued work, so neither automatic timer starts from an intermediate run.
     const generation = sessionGeneration;
     const sessionManager = ctx.sessionManager;
     if (ctx.mode === "tui" && isBlurred) {
-      clearPostTurnTimer();
+      // The blur threshold can expire during the settlement debounce. Let the
+      // settled path own the recap so later handlers can queue a continuation.
+      clearAwayTimer();
+      clearPostSettleTimer();
       const timer = setTimeout(() => {
-        if (postTurnTimer === timer) postTurnTimer = undefined;
+        if (postSettleTimer === timer) postSettleTimer = undefined;
         if (!isCurrentIdentity(generation, sessionManager)) return;
         tryAwayRecap(ctx);
-      }, POST_TURN_DEBOUNCE_MS);
-      postTurnTimer = timer;
+      }, POST_SETTLE_DEBOUNCE_MS);
+      postSettleTimer = timer;
     }
 
     if (!focusEventsSeen) {
@@ -755,49 +958,14 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("turn_start", () => {
-    clearIdleTimer();
-    clearPostTurnTimer();
-    cancelActive();
-  });
-
-  pi.on("input", (_event, ctx) => {
-    if (!ownsSession(ctx)) return;
-    clearIdleTimer();
-    clearPostTurnTimer();
-    clearAwayTimer();
-    cancelActive();
-    awayRecapPending = false;
-    clearRecap(ctx);
-  });
-
-  pi.on("agent_start", (_event, ctx) => {
-    if (!ownsSession(ctx)) return;
-    agentActive = true;
-    clearIdleTimer();
-    clearPostTurnTimer();
-    cancelActive();
-    clearRecap(ctx);
-  });
-
-  pi.on("agent_end", (_event, ctx) => {
-    if (!ownsSession(ctx)) return;
-    agentActive = false;
-    if (awayRecapPending) {
-      awayRecapPending = false;
-      tryAwayRecap(ctx);
-    }
-  });
-
   const resetSessionState = (ctx: ExtensionContext): boolean => {
     if (!ownsSession(ctx)) return false;
     sessionGeneration += 1;
     agentActive = false;
-    awayRecapPending = false;
     lastDraftedContext = undefined;
     clearIdleTimer();
     clearAwayTimer();
-    clearPostTurnTimer();
+    clearPostSettleTimer();
     clearResumeTimer();
     cancelActive();
     clearRecap(ctx);
@@ -829,7 +997,7 @@ export default function (pi: ExtensionAPI) {
     focusEventsSeen = false;
     isBlurred = false;
     attachFocusReporting(ctx);
-    if (isDisabled() || !hasRecapUi(ctx)) return;
+    if (!automaticEnabled() || !hasRecapUi(ctx)) return;
     if (event.reason === "resume" || event.reason === "fork") {
       const generation = sessionGeneration;
       const sessionManager = ctx.sessionManager;

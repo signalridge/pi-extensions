@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
 import { CHILD_CONTEXT_RPC } from "../src/cross-extension-rpc.js";
@@ -156,24 +158,42 @@ describe("strictAgentFiles activation wiring", () => {
     await pi.lifecycle.get("session_start")?.({}, sessionCtx());
     writeFileSync(path, BROKEN);
 
-    const agentTool = [...pi.tools.values()].find((tool: any) => tool.name === "Agent");
-    expect(agentTool).toBeDefined();
-    const result = await agentTool.execute(
-      "call-1",
-      { subagent_type: "nope", prompt: "x" },
-      undefined,
-      vi.fn(),
-      {
-        hasUI: false,
-        ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
-        cwd,
-        model: undefined,
-        modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-        sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
-        getSystemPrompt: vi.fn(() => "parent"),
-      },
-    );
-    expect(JSON.stringify(result)).not.toContain("Nested mappings");
+    // This tool call reaches an SDK child: use a real parent runtime so the
+    // reload behavior is tested without a missing-runtime admission failure.
+    const faux = fauxProvider({ provider: "strict-files-faux", models: [{ id: "physical", contextWindow: 200_000 }] });
+    const runtime = await ModelRuntime.create({
+      authPath: join(cwd, "auth.json"), modelsPath: null, allowModelNetwork: false,
+    });
+    runtime.registerNativeProvider(faux.provider);
+    await runtime.refresh({ allowNetwork: false });
+    const model = runtime.getModel("strict-files-faux", "physical");
+    if (!model) throw new Error("Physical model was not registered in real Pi runtime");
+    const registry = new ModelRegistry(runtime);
+    const providerCall = vi.fn(() => fauxAssistantMessage(fauxText("done")));
+    faux.setResponses([providerCall]);
+    try {
+      const agentTool = [...pi.tools.values()].find((tool: any) => tool.name === "Agent");
+      expect(agentTool).toBeDefined();
+      const result = await agentTool.execute(
+        "call-1",
+        { subagent_type: "nope", prompt: "x" },
+        undefined,
+        vi.fn(),
+        {
+          hasUI: false,
+          ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
+          cwd,
+          model,
+          modelRegistry: registry,
+          sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
+          getSystemPrompt: vi.fn(() => "parent"),
+        },
+      );
+      expect(JSON.stringify(result)).not.toContain("Nested mappings");
+      expect(providerCall).toHaveBeenCalledOnce();
+    } finally {
+      faux.setResponses([]);
+    }
   });
 
   it("routes /agents disable to the active lower-priority source after a higher file is skipped", async () => {

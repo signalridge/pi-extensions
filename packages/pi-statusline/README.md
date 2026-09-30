@@ -74,7 +74,7 @@ Model ids, provider ids, active tool names, directory names, and Git branch name
 
 ## Lifecycle behavior
 
-The footer is installed only for TUI sessions. Git status is collected asynchronously and cached outside rendering, with stale cwd/branch results discarded. Usage totals are maintained by a runtime-owned incremental snapshot: rendering does not rescan session history; session replacement, branch/compaction boundaries rebuild it and message/turn events update it. Footer timers, branch listeners, pending Git work, command menus, and session ownership are cleaned up on footer disposal, session replacement, compaction, and shutdown. Context usage refreshes after `session_compact`.
+The footer is installed only for TUI sessions. Git status is collected asynchronously and cached outside rendering, with stale cwd/branch results discarded. Usage totals are maintained by a runtime-owned incremental snapshot: rendering does not rescan session history; session replacement, branch/compaction boundaries rebuild it and message/turn events update it. Standalone usage entries (including cache warming) count toward historical tokens, cache, and cost. When tokens, cache, or cost is configured, the footer checks the session leaf every five seconds (including while idle), copying history only after the leaf changes and inspecting only entries appended since its last check. Presets without those segments skip the usage check. Context percentage still comes from `ctx.getContextUsage()`. Footer timers, branch listeners, pending Git work, command menus, and session ownership are cleaned up on footer disposal, session replacement, compaction, and shutdown. Context usage refreshes after `session_compact`.
 
 ## Package layout
 

@@ -65,10 +65,10 @@ The extension shells out to `gh`; GitHub Enterprise hosts and credential storage
 
 The extension runs passively:
 
-- On session start, it checks the current branch PR and sets a compact statusline entry.
-- On Git branch change, it clears the old PR immediately and refreshes the new current branch.
+- On session start, it checks the current branch PR in the background, so slow GitHub calls do not delay startup; the compact statusline entry appears when the check completes. The session-start `gh` request waits for Git HEAD-path discovery (up to its 5-second timeout) so the branch watcher and request can be reconciled without duplicating work; an agent-turn refresh may run during discovery.
+- On Git branch change, it clears the old PR immediately and refreshes the new current branch. An agent-turn refresh for that same HEAD supersedes a pending branch debounce.
 - While the session remains open, it refreshes that same current branch PR every 60 seconds and after each agent turn.
-- On branch change, session replacement, or session shutdown, it cancels the previous refresh timer and any in-flight periodic request.
+- On branch change, session replacement, or session shutdown, it cancels outstanding refresh work and ignores stale results.
 - On session shutdown, it clears the statusline entry.
 - If the directory has no GitHub PR, the statusline entry stays empty.
 - If `gh` is missing or unauthenticated, the statusline shows a short hint such as `PR gh missing` or `PR gh auth`.

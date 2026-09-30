@@ -1,5 +1,6 @@
 /**
- * arming.ts — the keyword that authorizes the workflow tool for a turn.
+ * arming.ts — a keyword that tells the model a workflow is appropriate this turn.
+ * It is advisory prompt guidance, not an execution-time permission gate.
  *
  * Typing the bounded word `workflow` (or `workflows`, or a configured synonym)
  * in an ordinary message is an explicit opt-in to multi-agent orchestration, so

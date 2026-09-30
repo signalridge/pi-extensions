@@ -3,7 +3,7 @@
  *
  * Performance model (see CHANGELOG 0.4.0):
  * - Session JSONL files are scanned at the buffer level. Only lines relevant
- *   to assistant or auxiliary accounting are decoded and JSON.parsed. Ordinary
+ *   to assistant or non-message accounting are decoded and JSON.parsed. Ordinary
  *   multi-megabyte tool results are skipped; accounting-bearing large results
  *   use an allocation-safe byte parser for their small metadata fields.
  * - Per-file extraction results are persisted to an on-disk cache keyed by
@@ -11,10 +11,11 @@
  *   re-parses files that changed since the last run.
  */
 
-import { randomUUID } from "node:crypto";
-import { open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, open, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 // =============================================================================
 // Types
@@ -67,10 +68,12 @@ interface CostCount {
 }
 
 interface PeriodRawData {
-  /** All recorded cost, including usage reported by tools and summaries. */
+  /** All recorded cost, including non-message usage and tool/summary reports. */
   totalCost: number;
   /** Cost attached to assistant messages, used as the turn-insight denominator. */
   assistantCost: number;
+  /** Cost from standalone usage entries and tool/summary reports. */
+  nonAssistantCost: number;
   /** Usage reported by tool results, compactions, and branch summaries. */
   auxiliaryCost: number;
   /** Messages at ≥ CTX_TAX_THRESHOLD context. */
@@ -95,7 +98,7 @@ interface PeriodRawData {
 
 /** Per-message adjacency info, computed on raw file order before dedupe. */
 interface MessageMeta {
-  /** Gap to the previous assistant message in the same file; -1 when unknown. */
+  /** Gap to the previous assistant or matching cache-warm request; -1 when unknown. */
   gapMs: number;
   /** Context size of the previous assistant message in the same file; 0 when first. */
   prevCtx: number;
@@ -169,7 +172,7 @@ export type TabName = "today" | "thisWeek" | "lastWeek" | "last30Days" | "allTim
 
 export const TAB_ORDER: TabName[] = ["today", "thisWeek", "lastWeek", "last30Days", "allTime"];
 
-export type UsageSource = "assistant" | "auxiliary";
+export type UsageSource = "assistant" | "auxiliary" | "usage";
 
 /** Pi's own label for usage that cannot be attributed to a provider/model. */
 export const AUXILIARY_PROVIDER = "Tools";
@@ -190,17 +193,27 @@ export interface SessionMessage extends UsageAmount {
   model: string;
   /** Thinking level active when the message was produced; "" when unknown. */
   thinkingLevel: string;
-  /** Assistant response, or usage reported by a tool/summary entry. */
+  /** Assistant response, tool/summary report, or standalone model-attributed usage. */
   source: UsageSource;
   /** Stable Pi session entry id; empty only for legacy records without one. */
   sourceId: string;
   timestamp: number;
   /**
-   * True when a compaction entry occurred between the previous assistant
-   * message and this one. Compaction legitimately changes the request prefix,
+   * True when a compaction entry occurred between this request's nearest
+   * assistant ancestor and this one. Compaction legitimately changes the request prefix,
    * so such messages are excluded from prefix-change cache-miss accounting.
    */
   afterCompaction: boolean;
+  /** A context edit on this request's branch intentionally changes its prefix. */
+  afterContextEdit?: boolean;
+  /** Concrete response model, when Pi recorded one in addition to the request alias. */
+  responseModel?: string;
+  /** Only cache_warm usage refreshes the TTL for its provider/model on its branch. */
+  cacheWarm?: boolean;
+  /** Nearest assistant ancestor's entry id (when the journal has usable lineage). */
+  previousAssistantId?: string;
+  /** Timestamp of the latest matching cache warm on this assistant's branch. */
+  branchWarmAt?: number;
 }
 
 export interface ChildToolUsage {
@@ -303,6 +316,10 @@ const PATTERN_THINKING_COMPACT = Buffer.from('"type":"thinking_level_change"');
 const PATTERN_THINKING_SPACED = Buffer.from('"type": "thinking_level_change"');
 const PATTERN_COMPACTION_COMPACT = Buffer.from('"type":"compaction"');
 const PATTERN_COMPACTION_SPACED = Buffer.from('"type": "compaction"');
+const PATTERN_CONTEXT_EDIT_COMPACT = Buffer.from('"type":"context_edit"');
+const PATTERN_CONTEXT_EDIT_SPACED = Buffer.from('"type": "context_edit"');
+const PATTERN_USAGE_ENTRY_COMPACT = Buffer.from('"type":"usage"');
+const PATTERN_USAGE_ENTRY_SPACED = Buffer.from('"type": "usage"');
 const PATTERN_BRANCH_SUMMARY_COMPACT = Buffer.from('"type":"branch_summary"');
 const PATTERN_BRANCH_SUMMARY_SPACED = Buffer.from('"type": "branch_summary"');
 // pi-subagents versions predating Pi 0.81 persisted child usage in details but
@@ -361,6 +378,29 @@ function auxiliaryMessage(usage: UsageAmount, timestamp: number, sourceId: strin
     ...usage,
     timestamp,
     afterCompaction: false,
+  };
+}
+
+function standaloneUsageMessage(entry: Record<string, unknown>, thinkingLevel: string): SessionMessage | null {
+  const usage = parseUsageAmount(entry.usage);
+  if (
+    !usage ||
+    typeof entry.provider !== "string" ||
+    !entry.provider ||
+    typeof entry.model !== "string" ||
+    !entry.model
+  )
+    return null;
+  return {
+    provider: entry.provider,
+    model: entry.model,
+    thinkingLevel,
+    source: "usage",
+    sourceId: typeof entry.id === "string" ? entry.id : "",
+    ...usage,
+    timestamp: parsedTimestamp(undefined, entry.timestamp),
+    afterCompaction: false,
+    ...(entry.kind === "cache_warm" ? { cacheWarm: true } : {}),
   };
 }
 
@@ -494,6 +534,8 @@ function scanDirectObjectProperties(
   objectStart: number,
   limit: number,
   wanted: Set<string>,
+  stopWhenFound = false,
+  decodeKeys = false,
 ): DirectObjectScan {
   const values = new Map<string, [number, number]>();
   let cursor = objectStart + 1;
@@ -510,8 +552,11 @@ function scanDirectObjectProperties(
     if (buffer[colon] !== 0x3a) return { end: jsonValueEnd(buffer, objectStart, limit), values };
     const valueStart = skipJsonWhitespace(buffer, colon + 1, limit);
     const valueEnd = jsonValueEnd(buffer, valueStart, limit);
-    const key = buffer.toString("utf8", cursor + 1, keyEnd - 1);
+    const key = decodeKeys
+      ? (JSON.parse(buffer.toString("utf8", cursor, keyEnd)) as string)
+      : buffer.toString("utf8", cursor + 1, keyEnd - 1);
     if (wanted.has(key)) values.set(key, [valueStart, valueEnd]);
+    if (stopWhenFound && values.size === wanted.size) return { end: valueEnd, values };
     if (valueEnd <= valueStart) return { end: limit, values };
     cursor = valueEnd;
   }
@@ -660,12 +705,447 @@ function lineMightBeRelevant(line: Buffer): boolean {
     head.includes(PATTERN_SESSION_COMPACT) ||
     head.includes(PATTERN_THINKING_COMPACT) ||
     head.includes(PATTERN_COMPACTION_COMPACT) ||
+    head.includes(PATTERN_CONTEXT_EDIT_COMPACT) ||
+    head.includes(PATTERN_USAGE_ENTRY_COMPACT) ||
     head.includes(PATTERN_BRANCH_SUMMARY_COMPACT) ||
     head.includes(PATTERN_SESSION_SPACED) ||
     head.includes(PATTERN_THINKING_SPACED) ||
     head.includes(PATTERN_COMPACTION_SPACED) ||
+    head.includes(PATTERN_CONTEXT_EDIT_SPACED) ||
+    head.includes(PATTERN_USAGE_ENTRY_SPACED) ||
     head.includes(PATTERN_BRANCH_SUMMARY_SPACED)
   );
+}
+
+const LINEAGE_PROPERTIES = new Set(["id", "parentId"]);
+
+/** Validate a skipped large JSONL entry without decoding or allocating its body.
+ * A header alone is not a lineage node: Pi skips the entire malformed line. */
+function validLargeJsonLine(line: Buffer, lineageKeys: { ambiguous: boolean }): boolean {
+  let seenId = false;
+  let seenParentId = false;
+  type Frame = {
+    kind: "object" | "array";
+    expect: "keyOrEnd" | "key" | "colon" | "valueOrEnd" | "value" | "commaOrEnd";
+  };
+  const stack: Frame[] = [];
+  let cursor = skipJsonWhitespace(line, 0, line.length);
+  let expectValue = true;
+  const stringEnd = (start: number): number => {
+    for (let i = start + 1; i < line.length; i++) {
+      const byte = line[i];
+      if (byte === 0x22) return i + 1;
+      if (byte < 0x20) return -1;
+      if (byte !== 0x5c) continue;
+      const escaped = line[++i];
+      if (escaped === 0x75) {
+        for (let digit = 0; digit < 4; digit++) {
+          const hex = line[++i];
+          if (!((hex >= 0x30 && hex <= 0x39) || (hex >= 0x41 && hex <= 0x46) || (hex >= 0x61 && hex <= 0x66)))
+            return -1;
+        }
+      } else if (![0x22, 0x5c, 0x2f, 0x62, 0x66, 0x6e, 0x72, 0x74].includes(escaped)) return -1;
+    }
+    return -1;
+  };
+  while (cursor < line.length) {
+    cursor = skipJsonWhitespace(line, cursor, line.length);
+    if (cursor >= line.length) break;
+    const frame = stack.at(-1);
+    const byte = line[cursor];
+    if (!expectValue && !frame) return false;
+    if (!expectValue && frame) {
+      if (frame.expect === "keyOrEnd" || frame.expect === "key") {
+        if (byte === 0x7d && frame.expect === "keyOrEnd") {
+          stack.pop();
+          cursor++;
+          continue;
+        }
+        if (byte !== 0x22) return false;
+        const keyStart = cursor;
+        cursor = stringEnd(cursor);
+        if (cursor < 0) return false;
+        if (stack.length === 1 && frame.kind === "object") {
+          // Validation already walks the entire line. Notice non-canonical
+          // top-level keys without decoding the multi-megabyte content body.
+          if (line.subarray(keyStart + 1, cursor - 1).includes(0x5c)) lineageKeys.ambiguous = true;
+          const keyLength = cursor - keyStart - 2;
+          const rawKey = keyLength === 2 || keyLength === 8 ? line.toString("ascii", keyStart + 1, cursor - 1) : "";
+          if (rawKey === "id") {
+            if (seenId) lineageKeys.ambiguous = true;
+            seenId = true;
+          } else if (rawKey === "parentId") {
+            if (seenParentId) lineageKeys.ambiguous = true;
+            seenParentId = true;
+          }
+        }
+        frame.expect = "colon";
+        continue;
+      }
+      if (frame.expect === "colon") {
+        if (byte !== 0x3a) return false;
+        frame.expect = "value";
+        cursor++;
+        continue;
+      }
+      if (frame.expect === "commaOrEnd") {
+        if (byte === (frame.kind === "object" ? 0x7d : 0x5d)) {
+          stack.pop();
+          cursor++;
+          continue;
+        }
+        if (byte !== 0x2c) return false;
+        frame.expect = frame.kind === "object" ? "key" : "value";
+        cursor++;
+        continue;
+      }
+      if (frame.expect === "valueOrEnd" && byte === 0x5d) {
+        stack.pop();
+        cursor++;
+        continue;
+      }
+    }
+    if (frame && frame.expect !== "value" && frame.expect !== "valueOrEnd") return false;
+    if (frame) frame.expect = "commaOrEnd";
+    else expectValue = false;
+    if (byte === 0x7b || byte === 0x5b) {
+      stack.push({ kind: byte === 0x7b ? "object" : "array", expect: byte === 0x7b ? "keyOrEnd" : "valueOrEnd" });
+      cursor++;
+    } else if (byte === 0x22) {
+      cursor = stringEnd(cursor);
+      if (cursor < 0) return false;
+    } else if (byte === 0x74 || byte === 0x66 || byte === 0x6e) {
+      const word = byte === 0x74 ? "true" : byte === 0x66 ? "false" : "null";
+      if (line.toString("ascii", cursor, cursor + word.length) !== word) return false;
+      cursor += word.length;
+    } else if (byte === 0x2d || (byte >= 0x30 && byte <= 0x39)) {
+      if (byte === 0x2d) cursor++;
+      if (line[cursor] === 0x30) cursor++;
+      else if (line[cursor] >= 0x31 && line[cursor] <= 0x39) {
+        do cursor++;
+        while (line[cursor] >= 0x30 && line[cursor] <= 0x39);
+      } else return false;
+      if (line[cursor] === 0x2e) {
+        cursor++;
+        if (line[cursor] < 0x30 || line[cursor] > 0x39) return false;
+        do cursor++;
+        while (line[cursor] >= 0x30 && line[cursor] <= 0x39);
+      }
+      if (line[cursor] === 0x65 || line[cursor] === 0x45) {
+        cursor++;
+        if (line[cursor] === 0x2b || line[cursor] === 0x2d) cursor++;
+        if (line[cursor] < 0x30 || line[cursor] > 0x39) return false;
+        do cursor++;
+        while (line[cursor] >= 0x30 && line[cursor] <= 0x39);
+      }
+    } else return false;
+  }
+  return !expectValue && stack.length === 0;
+}
+
+/** Read direct entry properties without decoding nested content. Pi writes custom
+ * data/content before id and parentId, and tool results can be megabytes long. */
+function skippedEntryLineage(
+  line: Buffer,
+  verifiedLineageKeys?: { ambiguous: boolean },
+): { id: string; parentId: string | null } | null {
+  let start = 0;
+  while (start < line.length && (line[start] === 0x20 || line[start] === 0x09 || line[start] === 0x0d)) start++;
+  if (line[start] !== 0x7b) return null;
+  if (line.length <= LARGE_TOOL_RESULT_BYTES) {
+    try {
+      const parsed: unknown = JSON.parse(line.toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const { id, parentId } = parsed as Record<string, unknown>;
+      return typeof id === "string" && (typeof parentId === "string" || parentId === null) ? { id, parentId } : null;
+    } catch {
+      return null;
+    }
+  }
+  const lineageKeys = verifiedLineageKeys ?? { ambiguous: false };
+  if (!verifiedLineageKeys && !validLargeJsonLine(line, lineageKeys)) return null;
+  // Canonical Pi entries put id and parentId before message/content. Only
+  // duplicate or escaped top-level keys require a full direct-property scan;
+  // JSON.parse uses decoded keys and the final value for duplicates.
+  const { values } = scanDirectObjectProperties(
+    line,
+    start,
+    line.length,
+    LINEAGE_PROPERTIES,
+    !lineageKeys.ambiguous,
+    lineageKeys.ambiguous,
+  );
+  const id = parseJsonRange(line, values.get("id"));
+  const parentId = parseJsonRange(line, values.get("parentId"));
+  return typeof id === "string" && (typeof parentId === "string" || parentId === null) ? { id, parentId } : null;
+}
+
+interface EffectiveEdit {
+  fingerprint: string;
+  editId: string;
+}
+
+/** Immutable AVL map: branch forks share untouched nodes instead of copying every
+ * edit. Height and size are cached so updates stay logarithmic and the changed
+ * target check stays constant-time. */
+interface EditTree<Value> {
+  readonly key: string;
+  readonly value: Value;
+  readonly left: EditTree<Value> | null;
+  readonly right: EditTree<Value> | null;
+  readonly height: number;
+  readonly size: number;
+}
+
+function editNode<Value>(
+  key: string,
+  value: Value,
+  left: EditTree<Value> | null,
+  right: EditTree<Value> | null,
+): EditTree<Value> {
+  return {
+    key,
+    value,
+    left,
+    right,
+    height: 1 + Math.max(left?.height ?? 0, right?.height ?? 0),
+    size: 1 + (left?.size ?? 0) + (right?.size ?? 0),
+  };
+}
+
+function balanceEditTree<Value>(node: EditTree<Value>): EditTree<Value> {
+  const skew = (node.left?.height ?? 0) - (node.right?.height ?? 0);
+  if (skew > 1) {
+    const left = node.left as EditTree<Value>;
+    if ((left.left?.height ?? 0) < (left.right?.height ?? 0)) {
+      const pivot = left.right as EditTree<Value>;
+      const rotated = editNode(left.key, left.value, left.left, pivot.left);
+      return balanceEditTree(
+        editNode(pivot.key, pivot.value, rotated, editNode(node.key, node.value, pivot.right, node.right)),
+      );
+    }
+    return editNode(left.key, left.value, left.left, editNode(node.key, node.value, left.right, node.right));
+  }
+  if (skew < -1) {
+    const right = node.right as EditTree<Value>;
+    if ((right.right?.height ?? 0) < (right.left?.height ?? 0)) {
+      const pivot = right.left as EditTree<Value>;
+      const rotated = editNode(right.key, right.value, pivot.right, right.right);
+      return balanceEditTree(
+        editNode(pivot.key, pivot.value, editNode(node.key, node.value, node.left, pivot.left), rotated),
+      );
+    }
+    return editNode(right.key, right.value, editNode(node.key, node.value, node.left, right.left), right.right);
+  }
+  return node;
+}
+
+function editTreeGet<Value>(root: EditTree<Value> | null, key: string): Value | undefined {
+  let node = root;
+  while (node) {
+    if (key === node.key) return node.value;
+    node = key < node.key ? node.left : node.right;
+  }
+  return undefined;
+}
+
+function editTreeSet<Value>(root: EditTree<Value> | null, key: string, value: Value): EditTree<Value> {
+  if (!root) return editNode(key, value, null, null);
+  if (key === root.key) return editNode(key, value, root.left, root.right);
+  return key < root.key
+    ? balanceEditTree(editNode(root.key, root.value, editTreeSet(root.left, key, value), root.right))
+    : balanceEditTree(editNode(root.key, root.value, root.left, editTreeSet(root.right, key, value)));
+}
+
+function editTreeDelete<Value>(root: EditTree<Value> | null, key: string): EditTree<Value> | null {
+  if (!root) return null;
+  if (key < root.key) {
+    const left = editTreeDelete(root.left, key);
+    return left === root.left ? root : balanceEditTree(editNode(root.key, root.value, left, root.right));
+  }
+  if (key > root.key) {
+    const right = editTreeDelete(root.right, key);
+    return right === root.right ? root : balanceEditTree(editNode(root.key, root.value, root.left, right));
+  }
+  if (!root.left) return root.right;
+  if (!root.right) return root.left;
+  let successor = root.right;
+  while (successor.left) successor = successor.left;
+  return balanceEditTree(
+    editNode(successor.key, successor.value, root.left, editTreeDelete(root.right, successor.key)),
+  );
+}
+
+function editTreeForEach<Value>(root: EditTree<Value> | null, visit: (key: string, value: Value) => void): void {
+  if (!root) return;
+  editTreeForEach(root.left, visit);
+  visit(root.key, root.value);
+  editTreeForEach(root.right, visit);
+}
+
+interface BranchState {
+  thinkingLevel: string;
+  lastAssistantId: string;
+  /** Only changed targets in the previous assistant's projected context explain a prefix miss. */
+  changedTargets: EditTree<true> | null;
+  effectiveEdits: EditTree<EffectiveEdit> | null;
+  /** An ancestor of every effective edit, used to retain the tree on full-range compactions. */
+  earliestEffectiveEditId: string;
+  baselineEdits: EditTree<EffectiveEdit> | null;
+  pendingCompaction: boolean;
+  latestCompactionId: string;
+  warmByModel: ReadonlyMap<string, number>;
+}
+
+const EMPTY_BRANCH: BranchState = {
+  thinkingLevel: "",
+  lastAssistantId: "",
+  changedTargets: null,
+  effectiveEdits: null,
+  earliestEffectiveEditId: "",
+  baselineEdits: null,
+  pendingCompaction: false,
+  latestCompactionId: "",
+  warmByModel: new Map(),
+};
+
+interface LineageEntry {
+  parentId: string | null;
+  state: BranchState;
+  /** Byte offsets into the current parse buffer, not a retained JSON body. */
+  lineRange: [number, number];
+  content?: { role: "user" | "assistant" | "toolResult" | "custom"; fingerprint: string } | null;
+  firstKeptId?: string;
+  /** Present only when every parent was seen before this unique canonical id. */
+  depth?: number;
+  /** Ancestors at distances 1, 2, 4, ... for logarithmic lineage checks. */
+  jumps?: string[];
+}
+
+function isAncestor(
+  lineage: Map<string, LineageEntry>,
+  ancestorId: string,
+  descendantId: string,
+  duplicateIds: boolean,
+): boolean {
+  if (ancestorId === descendantId) return true;
+  const descendant = lineage.get(descendantId);
+  if (!duplicateIds && descendant?.depth !== undefined) {
+    const ancestor = lineage.get(ancestorId);
+    // A canonical path contains only already-seen canonical entries.
+    if (ancestor?.depth === undefined || ancestor.depth > descendant.depth) return false;
+    let cursor = descendantId;
+    let distance = descendant.depth - ancestor.depth;
+    let bit = 0;
+    while (distance > 0) {
+      if (distance % 2 === 1) cursor = lineage.get(cursor)?.jumps?.[bit] ?? "";
+      distance = Math.floor(distance / 2);
+      bit++;
+    }
+    return cursor === ancestorId;
+  }
+  let cursor: string | null = descendantId;
+  // Malformed/imported journals may contain cycles or late/duplicate ids.
+  const visited = new Set<string>();
+  while (cursor !== null && !visited.has(cursor)) {
+    if (cursor === ancestorId) return true;
+    visited.add(cursor);
+    cursor = lineage.get(cursor)?.parentId ?? null;
+  }
+  return false;
+}
+
+/** A context edit only changes a request if its target survives the latest
+ * compaction on this branch (Pi's buildContextEntries projection). */
+function editChangesContext(
+  lineage: Map<string, LineageEntry>,
+  parentId: string | null,
+  targetId: unknown,
+  compactionId: string,
+  duplicateIds: boolean,
+): boolean {
+  if (typeof targetId !== "string" || !parentId || !isAncestor(lineage, targetId, parentId, duplicateIds)) return false;
+  if (!compactionId || isAncestor(lineage, compactionId, targetId, duplicateIds)) return true;
+  const firstKeptId = lineage.get(compactionId)?.firstKeptId;
+  return Boolean(firstKeptId && isAncestor(lineage, firstKeptId, targetId, duplicateIds));
+}
+
+function contentFingerprint(content: unknown): string {
+  return createHash("sha256").update(JSON.stringify(content)).digest("hex");
+}
+
+/** Decode a target only when an edit actually references it. Most tool results
+ * never need their content inspected; lineage retains only byte offsets. */
+function originalContent(
+  lineage: Map<string, LineageEntry>,
+  targetId: string,
+  buffer: Buffer,
+): Exclude<LineageEntry["content"], undefined> {
+  const target = lineage.get(targetId);
+  if (!target) return null;
+  if (target.content !== undefined) return target.content;
+  let content: Exclude<LineageEntry["content"], undefined> = null;
+  try {
+    const [start, end] = target.lineRange;
+    const entry = JSON.parse(buffer.toString("utf8", start, end)) as Record<string, unknown>;
+    if (entry.type === "custom_message") {
+      content = { role: "custom", fingerprint: contentFingerprint(entry.content ?? []) };
+    } else if (entry.type === "message" && entry.message && typeof entry.message === "object") {
+      const msg = entry.message as Record<string, unknown>;
+      if (
+        msg.role === "user" ||
+        msg.role === "toolResult" ||
+        (msg.role === "assistant" && msg.stopReason !== "aborted" && msg.stopReason !== "error")
+      ) {
+        content = { role: msg.role, fingerprint: contentFingerprint(msg.content ?? []) };
+      }
+    }
+  } catch {
+    // Invalid imported entries cannot contribute an editable model message.
+  }
+  target.content = content;
+  return content;
+}
+
+function applyContextEdit(
+  lineage: Map<string, LineageEntry>,
+  branch: BranchState,
+  targetId: string,
+  replacement: unknown,
+  editId: string,
+  buffer: Buffer,
+  changesCachedPrefix: boolean,
+): BranchState {
+  const original = originalContent(lineage, targetId, buffer);
+  if (!original) return branch;
+  let fingerprint: string;
+  if (replacement === null) {
+    fingerprint = "omitted";
+  } else if (replacement && typeof replacement === "object" && "content" in replacement) {
+    let content = (replacement as { content: unknown }).content;
+    if (typeof content !== "string" && !Array.isArray(content)) return branch;
+    if ((original.role === "assistant" || original.role === "toolResult") && typeof content === "string") {
+      content = [{ type: "text", text: content }];
+    }
+    fingerprint = contentFingerprint(content);
+  } else {
+    return branch;
+  }
+  const effective = editTreeGet(branch.effectiveEdits, targetId)?.fingerprint ?? original.fingerprint;
+  if (effective === fingerprint) return branch;
+  const effectiveEdits = editTreeSet(branch.effectiveEdits, targetId, { fingerprint, editId });
+  const baseline = editTreeGet(branch.baselineEdits, targetId)?.fingerprint ?? original.fingerprint;
+  const changedTargets = !changesCachedPrefix
+    ? branch.changedTargets
+    : fingerprint === baseline
+      ? editTreeDelete(branch.changedTargets, targetId)
+      : editTreeSet(branch.changedTargets, targetId, true);
+  return {
+    ...branch,
+    effectiveEdits,
+    earliestEffectiveEditId: branch.earliestEffectiveEditId || editId,
+    changedTargets,
+  };
 }
 
 /**
@@ -679,12 +1159,18 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
   let sessionId = "";
   let parentSession = "";
   let cwd = "";
-  // Assistant messages don't carry the thinking level; pi records it as separate
-  // thinking_level_change entries, always written before the first assistant
-  // message of a session. Replaying them in append order attributes each message
-  // to the level active when it was produced.
-  let thinkingLevel = "";
-  let compactionPending = false;
+  // Legacy/imported entries without parent links can only use append-order
+  // thinking changes. Canonical Pi entries (including parentId: null roots)
+  // use their branch state, so separate roots and siblings cannot leak levels.
+  let legacyThinkingLevel = "";
+  // Replay the small ancestry state for each entry, including skipped entries.
+  // Parent links, not append order, determine which branch owns an edit, a
+  // compaction, or a cache warm. No message/tool/custom bodies are retained.
+  const lineage = new Map<string, LineageEntry>();
+  // Reused ids can invalidate ancestry cached by older entries. Fall back to the
+  // bounded parent walk for the rest of such an imported/malformed journal.
+  let duplicateIds = false;
+  let appendState = EMPTY_BRANCH; // Best effort for imported entries without usable parent links.
 
   let start = 0;
   let lineNumber = 0;
@@ -700,83 +1186,228 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
     }
 
     const lineBuffer = buffer.subarray(start, end);
-    if (end > start && lineMightBeRelevant(lineBuffer)) {
+    if (end > start) {
+      const relevant = lineMightBeRelevant(lineBuffer);
       const head = lineBuffer.subarray(0, Math.min(1024, lineBuffer.length));
-      if (lineBuffer.length > LARGE_TOOL_RESULT_BYTES && head.includes(PATTERN_TOOL_RESULT_COMPACT)) {
+      const largeToolResult =
+        relevant && lineBuffer.length > LARGE_TOOL_RESULT_BYTES && head.includes(PATTERN_TOOL_RESULT_COMPACT);
+      const lineageKeys = { ambiguous: false };
+      const validLargeToolResult = largeToolResult && validLargeJsonLine(lineBuffer, lineageKeys);
+      let entry: Record<string, unknown> | null = null;
+      if (relevant && !largeToolResult) {
+        try {
+          const parsed: unknown = JSON.parse(buffer.toString("utf8", start, end));
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) entry = parsed as Record<string, unknown>;
+        } catch {
+          // Skip malformed lines.
+        }
+      }
+      const header = entry
+        ? {
+            id: entry.id,
+            parentId: entry.parentId,
+          }
+        : largeToolResult && !validLargeToolResult
+          ? null
+          : skippedEntryLineage(lineBuffer, validLargeToolResult ? lineageKeys : undefined);
+      const id = typeof header?.id === "string" ? header.id : "";
+      const parentId = typeof header?.parentId === "string" ? header.parentId : null;
+      const hasParentLink = typeof header?.parentId === "string" || header?.parentId === null;
+      const parent = parentId ? lineage.get(parentId) : undefined;
+      const branch = parent?.state ?? (hasParentLink ? EMPTY_BRANCH : appendState);
+      let state = branch;
+      let firstKeptId: string | undefined;
+
+      if (validLargeToolResult) {
         const toolUsage = parseLargeToolResultLine(lineBuffer);
         if (toolUsage) toolUsages.push(toolUsage);
-        start = end + 1;
-        continue;
-      }
-      try {
-        const entry = JSON.parse(buffer.toString("utf8", start, end));
-
-        if (entry.type === "session") {
-          sessionId = entry.id;
-          if (typeof entry.cwd === "string") cwd = entry.cwd;
-          if (typeof entry.parentSession === "string") parentSession = entry.parentSession;
-        } else if (entry.type === "thinking_level_change") {
-          if (typeof entry.thinkingLevel === "string") thinkingLevel = entry.thinkingLevel;
-        } else if (entry.type === "compaction") {
-          const usage = parseUsageAmount(entry.usage);
-          if (usage)
-            messages.push(
-              auxiliaryMessage(
-                usage,
-                parsedTimestamp(undefined, entry.timestamp),
-                typeof entry.id === "string" ? entry.id : "",
-              ),
-            );
-          compactionPending = true;
-        } else if (entry.type === "branch_summary") {
-          const usage = parseUsageAmount(entry.usage);
-          if (usage)
-            messages.push(
-              auxiliaryMessage(
-                usage,
-                parsedTimestamp(undefined, entry.timestamp),
-                typeof entry.id === "string" ? entry.id : "",
-              ),
-            );
-        } else if (entry.type === "message" && entry.message?.role === "assistant") {
-          const msg = entry.message;
-          if (msg.usage && msg.provider && msg.model) {
-            const fallbackTs = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
-            messages.push({
-              provider: msg.provider,
-              model: msg.model,
-              thinkingLevel,
-              source: "assistant",
-              // Pi entry ids are stable when a branch is copied into another
-              // session file. Legacy/imported lines without an id remain
-              // deliberately unmergeable across independent files.
-              sourceId: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : "",
-              cost: msg.usage.cost?.total || 0,
-              input: msg.usage.input || 0,
-              output: msg.usage.output || 0,
-              cacheRead: msg.usage.cacheRead || 0,
-              cacheWrite: msg.usage.cacheWrite || 0,
-              reasoning: msg.usage.reasoning || 0,
-              timestamp: msg.timestamp || (Number.isNaN(fallbackTs) ? 0 : fallbackTs),
-              afterCompaction: compactionPending,
-            });
-            compactionPending = false;
-          }
-        } else if (entry.type === "message" && entry.message?.role === "toolResult") {
-          const msg = entry.message;
-          const toolUsage = buildToolUsageRecord(
-            msg.toolName,
-            msg.details,
-            msg.usage,
-            entry.id,
-            msg.timestamp,
-            entry.timestamp,
-          );
-          if (toolUsage) toolUsages.push(toolUsage);
+      } else if (entry?.type === "session") {
+        if (typeof entry.id === "string") sessionId = entry.id;
+        if (typeof entry.cwd === "string") cwd = entry.cwd;
+        if (typeof entry.parentSession === "string") parentSession = entry.parentSession;
+      } else if (entry?.type === "thinking_level_change") {
+        if (typeof entry.thinkingLevel === "string") {
+          legacyThinkingLevel = entry.thinkingLevel;
+          state = { ...branch, thinkingLevel: entry.thinkingLevel };
         }
-      } catch {
-        // Skip malformed lines
+      } else if (entry?.type === "compaction") {
+        const usage = parseUsageAmount(entry.usage);
+        if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), id));
+        firstKeptId = typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined;
+        // Pi's context projection discards edits before the kept range, even
+        // when the edited target itself survives compaction.
+        let effectiveEdits: EditTree<EffectiveEdit> | null = null;
+        let earliestEffectiveEditId = "";
+        const keptId = firstKeptId;
+        if (keptId && branch.effectiveEdits) {
+          if (
+            branch.earliestEffectiveEditId &&
+            isAncestor(lineage, keptId, branch.earliestEffectiveEditId, duplicateIds)
+          ) {
+            // All effective edits follow this ancestor on the same branch. Reuse
+            // the immutable tree instead of rebuilding it at every compaction.
+            effectiveEdits = branch.effectiveEdits;
+            earliestEffectiveEditId = branch.earliestEffectiveEditId;
+          } else {
+            editTreeForEach(branch.effectiveEdits, (targetId, edit) => {
+              if (isAncestor(lineage, keptId, edit.editId, duplicateIds)) {
+                effectiveEdits = editTreeSet(effectiveEdits, targetId, edit);
+              }
+            });
+            // A conservative ancestor bound for retained edits; a later
+            // compaction keeping this point can reuse the filtered tree.
+            if (effectiveEdits) earliestEffectiveEditId = keptId;
+          }
+        }
+        state = {
+          ...branch,
+          effectiveEdits,
+          earliestEffectiveEditId,
+          changedTargets: null,
+          pendingCompaction: true,
+          latestCompactionId: id,
+        };
+      } else if (entry?.type === "context_edit") {
+        if (
+          typeof entry.targetId === "string" &&
+          parentId &&
+          isAncestor(lineage, entry.targetId, parentId, duplicateIds)
+        ) {
+          const previousAssistant = lineage.get(branch.lastAssistantId);
+          // Retain edits to targets hidden by the current compaction: a later
+          // compaction can keep an earlier range and make those edits effective.
+          // Only a target visible in both requests can explain a cache miss.
+          const changesCachedPrefix =
+            editChangesContext(lineage, parentId, entry.targetId, branch.latestCompactionId, duplicateIds) &&
+            Boolean(
+              branch.lastAssistantId &&
+                editChangesContext(
+                  lineage,
+                  branch.lastAssistantId,
+                  entry.targetId,
+                  previousAssistant?.state.latestCompactionId ?? "",
+                  duplicateIds,
+                ),
+            );
+          state = applyContextEdit(
+            lineage,
+            branch,
+            entry.targetId as string,
+            entry.replacement,
+            id,
+            buffer,
+            changesCachedPrefix,
+          );
+        }
+      } else if (entry?.type === "usage") {
+        const message = standaloneUsageMessage(entry, hasParentLink ? branch.thinkingLevel : legacyThinkingLevel);
+        if (message) messages.push(message);
+        // Successful zero-usage refreshes have no billable record, but still
+        // reset the TTL on this branch. Keep timing separate from accounting.
+        if (
+          entry.kind === "cache_warm" &&
+          entry.usage &&
+          typeof entry.usage === "object" &&
+          typeof entry.provider === "string" &&
+          entry.provider &&
+          typeof entry.model === "string" &&
+          entry.model
+        ) {
+          const timestamp = parsedTimestamp(undefined, entry.timestamp);
+          if (timestamp > 0) {
+            const warmByModel = new Map(branch.warmByModel);
+            warmByModel.set(JSON.stringify([entry.provider, entry.model]), timestamp);
+            state = { ...branch, warmByModel };
+          }
+        }
+      } else if (entry?.type === "branch_summary") {
+        const usage = parseUsageAmount(entry.usage);
+        if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), id));
+      } else if (entry?.type === "message" && (entry.message as { role?: unknown } | undefined)?.role === "assistant") {
+        const msg = entry.message as Record<string, unknown>;
+        const usage = msg.usage as
+          | {
+              cost?: { total?: number };
+              input?: number;
+              output?: number;
+              cacheRead?: number;
+              cacheWrite?: number;
+              reasoning?: number;
+            }
+          | undefined;
+        if (usage && typeof msg.provider === "string" && typeof msg.model === "string") {
+          const fallbackTs = entry.timestamp ? new Date(entry.timestamp as string).getTime() : 0;
+          const timestamp = (msg.timestamp as number) || (Number.isNaN(fallbackTs) ? 0 : fallbackTs);
+          // Pi persists warm usage under responseModel ?? model, while the
+          // assistant's model field may be a request alias. Never fall back to
+          // an alias when a different concrete responseModel is known.
+          const responseModel =
+            typeof msg.responseModel === "string" && msg.responseModel ? msg.responseModel : undefined;
+          const branchWarmAt = branch.warmByModel.get(JSON.stringify([msg.provider, responseModel ?? msg.model]));
+          messages.push({
+            provider: msg.provider,
+            model: msg.model,
+            ...(responseModel ? { responseModel } : {}),
+            thinkingLevel: hasParentLink ? branch.thinkingLevel : legacyThinkingLevel,
+            source: "assistant",
+            sourceId: id,
+            cost: usage.cost?.total || 0,
+            input: usage.input || 0,
+            output: usage.output || 0,
+            cacheRead: usage.cacheRead || 0,
+            cacheWrite: usage.cacheWrite || 0,
+            reasoning: usage.reasoning || 0,
+            timestamp,
+            afterCompaction: branch.pendingCompaction,
+            ...((branch.changedTargets?.size ?? 0) > 0 ? { afterContextEdit: true } : {}),
+            ...(hasParentLink && id ? { previousAssistantId: branch.lastAssistantId } : {}),
+            ...(branchWarmAt ? { branchWarmAt } : {}),
+          });
+          state = {
+            ...branch,
+            lastAssistantId: id,
+            baselineEdits: branch.effectiveEdits,
+            changedTargets: null,
+            pendingCompaction: false,
+          };
+        }
+      } else if (
+        entry?.type === "message" &&
+        (entry.message as { role?: unknown } | undefined)?.role === "toolResult"
+      ) {
+        const msg = entry.message as Record<string, unknown>;
+        const toolUsage = buildToolUsageRecord(
+          msg.toolName,
+          msg.details,
+          msg.usage,
+          entry.id,
+          msg.timestamp,
+          entry.timestamp,
+        );
+        if (toolUsage) toolUsages.push(toolUsage);
       }
+
+      if (id) {
+        if (lineage.has(id)) duplicateIds = true;
+        const canonical = hasParentLink && (parentId === null || parent?.depth !== undefined) && !duplicateIds;
+        const jumps: string[] = [];
+        if (canonical && parentId) {
+          jumps.push(parentId);
+          for (let bit = 1; ; bit++) {
+            const next = lineage.get(jumps[bit - 1])?.jumps?.[bit - 1];
+            if (!next) break;
+            jumps.push(next);
+          }
+        }
+        lineage.set(id, {
+          parentId,
+          state,
+          lineRange: [start, end],
+          ...(firstKeptId ? { firstKeptId } : {}),
+          ...(canonical ? { depth: (parent?.depth ?? -1) + 1, jumps } : {}),
+        });
+      }
+      appendState = state;
     }
 
     start = end + 1;
@@ -789,7 +1420,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // On-disk cache
 // =============================================================================
 
-const CACHE_VERSION = 7;
+const CACHE_VERSION = 11;
 
 type CachedMessageTuple = [
   providerIdx: number,
@@ -803,8 +1434,13 @@ type CachedMessageTuple = [
   thinkingLevelIdx: number,
   reasoning: number,
   afterCompaction: 0 | 1,
-  auxiliary: 0 | 1,
+  source: 0 | 1 | 2,
   sourceIdIdx: number,
+  afterContextEdit: 0 | 1,
+  cacheWarm: 0 | 1,
+  previousAssistantIdIdx: number,
+  branchWarmAt: number,
+  responseModelIdx: number,
 ];
 
 type CachedUsageTuple = [
@@ -842,12 +1478,18 @@ export interface CachedFileState {
   parsed: ParsedSessionFile;
 }
 
-export async function loadUsageCache(cachePath: string): Promise<Map<string, CachedFileState>> {
+export async function loadUsageCache(cachePath: string, signal?: AbortSignal): Promise<Map<string, CachedFileState>> {
   const result = new Map<string, CachedFileState>();
   let raw: { version?: unknown; names?: unknown; files?: unknown };
   try {
-    raw = JSON.parse(await readFile(cachePath, "utf8"));
+    signal?.throwIfAborted();
+    const text = await readFile(cachePath, { encoding: "utf8", signal });
+    signal?.throwIfAborted();
+    // JSON.parse is synchronous; an abort cannot interrupt an in-flight parse.
+    raw = JSON.parse(text);
+    signal?.throwIfAborted();
   } catch {
+    signal?.throwIfAborted();
     return result; // Missing or corrupt cache — rebuild from scratch.
   }
   if (
@@ -862,6 +1504,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
 
   const names = raw.names as unknown[];
   for (const [filePath, entry] of Object.entries(raw.files as Record<string, CacheFileEntry>)) {
+    signal?.throwIfAborted();
     if (
       !entry ||
       typeof entry.size !== "number" ||
@@ -877,7 +1520,8 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
     const messages: SessionMessage[] = [];
     let valid = true;
     for (const tuple of entry.messages) {
-      if (!Array.isArray(tuple) || tuple.length !== 13) {
+      signal?.throwIfAborted();
+      if (!Array.isArray(tuple) || tuple.length !== 18) {
         valid = false;
         break;
       }
@@ -890,7 +1534,17 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
         typeof model !== "string" ||
         typeof thinkingLevel !== "string" ||
         typeof sourceId !== "string" ||
-        (tuple[11] !== 0 && tuple[11] !== 1)
+        (tuple[10] !== 0 && tuple[10] !== 1) ||
+        (tuple[11] !== 0 && tuple[11] !== 1 && tuple[11] !== 2) ||
+        (tuple[13] !== 0 && tuple[13] !== 1) ||
+        (tuple[14] !== 0 && tuple[14] !== 1) ||
+        (tuple[14] === 1 && tuple[11] !== 2) ||
+        (tuple[15] !== -1 && typeof names[tuple[15]] !== "string") ||
+        typeof tuple[16] !== "number" ||
+        !Number.isFinite(tuple[16]) ||
+        tuple[16] < 0 ||
+        (tuple[16] > 0 && tuple[11] !== 0) ||
+        (tuple[17] !== -1 && (typeof names[tuple[17]] !== "string" || tuple[11] !== 0))
       ) {
         valid = false;
         break;
@@ -899,7 +1553,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
         provider,
         model,
         thinkingLevel,
-        source: tuple[11] === 1 ? "auxiliary" : "assistant",
+        source: tuple[11] === 1 ? "auxiliary" : tuple[11] === 2 ? "usage" : "assistant",
         sourceId,
         cost: Number(tuple[2]) || 0,
         input: Number(tuple[3]) || 0,
@@ -909,11 +1563,17 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
         timestamp: Number(tuple[7]) || 0,
         reasoning: Number(tuple[9]) || 0,
         afterCompaction: tuple[10] === 1,
+        ...(tuple[13] === 1 ? { afterContextEdit: true } : {}),
+        ...(tuple[14] === 1 ? { cacheWarm: true } : {}),
+        ...(tuple[15] >= 0 ? { previousAssistantId: names[tuple[15]] as string } : {}),
+        ...(tuple[16] > 0 ? { branchWarmAt: tuple[16] } : {}),
+        ...(tuple[17] >= 0 ? { responseModel: names[tuple[17]] as string } : {}),
       });
     }
     if (!valid) continue;
     const toolUsages: ToolUsageRecord[] = [];
     for (const tuple of entry.toolUsages) {
+      signal?.throwIfAborted();
       if (!Array.isArray(tuple) || tuple.length !== 5 || !Array.isArray(tuple[4])) {
         valid = false;
         break;
@@ -927,6 +1587,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
       }
       const children: ChildToolUsage[] = [];
       for (const childTuple of tuple[4]) {
+        signal?.throwIfAborted();
         if (!Array.isArray(childTuple) || childTuple.length !== 3) {
           valid = false;
           break;
@@ -955,6 +1616,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
       parsed: { sessionId: entry.sessionId, cwd: entry.cwd, parentSession: entry.parentSession, messages, toolUsages },
     });
   }
+  signal?.throwIfAborted();
   return result;
 }
 
@@ -981,7 +1643,6 @@ function cacheUsageAmount(usage: UsageAmount): CachedUsageTuple {
 }
 
 const CACHE_LOCK_TIMEOUT_MS = 5_000;
-const CACHE_LOCK_STALE_MS = 30_000;
 
 function errorCode(error: unknown): string | undefined {
   if (!(error instanceof Error) || !("code" in error)) return undefined;
@@ -1001,9 +1662,11 @@ async function cacheFileMatches(filePath: string, state: CachedFileState): Promi
 async function mergeCacheStates(
   latest: Map<string, CachedFileState>,
   requested: Map<string, CachedFileState>,
+  signal?: AbortSignal,
 ): Promise<Map<string, CachedFileState>> {
   const merged = new Map(requested);
   for (const [filePath, latestState] of latest) {
+    signal?.throwIfAborted();
     const requestedState = merged.get(filePath);
     if (requestedState) {
       if (latestState.mtimeMs > requestedState.mtimeMs && (await cacheFileMatches(filePath, latestState))) {
@@ -1016,33 +1679,79 @@ async function mergeCacheStates(
   return merged;
 }
 
-async function acquireCacheLock(lockPath: string): Promise<() => Promise<void>> {
+async function acquireCacheLock(
+  lockPath: string,
+  { signal, waitForLock = true }: { signal?: AbortSignal; waitForLock?: boolean } = {},
+): Promise<(() => Promise<void>) | null> {
   const deadline = Date.now() + CACHE_LOCK_TIMEOUT_MS;
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
+    let handle: Awaited<ReturnType<typeof open>>;
     try {
-      const handle = await open(lockPath, "wx");
-      return async () => {
-        await handle.close();
-        await unlink(lockPath).catch(() => {});
-      };
+      handle = await open(lockPath, "wx");
     } catch (error: unknown) {
+      signal?.throwIfAborted();
       if (errorCode(error) !== "EEXIST") throw error;
+      if (!waitForLock) return null;
+      // Age alone cannot establish that a writer is dead. Never steal a lock;
+      // an active writer can legitimately take longer than the old 30s threshold.
+      await sleep(25, undefined, { signal });
+      continue;
+    }
+
+    const owner = `${process.pid}:${randomUUID()}`;
+    let initialized = false;
+    const release = async (): Promise<void> => {
       try {
-        const lockStat = await stat(lockPath);
-        if (Date.now() - lockStat.mtimeMs > CACHE_LOCK_STALE_MS) await unlink(lockPath).catch(() => {});
-      } catch {
-        // The owner may have released the lock between open and stat.
+        const held = await handle.stat();
+        const onDisk = await lstat(lockPath).catch((error: unknown) => {
+          if (errorCode(error) === "ENOENT") return null;
+          throw error;
+        });
+        // A manual lock replacement must not be unlinked by its predecessor.
+        // This check is best effort, not an atomic compare-and-unlink: only
+        // remove an orphan manually after confirming no writer is active.
+        if (onDisk && held.dev === onDisk.dev && held.ino === onDisk.ino) {
+          if (!initialized || (await readFile(lockPath, "utf8")) === owner) {
+            await unlink(lockPath);
+          }
+        }
+      } catch (error) {
+        // Another process may have removed the lock between the ownership
+        // check and the read/unlink. Do not hide unrelated filesystem failures.
+        if (errorCode(error) !== "ENOENT") throw error;
+      } finally {
+        await handle.close();
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    };
+    try {
+      await handle.writeFile(owner);
+      initialized = true;
+      // open/write may finish after cancellation; clean up before returning.
+      signal?.throwIfAborted();
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
     }
   }
-  throw new Error(`usage cache lock timed out: ${lockPath}`);
+  signal?.throwIfAborted();
+  throw new Error(
+    `usage cache lock busy: ${lockPath}; cache not saved. If no /usage writer is active, remove this orphaned lock manually and retry.`,
+  );
 }
 
-export async function saveUsageCache(cachePath: string, states: Map<string, CachedFileState>): Promise<void> {
-  const release = await acquireCacheLock(`${cachePath}.lock`);
+export async function saveUsageCache(
+  cachePath: string,
+  states: Map<string, CachedFileState>,
+  options: { signal?: AbortSignal; waitForLock?: boolean } = {},
+): Promise<void> {
+  const release = await acquireCacheLock(`${cachePath}.lock`, options);
+  if (!release) return;
+  const { signal } = options;
   try {
-    const statesToWrite = await mergeCacheStates(await loadUsageCache(cachePath), states);
+    const statesToWrite = await mergeCacheStates(await loadUsageCache(cachePath, signal), states, signal);
+    signal?.throwIfAborted();
     const names: string[] = [];
     const nameIndex = new Map<string, number>();
     const intern = (name: string): number => {
@@ -1057,14 +1766,16 @@ export async function saveUsageCache(cachePath: string, states: Map<string, Cach
 
     const files: Record<string, CacheFileEntry> = {};
     for (const [filePath, state] of statesToWrite) {
+      signal?.throwIfAborted();
       files[filePath] = {
         size: state.size,
         mtimeMs: state.mtimeMs,
         sessionId: state.parsed.sessionId,
         cwd: state.parsed.cwd,
         parentSession: state.parsed.parentSession,
-        messages: state.parsed.messages.map(
-          (m): CachedMessageTuple => [
+        messages: state.parsed.messages.map((m): CachedMessageTuple => {
+          signal?.throwIfAborted();
+          return [
             intern(m.provider),
             intern(m.model),
             m.cost,
@@ -1076,34 +1787,45 @@ export async function saveUsageCache(cachePath: string, states: Map<string, Cach
             intern(m.thinkingLevel),
             m.reasoning,
             m.afterCompaction ? 1 : 0,
-            m.source === "auxiliary" ? 1 : 0,
+            m.source === "auxiliary" ? 1 : m.source === "usage" ? 2 : 0,
             intern(m.sourceId),
-          ],
-        ),
-        toolUsages: state.parsed.toolUsages.map(
-          (tool): CachedToolUsageTuple => [
+            m.afterContextEdit ? 1 : 0,
+            m.cacheWarm ? 1 : 0,
+            m.previousAssistantId === undefined ? -1 : intern(m.previousAssistantId),
+            m.branchWarmAt || 0,
+            m.responseModel ? intern(m.responseModel) : -1,
+          ];
+        }),
+        toolUsages: state.parsed.toolUsages.map((tool): CachedToolUsageTuple => {
+          signal?.throwIfAborted();
+          return [
             intern(tool.sourceId),
             tool.timestamp,
             tool.reportedUsage ? cacheUsageAmount(tool.reportedUsage) : null,
             intern(tool.runId),
-            tool.children.map(
-              (child): CachedChildToolUsageTuple => [
-                child.resultIndex,
-                intern(child.sessionFile),
-                cacheUsageAmount(child.usage),
-              ],
-            ),
-          ],
-        ),
+            tool.children.map((child): CachedChildToolUsageTuple => {
+              signal?.throwIfAborted();
+              return [child.resultIndex, intern(child.sessionFile), cacheUsageAmount(child.usage)];
+            }),
+          ];
+        }),
       };
     }
 
+    signal?.throwIfAborted();
     const payload = JSON.stringify({ version: CACHE_VERSION, names, files });
+    signal?.throwIfAborted();
     // A unique temporary name plus the lock prevents same-process collisions and
     // merges concurrently discovered files before the final atomic rename.
     const tmpPath = join(dirname(cachePath), `.usage-cache-${process.pid}-${randomUUID()}.tmp`);
-    await writeFile(tmpPath, payload, "utf8");
-    await rename(tmpPath, cachePath);
+    try {
+      signal?.throwIfAborted();
+      await writeFile(tmpPath, payload, { encoding: "utf8", signal });
+      signal?.throwIfAborted();
+      await rename(tmpPath, cachePath);
+    } finally {
+      await unlink(tmpPath).catch(() => {});
+    }
   } finally {
     await release();
   }
@@ -1137,6 +1859,7 @@ function emptyPeriodRawData(): PeriodRawData {
   return {
     totalCost: 0,
     assistantCost: 0,
+    nonAssistantCost: 0,
     auxiliaryCost: 0,
     ctxHigh: { cost: 0, messages: 0 },
     ctxLow: { cost: 0, messages: 0 },
@@ -1326,11 +2049,12 @@ function addMessagesToUsageData(
       raw.projectCosts.set(project, (raw.projectCosts.get(project) ?? 0) + msg.cost);
       raw.sessionCosts.set(sessionId, (raw.sessionCosts.get(sessionId) ?? 0) + msg.cost);
 
-      // Auxiliary calls belong in accounting totals, project/session mix, and
-      // burn trend. They are not assistant turns, so do not let their synthetic
-      // model identity or nested context distort turn/cache insights.
+      // Non-message usage belongs in accounting totals, project/session mix,
+      // and burn trend, but not assistant-turn or cache-miss insights. Only
+      // tool/summary reports lack a real provider/model attribution.
       if (!isAssistant) {
-        raw.auxiliaryCost += msg.cost;
+        raw.nonAssistantCost += msg.cost;
+        if (msg.source === "auxiliary") raw.auxiliaryCost += msg.cost;
         continue;
       }
       raw.assistantCost += msg.cost;
@@ -1346,6 +2070,7 @@ function addMessagesToUsageData(
       if (mm.isSessionStart) raw.upfrontCost += msg.cost;
       if (
         !msg.afterCompaction &&
+        !msg.afterContextEdit &&
         mm.prevCtx >= MISS_MIN_PREV_CONTEXT &&
         msg.cacheRead < Math.min(MISS_MAX_CACHE_READ, 0.3 * mm.prevCtx)
       ) {
@@ -1614,7 +2339,13 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
       // No cache file yet — first run.
     }
   }
-  const previous = cachePath ? await loadUsageCache(cachePath) : new Map<string, CachedFileState>();
+  let previous: Map<string, CachedFileState>;
+  try {
+    previous = cachePath ? await loadUsageCache(cachePath, signal) : new Map<string, CachedFileState>();
+  } catch (error) {
+    if (signal?.aborted) return null;
+    throw error;
+  }
   if (signal?.aborted) return null;
   const current = new Map<string, CachedFileState>();
   const toParse: string[] = [];
@@ -1684,23 +2415,16 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
     );
   }
 
-  if (signal?.aborted) {
-    // Best effort: persist whatever finished so a cancelled cold build makes
-    // the next attempt cheaper. Keep old entries for files not processed yet —
-    // they are re-validated against size/mtime next run anyway.
-    if (cachePath && dirty && current.size > 0) {
-      const merged = new Map(previous);
-      for (const [filePath, state] of current) merged.set(filePath, state);
-      await saveUsageCache(cachePath, merged).catch(() => {});
-    }
-    return null;
-  }
+  // A cancelled scan must not read/merge/serialize the entire cache just to
+  // preserve completed files. The next invocation will reparse uncached files.
+  if (signal?.aborted) return null;
 
   // 5. Persist the refreshed cache (also evicts entries for deleted files).
   if (cachePath && dirty) {
-    await saveUsageCache(cachePath, current).catch(() => {
-      // Cache write failures must never break /usage.
+    await saveUsageCache(cachePath, current, { signal }).catch(() => {
+      // Cache write failures (including cancellation) must never break /usage.
     });
+    if (signal?.aborted) return null;
   }
 
   // 6. Aggregate in sorted path order with cross-file dedupe.
@@ -1739,11 +2463,23 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
     const deduped: SessionMessage[] = [];
     const meta: MessageMeta[] = [];
     let previousAssistant: SessionMessage | null = null;
+    const assistantsById = new Map<string, SessionMessage>();
     for (const [messageIndex, m] of rawMsgs.entries()) {
-      // Auxiliary usage is interleaved with conversation entries, but it must
-      // not become the "previous message" for cache-miss classification.
-      const prev = m.source === "assistant" ? previousAssistant : null;
-      if (m.source === "assistant") previousAssistant = m;
+      // Parent-linked journals can fork within one file. Use the assistant on
+      // this entry's ancestor path, not the last assistant appended on a sibling.
+      const prev =
+        m.source !== "assistant"
+          ? null
+          : m.previousAssistantId === undefined
+            ? previousAssistant
+            : (assistantsById.get(m.previousAssistantId) ?? null);
+      const warmAt = m.branchWarmAt;
+      const previousRequestAt =
+        prev && warmAt && warmAt > prev.timestamp && warmAt <= m.timestamp ? warmAt : prev?.timestamp;
+      if (m.source === "assistant") {
+        previousAssistant = m;
+        if (m.sourceId) assistantsById.set(m.sourceId, m);
+      }
 
       // Stable Pi entry ids identify copied branch entries. Deduplicate only when
       // the persisted session-file lineage proves that two observations belong to
@@ -1782,9 +2518,14 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
       }
       deduped.push(m);
       meta.push({
-        gapMs: prev && prev.timestamp > 0 && m.timestamp > 0 ? m.timestamp - prev.timestamp : -1,
+        gapMs:
+          prev && previousRequestAt && previousRequestAt > 0 && m.timestamp > 0 ? m.timestamp - previousRequestAt : -1,
         prevCtx: prev ? prev.input + prev.cacheRead + prev.cacheWrite : 0,
-        modelSwitched: prev !== null && (prev.provider !== m.provider || prev.model !== m.model),
+        modelSwitched:
+          prev !== null &&
+          (prev.provider !== m.provider ||
+            ((prev.responseModel ?? prev.model) !== (m.responseModel ?? m.model) &&
+              (prev.model !== m.model || Boolean(prev.responseModel && m.responseModel)))),
         isSessionStart: false,
       });
     }
@@ -1884,7 +2625,7 @@ function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodIns
   }
   const total = raw.totalCost;
   const assistantTotal = raw.assistantCost;
-  const assistantPctLabel = raw.auxiliaryCost > 0 ? "assistant-message cost" : "this period";
+  const assistantPctLabel = raw.nonAssistantCost > 0 ? "assistant-message cost" : "this period";
   const insights: Insight[] = [];
 
   // --- Alarms (listed first) ---
@@ -1918,7 +2659,7 @@ function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodIns
       stat: fmtMoney(raw.prefixMissCost),
       headline: `spent re-sending conversations mid-session (${fmtPercent(prefixPct)} of ${assistantPctLabel})`,
       advice:
-        "These messages paid full price for context that had already been sent — with no break, compaction, or model switch to explain it. Usually a tool or workflow is restarting or rewriting conversations. Worth a look if it stays high.",
+        "These messages paid full price for context that had already been sent — with no break, compaction, context edit, or model switch to explain it. Usually a tool or workflow is restarting or rewriting conversations. Worth a look if it stays high.",
     });
   }
 
@@ -1985,7 +2726,7 @@ function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodIns
       insights.push({
         kind: "structure",
         stat: fmtPercent(pct),
-        headline: `of your ${raw.auxiliaryCost > 0 ? "assistant-message cost" : "cost"} came from messages with ≥${formatThresholdTokens(CTX_TAX_THRESHOLD)} tokens loaded${cmp}`,
+        headline: `of your ${raw.nonAssistantCost > 0 ? "assistant-message cost" : "cost"} came from messages with ≥${formatThresholdTokens(CTX_TAX_THRESHOLD)} tokens loaded${cmp}`,
         advice: "Long conversations cost more per message. /compact mid-task and /clear between tasks keep them lean.",
       });
     }

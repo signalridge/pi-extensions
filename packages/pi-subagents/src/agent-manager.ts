@@ -11,11 +11,27 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import type { ManagedSpawnRequest as ProtocolManagedSpawnRequest } from "@signalridge/pi-subagents-protocol";
-import { isManagedAgentTier, parseManagedSpawnRequest } from "@signalridge/pi-subagents-protocol";
+import {
+  isManagedAgentTier,
+  parseManagedSpawnRequest,
+} from "@signalridge/pi-subagents-protocol";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import { type AgentTierResolutionSnapshot, getAgentTiersSettings } from "./agent-tiers.js";
+import {
+  type AgentTierResolutionSnapshot,
+  getAgentTiersSettings,
+  resolveAgentTier,
+} from "./agent-tiers.js";
+import { getAgentConfig } from "./agent-types.js";
+import {
+  assertNoRawInheritance,
+  assertSafeChildSession,
+} from "./context-boundary.js";
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
@@ -23,9 +39,22 @@ import {
   type ParentPolicySnapshot,
 } from "./internal-run.js";
 import { assignHandle, handleBase } from "./mention.js";
+import {
+  assertParentModelRuntimeAvailable,
+  parentModelSessionOptions,
+} from "./model-runtime-bridge.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { TierThinking } from "./settings.js";
-import type { AgentInvocation, AgentOwner, AgentRecord, AgentRecordSnapshot, IsolationMode, ResumableAgentEntry, SubagentType, ThinkingLevel } from "./types.js";
+import type {
+  AgentInvocation,
+  AgentOwner,
+  AgentRecord,
+  AgentRecordSnapshot,
+  IsolationMode,
+  ResumableAgentEntry,
+  SubagentType,
+  ThinkingLevel,
+} from "./types.js";
 import { addUsage } from "./usage.js";
 import {
   cleanupWorktree,
@@ -41,8 +70,14 @@ import {
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentCreated = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
-export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
-export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
+export type OnAgentCompact = (
+  record: AgentRecord,
+  info: CompactionInfo,
+) => void;
+export type CompactionInfo = {
+  reason: "manual" | "threshold" | "overflow";
+  tokensBefore: number;
+};
 
 export interface WorktreeCleanupFailure {
   readonly path: string;
@@ -70,6 +105,7 @@ export const DEFAULT_MAX_SUBAGENT_SPAWNS_PER_BRANCH = 64;
 const OWNED_CHILD_QUIESCE_TIMEOUT_MS = 5_000;
 /** Shutdown briefly drains abort-responsive providers; stragglers retain worktrees. */
 const DISPOSE_PROVIDER_QUIESCE_TIMEOUT_MS = 1_000;
+const DISPOSE_SESSION_TEARDOWN_TIMEOUT_MS = 1_000;
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -77,10 +113,14 @@ const DISPOSE_PROVIDER_QUIESCE_TIMEOUT_MS = 1_000;
  * directory — curated errors instead of TypeErrors from path/fs internals
  * (RPC callers send arbitrary JSON: null, numbers, file paths).
  */
-function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | null {
+function assertValidSpawnCwd(
+  cwd: unknown,
+): asserts cwd is string | undefined | null {
   if (cwd == null) return;
   if (typeof cwd !== "string" || !isAbsolute(cwd)) {
-    throw new Error(`SpawnOptions.cwd must be an absolute path: "${String(cwd)}"`);
+    throw new Error(
+      `SpawnOptions.cwd must be an absolute path: "${String(cwd)}"`,
+    );
   }
   let isDirectory = false;
   try {
@@ -102,17 +142,29 @@ function assertValidSpawnCwd(cwd: unknown): asserts cwd is string | undefined | 
  * goes, not how WIDE. A parent's only limit on concurrent children is that each
  * spawn costs it a turn, which is unbounded when max turns is unlimited.
  */
-function occupiesPoolSlot(record: Pick<AgentRecord, "isBackground" | "parentAgentId">): boolean {
+function occupiesPoolSlot(
+  record: Pick<AgentRecord, "isBackground" | "parentAgentId">,
+): boolean {
   return !!record.isBackground && record.parentAgentId === undefined;
 }
 
-
 /** Clone only inert JSON-like data and freeze every level to break aliases. */
-function cloneFrozenData<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
-  if (value === null || value === undefined || typeof value === "string" ||
-    typeof value === "number" || typeof value === "boolean") return value;
-  if (typeof value !== "object") throw new Error("Agent invocation metadata must contain only inert data");
-  if (seen.has(value)) throw new Error("Agent invocation metadata must not be cyclic");
+function cloneFrozenData<T>(
+  value: T,
+  seen: WeakSet<object> = new WeakSet(),
+): T {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  )
+    return value;
+  if (typeof value !== "object")
+    throw new Error("Agent invocation metadata must contain only inert data");
+  if (seen.has(value))
+    throw new Error("Agent invocation metadata must not be cyclic");
   seen.add(value);
   try {
     if (Array.isArray(value)) {
@@ -124,10 +176,13 @@ function cloneFrozenData<T>(value: T, seen: WeakSet<object> = new WeakSet()): T 
     }
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) {
-      throw new Error("Agent invocation metadata must contain only plain objects");
+      throw new Error(
+        "Agent invocation metadata must contain only plain objects",
+      );
     }
     const clone: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) clone[key] = cloneFrozenData(item, seen);
+    for (const [key, item] of Object.entries(value))
+      clone[key] = cloneFrozenData(item, seen);
     return Object.freeze(clone) as T;
   } finally {
     seen.delete(value);
@@ -143,14 +198,24 @@ function cloneFrozenData<T>(value: T, seen: WeakSet<object> = new WeakSet()): T 
 function snapshotAgentRecord(record: AgentRecord): AgentRecordSnapshot {
   const owner = record.owner ? Object.freeze({ ...record.owner }) : undefined;
   const lifetimeUsage = Object.freeze({ ...record.lifetimeUsage });
-  const pendingSteers = record.pendingSteers ? Object.freeze([...record.pendingSteers]) : undefined;
-  const invocation = record.invocation ? cloneFrozenData(record.invocation) : undefined;
-  const worktree = record.worktree ? Object.freeze({ ...record.worktree }) : undefined;
+  const pendingSteers = record.pendingSteers
+    ? Object.freeze([...record.pendingSteers])
+    : undefined;
+  const invocation = record.invocation
+    ? cloneFrozenData(record.invocation)
+    : undefined;
+  const worktree = record.worktree
+    ? Object.freeze({ ...record.worktree })
+    : undefined;
   const worktreeResult = record.worktreeResult
     ? Object.freeze({
         ...record.worktreeResult,
         ...(record.worktreeResult.recoveryCommands
-          ? { recoveryCommands: Object.freeze([...record.worktreeResult.recoveryCommands]) }
+          ? {
+              recoveryCommands: Object.freeze([
+                ...record.worktreeResult.recoveryCommands,
+              ]),
+            }
           : {}),
       })
     : undefined;
@@ -182,7 +247,10 @@ function shellQuote(value: string | undefined): string {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
-function worktreeRecoveryCommands(cwd?: string, path?: string): readonly string[] {
+function worktreeRecoveryCommands(
+  cwd?: string,
+  path?: string,
+): readonly string[] {
   const c = cwd ? shellQuote(cwd) : "'.'";
   const p = path ? shellQuote(path) : "''";
   return Object.freeze([
@@ -191,7 +259,6 @@ function worktreeRecoveryCommands(cwd?: string, path?: string): readonly string[
     `git -C ${c} worktree prune`,
   ]);
 }
-
 
 function sameFilesystemPath(left: string, right: string): boolean {
   if (left === right) return true;
@@ -202,10 +269,15 @@ function sameFilesystemPath(left: string, right: string): boolean {
   }
 }
 
-function cleanupFailureResult(cwd: string, worktree: WorktreeInfo, error: unknown): WorktreeCleanupResult {
-  const reason = `Worktree cleanup threw before reporting an outcome for ${worktree.path}: ${error instanceof Error ? error.message : String(error)}`
-    .replace(/\s+/g, " ")
-    .slice(0, WORKTREE_FAILURE_DIAGNOSTIC_LIMIT);
+function cleanupFailureResult(
+  cwd: string,
+  worktree: WorktreeInfo,
+  error: unknown,
+): WorktreeCleanupResult {
+  const reason =
+    `Worktree cleanup threw before reporting an outcome for ${worktree.path}: ${error instanceof Error ? error.message : String(error)}`
+      .replace(/\s+/g, " ")
+      .slice(0, WORKTREE_FAILURE_DIAGNOSTIC_LIMIT);
   return {
     hasChanges: false,
     path: worktree.path,
@@ -215,8 +287,13 @@ function cleanupFailureResult(cwd: string, worktree: WorktreeInfo, error: unknow
   };
 }
 
-function snapshotCleanupFailure(worktree: WorktreeInfo, result: WorktreeCleanupResult): WorktreeCleanupFailure {
-  const reason = (result.cleanupDiagnostic ?? `Worktree cleanup failed for ${worktree.path}`)
+function snapshotCleanupFailure(
+  worktree: WorktreeInfo,
+  result: WorktreeCleanupResult,
+): WorktreeCleanupFailure {
+  const reason = (
+    result.cleanupDiagnostic ?? `Worktree cleanup failed for ${worktree.path}`
+  )
     .replace(/\s+/g, " ")
     .slice(0, WORKTREE_FAILURE_DIAGNOSTIC_LIMIT);
   const recovery = result.recoveryCommands?.length
@@ -258,7 +335,8 @@ const MANAGED_PERSIST_RETRY_INITIAL_DELAY_MS = 25;
 const MANAGED_PERSIST_RETRY_MAX_DELAY_MS = 2_000;
 const MANAGED_PERSIST_RETRY_MAX_ATTEMPTS = 8;
 
-export type ManagedSpawnState = "queued" | "running" | "completed" | "failed" | "stopped" | "interrupted";
+export type ManagedSpawnState =
+  "queued" | "running" | "completed" | "failed" | "stopped" | "interrupted";
 
 export interface ManagedTerminalSnapshot {
   status: "completed" | "failed" | "stopped" | "interrupted";
@@ -325,35 +403,56 @@ type ManagedRecordStatus = AgentRecord["status"];
 
 type ManagedRequestRecord = Record<string, unknown>;
 
-const MANAGED_OWNER_KEYS = new Set(["extension", "runId", "nodeId", "attemptId"]);
+const MANAGED_OWNER_KEYS = new Set([
+  "extension",
+  "runId",
+  "nodeId",
+  "attemptId",
+]);
 
 function isRecord(value: unknown): value is ManagedRequestRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function boundedManagedString(value: unknown, label: string, max: number): string {
+function boundedManagedString(
+  value: unknown,
+  label: string,
+  max: number,
+): string {
   if (typeof value !== "string") throw new Error(`${label} must be a string`);
   const normalized = value.trim();
   if (!normalized) throw new Error(`${label} must not be empty`);
-  if (normalized.length > max) throw new Error(`${label} exceeds ${max} characters`);
+  if (normalized.length > max)
+    throw new Error(`${label} exceeds ${max} characters`);
   return normalized;
 }
 
-function rejectManagedKeys(value: ManagedRequestRecord, allowed: ReadonlySet<string>, label: string): void {
+function rejectManagedKeys(
+  value: ManagedRequestRecord,
+  allowed: ReadonlySet<string>,
+  label: string,
+): void {
   for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) throw new Error(`${label} contains unsupported field "${key}"`);
+    if (!allowed.has(key))
+      throw new Error(`${label} contains unsupported field "${key}"`);
   }
 }
 
-function normalizeManagedOwner(raw: unknown, requireAttempt = false): AgentOwner {
+function normalizeManagedOwner(
+  raw: unknown,
+  requireAttempt = false,
+): AgentOwner {
   if (!isRecord(raw)) throw new Error("owner must be an object");
   rejectManagedKeys(raw, MANAGED_OWNER_KEYS, "owner");
   const extension = boundedManagedString(raw.extension, "owner.extension", 64);
-  if (extension !== "pi-workflows") throw new Error('owner.extension must be "pi-workflows"');
-  const attemptId = raw.attemptId === undefined
-    ? undefined
-    : boundedManagedString(raw.attemptId, "owner.attemptId", 256);
-  if (requireAttempt && attemptId === undefined) throw new Error("owner.attemptId is required");
+  if (extension !== "pi-workflows")
+    throw new Error('owner.extension must be "pi-workflows"');
+  const attemptId =
+    raw.attemptId === undefined
+      ? undefined
+      : boundedManagedString(raw.attemptId, "owner.attemptId", 256);
+  if (requireAttempt && attemptId === undefined)
+    throw new Error("owner.attemptId is required");
   return {
     extension,
     runId: boundedManagedString(raw.runId, "owner.runId", 256),
@@ -362,30 +461,41 @@ function normalizeManagedOwner(raw: unknown, requireAttempt = false): AgentOwner
   };
 }
 
-function managedFingerprint(request: ManagedSpawnRequest, policyFingerprint?: string): string {
+function managedFingerprint(
+  request: ManagedSpawnRequest,
+  policyFingerprint?: string,
+): string {
   return createHash("sha256")
-    .update(JSON.stringify([
-      request.type,
-      request.prompt,
-      request.description,
-      request.tier,
-      request.toolset,
-      request.excludeTools,
-      request.isolation,
-      request.thread,
-      request.owner.extension,
-      request.owner.runId,
-      request.owner.nodeId,
-      request.owner.attemptId,
-      policyFingerprint,
-    ]))
+    .update(
+      JSON.stringify([
+        request.type,
+        request.prompt,
+        request.description,
+        request.tier,
+        request.toolset,
+        request.excludeTools,
+        request.isolation,
+        request.thread,
+        request.owner.extension,
+        request.owner.runId,
+        request.owner.nodeId,
+        request.owner.attemptId,
+        policyFingerprint,
+      ]),
+    )
     .digest("hex");
 }
 
-
-function currentParentThinkingLevel(pi: ExtensionAPI): ThinkingLevel | undefined {
+function currentParentThinkingLevel(
+  pi: ExtensionAPI,
+): ThinkingLevel | undefined {
   const level = pi.getThinkingLevel?.();
-  return level === "minimal" || level === "low" || level === "medium" || level === "high" || level === "xhigh" || level === "max"
+  return level === "minimal" ||
+    level === "low" ||
+    level === "medium" ||
+    level === "high" ||
+    level === "xhigh" ||
+    level === "max"
     ? level
     : undefined;
 }
@@ -407,27 +517,39 @@ function managedThreadPolicyFingerprint(
   parentThinking: ThinkingLevel | undefined,
 ): string {
   const effectiveTier = request.tier ?? policy.invocation?.agentTier;
-  const profile = effectiveTier ? getAgentTiersSettings().profiles?.[effectiveTier] : undefined;
+  const profile = effectiveTier
+    ? getAgentTiersSettings().profiles?.[effectiveTier]
+    : undefined;
   const inheritedModelIdentity =
-    profile?.model === "inherit" ? { provider: parentModel?.provider, id: parentModel?.id } : undefined;
-  const inheritedThinkingIdentity = profile?.thinking === "inherit" ? parentThinking : undefined;
-  const excludeTools = [...new Set([...(request.excludeTools ?? []), ...(policy.excludeTools ?? [])])].sort();
+    profile?.model === "inherit"
+      ? { provider: parentModel?.provider, id: parentModel?.id }
+      : undefined;
+  const inheritedThinkingIdentity =
+    profile?.thinking === "inherit" ? parentThinking : undefined;
+  const excludeTools = [
+    ...new Set([
+      ...(request.excludeTools ?? []),
+      ...(policy.excludeTools ?? []),
+    ]),
+  ].sort();
   return createHash("sha256")
-    .update(JSON.stringify([
-      request.type,
-      effectiveTier,
-      profile?.model,
-      profile?.thinking,
-      inheritedModelIdentity,
-      inheritedThinkingIdentity,
-      request.toolset ?? policy.toolset,
-      excludeTools,
-      request.isolation ?? policy.isolation,
-      policy.maxTurns,
-      policy.isolated,
-      policy.inheritContext,
-      policy.policyFingerprint,
-    ]))
+    .update(
+      JSON.stringify([
+        request.type,
+        effectiveTier,
+        profile?.model,
+        profile?.thinking,
+        inheritedModelIdentity,
+        inheritedThinkingIdentity,
+        request.toolset ?? policy.toolset,
+        excludeTools,
+        request.isolation ?? policy.isolation,
+        policy.maxTurns,
+        policy.isolated,
+        policy.inheritContext,
+        policy.policyFingerprint,
+      ]),
+    )
     .digest("hex");
 }
 
@@ -439,7 +561,10 @@ function managedThreadPolicyFingerprint(
  * resolves to and invalidates the session it was reusing. A message that only
  * says "policy changed" sends the reader looking in the wrong file.
  */
-function threadPolicyConflictMessage(thread: string, tier: string | undefined): string {
+function threadPolicyConflictMessage(
+  thread: string,
+  tier: string | undefined,
+): string {
   const cause = tier
     ? `Its tier "${tier}", the session model or thinking level that tier inherits, or its tool/isolation policy changed since the thread's last call.`
     : "Its model, thinking, tool, or isolation policy changed since the thread's last call.";
@@ -450,34 +575,64 @@ function threadPolicyConflictMessage(thread: string, tier: string | undefined): 
 }
 
 function isManagedState(value: unknown): value is ManagedSpawnState {
-  return value === "queued" || value === "running" || value === "completed" || value === "failed" || value === "stopped" || value === "interrupted";
+  return (
+    value === "queued" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "stopped" ||
+    value === "interrupted"
+  );
 }
 
-function isManagedTerminalState(value: ManagedSpawnState): value is "completed" | "failed" | "stopped" | "interrupted" {
-  return value === "completed" || value === "failed" || value === "stopped" || value === "interrupted";
+function isManagedTerminalState(
+  value: ManagedSpawnState,
+): value is "completed" | "failed" | "stopped" | "interrupted" {
+  return (
+    value === "completed" ||
+    value === "failed" ||
+    value === "stopped" ||
+    value === "interrupted"
+  );
 }
 
-function capManagedText(value: string | undefined, limit: number): string | undefined {
+function capManagedText(
+  value: string | undefined,
+  limit: number,
+): string | undefined {
   if (!value) return undefined;
   if (value.length <= limit) return value;
   const marker = "\n…[truncated]";
   return `${value.slice(0, Math.max(0, limit - marker.length))}${marker}`;
 }
 
-function cloneManagedTerminal(terminal: ManagedTerminalSnapshot | undefined): ManagedTerminalSnapshot | undefined {
+function cloneManagedTerminal(
+  terminal: ManagedTerminalSnapshot | undefined,
+): ManagedTerminalSnapshot | undefined {
   return terminal ? { ...terminal } : undefined;
 }
 
-function cloneManagedTombstone(tombstone: ManagedSpawnTombstone): ManagedSpawnTombstone {
+function cloneManagedTombstone(
+  tombstone: ManagedSpawnTombstone,
+): ManagedSpawnTombstone {
   return {
     ...tombstone,
     owner: { ...tombstone.owner },
-    ...(tombstone.tierSnapshot ? { tierSnapshot: { ...tombstone.tierSnapshot } } : {}),
+    ...(tombstone.tierSnapshot
+      ? { tierSnapshot: { ...tombstone.tierSnapshot } }
+      : {}),
     terminal: cloneManagedTerminal(tombstone.terminal),
   };
 }
 
-const THINKING_LEVELS = new Set<ThinkingLevel>(["minimal", "low", "medium", "high", "xhigh", "max"]);
+const THINKING_LEVELS = new Set<ThinkingLevel>([
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
 const TIER_SNAPSHOT_KEYS = new Set([
   "tier",
   "source",
@@ -490,29 +645,57 @@ const TIER_SNAPSHOT_KEYS = new Set([
   "diagnostic",
 ]);
 
-function parseTierSnapshot(raw: unknown, tier: string): AgentTierResolutionSnapshot | undefined {
-  if (!isRecord(raw) || raw.tier !== tier || !isManagedAgentTier(tier)) return undefined;
+function parseTierSnapshot(
+  raw: unknown,
+  tier: string,
+): AgentTierResolutionSnapshot | undefined {
+  if (!isRecord(raw) || raw.tier !== tier || !isManagedAgentTier(tier))
+    return undefined;
   try {
     rejectManagedKeys(raw, TIER_SNAPSHOT_KEYS, "tierSnapshot");
     const source = raw.source;
-    if (source !== "call" && source !== "frontmatter" && source !== "default") return undefined;
+    if (source !== "call" && source !== "frontmatter" && source !== "default")
+      return undefined;
     const optionalThinking = (value: unknown): ThinkingLevel | undefined => {
       if (value === undefined) return undefined;
-      return typeof value === "string" && THINKING_LEVELS.has(value as ThinkingLevel)
-        ? value as ThinkingLevel
+      return typeof value === "string" &&
+        THINKING_LEVELS.has(value as ThinkingLevel)
+        ? (value as ThinkingLevel)
         : undefined;
     };
     const thinking = optionalThinking(raw.thinking);
     const requestedThinking = optionalThinking(raw.requestedThinking);
     const configuredThinking = raw.configuredThinking;
-    if (typeof raw.configuredModel !== "string" || !raw.configuredModel.trim() || raw.configuredModel.length > MANAGED_PATH_LIMIT) return undefined;
-    if (typeof configuredThinking !== "string" || ![...THINKING_LEVELS, "inherit"].includes(configuredThinking)) return undefined;
-    if (raw.model !== undefined &&
-      (typeof raw.model !== "string" || !raw.model.trim() || raw.model.length > MANAGED_PATH_LIMIT || !raw.model.includes("/"))) return undefined;
+    if (
+      typeof raw.configuredModel !== "string" ||
+      !raw.configuredModel.trim() ||
+      raw.configuredModel.length > MANAGED_PATH_LIMIT
+    )
+      return undefined;
+    if (
+      typeof configuredThinking !== "string" ||
+      ![...THINKING_LEVELS, "inherit"].includes(configuredThinking)
+    )
+      return undefined;
+    if (
+      raw.model !== undefined &&
+      (typeof raw.model !== "string" ||
+        !raw.model.trim() ||
+        raw.model.length > MANAGED_PATH_LIMIT ||
+        !raw.model.includes("/"))
+    )
+      return undefined;
     if (raw.thinking !== undefined && thinking === undefined) return undefined;
-    if (raw.requestedThinking !== undefined && requestedThinking === undefined) return undefined;
-    if (raw.clamped !== undefined && typeof raw.clamped !== "boolean") return undefined;
-    if (raw.diagnostic !== undefined && (typeof raw.diagnostic !== "string" || raw.diagnostic.length > MANAGED_ERROR_LIMIT)) return undefined;
+    if (raw.requestedThinking !== undefined && requestedThinking === undefined)
+      return undefined;
+    if (raw.clamped !== undefined && typeof raw.clamped !== "boolean")
+      return undefined;
+    if (
+      raw.diagnostic !== undefined &&
+      (typeof raw.diagnostic !== "string" ||
+        raw.diagnostic.length > MANAGED_ERROR_LIMIT)
+    )
+      return undefined;
     return {
       tier,
       source,
@@ -522,14 +705,18 @@ function parseTierSnapshot(raw: unknown, tier: string): AgentTierResolutionSnaps
       configuredThinking: configuredThinking as TierThinking,
       ...(requestedThinking ? { requestedThinking } : {}),
       ...(raw.clamped === true ? { clamped: true } : {}),
-      ...(typeof raw.diagnostic === "string" ? { diagnostic: raw.diagnostic } : {}),
+      ...(typeof raw.diagnostic === "string"
+        ? { diagnostic: raw.diagnostic }
+        : {}),
     };
   } catch {
     return undefined;
   }
 }
 
-function terminalStatusForRecord(status: ManagedRecordStatus): ManagedTerminalSnapshot["status"] | undefined {
+function terminalStatusForRecord(
+  status: ManagedRecordStatus,
+): ManagedTerminalSnapshot["status"] | undefined {
   if (status === "completed" || status === "steered") return "completed";
   if (status === "error" || status === "aborted") return "failed";
   if (status === "stopped") return "stopped";
@@ -543,18 +730,30 @@ function managedSpawnKeyForQuarantine(raw: unknown): string | undefined {
   return key.length > 0 && key.length <= 256 ? key : undefined;
 }
 
-function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined {
-  if (!isRecord(raw) || raw.schemaVersion !== MANAGED_SPAWN_SCHEMA_VERSION) return undefined;
+function parseManagedTombstone(
+  raw: unknown,
+): ManagedSpawnTombstone | undefined {
+  if (!isRecord(raw) || raw.schemaVersion !== MANAGED_SPAWN_SCHEMA_VERSION)
+    return undefined;
   try {
     const state = raw.state;
     if (!isManagedState(state)) return undefined;
     const terminalValue = raw.terminal;
     const persistedCompactionCount = raw.compactionCount;
-    const thread = raw.thread === undefined ? undefined : boundedManagedString(raw.thread, "thread", 128);
-    const threadPolicyFingerprint = raw.threadPolicyFingerprint === undefined
-      ? undefined
-      : boundedManagedString(raw.threadPolicyFingerprint, "threadPolicyFingerprint", 128);
-    if ((thread === undefined) !== (threadPolicyFingerprint === undefined)) return undefined;
+    const thread =
+      raw.thread === undefined
+        ? undefined
+        : boundedManagedString(raw.thread, "thread", 128);
+    const threadPolicyFingerprint =
+      raw.threadPolicyFingerprint === undefined
+        ? undefined
+        : boundedManagedString(
+            raw.threadPolicyFingerprint,
+            "threadPolicyFingerprint",
+            128,
+          );
+    if ((thread === undefined) !== (threadPolicyFingerprint === undefined))
+      return undefined;
     const rawTier = raw.tier;
     if (rawTier !== undefined && !isManagedAgentTier(rawTier)) return undefined;
     const tier = rawTier as string | undefined;
@@ -567,40 +766,108 @@ function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined 
     }
     if (
       typeof persistedCompactionCount !== "undefined" &&
-      (typeof persistedCompactionCount !== "number" || !Number.isInteger(persistedCompactionCount) || persistedCompactionCount < 0)
-    ) return undefined;
+      (typeof persistedCompactionCount !== "number" ||
+        !Number.isInteger(persistedCompactionCount) ||
+        persistedCompactionCount < 0)
+    )
+      return undefined;
     let terminal: ManagedTerminalSnapshot | undefined;
     if (terminalValue !== undefined) {
-      if (!isRecord(terminalValue) || !isManagedTerminalState(terminalValue.status as ManagedSpawnState)) return undefined;
+      if (
+        !isRecord(terminalValue) ||
+        !isManagedTerminalState(terminalValue.status as ManagedSpawnState)
+      )
+        return undefined;
       const completedAt = terminalValue.completedAt;
       const compactionCount = terminalValue.compactionCount;
       if (
-        typeof completedAt !== "number" || !Number.isFinite(completedAt) || completedAt < 0 || completedAt > MANAGED_MAX_TIMESTAMP ||
-        typeof compactionCount !== "number" || !Number.isInteger(compactionCount) || compactionCount < 0
-      ) return undefined;
-      if (typeof terminalValue.tokenCount !== "undefined" &&
-        (typeof terminalValue.tokenCount !== "number" || !Number.isInteger(terminalValue.tokenCount) || terminalValue.tokenCount < 0)) return undefined;
-      if (typeof terminalValue.result !== "undefined" && typeof terminalValue.result !== "string") return undefined;
-      if (typeof terminalValue.error !== "undefined" && typeof terminalValue.error !== "string") return undefined;
-      if (typeof terminalValue.outputFile !== "undefined" && typeof terminalValue.outputFile !== "string") return undefined;
+        typeof completedAt !== "number" ||
+        !Number.isFinite(completedAt) ||
+        completedAt < 0 ||
+        completedAt > MANAGED_MAX_TIMESTAMP ||
+        typeof compactionCount !== "number" ||
+        !Number.isInteger(compactionCount) ||
+        compactionCount < 0
+      )
+        return undefined;
+      if (
+        typeof terminalValue.tokenCount !== "undefined" &&
+        (typeof terminalValue.tokenCount !== "number" ||
+          !Number.isInteger(terminalValue.tokenCount) ||
+          terminalValue.tokenCount < 0)
+      )
+        return undefined;
+      if (
+        typeof terminalValue.result !== "undefined" &&
+        typeof terminalValue.result !== "string"
+      )
+        return undefined;
+      if (
+        typeof terminalValue.error !== "undefined" &&
+        typeof terminalValue.error !== "string"
+      )
+        return undefined;
+      if (
+        typeof terminalValue.outputFile !== "undefined" &&
+        typeof terminalValue.outputFile !== "string"
+      )
+        return undefined;
       terminal = {
         status: terminalValue.status as ManagedTerminalSnapshot["status"],
-        ...(capManagedText(typeof terminalValue.result === "string" ? terminalValue.result : undefined, MANAGED_TEXT_LIMIT) ? { result: capManagedText(terminalValue.result as string, MANAGED_TEXT_LIMIT) } : {}),
-        ...(capManagedText(typeof terminalValue.error === "string" ? terminalValue.error : undefined, MANAGED_ERROR_LIMIT) ? { error: capManagedText(terminalValue.error as string, MANAGED_ERROR_LIMIT) } : {}),
-        ...(typeof terminalValue.outputFile === "string" ? { outputFile: terminalValue.outputFile.slice(0, MANAGED_PATH_LIMIT) } : {}),
-        ...(typeof terminalValue.tokenCount === "number" ? { tokenCount: terminalValue.tokenCount } : {}),
+        ...(capManagedText(
+          typeof terminalValue.result === "string"
+            ? terminalValue.result
+            : undefined,
+          MANAGED_TEXT_LIMIT,
+        )
+          ? {
+              result: capManagedText(
+                terminalValue.result as string,
+                MANAGED_TEXT_LIMIT,
+              ),
+            }
+          : {}),
+        ...(capManagedText(
+          typeof terminalValue.error === "string"
+            ? terminalValue.error
+            : undefined,
+          MANAGED_ERROR_LIMIT,
+        )
+          ? {
+              error: capManagedText(
+                terminalValue.error as string,
+                MANAGED_ERROR_LIMIT,
+              ),
+            }
+          : {}),
+        ...(typeof terminalValue.outputFile === "string"
+          ? {
+              outputFile: terminalValue.outputFile.slice(0, MANAGED_PATH_LIMIT),
+            }
+          : {}),
+        ...(typeof terminalValue.tokenCount === "number"
+          ? { tokenCount: terminalValue.tokenCount }
+          : {}),
         compactionCount,
         completedAt,
       };
     }
-    if (isManagedTerminalState(state) !== (terminal !== undefined)) return undefined;
+    if (isManagedTerminalState(state) !== (terminal !== undefined))
+      return undefined;
     if (terminal && terminal.status !== state) return undefined;
     const createdAt = raw.createdAt;
     const updatedAt = raw.updatedAt;
     if (
-      typeof createdAt !== "number" || !Number.isFinite(createdAt) || createdAt < 0 || createdAt > MANAGED_MAX_TIMESTAMP ||
-      typeof updatedAt !== "number" || !Number.isFinite(updatedAt) || updatedAt < 0 || updatedAt > MANAGED_MAX_TIMESTAMP
-    ) return undefined;
+      typeof createdAt !== "number" ||
+      !Number.isFinite(createdAt) ||
+      createdAt < 0 ||
+      createdAt > MANAGED_MAX_TIMESTAMP ||
+      typeof updatedAt !== "number" ||
+      !Number.isFinite(updatedAt) ||
+      updatedAt < 0 ||
+      updatedAt > MANAGED_MAX_TIMESTAMP
+    )
+      return undefined;
     return {
       schemaVersion: MANAGED_SPAWN_SCHEMA_VERSION,
       spawnKey: boundedManagedString(raw.spawnKey, "spawnKey", 256),
@@ -616,7 +883,10 @@ function parseManagedTombstone(raw: unknown): ManagedSpawnTombstone | undefined 
       state,
       createdAt,
       updatedAt,
-      compactionCount: typeof persistedCompactionCount === "number" ? persistedCompactionCount : terminal?.compactionCount ?? 0,
+      compactionCount:
+        typeof persistedCompactionCount === "number"
+          ? persistedCompactionCount
+          : (terminal?.compactionCount ?? 0),
       terminal,
     };
   } catch {
@@ -672,13 +942,20 @@ export interface SpawnOptions {
   /** Called when the agent session is created (for accessing session stats). */
   onSessionCreated?: (session: AgentSession) => void;
   /** Called after pi-subagents resolves the tier for this spawn; see RunOptions. */
-  onAgentTierResolved?: (snapshot: AgentTierResolutionSnapshot, modelLabel?: string) => void;
+  onAgentTierResolved?: (
+    snapshot: AgentTierResolutionSnapshot,
+    modelLabel?: string,
+  ) => void;
   /** Called synchronously after a new record is allocated, before session creation. */
   onSpawned?: (id: string) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
-  onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  onAssistantUsage?: (usage: {
+    input: number;
+    output: number;
+    cacheWrite: number;
+  }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
   /** Nesting depth: top-level subagent = 1. */
@@ -710,7 +987,14 @@ export interface SpawnOptions {
 /** Internal managed-spawn policy; model/thinking resolution is finalized by runAgent. */
 export type ManagedSpawnPolicy = Pick<
   SpawnOptions,
-  "maxTurns" | "isolated" | "inheritContext" | "isolation" | "invocation" | "rootSessionId" | "toolset" | "excludeTools"
+  | "maxTurns"
+  | "isolated"
+  | "inheritContext"
+  | "isolation"
+  | "invocation"
+  | "rootSessionId"
+  | "toolset"
+  | "excludeTools"
 > & {
   /** In-process identity of the resolved agent definition/tool allowlist for thread reuse. */
   policyFingerprint?: string;
@@ -762,11 +1046,14 @@ export class AgentManager {
   /** Reservation closes the synchronous onSpawned -> same-thread re-entry window. */
   private managedThreadReservations = new Set<string>();
   private managedPersistence?: ManagedSpawnPersistence;
-  private readonly managedPersistenceRetries = new Map<string, {
-    tombstone: ManagedSpawnTombstone;
-    attempt: number;
-    timer?: ReturnType<typeof setTimeout>;
-  }>();
+  private readonly managedPersistenceRetries = new Map<
+    string,
+    {
+      tombstone: ManagedSpawnTombstone;
+      attempt: number;
+      timer?: ReturnType<typeof setTimeout>;
+    }
+  >();
   private maxConcurrent: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
@@ -819,11 +1106,12 @@ export class AgentManager {
   /** Idempotent async manager disposal shared by root shutdown and callers. */
   private disposePromise?: Promise<readonly WorktreeCleanupFailure[]>;
   /** Teardown promise associated with a record that has been quarantined/evicted. */
-  private readonly recordSessionTeardowns = new Map<string, Promise<void>>;
+  private readonly recordSessionTeardowns = new Map<string, Promise<void>>();
   /** Prevent late promise continuations from recreating disposed ownership metadata. */
   private disposed = false;
   /** Immutable diagnostics retained when shutdown cannot remove a worktree. */
-  private worktreeCleanupFailures: readonly WorktreeCleanupFailure[] = Object.freeze([]);
+  private worktreeCleanupFailures: readonly WorktreeCleanupFailure[] =
+    Object.freeze([]);
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -875,7 +1163,10 @@ export class AgentManager {
     return teardown;
   }
 
-  private trackRecordSessionTeardown(id: string, session: AgentSession): Promise<void> {
+  private trackRecordSessionTeardown(
+    id: string,
+    session: AgentSession,
+  ): Promise<void> {
     const teardown = this.trackSessionTeardown(session);
     this.recordSessionTeardowns.set(id, teardown);
     const release = (): void => {
@@ -890,13 +1181,28 @@ export class AgentManager {
     return teardown;
   }
 
-  private async awaitSessionTeardowns(): Promise<void> {
+  private async awaitSessionTeardowns(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
     while (this.sessionTeardowns.size > 0) {
-      await Promise.allSettled([...this.sessionTeardowns]);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const completed = await Promise.race([
+        Promise.allSettled([...this.sessionTeardowns]).then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(
+            () => resolve(false),
+            Math.max(0, deadline - Date.now()),
+          );
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+      if (!completed) return false;
     }
+    return true;
   }
 
-  private async awaitSessionTeardown(session: AgentSession | undefined): Promise<void> {
+  private async awaitSessionTeardown(
+    session: AgentSession | undefined,
+  ): Promise<void> {
     if (!session) return;
     try {
       await this.trackSessionTeardown(session);
@@ -926,7 +1232,8 @@ export class AgentManager {
    * without walking mutable parent links.
    */
   private nestedOwnerValidation(parentId: unknown): string | undefined {
-    if (typeof parentId !== "string" || parentId.length === 0) return "the parent id is missing";
+    if (typeof parentId !== "string" || parentId.length === 0)
+      return "the parent id is missing";
 
     const parent = this.agents.get(parentId);
     if (!parent) return `parent agent "${parentId}" is missing`;
@@ -934,15 +1241,19 @@ export class AgentManager {
     const ownerIds = [parent.id, ...(parent.ancestorAgentIds ?? [])];
     const seen = new Set<string>();
     for (const ownerId of ownerIds) {
-      if (seen.has(ownerId)) return `the parent chain for "${ownerId}" is cyclic`;
+      if (seen.has(ownerId))
+        return `the parent chain for "${ownerId}" is cyclic`;
       seen.add(ownerId);
 
       const record = this.agents.get(ownerId);
       if (!record) return `parent agent "${ownerId}" is missing`;
-      if (this.removingRecords.has(ownerId)) return `parent agent "${ownerId}" is being removed`;
-      if (this.deferredRecordRemovals.has(ownerId)) return `parent agent "${ownerId}" is pending removal`;
+      if (this.removingRecords.has(ownerId))
+        return `parent agent "${ownerId}" is being removed`;
+      if (this.deferredRecordRemovals.has(ownerId))
+        return `parent agent "${ownerId}" is pending removal`;
       if (record.detached) return `parent agent "${ownerId}" is detached`;
-      if (this.nestedSpawnSeals.has(ownerId)) return `parent agent "${ownerId}" is sealed`;
+      if (this.nestedSpawnSeals.has(ownerId))
+        return `parent agent "${ownerId}" is sealed`;
       if (record.status !== "queued" && record.status !== "running") {
         return `parent agent "${ownerId}" is terminal`;
       }
@@ -964,10 +1275,14 @@ export class AgentManager {
 
   /** Validate a nested record's ancestors before a resume can restart it. */
   private canResumeNested(record: AgentRecord): boolean {
-    return !record.detached && !this.removingRecords.has(record.id) &&
+    return (
+      !record.detached &&
+      !this.removingRecords.has(record.id) &&
       !this.settlingRecords.has(record.id) &&
       !this.deferredRecordRemovals.has(record.id) &&
-      (record.parentAgentId === undefined || this.nestedOwnerValidation(record.parentAgentId) === undefined);
+      (record.parentAgentId === undefined ||
+        this.nestedOwnerValidation(record.parentAgentId) === undefined)
+    );
   }
 
   private clearManagedPersistenceRetry(key: string): void {
@@ -978,16 +1293,23 @@ export class AgentManager {
   }
 
   private clearManagedPersistenceRetries(): void {
-    for (const key of this.managedPersistenceRetries.keys()) this.clearManagedPersistenceRetry(key);
+    for (const key of this.managedPersistenceRetries.keys())
+      this.clearManagedPersistenceRetry(key);
   }
 
-  private scheduleManagedPersistenceRetry(tombstone: ManagedSpawnTombstone): void {
+  private scheduleManagedPersistenceRetry(
+    tombstone: ManagedSpawnTombstone,
+  ): void {
     if (this.disposed) return;
     const persistence = this.managedPersistence;
     if (!persistence) return;
     const key = tombstone.spawnKey;
     this.clearManagedPersistenceRetry(key);
-    const pending = { tombstone, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    const pending = {
+      tombstone,
+      attempt: 0,
+      timer: undefined as ReturnType<typeof setTimeout> | undefined,
+    };
     this.managedPersistenceRetries.set(key, pending);
     const attempt = (): void => {
       if (this.managedPersistenceRetries.get(key) !== pending) return;
@@ -1003,12 +1325,15 @@ export class AgentManager {
         pending.attempt += 1;
         if (pending.attempt >= MANAGED_PERSIST_RETRY_MAX_ATTEMPTS) {
           this.managedPersistenceRetries.delete(key);
-          console.warn(`[pi-subagents] managed tombstone persistence retry exhausted for ${key}: ${error instanceof Error ? error.message : String(error)}`);
+          console.warn(
+            `[pi-subagents] managed tombstone persistence retry exhausted for ${key}: ${error instanceof Error ? error.message : String(error)}`,
+          );
           return;
         }
         const delay = Math.min(
           MANAGED_PERSIST_RETRY_MAX_DELAY_MS,
-          MANAGED_PERSIST_RETRY_INITIAL_DELAY_MS * 2 ** Math.min(pending.attempt - 1, 6),
+          MANAGED_PERSIST_RETRY_INITIAL_DELAY_MS *
+            2 ** Math.min(pending.attempt - 1, 6),
         );
         pending.timer = setTimeout(attempt, delay);
         pending.timer.unref?.();
@@ -1017,7 +1342,10 @@ export class AgentManager {
     queueMicrotask(attempt);
   }
 
-  private persistManaged(tombstone: ManagedSpawnTombstone, required = false): void {
+  private persistManaged(
+    tombstone: ManagedSpawnTombstone,
+    required = false,
+  ): void {
     if (!this.managedPersistence) {
       if (required) throw new Error("managed spawn persistence is unavailable");
       return;
@@ -1044,7 +1372,11 @@ export class AgentManager {
     }
   }
 
-  private replaceManagedTombstone(key: string, next: ManagedSpawnTombstone, required = false): void {
+  private replaceManagedTombstone(
+    key: string,
+    next: ManagedSpawnTombstone,
+    required = false,
+  ): void {
     const previous = this.managedSpawns.get(key);
     if (previous && JSON.stringify(previous) === JSON.stringify(next)) return;
     this.clearManagedPersistenceRetry(key);
@@ -1067,36 +1399,56 @@ export class AgentManager {
     const tombstone = this.managedSpawns.get(key);
     if (!tombstone) return;
     const terminalStatus = terminalStatusForRecord(record.status);
-    const state: ManagedSpawnState = terminalStatus ?? (record.status === "queued" ? "queued" : "running");
+    const state: ManagedSpawnState =
+      terminalStatus ?? (record.status === "queued" ? "queued" : "running");
     const compactionCount = Math.max(0, Math.floor(record.compactionCount));
     const terminal = terminalStatus
       ? {
           status: terminalStatus,
-          ...(capManagedText(record.result, MANAGED_TEXT_LIMIT) ? { result: capManagedText(record.result, MANAGED_TEXT_LIMIT) } : {}),
-          ...(capManagedText(record.error, MANAGED_ERROR_LIMIT) ? { error: capManagedText(record.error, MANAGED_ERROR_LIMIT) } : {}),
-          ...(record.outputFile ? { outputFile: record.outputFile.slice(0, MANAGED_PATH_LIMIT) } : {}),
+          ...(capManagedText(record.result, MANAGED_TEXT_LIMIT)
+            ? { result: capManagedText(record.result, MANAGED_TEXT_LIMIT) }
+            : {}),
+          ...(capManagedText(record.error, MANAGED_ERROR_LIMIT)
+            ? { error: capManagedText(record.error, MANAGED_ERROR_LIMIT) }
+            : {}),
+          ...(record.outputFile
+            ? { outputFile: record.outputFile.slice(0, MANAGED_PATH_LIMIT) }
+            : {}),
           ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
-            ? { tokenCount: Math.floor(record.lifetimeUsage.input + record.lifetimeUsage.output) }
+            ? {
+                tokenCount: Math.floor(
+                  record.lifetimeUsage.input + record.lifetimeUsage.output,
+                ),
+              }
             : {}),
           compactionCount,
           completedAt: record.completedAt ?? Date.now(),
         }
       : undefined;
-    this.replaceManagedTombstone(key, {
-      ...tombstone,
-      ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } } : {}),
-      ...(record.invocation?.agentTier !== undefined ? { tier: record.invocation.agentTier } : {}),
-      state,
-      updatedAt: Date.now(),
-      compactionCount,
-      ...(terminal ? { terminal } : { terminal: undefined }),
-    }, required);
+    this.replaceManagedTombstone(
+      key,
+      {
+        ...tombstone,
+        ...(record.invocation?.agentTierSnapshot
+          ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } }
+          : {}),
+        ...(record.invocation?.agentTier !== undefined
+          ? { tier: record.invocation.agentTier }
+          : {}),
+        state,
+        updatedAt: Date.now(),
+        compactionCount,
+        ...(terminal ? { terminal } : { terminal: undefined }),
+      },
+      required,
+    );
   }
 
   private settleMissingManaged(key: string): ManagedSpawnTombstone {
     const tombstone = this.managedSpawns.get(key);
     if (!tombstone) throw new Error(`managed spawn key not found: "${key}"`);
-    if (isManagedTerminalState(tombstone.state) && tombstone.terminal) return tombstone;
+    if (isManagedTerminalState(tombstone.state) && tombstone.terminal)
+      return tombstone;
     const now = Date.now();
     const settled: ManagedSpawnTombstone = {
       ...tombstone,
@@ -1104,7 +1456,8 @@ export class AgentManager {
       updatedAt: now,
       terminal: {
         status: "interrupted",
-        error: "managed agent interrupted: no live AgentSession after session reload",
+        error:
+          "managed agent interrupted: no live AgentSession after session reload",
         compactionCount: tombstone.compactionCount,
         completedAt: now,
       },
@@ -1130,14 +1483,19 @@ export class AgentManager {
       ...(tombstone.tier === undefined ? {} : { tier: tombstone.tier }),
       state: tombstone.state,
       created,
-      ...(tombstone.terminal ? { terminal: cloneManagedTerminal(tombstone.terminal) } : {}),
+      ...(tombstone.terminal
+        ? { terminal: cloneManagedTerminal(tombstone.terminal) }
+        : {}),
     };
   }
 
   private retireLiveManagedKeys(): void {
     for (const [key, tombstone] of this.managedSpawns) {
       const record = this.agents.get(tombstone.id);
-      if (!isManagedTerminalState(tombstone.state) || (record !== undefined && !this.isFullyCleaned(record))) {
+      if (
+        !isManagedTerminalState(tombstone.state) ||
+        (record !== undefined && !this.isFullyCleaned(record))
+      ) {
         // Re-inserting moves an existing key to the end of iteration order, so
         // the eviction below always drops the least recently retired key.
         this.managedRetiredKeys.delete(key);
@@ -1166,7 +1524,11 @@ export class AgentManager {
     this.managedThreadPolicies.clear();
     this.managedThreadReservations.clear();
     for (const entry of entries) {
-      if (entry.type !== "custom" || entry.customType !== MANAGED_SPAWN_ENTRY_TYPE) continue;
+      if (
+        entry.type !== "custom" ||
+        entry.customType !== MANAGED_SPAWN_ENTRY_TYPE
+      )
+        continue;
       const tombstone = parseManagedTombstone(entry.data);
       if (!tombstone) {
         const key = managedSpawnKeyForQuarantine(entry.data);
@@ -1185,18 +1547,28 @@ export class AgentManager {
           // fact for the same key. Otherwise restore order could resurrect a
           // spawn that the clean-break quarantine is meant to reject.
           this.managedSpawns.delete(key);
-          console.warn(`[pi-subagents] quarantined unsupported managed spawn tombstone for ${key}`);
+          console.warn(
+            `[pi-subagents] quarantined unsupported managed spawn tombstone for ${key}`,
+          );
         }
         continue;
       }
-      if (this.managedQuarantinedKeys.has(tombstone.spawnKey) || this.managedRetiredKeys.has(tombstone.spawnKey)) continue;
-      if (options.dropActive && !isManagedTerminalState(tombstone.state)) continue;
+      if (
+        this.managedQuarantinedKeys.has(tombstone.spawnKey) ||
+        this.managedRetiredKeys.has(tombstone.spawnKey)
+      )
+        continue;
+      if (options.dropActive && !isManagedTerminalState(tombstone.state))
+        continue;
       this.managedSpawns.set(tombstone.spawnKey, tombstone);
       this.managedKeysById.set(tombstone.id, tombstone.spawnKey);
       if (tombstone.thread && tombstone.threadPolicyFingerprint) {
         const threadKey = `${tombstone.owner.runId}\u0000${tombstone.thread}`;
         this.managedThreads.set(threadKey, tombstone.id);
-        this.managedThreadPolicies.set(threadKey, tombstone.threadPolicyFingerprint);
+        this.managedThreadPolicies.set(
+          threadKey,
+          tombstone.threadPolicyFingerprint,
+        );
       }
     }
     const recovered: ManagedSpawnTombstone[] = [];
@@ -1218,7 +1590,10 @@ export class AgentManager {
   }
 
   /** Reconcile a spawn whose RPC reply was lost after allocation. */
-  reconcileManaged(spawnKey: string, owner: AgentOwner): ManagedSpawnResult | undefined {
+  reconcileManaged(
+    spawnKey: string,
+    owner: AgentOwner,
+  ): ManagedSpawnResult | undefined {
     const key = spawnKey.trim();
     const tombstone = this.managedSpawns.get(key);
     if (!tombstone) return undefined;
@@ -1227,9 +1602,11 @@ export class AgentManager {
       tombstone.owner.runId !== owner.runId ||
       tombstone.owner.nodeId !== owner.nodeId ||
       tombstone.owner.attemptId !== owner.attemptId
-    ) return undefined;
+    )
+      return undefined;
     const record = this.agents.get(tombstone.id);
-    if (record && (record.status === "queued" || record.status === "running")) this.abortOwned(record.id, owner);
+    if (record && (record.status === "queued" || record.status === "running"))
+      this.abortOwned(record.id, owner);
     return this.managedResult(key);
   }
 
@@ -1262,21 +1639,37 @@ export class AgentManager {
     if (this.disposed) throw new Error("AgentManager is disposed");
 
     if (typeof type !== "string" || !type.trim() || type.length > 256) {
-      throw new Error("Agent type must be a non-empty string of at most 256 characters");
+      throw new Error(
+        "Agent type must be a non-empty string of at most 256 characters",
+      );
     }
     if (typeof prompt !== "string" || prompt.length > 100_000) {
-      throw new Error("Agent prompt must be a string of at most 100000 characters");
+      throw new Error(
+        "Agent prompt must be a string of at most 100000 characters",
+      );
     }
     if (typeof options !== "object" || options === null) {
       throw new Error("Spawn options must be an object");
     }
-    if (options.description !== undefined &&
-      (typeof options.description !== "string" || options.description.length > 1_000)) {
-      throw new Error("Agent description must be a string of at most 1000 characters");
+    if (
+      options.description !== undefined &&
+      (typeof options.description !== "string" ||
+        options.description.length > 1_000)
+    ) {
+      throw new Error(
+        "Agent description must be a string of at most 1000 characters",
+      );
     }
     // Legacy in-process callers omitted description before it became required.
     // Normalize that shape to an inert string while rejecting reference values.
     options = { ...options, description: options.description ?? type };
+    // Covers top-level, nested, managed, and queued spawns before allocating a
+    // record, consuming a branch budget, or creating an isolation worktree.
+    assertNoRawInheritance(
+      internalOverride?.inheritContext ??
+        options.inheritContext ??
+        getAgentConfig(type)?.inheritContext,
+    );
 
     for (const [label, value] of [
       ["isBackground", options.isBackground],
@@ -1297,22 +1690,36 @@ export class AgentManager {
         throw new Error(`${label} must be a non-negative safe integer`);
       }
     }
-    if (options.parentAgentId !== undefined && typeof options.parentAgentId !== "string") {
+    if (
+      options.parentAgentId !== undefined &&
+      typeof options.parentAgentId !== "string"
+    ) {
       throw new Error("parentAgentId must be a string");
     }
-    if (options.rootSessionId !== undefined && typeof options.rootSessionId !== "string") {
+    if (
+      options.rootSessionId !== undefined &&
+      typeof options.rootSessionId !== "string"
+    ) {
       throw new Error("rootSessionId must be a string");
     }
+    // Admission must be synchronous and shape-only: a child can select another
+    // model after this point, but no unsupported host may receive an ID, branch
+    // budget, queue slot, lifecycle event, or transcript before the guard fails.
+    assertParentModelRuntimeAvailable(ctx);
     // Validate the owner capability before cwd checks, ID allocation, lifecycle
     // callbacks, queueing, or worktree creation. A missing/terminal/sealed owner
     // must fail closed without leaving any observable allocation behind.
-    const nestedParent = options.parentAgentId === undefined
-      ? undefined
-      : this.assertNestedOwner(options.parentAgentId);
+    const nestedParent =
+      options.parentAgentId === undefined
+        ? undefined
+        : this.assertNestedOwner(options.parentAgentId);
     // Never trust lineage supplied through public SpawnOptions. It is copied only
     // from the validated live immediate parent, before this record exists.
     const ancestorAgentIds = nestedParent
-      ? Object.freeze([...(nestedParent.ancestorAgentIds ?? []), nestedParent.id])
+      ? Object.freeze([
+          ...(nestedParent.ancestorAgentIds ?? []),
+          nestedParent.id,
+        ])
       : undefined;
 
     // Cumulative spawn budget for the branch. The depth cap bounds how DEEP
@@ -1362,7 +1769,9 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
-      invocation: options.invocation ? cloneFrozenData(options.invocation) : undefined,
+      invocation: options.invocation
+        ? cloneFrozenData(options.invocation)
+        : undefined,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       ...(ancestorAgentIds ? { ancestorAgentIds } : {}),
@@ -1373,22 +1782,44 @@ export class AgentManager {
     // Top-level agents get a mention handle derived from their type. The name
     // space covers live records and resumable entries, so a handle is never
     // allocated twice while its conversation is still reachable.
-    if (options.parentAgentId === undefined && options.reclaimHandle === undefined) {
+    if (
+      options.parentAgentId === undefined &&
+      options.reclaimHandle === undefined
+    ) {
       record.handle = assignHandle(handleBase(type), this.takenHandles());
     } else if (options.reclaimHandle !== undefined) {
       record.handle = options.reclaimHandle;
     }
     this.agents.set(id, record);
     if (!record.detached) {
-      try { this.onCreated?.(record); } catch { /* observer failures cannot orphan a record */ }
-      try { options.onSpawned?.(id); } catch { /* observer failures cannot orphan a record */ }
+      try {
+        this.onCreated?.(record);
+      } catch {
+        /* observer failures cannot orphan a record */
+      }
+      try {
+        options.onSpawned?.(id);
+      } catch {
+        /* observer failures cannot orphan a record */
+      }
     }
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options, internalOverride };
+    const args: SpawnArgs = {
+      pi,
+      ctx,
+      type,
+      prompt,
+      options,
+      internalOverride,
+    };
     // Lifecycle observers may synchronously stop or dispose a freshly allocated
     // record. Do not let the normal queue/start path resurrect that decision.
-    if (this.disposed || this.agents.get(id) !== record || record.detached ||
-      record.status !== (options.isBackground ? "queued" : "running")) {
+    if (
+      this.disposed ||
+      this.agents.get(id) !== record ||
+      record.detached ||
+      record.status !== (options.isBackground ? "queued" : "running")
+    ) {
       return id;
     }
 
@@ -1397,7 +1828,8 @@ export class AgentManager {
     // it only in startAgent loses both cases.
     if (options.signal) {
       const onParentAbort = () => this.abort(id);
-      const cleanup = () => options.signal!.removeEventListener("abort", onParentAbort);
+      const cleanup = () =>
+        options.signal!.removeEventListener("abort", onParentAbort);
       this.parentSignalCleanups.set(id, cleanup);
       if (options.signal.aborted) {
         this.clearParentSignal(id);
@@ -1418,7 +1850,11 @@ export class AgentManager {
       }
     }
 
-    if (occupiesPoolSlot(record) && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    if (
+      occupiesPoolSlot(record) &&
+      !options.bypassQueue &&
+      this.runningBackground >= this.maxConcurrent
+    ) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ kind: "spawn", id, args });
       return id;
@@ -1461,7 +1897,16 @@ export class AgentManager {
     ctx: ExtensionContext,
     request: ManagedSpawnRequest,
     policy: ManagedSpawnPolicy,
-    callbacks?: Pick<SpawnOptions, "onToolActivity" | "onTextDelta" | "onSessionCreated" | "onTurnEnd" | "onAssistantUsage" | "onCompaction" | "onSpawned">,
+    callbacks?: Pick<
+      SpawnOptions,
+      | "onToolActivity"
+      | "onTextDelta"
+      | "onSessionCreated"
+      | "onTurnEnd"
+      | "onAssistantUsage"
+      | "onCompaction"
+      | "onSpawned"
+    >,
   ): ManagedSpawnResult {
     if (this.disposed) throw new Error("AgentManager is disposed");
     const normalized = parseManagedSpawnRequest(request);
@@ -1474,12 +1919,22 @@ export class AgentManager {
     // non-null assertion on a field TypeScript cannot re-narrow across the
     // intervening lookups.
     const thread = normalized.thread;
-    if (thread && (normalized.isolation === "worktree" || policy.isolation === "worktree")) {
-      throw new Error("Managed workflow threads cannot use worktree isolation; use separate calls instead.");
+    if (
+      thread &&
+      (normalized.isolation === "worktree" || policy.isolation === "worktree")
+    ) {
+      throw new Error(
+        "Managed workflow threads cannot use worktree isolation; use separate calls instead.",
+      );
     }
     const scope = normalized.spawnKey;
-    if (this.managedQuarantinedKeys.has(scope) || this.managedRetiredKeys.has(scope)) {
-      throw new Error(`Managed spawn key is quarantined and cannot be reused: "${scope}"`);
+    if (
+      this.managedQuarantinedKeys.has(scope) ||
+      this.managedRetiredKeys.has(scope)
+    ) {
+      throw new Error(
+        `Managed spawn key is quarantined and cannot be reused: "${scope}"`,
+      );
     }
     const parentThinking = currentParentThinkingLevel(pi);
     const parentPolicySnapshot: ParentPolicySnapshot = Object.freeze({
@@ -1499,23 +1954,71 @@ export class AgentManager {
       if (previous.fingerprint !== fingerprint) {
         throw new Error(`Managed spawn key conflict: "${normalized.spawnKey}"`);
       }
-      if (thread && previous.threadPolicyFingerprint !== threadPolicyFingerprint) {
+      if (
+        thread &&
+        previous.threadPolicyFingerprint !== threadPolicyFingerprint
+      ) {
         throw new Error(threadPolicyConflictMessage(thread, identityTier));
       }
       return this.managedResult(scope);
     }
-
-    const threadKey = thread ? `${normalized.owner.runId}\u0000${thread}` : undefined;
-    if (threadKey && this.managedThreadReservations.has(threadKey)) {
-      throw new Error(`Managed workflow thread "${thread}" is already running; calls must be sequential.`);
+    // Existing idempotency keys remain readable even if the host subsequently
+    // loses its runtime. A new key (including a resumed thread) must fail before
+    // any tombstone, reservation, or persistent identity is allocated.
+    assertParentModelRuntimeAvailable(ctx);
+    const agentConfig = getAgentConfig(normalized.type);
+    assertNoRawInheritance(
+      policy.inheritContext ?? agentConfig?.inheritContext,
+    );
+    // A managed key is journaled before the runner starts. Resolve its tier now
+    // so an unavailable selected model cannot poison the key or reserve a thread.
+    // Checking only ctx.model would reject a valid explicit alternate tier.
+    const selected = resolveAgentTier({
+      requestedTier: normalized.tier,
+      requireTier: true,
+      agentConfig,
+      parentModel: parentPolicySnapshot.model,
+      parentThinking: parentPolicySnapshot.thinking,
+      modelRegistry: ctx.modelRegistry,
+    });
+    if (!selected.snapshot) {
+      throw new Error(
+        `No agent tier selected for "${normalized.type}". A managed workflow call must name a tier, ` +
+          "the agent must declare one, or agentTiers must offer a default; " +
+          "inheriting the parent session's model is not a policy this call can fall back to.",
+      );
     }
-    const threadedId = threadKey ? this.managedThreads.get(threadKey) : undefined;
+    parentModelSessionOptions(ctx, selected.model);
+
+    const threadKey = thread
+      ? `${normalized.owner.runId}\u0000${thread}`
+      : undefined;
+    if (threadKey && this.managedThreadReservations.has(threadKey)) {
+      throw new Error(
+        `Managed workflow thread "${thread}" is already running; calls must be sequential.`,
+      );
+    }
+    const threadedId = threadKey
+      ? this.managedThreads.get(threadKey)
+      : undefined;
     if (threadedId && threadKey && thread) {
-      if (threadPolicyFingerprint !== undefined && this.managedThreadPolicies.get(threadKey) !== threadPolicyFingerprint) {
+      if (
+        threadPolicyFingerprint !== undefined &&
+        this.managedThreadPolicies.get(threadKey) !== threadPolicyFingerprint
+      ) {
         throw new Error(threadPolicyConflictMessage(thread, identityTier));
       }
       const record = this.agents.get(threadedId);
-      if (record?.session && record.status !== "running" && record.status !== "queued" && !record.detached) {
+      if (
+        record?.session &&
+        record.status !== "running" &&
+        record.status !== "queued" &&
+        !record.detached
+      ) {
+        assertSafeChildSession(
+          record.session,
+          record.invocation?.inheritContext === true,
+        );
         const previousOwner = record.owner;
         const previousInvocation = record.invocation;
         const previousManagedKey = this.managedKeysById.get(threadedId);
@@ -1524,7 +2027,9 @@ export class AgentManager {
         record.invocation = {
           ...(policy.invocation ?? {}),
           ...(resumedTier === undefined ? {} : { agentTier: resumedTier }),
-          ...(previousInvocation?.agentTierSnapshot ? { agentTierSnapshot: previousInvocation.agentTierSnapshot } : {}),
+          ...(previousInvocation?.agentTierSnapshot
+            ? { agentTierSnapshot: previousInvocation.agentTierSnapshot }
+            : {}),
         };
         const now = Date.now();
         const tombstone: ManagedSpawnTombstone = {
@@ -1542,7 +2047,9 @@ export class AgentManager {
           createdAt: now,
           updatedAt: now,
           compactionCount: record.compactionCount,
-          ...(record.invocation?.agentTierSnapshot ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } } : {}),
+          ...(record.invocation?.agentTierSnapshot
+            ? { tierSnapshot: { ...record.invocation.agentTierSnapshot } }
+            : {}),
         };
         this.clearManagedPersistenceRetry(scope);
         this.managedSpawns.set(scope, tombstone);
@@ -1551,7 +2058,8 @@ export class AgentManager {
           this.persistManaged(tombstone, true);
         } catch (error: unknown) {
           this.managedSpawns.delete(scope);
-          if (previousManagedKey === undefined) this.managedKeysById.delete(threadedId);
+          if (previousManagedKey === undefined)
+            this.managedKeysById.delete(threadedId);
           else this.managedKeysById.set(threadedId, previousManagedKey);
           record.owner = previousOwner;
           record.invocation = previousInvocation;
@@ -1561,7 +2069,9 @@ export class AgentManager {
           isBackground: true,
           onToolActivity: callbacks?.onToolActivity,
           onAssistantUsage: callbacks?.onAssistantUsage,
-          onCompaction: callbacks?.onCompaction ? (info) => callbacks.onCompaction?.(info as CompactionInfo) : undefined,
+          onCompaction: callbacks?.onCompaction
+            ? (info) => callbacks.onCompaction?.(info as CompactionInfo)
+            : undefined,
         }).catch(() => {});
         this.syncManagedRecord(record, true);
         const resumedState = String(record.status);
@@ -1572,8 +2082,14 @@ export class AgentManager {
           created: true,
         };
       }
-      if (record && !record.detached && (record.status === "running" || record.status === "queued")) {
-        throw new Error(`Managed workflow thread "${thread}" is already running; calls must be sequential.`);
+      if (
+        record &&
+        !record.detached &&
+        (record.status === "running" || record.status === "queued")
+      ) {
+        throw new Error(
+          `Managed workflow thread "${thread}" is already running; calls must be sequential.`,
+        );
       }
       if (!record || record.detached || !record.session) {
         this.managedThreads.delete(threadKey!);
@@ -1625,18 +2141,28 @@ export class AgentManager {
     }
 
     try {
-      this.spawnInternal(pi, ctx, normalized.type, normalized.prompt, {
-        ...policy,
-        [INTERNAL_PARENT_POLICY_SNAPSHOT]: parentPolicySnapshot,
-        // A managed workflow must resolve a tier or fail closed; it may not
-        // silently inherit the parent session's model when nobody named one.
-        requireAgentTier: true,
-        ...(normalized.tier === undefined ? {} : { agentTier: normalized.tier }),
-        ...(thread === undefined ? {} : { thread }),
-        description: normalized.description,
-        isBackground: true,
-        ...callbacks,
-      }, normalized.owner, id);
+      this.spawnInternal(
+        pi,
+        ctx,
+        normalized.type,
+        normalized.prompt,
+        {
+          ...policy,
+          [INTERNAL_PARENT_POLICY_SNAPSHOT]: parentPolicySnapshot,
+          // A managed workflow must resolve a tier or fail closed; it may not
+          // silently inherit the parent session's model when nobody named one.
+          requireAgentTier: true,
+          ...(normalized.tier === undefined
+            ? {}
+            : { agentTier: normalized.tier }),
+          ...(thread === undefined ? {} : { thread }),
+          description: normalized.description,
+          isBackground: true,
+          ...callbacks,
+        },
+        normalized.owner,
+        id,
+      );
     } catch (error: unknown) {
       if (threadKey) {
         this.managedThreads.delete(threadKey);
@@ -1644,7 +2170,8 @@ export class AgentManager {
         this.managedThreadReservations.delete(threadKey);
       }
       const existing = this.managedSpawns.get(scope);
-      if (existing?.state === "failed" && existing.terminal) return this.managedResult(scope, true);
+      if (existing?.state === "failed" && existing.terminal)
+        return this.managedResult(scope, true);
       const completedAt = Date.now();
       this.replaceManagedTombstone(scope, {
         ...tombstone,
@@ -1652,7 +2179,10 @@ export class AgentManager {
         updatedAt: completedAt,
         terminal: {
           status: "failed",
-          error: capManagedText(error instanceof Error ? error.message : String(error), MANAGED_ERROR_LIMIT),
+          error: capManagedText(
+            error instanceof Error ? error.message : String(error),
+            MANAGED_ERROR_LIMIT,
+          ),
           compactionCount: 0,
           completedAt,
         },
@@ -1682,8 +2212,13 @@ export class AgentManager {
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
-  private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, options, internalOverride }: SpawnArgs) {
-    if (this.disposed || record.detached || this.agents.get(id) !== record) return;
+  private startAgent(
+    id: string,
+    record: AgentRecord,
+    { pi, ctx, type, prompt, options, internalOverride }: SpawnArgs,
+  ) {
+    if (this.disposed || record.detached || this.agents.get(id) !== record)
+      return;
     // Re-validate a caller-supplied cwd: queued spawns can start minutes after
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
@@ -1703,13 +2238,15 @@ export class AgentManager {
       // Explicit opt-out — no worktree, no check.
     } else if (options.isolation === "worktree") {
       if (!isWorktreeIsolationEnabled()) {
-        throw new Error('Cannot run with isolation: "worktree" — worktree isolation is disabled in project settings. Enable it or omit `isolation`.');
+        throw new Error(
+          'Cannot run with isolation: "worktree" — worktree isolation is disabled in project settings. Enable it or omit `isolation`.',
+        );
       }
       const wt = createWorktree(baseCwd, id);
       if (!wt) {
         throw new Error(
           'Cannot run with isolation: "worktree" — not a git repo, no commits yet, or `git worktree add` failed. ' +
-            'Initialize git and commit at least once, or omit `isolation`.',
+            "Initialize git and commit at least once, or omit `isolation`.",
         );
       }
       record.worktree = wt;
@@ -1725,16 +2262,29 @@ export class AgentManager {
       this.runningBackground++;
     }
     if (!record.detached) {
-      try { this.onStart?.(record); } catch { /* lifecycle observers are best effort */ }
+      try {
+        this.onStart?.(record);
+      } catch {
+        /* lifecycle observers are best effort */
+      }
     }
     // `onStart` can synchronously stop the record (for example, an owner-scoped
     // stop arriving from a lifecycle observer). Do not invoke the runner after
     // that decision, and release the slot acquired above.
-    if (this.disposed || record.detached || this.agents.get(id) !== record || record.status !== "running") {
+    if (
+      this.disposed ||
+      record.detached ||
+      this.agents.get(id) !== record ||
+      record.status !== "running"
+    ) {
       this.clearParentSignal(id);
       this.releasePoolSlot(id);
       if (record.worktree) {
-        this.cleanupRecordWorktree(record, worktreeRepoRoot ?? baseCwd, options.description);
+        this.cleanupRecordWorktree(
+          record,
+          worktreeRepoRoot ?? baseCwd,
+          options.description,
+        );
       }
       return;
     }
@@ -1750,101 +2300,108 @@ export class AgentManager {
     let rawPromise: ReturnType<typeof runAgent>;
     try {
       rawPromise = runAgent(ctx, type, prompt, {
-      pi,
-      agentId: id,
-      model: options.model,
-      maxTurns: options.maxTurns,
-      isolated: internalOverride?.isolated ?? options.isolated,
-      inheritContext: internalOverride?.inheritContext ?? options.inheritContext,
-      ...(internalOverride ? { [INTERNAL_AGENT_CONFIG_OVERRIDE]: internalOverride } : {}),
-      [INTERNAL_PARENT_POLICY_SNAPSHOT]: options[INTERNAL_PARENT_POLICY_SNAPSHOT],
-      thinkingLevel: options.thinkingLevel,
-      agentTier: options.agentTier,
-      requireAgentTier: options.requireAgentTier,
-      // Worktree wins for the working dir (the agent must run in the copy —
-      // which, with a custom cwd, was created from that target). Config stays
-      // with the parent project when a caller-supplied cwd is in play; it must
-      // stay undefined otherwise so plain worktree runs keep resolving config
-      // (incl. relative extension paths and memory) inside the worktree copy.
-      cwd: worktreeCwd ?? customCwd,
-      // Preserve the original repository top-level separately from the
-      // worktree cwd so the child prompt can mark the whole base checkout
-      // off-limits, even when the invocation started in a subdirectory.
-      worktreeBase: worktreeRepoRoot,
-      configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
-      // Top-level conversations persist by default so `@handle` has something
-      // to reopen after the record is evicted; frontmatter still overrides.
-      rememberAgents: this.rememberAgents,
-      supervisorQuestions: this.supervisorQuestions,
-      resumeSessionFile: options.resumeSessionFile,
-      toolset: options.toolset,
-      excludeTools: options.excludeTools,
-      thread: options.thread,
-      signal: record.abortController!.signal,
-      onToolActivity: (activity) => {
-        if (record.detached) return;
-        if (activity.type === "end") record.toolUses++;
-        options.onToolActivity?.(activity);
-      },
-      onTurnEnd: (turnCount) => {
-        if (!record.detached) options.onTurnEnd?.(turnCount);
-      },
-      onTextDelta: (delta, fullText) => {
-        if (!record.detached) options.onTextDelta?.(delta, fullText);
-      },
-      onAssistantUsage: (usage) => {
-        if (record.detached) return;
-        addUsage(record.lifetimeUsage, usage);
-        options.onAssistantUsage?.(usage);
-      },
-      onCompaction: (info) => {
-        if (record.detached) return;
-        record.compactionCount++;
-        this.syncManagedRecord(record);
-        this.onCompact?.(record, info);
-        options.onCompaction?.(info);
-      },
-      nestedRuntime: {
-        manager: this,
-        parentAgentId: id,
-        depth: record.depth ?? 1,
-        maxSubagentDepth: record.maxSubagentDepth,
-      },
-      onAgentTierResolved: (snapshot, modelLabel) => {
-        if (!record.detached) {
-          record.invocation = {
-            ...(record.invocation ?? {}),
-            // The tier owns model and thinking, so it owns their display too —
-            // including clearing a label a caller pre-computed before the tier
-            // resolved. Without this a tiered spawn shows its tier name and no
-            // model at all, even when the profile pins one.
-            modelName: modelLabel,
-            agentTier: snapshot.tier,
-            thinking: snapshot.thinking,
-            agentTierSnapshot: { ...snapshot },
-          };
-          this.syncManagedRecord(record, true);
-          options.onAgentTierResolved?.(snapshot, modelLabel);
-        }
-      },
-      onSessionCreated: (session) => {
-        if (record.detached) {
-          this.trackRecordSessionTeardown(id, session);
-          return;
-        }
-        record.session = session;
-        // Capture the persisted session file so an evicted record can be
-        // reopened as a resumable entry (@handle reopen).
-        record.sessionFile = session.sessionManager?.getSessionFile?.() ?? (session as { sessionFile?: string })?.sessionFile;
-        // Flush any steers that arrived before the session was ready
-        if (record.pendingSteers?.length) {
-          for (const msg of record.pendingSteers) {
-            session.steer(msg).catch(() => {});
+        pi,
+        agentId: id,
+        model: options.model,
+        maxTurns: options.maxTurns,
+        isolated: internalOverride?.isolated ?? options.isolated,
+        inheritContext:
+          internalOverride?.inheritContext ?? options.inheritContext,
+        ...(internalOverride
+          ? { [INTERNAL_AGENT_CONFIG_OVERRIDE]: internalOverride }
+          : {}),
+        [INTERNAL_PARENT_POLICY_SNAPSHOT]:
+          options[INTERNAL_PARENT_POLICY_SNAPSHOT],
+        thinkingLevel: options.thinkingLevel,
+        agentTier: options.agentTier,
+        requireAgentTier: options.requireAgentTier,
+        // Worktree wins for the working dir (the agent must run in the copy —
+        // which, with a custom cwd, was created from that target). Config stays
+        // with the parent project when a caller-supplied cwd is in play; it must
+        // stay undefined otherwise so plain worktree runs keep resolving config
+        // (incl. relative extension paths and memory) inside the worktree copy.
+        cwd: worktreeCwd ?? customCwd,
+        // Preserve the original repository top-level separately from the
+        // worktree cwd so the child prompt can mark the whole base checkout
+        // off-limits, even when the invocation started in a subdirectory.
+        worktreeBase: worktreeRepoRoot,
+        configCwd:
+          options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
+        // Top-level conversations persist by default so `@handle` has something
+        // to reopen after the record is evicted; frontmatter still overrides.
+        rememberAgents: this.rememberAgents,
+        supervisorQuestions: this.supervisorQuestions,
+        resumeSessionFile: options.resumeSessionFile,
+        toolset: options.toolset,
+        excludeTools: options.excludeTools,
+        thread: options.thread,
+        signal: record.abortController!.signal,
+        onToolActivity: (activity) => {
+          if (record.detached) return;
+          if (activity.type === "end") record.toolUses++;
+          options.onToolActivity?.(activity);
+        },
+        onTurnEnd: (turnCount) => {
+          if (!record.detached) options.onTurnEnd?.(turnCount);
+        },
+        onTextDelta: (delta, fullText) => {
+          if (!record.detached) options.onTextDelta?.(delta, fullText);
+        },
+        onAssistantUsage: (usage) => {
+          if (record.detached) return;
+          addUsage(record.lifetimeUsage, usage);
+          options.onAssistantUsage?.(usage);
+        },
+        onCompaction: (info) => {
+          if (record.detached) return;
+          record.compactionCount++;
+          this.syncManagedRecord(record);
+          this.onCompact?.(record, info);
+          options.onCompaction?.(info);
+        },
+        nestedRuntime: {
+          manager: this,
+          parentAgentId: id,
+          depth: record.depth ?? 1,
+          maxSubagentDepth: record.maxSubagentDepth,
+        },
+        onAgentTierResolved: (snapshot, modelLabel) => {
+          if (!record.detached) {
+            record.invocation = {
+              ...(record.invocation ?? {}),
+              // The tier owns model and thinking, so it owns their display too —
+              // including clearing a label a caller pre-computed before the tier
+              // resolved. Without this a tiered spawn shows its tier name and no
+              // model at all, even when the profile pins one.
+              modelName: modelLabel,
+              agentTier: snapshot.tier,
+              thinking: snapshot.thinking,
+              agentTierSnapshot: { ...snapshot },
+            };
+            this.syncManagedRecord(record, true);
+            options.onAgentTierResolved?.(snapshot, modelLabel);
           }
-          record.pendingSteers = undefined;
-        }
-        options.onSessionCreated?.(session);
-      },
+        },
+        onSessionCreated: (session) => {
+          if (record.detached) {
+            this.trackRecordSessionTeardown(id, session);
+            return;
+          }
+          record.session = session;
+          // Capture the persisted session file so an evicted record can be
+          // reopened as a resumable entry (@handle reopen).
+          record.sessionFile =
+            session.sessionManager?.getSessionFile?.() ??
+            (session as { sessionFile?: string })?.sessionFile;
+          // Flush any steers that arrived before the session was ready
+          if (record.pendingSteers?.length) {
+            for (const msg of record.pendingSteers) {
+              session.steer(msg).catch(() => {});
+            }
+            record.pendingSteers = undefined;
+          }
+          options.onSessionCreated?.(session);
+        },
       });
     } catch (error) {
       this.settlingRecords.delete(id);
@@ -1858,10 +2415,18 @@ export class AgentManager {
       }
       const cleanupFailedStartWorktree = (): void => {
         if (this.disposed || !record.worktree) return;
-        this.cleanupRecordWorktree(record, worktreeRepoRoot ?? baseCwd, options.description);
+        this.cleanupRecordWorktree(
+          record,
+          worktreeRepoRoot ?? baseCwd,
+          options.description,
+        );
         this.retryDeferredRecordRemovals();
       };
-      if (sessionTeardown) void sessionTeardown.then(cleanupFailedStartWorktree, cleanupFailedStartWorktree);
+      if (sessionTeardown)
+        void sessionTeardown.then(
+          cleanupFailedStartWorktree,
+          cleanupFailedStartWorktree,
+        );
       else cleanupFailedStartWorktree();
       throw error;
     }
@@ -1896,7 +2461,11 @@ export class AgentManager {
 
         // Final flush of streaming output file
         if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
+          try {
+            record.outputCleanup();
+          } catch {
+            /* ignore */
+          }
           record.outputCleanup = undefined;
         }
 
@@ -1918,7 +2487,9 @@ export class AgentManager {
         // undefined output or session.
         record.result = responseText;
         record.session = session;
-        record.sessionFile = session.sessionManager?.getSessionFile?.() ?? (session as { sessionFile?: string })?.sessionFile;
+        record.sessionFile =
+          session.sessionManager?.getSessionFile?.() ??
+          (session as { sessionFile?: string })?.sessionFile;
         this.syncManagedRecord(record);
 
         // Quiesce descendants before removing the parent's worktree. A nested
@@ -1939,14 +2510,19 @@ export class AgentManager {
         if (record.worktree) {
           worktreeResult = this.hasIncompleteRepoDependency(record)
             ? this.blockedWorktreeCleanup(record)
-            : this.cleanupRecordWorktree(record, worktreeRepoRoot ?? baseCwd, options.description);
+            : this.cleanupRecordWorktree(
+                record,
+                worktreeRepoRoot ?? baseCwd,
+                options.description,
+              );
         }
         if (worktreeResult?.hasChanges && worktreeResult.branch) {
           // With a caller-supplied cwd the branch lives in THAT repo, not the
           // parent session's — say so, or the orchestrator merges in the wrong repo.
-          const repoNote = worktreeRepoRoot ? ` in \`${worktreeRepoRoot}\`` : "";
-          record.result +=
-            `\n\n---\nChanges saved to branch \`${worktreeResult.branch}\`${repoNote}. Merge with: \`git merge ${worktreeResult.branch}\`${worktreeRepoRoot ? ` (run in \`${worktreeRepoRoot}\`)` : ""}`;
+          const repoNote = worktreeRepoRoot
+            ? ` in \`${worktreeRepoRoot}\``
+            : "";
+          record.result += `\n\n---\nChanges saved to branch \`${worktreeResult.branch}\`${repoNote}. Merge with: \`git merge ${worktreeResult.branch}\`${worktreeRepoRoot ? ` (run in \`${worktreeRepoRoot}\`)` : ""}`;
         }
         if (worktreeResult && !worktreeResult.cleanupSucceeded) {
           record.result +=
@@ -1989,7 +2565,11 @@ export class AgentManager {
 
         // Final flush of streaming output file on error
         if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
+          try {
+            record.outputCleanup();
+          } catch {
+            /* ignore */
+          }
           record.outputCleanup = undefined;
         }
 
@@ -2008,7 +2588,11 @@ export class AgentManager {
         }
 
         if (record.worktree && !this.hasIncompleteRepoDependency(record)) {
-          this.cleanupRecordWorktree(record, worktreeRepoRoot ?? baseCwd, options.description);
+          this.cleanupRecordWorktree(
+            record,
+            worktreeRepoRoot ?? baseCwd,
+            options.description,
+          );
         }
 
         if (record.detached) {
@@ -2048,7 +2632,11 @@ export class AgentManager {
     // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
     // Used by spawnAndWait to set up output files before streaming starts.
     if (!this.agents.get(id)?.detached) {
-      try { this.onSpawned?.(id); } catch { /* observer failures cannot reject the run */ }
+      try {
+        this.onSpawned?.(id);
+      } catch {
+        /* observer failures cannot reject the run */
+      }
     }
   }
 
@@ -2075,17 +2663,22 @@ export class AgentManager {
     // Direct parent links are only an optimization for live records. Immutable
     // lineage is authoritative, so a grandchild remains discoverable after its
     // intermediate owner has been evicted.
-    const descendants = this.descendantsOf(parentId)
-      .sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
+    const descendants = this.descendantsOf(parentId).sort(
+      (left, right) => this.recordDepth(right) - this.recordDepth(left),
+    );
     for (const record of descendants) this.sealNestedSpawns(record.id);
 
     const active = descendants.filter((record) => !this.isFullyCleaned(record));
     for (const record of active) this.abortRecord(record.id, false);
     this.drainQueue();
 
-    const quiesced = active.length > 0
-      ? await this.waitForTerminalRecords(active, OWNED_CHILD_QUIESCE_TIMEOUT_MS)
-      : { settled: true, pending: [] as string[] };
+    const quiesced =
+      active.length > 0
+        ? await this.waitForTerminalRecords(
+            active,
+            OWNED_CHILD_QUIESCE_TIMEOUT_MS,
+          )
+        : { settled: true, pending: [] as string[] };
     if (quiesced.pending.length === 0) {
       this.retryDeferredRecordRemovals();
       return;
@@ -2103,14 +2696,20 @@ export class AgentManager {
       this.queue = [];
       return;
     }
-    while (this.queue.length > 0 && this.runningBackground < this.maxConcurrent) {
+    while (
+      this.queue.length > 0 &&
+      this.runningBackground < this.maxConcurrent
+    ) {
       const next = this.queue.shift()!;
       const record = this.agents.get(next.id);
       if (record?.status !== "queued") continue;
       // A queued nested record can survive only while its immutable owner branch
       // remains live. Never start one whose owner was sealed/removed while it
       // waited in the queue.
-      if (record.parentAgentId !== undefined && this.nestedOwnerValidation(record.parentAgentId) !== undefined) {
+      if (
+        record.parentAgentId !== undefined &&
+        this.nestedOwnerValidation(record.parentAgentId) !== undefined
+      ) {
         this.abortRecord(record.id, false);
         continue;
       }
@@ -2146,7 +2745,7 @@ export class AgentManager {
         this.clearParentSignal(record.id);
         this.releasePoolSlot(record.id);
         this.syncManagedRecord(record);
-        this.notifyComplete(record)
+        this.notifyComplete(record);
       }
     }
   }
@@ -2195,7 +2794,12 @@ export class AgentManager {
       ctx,
       type,
       prompt,
-      { ...options, isolated: true, isolation: undefined, inheritContext: false },
+      {
+        ...options,
+        isolated: true,
+        isolation: undefined,
+        inheritContext: false,
+      },
       onSpawned,
       internalOverride,
     );
@@ -2240,21 +2844,28 @@ export class AgentManager {
     return {
       status: record.status,
       startedAt: record.startedAt,
-      ...(record.completedAt === undefined ? {} : { completedAt: record.completedAt }),
+      ...(record.completedAt === undefined
+        ? {}
+        : { completedAt: record.completedAt }),
       ...(record.result === undefined ? {} : { result: record.result }),
       ...(record.error === undefined ? {} : { error: record.error }),
-      ...(record.invocation ? { invocation: cloneFrozenData(record.invocation) as AgentInvocation } : {}),
+      ...(record.invocation
+        ? { invocation: cloneFrozenData(record.invocation) as AgentInvocation }
+        : {}),
     };
   }
 
-  private restoreResumeSnapshot(record: AgentRecord, snapshot: ResumeTerminalSnapshot): void {
+  private restoreResumeSnapshot(
+    record: AgentRecord,
+    snapshot: ResumeTerminalSnapshot,
+  ): void {
     record.status = snapshot.status;
     record.startedAt = snapshot.startedAt;
     record.completedAt = snapshot.completedAt;
     record.result = snapshot.result;
     record.error = snapshot.error;
     record.invocation = snapshot.invocation
-      ? cloneFrozenData(snapshot.invocation) as AgentInvocation
+      ? (cloneFrozenData(snapshot.invocation) as AgentInvocation)
       : undefined;
   }
 
@@ -2269,14 +2880,22 @@ export class AgentManager {
     let control!: ResumeControl;
     const onAbort = (): void => {
       controller.abort(signal?.reason);
-      if (record.status === "queued" || record.status === "running") this.abort(id);
+      if (record.status === "queued" || record.status === "running")
+        this.abort(id);
     };
     const cleanup = (): void => {
       signal?.removeEventListener("abort", onAbort);
-      if (this.resumeControls.get(id) === control) this.resumeControls.delete(id);
-      if (record.abortController === controller) record.abortController = undefined;
+      if (this.resumeControls.get(id) === control)
+        this.resumeControls.delete(id);
+      if (record.abortController === controller)
+        record.abortController = undefined;
     };
-    control = { controller, cleanup, snapshot, ...(deferred ? { deferred } : {}) };
+    control = {
+      controller,
+      cleanup,
+      snapshot,
+      ...(deferred ? { deferred } : {}),
+    };
     this.resumeControls.set(id, control);
     record.abortController = controller;
     if (signal) {
@@ -2303,8 +2922,15 @@ export class AgentManager {
     signal?: AbortSignal,
     options?: {
       isBackground?: boolean;
-      onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
-      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+      onToolActivity?: (activity: {
+        type: "start" | "end";
+        toolName: string;
+      }) => void;
+      onAssistantUsage?: (usage: {
+        input: number;
+        output: number;
+        cacheWrite: number;
+      }) => void;
       onCompaction?: (info: unknown) => void;
       /** Called once a queued background resume has acquired its run slot. */
       onStarted?: () => void;
@@ -2315,8 +2941,17 @@ export class AgentManager {
     if (!record) return undefined;
     if (!this.canResumeNested(record)) return undefined;
     if (signal?.aborted) return record;
-    if (this.resumeControls.has(id) || record.status === "running" || record.status === "queued") return undefined;
+    if (
+      this.resumeControls.has(id) ||
+      record.status === "running" ||
+      record.status === "queued"
+    )
+      return undefined;
     if (!record.session) return undefined;
+    assertSafeChildSession(
+      record.session,
+      record.invocation?.inheritContext === true,
+    );
 
     const snapshot = this.resumeSnapshot(record);
     if (options?.isBackground) {
@@ -2342,13 +2977,20 @@ export class AgentManager {
       record.promise = lifecyclePromise;
 
       const start = (): void => {
-        const execution = this.startResume(id, record, prompt, control, options);
+        const execution = this.startResume(
+          id,
+          record,
+          prompt,
+          control,
+          options,
+        );
         record.promise = execution;
-        void execution
-          .then(resolveResume, rejectResume)
-          .catch(() => {});
+        void execution.then(resolveResume, rejectResume).catch(() => {});
       };
-      if (occupiesPoolSlot(record) && this.runningBackground >= this.maxConcurrent) {
+      if (
+        occupiesPoolSlot(record) &&
+        this.runningBackground >= this.maxConcurrent
+      ) {
         this.queue.push({ kind: "resume", id, start });
       } else {
         start();
@@ -2379,16 +3021,24 @@ export class AgentManager {
         },
         signal: control.controller.signal,
       });
-      if (!record.detached && !control.controller.signal.aborted && (record.status as AgentRecord["status"]) !== "stopped") {
+      if (
+        !record.detached &&
+        !control.controller.signal.aborted &&
+        (record.status as AgentRecord["status"]) !== "stopped"
+      ) {
         record.status = failure ? "error" : "completed";
         if (failure) record.error = failure;
         record.result = text;
         record.completedAt = Date.now();
       }
     } catch (err) {
-      if (!record.detached && (record.status as AgentRecord["status"]) !== "stopped") {
+      if (
+        !record.detached &&
+        (record.status as AgentRecord["status"]) !== "stopped"
+      ) {
         record.status = control.controller.signal.aborted ? "stopped" : "error";
-        if (record.status === "error") record.error = err instanceof Error ? err.message : String(err);
+        if (record.status === "error")
+          record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
       }
     } finally {
@@ -2423,8 +3073,15 @@ export class AgentManager {
     control: ResumeControl,
     options?: {
       isBackground?: boolean;
-      onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
-      onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+      onToolActivity?: (activity: {
+        type: "start" | "end";
+        toolName: string;
+      }) => void;
+      onAssistantUsage?: (usage: {
+        input: number;
+        output: number;
+        cacheWrite: number;
+      }) => void;
       onCompaction?: (info: unknown) => void;
       /** Called once a queued background resume has acquired its run slot. */
       onStarted?: () => void;
@@ -2499,16 +3156,26 @@ export class AgentManager {
           },
           signal: control.controller.signal,
         });
-        if (!record.detached && !control.controller.signal.aborted && (record.status as AgentRecord["status"]) !== "stopped") {
+        if (
+          !record.detached &&
+          !control.controller.signal.aborted &&
+          (record.status as AgentRecord["status"]) !== "stopped"
+        ) {
           record.status = failure ? "error" : "completed";
           if (failure) record.error = failure;
           record.result = text;
           record.completedAt = Date.now();
         }
       } catch (err) {
-        if (!record.detached && (record.status as AgentRecord["status"]) !== "stopped") {
-          record.status = control.controller.signal.aborted ? "stopped" : "error";
-          if (record.status === "error") record.error = err instanceof Error ? err.message : String(err);
+        if (
+          !record.detached &&
+          (record.status as AgentRecord["status"]) !== "stopped"
+        ) {
+          record.status = control.controller.signal.aborted
+            ? "stopped"
+            : "error";
+          if (record.status === "error")
+            record.error = err instanceof Error ? err.message : String(err);
           record.completedAt = Date.now();
         }
       }
@@ -2559,7 +3226,7 @@ export class AgentManager {
     return true;
   }
 
-/**
+  /**
    * Return an immutable observation snapshot. Internal manager/index code must
    * use `getRecordMutable()` when it needs to update authoritative state.
    */
@@ -2576,7 +3243,6 @@ export class AgentManager {
   getRecordMutable(id: string): AgentRecord | undefined {
     return this.agents.get(id);
   }
-
 
   /** Internal live list for this extension's UI and lifecycle wiring. */
   listAgentsMutable(): AgentRecord[] {
@@ -2597,7 +3263,7 @@ export class AgentManager {
 
     // Remove from queue if queued.
     if (record.status === "queued") {
-      this.queue = this.queue.filter(q => q.id !== id);
+      this.queue = this.queue.filter((q) => q.id !== id);
       record.status = "stopped";
       record.completedAt = Date.now();
       this.clearParentSignal(record.id);
@@ -2610,7 +3276,11 @@ export class AgentManager {
       this.syncManagedRecord(record);
       // Queued agents have no run promise yet. Still use the normal terminal
       // callback so lifecycle consumers (including workflow waits) cannot hang.
-      try { this.notifyComplete(record) } catch { /* ignore side-effect errors */ }
+      try {
+        this.notifyComplete(record);
+      } catch {
+        /* ignore side-effect errors */
+      }
       if (drain) this.drainQueue();
       return true;
     }
@@ -2635,7 +3305,9 @@ export class AgentManager {
     if (!record) return false;
 
     const descendants = this.descendantsOf(id);
-    const hasActiveDescendant = descendants.some((child) => !this.isFullyCleaned(child));
+    const hasActiveDescendant = descendants.some(
+      (child) => !this.isFullyCleaned(child),
+    );
     const isActive = record.status === "queued" || record.status === "running";
     if (!isActive && !hasActiveDescendant) return false;
 
@@ -2666,37 +3338,52 @@ export class AgentManager {
   }
 
   private descendantsOf(rootId: string): AgentRecord[] {
-    return [...this.agents.values()]
-      .filter((record) => record.id !== rootId && record.ancestorAgentIds?.includes(rootId) === true);
+    return [...this.agents.values()].filter(
+      (record) =>
+        record.id !== rootId &&
+        record.ancestorAgentIds?.includes(rootId) === true,
+    );
   }
 
   private hasIncompleteRepoDependency(record: AgentRecord): boolean {
     const worktreePath = record.worktree?.path;
     if (!worktreePath) return false;
-    return this.descendantsOf(record.id).some((child) =>
-      !this.isFullyCleaned(child) &&
-      // Isolated children depend on the checkout they were created from. A
-      // non-isolated nested child has no worktree record and may execute in any
-      // ancestor checkout, so retaining the ancestor is the fail-closed choice.
-      ((child.worktree !== undefined && sameFilesystemPath(child.worktree.repoRoot, worktreePath)) ||
-        child.worktree === undefined),
+    return this.descendantsOf(record.id).some(
+      (child) =>
+        !this.isFullyCleaned(child) &&
+        // Isolated children depend on the checkout they were created from. A
+        // non-isolated nested child has no worktree record and may execute in any
+        // ancestor checkout, so retaining the ancestor is the fail-closed choice.
+        ((child.worktree !== undefined &&
+          sameFilesystemPath(child.worktree.repoRoot, worktreePath)) ||
+          child.worktree === undefined),
     );
   }
 
-  private blockedWorktreeCleanup(record: AgentRecord, diagnostic?: string): WorktreeCleanupResult | undefined {
+  private blockedWorktreeCleanup(
+    record: AgentRecord,
+    diagnostic?: string,
+  ): WorktreeCleanupResult | undefined {
     const worktree = record.worktree;
     if (!worktree) return undefined;
-    const dependent = this.descendantsOf(record.id).find((child) =>
-      !this.isFullyCleaned(child) &&
-      ((child.worktree !== undefined && sameFilesystemPath(child.worktree.repoRoot, worktree.path)) ||
-        child.worktree === undefined),
+    const dependent = this.descendantsOf(record.id).find(
+      (child) =>
+        !this.isFullyCleaned(child) &&
+        ((child.worktree !== undefined &&
+          sameFilesystemPath(child.worktree.repoRoot, worktree.path)) ||
+          child.worktree === undefined),
     );
     const result: WorktreeCleanupResult = {
       hasChanges: false,
       path: worktree.path,
       cleanupSucceeded: false,
-      cleanupDiagnostic: diagnostic ?? `Worktree cleanup is pinned because descendant ${dependent?.id ?? "agent"} still depends on ${worktree.path}`,
-      recoveryCommands: worktreeRecoveryCommands(worktree.repoRoot, worktree.path),
+      cleanupDiagnostic:
+        diagnostic ??
+        `Worktree cleanup is pinned because descendant ${dependent?.id ?? "agent"} still depends on ${worktree.path}`,
+      recoveryCommands: worktreeRecoveryCommands(
+        worktree.repoRoot,
+        worktree.path,
+      ),
     };
     record.worktreeResult = result;
     return result;
@@ -2706,15 +3393,21 @@ export class AgentManager {
     // A quarantined record remains non-quiescent until its provider promise,
     // worktree cleanup, transcript cleanup, and session teardown all finish.
     // Terminal status alone is never proof that the branch is safe to replace.
-    return record.status !== "queued" && record.status !== "running" &&
+    return (
+      record.status !== "queued" &&
+      record.status !== "running" &&
       !this.settlingRecords.has(record.id) &&
+      !this.providerPendingRecords.has(record.id) &&
       !this.recordSessionTeardowns.has(record.id) &&
-      record.worktree === undefined && record.outputCleanup === undefined;
+      record.worktree === undefined &&
+      record.outputCleanup === undefined
+    );
   }
 
   private abortDescendantsSynchronously(rootId: string): void {
-    const descendants = this.descendantsOf(rootId)
-      .sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
+    const descendants = this.descendantsOf(rootId).sort(
+      (left, right) => this.recordDepth(right) - this.recordDepth(left),
+    );
     for (const child of descendants) this.sealNestedSpawns(child.id);
     for (const child of descendants) this.abortRecord(child.id, false);
     this.drainQueue();
@@ -2724,8 +3417,8 @@ export class AgentManager {
     if (this.disposed) return;
     for (const id of this.nestedSpawnSeals) {
       if (this.removingRecords.has(id) || this.agents.has(id)) continue;
-      const stillReferenced = [...this.agents.values()].some((record) =>
-        record.ancestorAgentIds?.includes(id) === true,
+      const stillReferenced = [...this.agents.values()].some(
+        (record) => record.ancestorAgentIds?.includes(id) === true,
       );
       if (!stillReferenced) this.nestedSpawnSeals.delete(id);
     }
@@ -2744,19 +3437,21 @@ export class AgentManager {
   private retryPinnedWorktreeCleanup(): void {
     if (this.disposed) return;
     const records = [...this.agents.values()]
-      .filter((record) =>
-        record.status !== "queued" && record.status !== "running" &&
-        record.worktree &&
-        !this.recordSessionTeardowns.has(record.id) &&
-        !this.settlingRecords.has(record.id),
+      .filter(
+        (record) =>
+          record.status !== "queued" &&
+          record.status !== "running" &&
+          record.worktree &&
+          !this.recordSessionTeardowns.has(record.id) &&
+          !this.settlingRecords.has(record.id),
       )
       .sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
     for (const record of records) {
-      if (this.hasIncompleteRepoDependency(record)) this.blockedWorktreeCleanup(record);
+      if (this.hasIncompleteRepoDependency(record))
+        this.blockedWorktreeCleanup(record);
       else this.cleanupDetachedWorktree(record);
     }
   }
-
 
   private retryDeferredRecordRemovals(): void {
     if (this.disposed || this.deferredRecordRemovals.size === 0) {
@@ -2790,7 +3485,9 @@ export class AgentManager {
     // invoke extension callbacks, and those callbacks must not reopen this owner.
     this.sealNestedSpawns(id);
     this.abortDescendantsSynchronously(id);
-    const blockedByDescendant = this.descendantsOf(id).some((child) => !this.isFullyCleaned(child));
+    const blockedByDescendant = this.descendantsOf(id).some(
+      (child) => !this.isFullyCleaned(child),
+    );
     if (!this.isFullyCleaned(record) || blockedByDescendant) {
       // Synchronous cleanup cannot await provider quiescence. Leave the owner
       // visible and retry after descendant settlement or on the next interval.
@@ -2803,7 +3500,11 @@ export class AgentManager {
     this.removingRecords.add(id);
     try {
       if (record.outputCleanup) {
-        try { record.outputCleanup(); } catch { /* ignore stale transcript cleanup errors */ }
+        try {
+          record.outputCleanup();
+        } catch {
+          /* ignore stale transcript cleanup errors */
+        }
         record.outputCleanup = undefined;
       }
       this.indexResumable(record);
@@ -2851,7 +3552,8 @@ export class AgentManager {
     while (this.resumable.size > MAX_RESUMABLE_ENTRIES) {
       let oldest: ResumableAgentEntry | undefined;
       for (const candidate of this.resumable.values()) {
-        if (!oldest || candidate.completedAt <= oldest.completedAt) oldest = candidate;
+        if (!oldest || candidate.completedAt <= oldest.completedAt)
+          oldest = candidate;
       }
       if (!oldest) break;
       this.resumable.delete(oldest.handle);
@@ -2881,11 +3583,17 @@ export class AgentManager {
    * time), so both can hold the same handle at once — and while a record is
    * live, it is the one the user means.
    */
-  resolveMention(handle: string): { kind: "live"; record: AgentRecord } | { kind: "resumable"; entry: ResumableAgentEntry } | undefined {
+  resolveMention(
+    handle: string,
+  ):
+    | { kind: "live"; record: AgentRecord }
+    | { kind: "resumable"; entry: ResumableAgentEntry }
+    | undefined {
     const wanted = handle.toLowerCase();
     for (const record of this.agents.values()) {
       if (record.detached) continue;
-      if (record.handle?.toLowerCase() === wanted || record.id === handle) return { kind: "live", record };
+      if (record.handle?.toLowerCase() === wanted || record.id === handle)
+        return { kind: "live", record };
     }
     const entry = this.getResumable(handle);
     return entry ? { kind: "resumable", entry } : undefined;
@@ -2895,14 +3603,17 @@ export class AgentManager {
   getResumable(name: string): ResumableAgentEntry | undefined {
     const wanted = name.toLowerCase();
     for (const entry of this.resumable.values()) {
-      if (entry.handle.toLowerCase() === wanted || entry.id === name) return entry;
+      if (entry.handle.toLowerCase() === wanted || entry.id === name)
+        return entry;
     }
     return undefined;
   }
 
   /** Evicted agents whose conversation can still be reopened, newest first. */
   listResumable(): ResumableAgentEntry[] {
-    return [...this.resumable.values()].sort((a, b) => b.completedAt - a.completedAt);
+    return [...this.resumable.values()].sort(
+      (a, b) => b.completedAt - a.completedAt,
+    );
   }
 
   /** Forget an evicted agent, by handle or id. */
@@ -2961,7 +3672,7 @@ export class AgentManager {
       this.removeRecord(id, record);
     }
     this.retryDeferredRecordRemovals();
-  }  /**
+  } /**
    * Remove all completed/stopped/errored records immediately.
    * Called on session start/switch so tasks from a prior session don't persist.
    * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
@@ -2979,7 +3690,21 @@ export class AgentManager {
   /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
     return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
+      (r) => r.status === "running" || r.status === "queued",
+    );
+  }
+
+  /** Synchronous navigation preflight: terminal status does not imply cleanup. */
+  hasUnsettledWork(): boolean {
+    return (
+      this.sessionTeardowns.size > 0 ||
+      this.managedPersistenceRetries.size > 0 ||
+      [...this.agents.values()].some(
+        (record) => !this.isFullyCleaned(record),
+      ) ||
+      [...this.managedSpawns.values()].some(
+        (spawn) => !isManagedTerminalState(spawn.state),
+      )
     );
   }
 
@@ -3005,8 +3730,16 @@ export class AgentManager {
     }
     for (const [index, owner] of owners.entries()) {
       const id = agentIds[index];
-      if (!id || owner.extension !== "pi-workflows" || owner.runId !== runId || !owner.attemptId) {
-        return { settled: false, pending: [...new Set(agentIds)].slice(0, 256) };
+      if (
+        !id ||
+        owner.extension !== "pi-workflows" ||
+        owner.runId !== runId ||
+        !owner.attemptId
+      ) {
+        return {
+          settled: false,
+          pending: [...new Set(agentIds)].slice(0, 256),
+        };
       }
       ownerById.set(id, owner);
     }
@@ -3017,12 +3750,21 @@ export class AgentManager {
         record.owner?.extension !== "pi-workflows" ||
         record.owner.runId !== runId ||
         !expected.has(record.id)
-      ) continue;
+      )
+        continue;
       const expectedOwner = ownerById.get(record.id);
-      if (!expectedOwner ||
+      if (
+        !expectedOwner ||
         record.owner.nodeId !== expectedOwner.nodeId ||
-        record.owner.attemptId !== expectedOwner.attemptId) continue;
-      if (!this.isFullyCleaned(record) || this.descendantsOf(record.id).some((child) => !this.isFullyCleaned(child))) {
+        record.owner.attemptId !== expectedOwner.attemptId
+      )
+        continue;
+      if (
+        !this.isFullyCleaned(record) ||
+        this.descendantsOf(record.id).some(
+          (child) => !this.isFullyCleaned(child),
+        )
+      ) {
         records.push(record);
       } else {
         // An exact-owner terminal record with no live descendant is already
@@ -3031,7 +3773,10 @@ export class AgentManager {
         settledIds.add(record.id);
       }
     }
-    const matched = new Set([...records.map((record) => record.id), ...settledIds]);
+    const matched = new Set([
+      ...records.map((record) => record.id),
+      ...settledIds,
+    ]);
     const pendingOwners = agentIds.filter((id) => !matched.has(id));
 
     // Managed callers name only top-level attempts, but nested descendants can
@@ -3040,32 +3785,45 @@ export class AgentManager {
     const quiescenceRecords = [...records];
     const branchOwnerById = new Map<string, string>();
     for (const record of records) branchOwnerById.set(record.id, record.id);
-    const branchRootIds = new Set([...agentIds, ...records.map((record) => record.id)]);
+    const branchRootIds = new Set([
+      ...agentIds,
+      ...records.map((record) => record.id),
+    ]);
     for (const rootId of branchRootIds) {
       for (const child of this.descendantsOf(rootId)) {
-        if (this.isFullyCleaned(child) || branchOwnerById.has(child.id)) continue;
+        if (this.isFullyCleaned(child) || branchOwnerById.has(child.id))
+          continue;
         branchOwnerById.set(child.id, rootId);
         quiescenceRecords.push(child);
       }
     }
     for (const record of quiescenceRecords) this.abort(record.id);
-    const result = await this.waitForTerminalRecords(quiescenceRecords, timeoutMs);
+    const result = await this.waitForTerminalRecords(
+      quiescenceRecords,
+      timeoutMs,
+    );
     const pendingBranchOwners = result.pending
-      .map((id) => expected.has(id) ? undefined : branchOwnerById.get(id))
+      .map((id) => (expected.has(id) ? undefined : branchOwnerById.get(id)))
       .filter((id): id is string => id !== undefined);
     return {
       settled: result.settled && pendingOwners.length === 0,
-      pending: [...new Set([
-        ...result.pending.filter((id) => expected.has(id)),
-        ...pendingOwners,
-        ...pendingBranchOwners,
-      ])].slice(0, 256),
+      pending: [
+        ...new Set([
+          ...result.pending.filter((id) => expected.has(id)),
+          ...pendingOwners,
+          ...pendingBranchOwners,
+        ]),
+      ].slice(0, 256),
     };
   }
 
   /** Stop every active record for session-tree preparation. */
-  async quiesceAll(timeoutMs: number): Promise<{ settled: boolean; pending: string[] }> {
-    const records = [...this.agents.values()].filter((record) => !this.isFullyCleaned(record));
+  async quiesceAll(
+    timeoutMs: number,
+  ): Promise<{ settled: boolean; pending: string[] }> {
+    const records = [...this.agents.values()].filter(
+      (record) => !this.isFullyCleaned(record),
+    );
     for (const record of records) this.abort(record.id);
     return this.waitForTerminalRecords(records, timeoutMs);
   }
@@ -3086,14 +3844,20 @@ export class AgentManager {
     if (!worktree) return undefined;
 
     if (this.providerPendingRecords.has(record.id)) {
-      return this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because provider/tool settlement for ${record.id} is still pending`);
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because provider/tool settlement for ${record.id} is still pending`,
+      );
     }
 
     if (this.hasIncompleteRepoDependency(record)) {
       return this.blockedWorktreeCleanup(record);
     }
     if (this.recordSessionTeardowns.has(record.id)) {
-      return this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`);
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`,
+      );
     }
     if (this.disposed && !allowDuringDispose) return record.worktreeResult;
 
@@ -3106,7 +3870,9 @@ export class AgentManager {
     if (!result.cleanupSucceeded && !result.recoveryCommands) {
       result = {
         ...result,
-        cleanupDiagnostic: result.cleanupDiagnostic ?? `Worktree cleanup failed for ${worktree.path}`,
+        cleanupDiagnostic:
+          result.cleanupDiagnostic ??
+          `Worktree cleanup failed for ${worktree.path}`,
         recoveryCommands: worktreeRecoveryCommands(cwd, worktree.path),
       };
     }
@@ -3126,28 +3892,37 @@ export class AgentManager {
     if (!worktree) return undefined;
 
     if (this.providerPendingRecords.has(record.id)) {
-      return this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because provider/tool settlement for ${record.id} is still pending`);
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because provider/tool settlement for ${record.id} is still pending`,
+      );
     }
 
     if (this.hasIncompleteRepoDependency(record)) {
       return this.blockedWorktreeCleanup(record);
     }
     if (this.recordSessionTeardowns.has(record.id)) {
-      return this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`);
+      return this.blockedWorktreeCleanup(
+        record,
+        `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`,
+      );
     }
 
     let result: WorktreeCleanupResult;
     try {
-      result = typeof cleanupWorktreeAsync === "function"
-        ? await cleanupWorktreeAsync(cwd, worktree, description)
-        : cleanupWorktree(cwd, worktree, description);
+      result =
+        typeof cleanupWorktreeAsync === "function"
+          ? await cleanupWorktreeAsync(cwd, worktree, description)
+          : cleanupWorktree(cwd, worktree, description);
     } catch (error: unknown) {
       result = cleanupFailureResult(cwd, worktree, error);
     }
     if (!result.cleanupSucceeded && !result.recoveryCommands) {
       result = {
         ...result,
-        cleanupDiagnostic: result.cleanupDiagnostic ?? `Worktree cleanup failed for ${worktree.path}`,
+        cleanupDiagnostic:
+          result.cleanupDiagnostic ??
+          `Worktree cleanup failed for ${worktree.path}`,
         recoveryCommands: worktreeRecoveryCommands(cwd, worktree.path),
       };
     }
@@ -3156,7 +3931,10 @@ export class AgentManager {
     return result;
   }
 
-  private cleanupDetachedWorktree(record: AgentRecord, allowDuringDispose = false): WorktreeCleanupResult | undefined {
+  private cleanupDetachedWorktree(
+    record: AgentRecord,
+    allowDuringDispose = false,
+  ): WorktreeCleanupResult | undefined {
     if (this.disposed && !allowDuringDispose) return record.worktreeResult;
     const worktree = record.worktree;
     if (!worktree) return undefined;
@@ -3164,7 +3942,12 @@ export class AgentManager {
     if (this.hasIncompleteRepoDependency(record)) {
       return this.blockedWorktreeCleanup(record);
     }
-    return this.cleanupRecordWorktree(record, worktree.repoRoot, record.description, allowDuringDispose);
+    return this.cleanupRecordWorktree(
+      record,
+      worktree.repoRoot,
+      record.description,
+      allowDuringDispose,
+    );
   }
 
   /** Quarantine a record before any late provider continuation can observe it. */
@@ -3186,7 +3969,11 @@ export class AgentManager {
     this.sealNestedSpawns(id);
     this.clearParentSignal(id);
     if (record.outputCleanup) {
-      try { record.outputCleanup(); } catch { /* ignore stale transcript cleanup errors */ }
+      try {
+        record.outputCleanup();
+      } catch {
+        /* ignore stale transcript cleanup errors */
+      }
       record.outputCleanup = undefined;
     }
     if (record.session) {
@@ -3201,7 +3988,9 @@ export class AgentManager {
     timeoutMs: number,
   ): Promise<{ settled: boolean; pending: string[] }> {
     const pendingIds = new Set(
-      records.filter((record) => !this.isFullyCleaned(record)).map((record) => record.id),
+      records
+        .filter((record) => !this.isFullyCleaned(record))
+        .map((record) => record.id),
     );
     const recheck = (record: AgentRecord): void => {
       if (this.isFullyCleaned(record)) pendingIds.delete(record.id);
@@ -3213,7 +4002,10 @@ export class AgentManager {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const allSettled = Promise.allSettled(pendingPromises).then(() => true);
     const timedOut = new Promise<boolean>((resolve) => {
-      timer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+      timer = setTimeout(
+        () => resolve(false),
+        Math.max(0, deadline - Date.now()),
+      );
     });
     const completed = await Promise.race([allSettled, timedOut]);
     if (timer) clearTimeout(timer);
@@ -3238,10 +4030,15 @@ export class AgentManager {
         .map((record) => this.recordSessionTeardowns.get(record.id))
         .filter((promise): promise is Promise<void> => promise !== undefined);
       if (teardownPromises.length > 0) {
-        const allTeardowns = Promise.allSettled(teardownPromises).then(() => true);
+        const allTeardowns = Promise.allSettled(teardownPromises).then(
+          () => true,
+        );
         let teardownTimer: ReturnType<typeof setTimeout> | undefined;
         const teardownTimeout = new Promise<boolean>((resolve) => {
-          teardownTimer = setTimeout(() => resolve(false), Math.max(0, deadline - Date.now()));
+          teardownTimer = setTimeout(
+            () => resolve(false),
+            Math.max(0, deadline - Date.now()),
+          );
         });
         await Promise.race([allTeardowns, teardownTimeout]);
         if (teardownTimer) clearTimeout(teardownTimer);
@@ -3254,9 +4051,15 @@ export class AgentManager {
         .sort((left, right) => this.recordDepth(right) - this.recordDepth(left))
         .forEach((record) => {
           if (this.settlingRecords.has(record.id)) {
-            this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`);
+            this.blockedWorktreeCleanup(
+              record,
+              `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`,
+            );
           } else if (this.recordSessionTeardowns.has(record.id)) {
-            this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`);
+            this.blockedWorktreeCleanup(
+              record,
+              `Worktree cleanup is pinned because child session teardown for ${record.id} is still pending`,
+            );
           } else if (this.hasIncompleteRepoDependency(record)) {
             this.blockedWorktreeCleanup(record);
           } else {
@@ -3282,11 +4085,18 @@ export class AgentManager {
     const records = [...this.agents.values()]
       .filter((record) => !this.isFullyCleaned(record))
       .sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
+    // An abort listener for one record can synchronously stop another owned
+    // record. Seal every journal owner before aborting any provider on the new leaf.
+    for (const record of records) record.detached = true;
     for (const record of records) this.quarantineRecord(record.id, record);
     for (const record of records) {
       if (this.settlingRecords.has(record.id)) {
-        this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`);
-      } else if (this.hasIncompleteRepoDependency(record)) this.blockedWorktreeCleanup(record);
+        this.blockedWorktreeCleanup(
+          record,
+          `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`,
+        );
+      } else if (this.hasIncompleteRepoDependency(record))
+        this.blockedWorktreeCleanup(record);
       else this.cleanupDetachedWorktree(record);
     }
     this.drainQueue();
@@ -3315,8 +4125,8 @@ export class AgentManager {
     while (true) {
       this.drainQueue();
       const pending = [...this.agents.values()]
-        .filter(r => r.status === "running" || r.status === "queued")
-        .map(r => r.promise)
+        .filter((r) => r.status === "running" || r.status === "queued")
+        .map((r) => r.promise)
         .filter(Boolean);
       if (pending.length === 0) break;
       await Promise.allSettled(pending);
@@ -3339,13 +4149,21 @@ export class AgentManager {
     for (const record of records) {
       if (record.worktree) reposToPrune.add(record.worktree.repoRoot);
     }
-    try { reposToPrune.add(process.cwd()); } catch { /* ignore an invalid cwd */ }
+    try {
+      reposToPrune.add(process.cwd());
+    } catch {
+      /* ignore an invalid cwd */
+    }
 
     // Stop dispatch first. A late settlement must not start queued work while
     // the old session is being torn down.
     this.queue = [];
     for (const cleanup of this.parentSignalCleanups.values()) {
-      try { cleanup(); } catch { /* ignore stale signal cleanup errors */ }
+      try {
+        cleanup();
+      } catch {
+        /* ignore stale signal cleanup errors */
+      }
     }
     this.parentSignalCleanups.clear();
     this.heldPoolSlots.clear();
@@ -3365,7 +4183,11 @@ export class AgentManager {
       this.nestedSpawnSeals.add(record.id);
       this.removingRecords.add(record.id);
       if (record.outputCleanup) {
-        try { record.outputCleanup(); } catch { /* ignore stale transcript cleanup errors */ }
+        try {
+          record.outputCleanup();
+        } catch {
+          /* ignore stale transcript cleanup errors */
+        }
         record.outputCleanup = undefined;
       }
     }
@@ -3382,14 +4204,24 @@ export class AgentManager {
     // Abort every record first, then start every session teardown before awaiting
     // any one of them. A failing handler therefore cannot starve its siblings.
     for (const record of records) {
-      try { await record.abortController?.abort(); } catch { /* ignore stale abort errors */ }
+      try {
+        await record.abortController?.abort();
+      } catch {
+        /* ignore stale abort errors */
+      }
       if (record.session) {
         this.trackRecordSessionTeardown(record.id, record.session);
         record.session = undefined;
       }
     }
-    await this.awaitSessionTeardowns();
-
+    const teardownsSettled = await this.awaitSessionTeardowns(
+      DISPOSE_SESSION_TEARDOWN_TIMEOUT_MS,
+    );
+    if (!teardownsSettled) {
+      console.warn(
+        `[pi-subagents] child session shutdown timed out; ${this.sessionTeardowns.size} teardown(s) still pending; attached worktrees remain pinned`,
+      );
+    }
 
     const providerPromises = records
       .map((record) => record.promise)
@@ -3397,30 +4229,49 @@ export class AgentManager {
     if (providerPromises.length > 0) {
       let providerTimer: ReturnType<typeof setTimeout> | undefined;
       const providerTimeout = new Promise<void>((resolve) => {
-        providerTimer = setTimeout(resolve, DISPOSE_PROVIDER_QUIESCE_TIMEOUT_MS);
+        providerTimer = setTimeout(
+          resolve,
+          DISPOSE_PROVIDER_QUIESCE_TIMEOUT_MS,
+        );
       });
-      await Promise.race([Promise.allSettled(providerPromises).then(() => undefined), providerTimeout]);
+      await Promise.race([
+        Promise.allSettled(providerPromises).then(() => undefined),
+        providerTimeout,
+      ]);
       if (providerTimer) clearTimeout(providerTimer);
     }
 
-    const orderedRecords = records.sort((left, right) => this.recordDepth(right) - this.recordDepth(left));
+    const orderedRecords = records.sort(
+      (left, right) => this.recordDepth(right) - this.recordDepth(left),
+    );
     const attemptCleanup = async (record: AgentRecord): Promise<void> => {
       if (!record.worktree) return;
       try {
         if (this.settlingRecords.has(record.id)) {
-          this.blockedWorktreeCleanup(record, `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`);
+          this.blockedWorktreeCleanup(
+            record,
+            `Worktree cleanup is pinned because provider settlement for ${record.id} is still pending`,
+          );
           return;
         }
         if (this.hasIncompleteRepoDependency(record)) {
           this.blockedWorktreeCleanup(record);
           return;
         }
-        await this.cleanupRecordWorktreeAsync(record, record.worktree.repoRoot, record.description);
+        await this.cleanupRecordWorktreeAsync(
+          record,
+          record.worktree.repoRoot,
+          record.description,
+        );
       } catch (error: unknown) {
         // Keep the live worktree reference so the final diagnostic remains
         // actionable, while continuing through every sibling and ancestor.
         if (record.worktree) {
-          record.worktreeResult = cleanupFailureResult(record.worktree.repoRoot, record.worktree, error);
+          record.worktreeResult = cleanupFailureResult(
+            record.worktree.repoRoot,
+            record.worktree,
+            error,
+          );
         }
       }
     };
@@ -3430,7 +4281,8 @@ export class AgentManager {
     for (const record of orderedRecords) await attemptCleanup(record);
     const pruneRepository = async (repo: string): Promise<void> => {
       try {
-        if (typeof pruneWorktreesAsync === "function") await pruneWorktreesAsync(repo);
+        if (typeof pruneWorktreesAsync === "function")
+          await pruneWorktreesAsync(repo);
         else pruneWorktrees(repo);
       } catch {
         // Pruning is best effort; individual cleanup results retain recovery data.
@@ -3449,20 +4301,87 @@ export class AgentManager {
     await pruneRepositories();
 
     const failures = orderedRecords
-      .filter((record): record is AgentRecord & { worktree: WorktreeInfo } => record.worktree !== undefined)
-      .map((record) => snapshotCleanupFailure(record.worktree, record.worktreeResult ?? {
-        hasChanges: false,
-        path: record.worktree.path,
-        cleanupSucceeded: false,
-        cleanupDiagnostic: `Worktree cleanup did not report an outcome for ${record.worktree.path}`,
-        recoveryCommands: worktreeRecoveryCommands(record.worktree.repoRoot, record.worktree.path),
-      }));
+      .filter(
+        (record): record is AgentRecord & { worktree: WorktreeInfo } =>
+          record.worktree !== undefined,
+      )
+      .map((record) =>
+        snapshotCleanupFailure(
+          record.worktree,
+          record.worktreeResult ?? {
+            hasChanges: false,
+            path: record.worktree.path,
+            cleanupSucceeded: false,
+            cleanupDiagnostic: `Worktree cleanup did not report an outcome for ${record.worktree.path}`,
+            recoveryCommands: worktreeRecoveryCommands(
+              record.worktree.repoRoot,
+              record.worktree.path,
+            ),
+          },
+        ),
+      );
     this.worktreeCleanupFailures = Object.freeze(failures);
     if (failures.length > 0) {
       console.warn(
-        `[pi-subagents] Worktree cleanup failures:\n${failures.map((failure) =>
-          `${failure.path}: ${failure.reason} Recovery: ${failure.recoveryCommands.join(" && ")}`).join("\n")}`,
+        `[pi-subagents] Worktree cleanup failures:\n${failures
+          .map(
+            (failure) =>
+              `${failure.path}: ${failure.reason} Recovery: ${failure.recoveryCommands.join(" && ")}`,
+          )
+          .join("\n")}`,
       );
+    }
+
+    if (!teardownsSettled && failures.length > 0) {
+      // Do not make host shutdown wait forever for an extension-owned child
+      // session. Keep worktrees attached until *both* child teardown and all
+      // providers settle; only then retry cleanup, deepest first. Detached
+      // records cannot publish into a replacement session while this waits.
+      const pending = [...this.sessionTeardowns, ...providerPromises];
+      void Promise.allSettled(pending)
+        .then(async (outcomes) => {
+          if (outcomes.some((outcome) => outcome.status === "rejected")) return;
+          const laterTeardowns = await Promise.allSettled([
+            ...this.sessionTeardowns,
+          ]);
+          if (laterTeardowns.some((outcome) => outcome.status === "rejected"))
+            return;
+          for (const record of orderedRecords) {
+            if (!record.worktree) continue;
+            await this.cleanupRecordWorktreeAsync(
+              record,
+              record.worktree.repoRoot,
+              record.description,
+            );
+          }
+          this.worktreeCleanupFailures = Object.freeze(
+            orderedRecords
+              .filter(
+                (record): record is AgentRecord & { worktree: WorktreeInfo } =>
+                  record.worktree !== undefined,
+              )
+              .map((record) =>
+                snapshotCleanupFailure(
+                  record.worktree,
+                  record.worktreeResult ?? {
+                    hasChanges: false,
+                    path: record.worktree.path,
+                    cleanupSucceeded: false,
+                    cleanupDiagnostic: `Worktree cleanup did not report an outcome for ${record.worktree.path}`,
+                    recoveryCommands: worktreeRecoveryCommands(
+                      record.worktree.repoRoot,
+                      record.worktree.path,
+                    ),
+                  },
+                ),
+              ),
+          );
+        })
+        .catch(() => {
+          console.warn(
+            "[pi-subagents] deferred child worktree cleanup failed; use the retained recovery instructions",
+          );
+        });
     }
 
     // Clear authoritative and ownership metadata only after quarantine, session

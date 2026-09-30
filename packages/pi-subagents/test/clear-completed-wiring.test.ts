@@ -5,7 +5,7 @@
  * Bug: a background agent that has COMPLETED but whose result the LLM hasn't read
  * yet (resultConsumed=false) was wiped by clearCompleted() on session_start /
  * session_before_switch, so the next get_subagent_result returned "Agent not
- * found". The fix makes both handlers call clearCompleted(true), preserving
+ * found". The committed session_start clears only consumed records, preserving
  * unread records (the 10-minute timer evicts them later).
  *
  * These tests exercise the wiring, not the manager method in isolation: spawn a
@@ -24,6 +24,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRuntime } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -35,7 +36,9 @@ function makePi() {
     registerCommand: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: {
-      emit: vi.fn(),
+      emit: vi.fn((event: string, data: unknown) => {
+        if (event === "pi:navigation-preflight") events.get(event)?.(data);
+      }),
       on: vi.fn((event: string, handler: any) => {
         events.set(event, handler);
         return vi.fn();
@@ -53,7 +56,7 @@ function ctx() {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), runtime: mockParentRuntime },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -139,7 +142,7 @@ describe("issue #108: unread completed background agents survive session events"
   });
 
 
-  it("session_before_switch aborts and awaits provider settlement before clearing branch state", async () => {
+  it("session_before_switch vetoes running work without aborting its provider", async () => {
     let finish!: (result: any) => void;
     let runSignal: AbortSignal | undefined;
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
@@ -158,22 +161,17 @@ describe("issue #108: unread completed background agents survive session events"
       ctx(),
     );
 
-    const switching = lifecycle.get("session_before_switch")?.() as Promise<void>;
-    expect(runSignal?.aborted).toBe(true);
-    let switched = false;
-    void switching.then(() => { switched = true; });
-    await Promise.resolve();
-    expect(switched).toBe(false);
+    const switching = lifecycle.get("session_before_switch")?.({}, ctx());
+    expect(switching).toEqual({ cancel: true });
+    expect(runSignal?.aborted).toBe(false);
 
     finish({
-      responseText: "stopped",
+      responseText: "finished after veto",
       session: { dispose: vi.fn() },
-      aborted: true,
+      aborted: false,
       steered: false,
     });
-    await switching;
-    expect(switched).toBe(true);
-
+    await flush();
     await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
@@ -203,8 +201,11 @@ describe("issue #108: unread completed background agents survive session events"
     const first = await tools.get("get_subagent_result").execute("tc-read1", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(first)).toContain("THE-RESULT-PAYLOAD");
 
-    // Now a session switch SHOULD clean it up (consumed records are not preserved).
+    // Preparation can be cancelled; only the committed replacement evicts it.
     await lifecycle.get("session_before_switch")?.();
+    const pending = await tools.get("get_subagent_result").execute("tc-pending", { agent_id: id }, undefined, undefined, ctx());
+    expect(textOf(pending)).not.toContain("Agent not found");
+    await lifecycle.get("session_start")?.({}, ctx());
 
     const second = await tools.get("get_subagent_result").execute("tc-read2", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(second)).toContain("Agent not found");

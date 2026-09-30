@@ -25,6 +25,117 @@ test("server environment overrides are forwarded to the LSP process", async () =
   }
 });
 
+test("large repeated stderr is bounded to a valid UTF-8 tail in errors", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-stderr-tail-"));
+  const adapter = fixtureAdapter("large-stderr", 30);
+  const client = new LspClient(adapter, adapter.defaultCommand, root, 5_000);
+
+  try {
+    await client.start();
+    await assert.rejects(client.initialize(root), (error: Error) => {
+      assert.match(error.message, /request timed out: initialize/);
+      assert.match(error.message, /Server stderr:\n/);
+      assert.match(error.message, /recent-stderr-marker/);
+      assert.doesNotMatch(error.message, /old-stderr-marker|�/);
+      assert.ok(Buffer.byteLength(error.message) < 17_000, "stderr must not make the error grow unbounded");
+      return true;
+    });
+  } finally {
+    await client.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("invalid and incomplete UTF-8 stderr stays bounded in errors", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-invalid-stderr-"));
+  try {
+    for (const scenario of ["invalid-stderr", "partial-stderr"]) {
+      const adapter = fixtureAdapter(scenario, 30);
+      const client = new LspClient(adapter, adapter.defaultCommand, root, 1_000);
+      try {
+        await client.start();
+        await assert.rejects(client.initialize(root), (error: Error) => {
+          assert.ok(Buffer.byteLength(error.message) < 17_000);
+          if (scenario === "invalid-stderr") assert.match(error.message, /Server stderr:/);
+          if (scenario === "partial-stderr") assert.doesNotMatch(error.message, /�/);
+          return true;
+        });
+      } finally {
+        await client.shutdown();
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("restarting a client does not reuse the previous server's stderr", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-stderr-restart-"));
+  const adapter = fixtureAdapter("stderr-once", 30);
+  const client = new LspClient(adapter, adapter.defaultCommand, root, 1_000);
+
+  try {
+    await client.start();
+    await assert.rejects(client.initialize(root), /first-run-stderr-marker/);
+    client.close();
+
+    await client.start();
+    await assert.rejects(client.initialize(root), (error: Error) => {
+      assert.match(error.message, /request timed out: initialize/);
+      assert.doesNotMatch(error.message, /first-run-stderr-marker|Server stderr:/);
+      return true;
+    });
+  } finally {
+    client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a restart discards a partial JSON-RPC response from the old server", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-response-restart-"));
+  const adapter = fixtureAdapter("partial-response-once", 30);
+  const client = new LspClient(adapter, adapter.defaultCommand, root, 300);
+
+  try {
+    await client.start();
+    await assert.rejects(client.initialize(root), /request timed out: initialize/);
+    client.close();
+    await client.start();
+    await client.initialize(root);
+  } finally {
+    client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a restart does not reuse diagnostics from the previous server", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-diagnostic-restart-"));
+  const file = path.join(root, "main.go");
+  writeFileSync(file, "package main\n");
+  const adapter = fixtureAdapter("diagnostic-once", 30, undefined, 100);
+  const client = new LspClient(adapter, adapter.defaultCommand, root, 1_000);
+  const uri = pathToFileURL(file).href;
+
+  try {
+    await client.start();
+    await client.initialize(root);
+    client.didOpen(uri, "package main\n", "go");
+    assert.deepEqual(
+      (await client.diagnostics(uri)).map(({ message }) => message),
+      ["old server diagnostic"],
+    );
+    client.close();
+
+    await client.start();
+    await client.initialize(root);
+    client.didOpen(uri, "package main\n", "go");
+    assert.deepEqual(await client.diagnostics(uri), []);
+  } finally {
+    client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("pull diagnostics omit optional params when no values are available", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-pull-strict-optional-params-"));
   const file = path.join(root, "main.go");

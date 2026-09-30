@@ -646,7 +646,7 @@ return await workflow("child");`;
     expect(oldState?.controller.signal.aborted).toBe(true);
     await quiescing;
     expect(client.spawned).toHaveLength(1);
-    await expect(engine.resume(started.runId, [], { background: true })).resolves.toBeUndefined();
+    await expect(engine.resume(started.runId, [], { background: true })).rejects.toThrow("not ready");
 
     const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     engine.restore(sessionEntries);

@@ -26,9 +26,10 @@ vi.mock("../src/worktree.js", () => ({
 }));
 
 import { runAgent } from "../src/agent-runner.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 const mockPi = {} as any;
-const mockCtx = { cwd: "/tmp" } as any;
+const mockCtx = { cwd: "/tmp", modelRegistry: mockParentRegistry } as any;
 
 const mockSession = (sessionFile?: string) =>
   ({ dispose: vi.fn(), sessionFile }) as any;

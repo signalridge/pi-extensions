@@ -42,10 +42,12 @@ export interface AgentConfig {
    */
   color?: string;
   /**
-   * Tools whose every call needs the user to agree first (`ask_tools:`). The
-   * third answer between `tools:` and `disallowed_tools:`, for tools that are
-   * usually fine and occasionally not. Approval comes from the human, never
-   * from a model — see `ask-tools.ts`.
+   * Tools whose first call needs human approval for the child session
+   * (`ask_tools:`), including resumed turns of this in-memory child. A reopened
+   * child must ask again. The third answer between
+   * `tools:` and `disallowed_tools:` for tools that are usually fine and
+   * occasionally not. Approval comes from the human, never from a model —
+   * see `ask-tools.ts`.
    */
   askTools?: string[];
   /**

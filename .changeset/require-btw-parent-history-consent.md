@@ -1,0 +1,5 @@
+---
+"@signalridge/pi-btw": minor
+---
+
+**Privacy behavior change:** Independent `/btw` requests no longer include the parent transcript or system prompt by default. Pi's parent `context` hooks can redact provider-visible messages, but their result is not exposed to extensions; forwarding the raw session projection bypassed those redactions. Side questions now send only the explicit question and their own successful side-thread turns. To include **unfiltered** parent history for one question, use `--with-parent=provider/model-id` before that question, naming the actual selected physical model. Each follow-up needs a new opt-in to read the parent again; mismatched, virtual, or auth-endpoint-overridden destinations fail closed. Once parent history has been shared, the side thread is bound to that physical model and effective endpoint, so later provider/model/endpoint switches require a fresh side thread rather than relaying an answer that may echo private parent data. Context-dependent questions without an opt-in will need details supplied in the question or the explicit destination-bound prefix.

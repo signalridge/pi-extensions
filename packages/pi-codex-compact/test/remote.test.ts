@@ -5,9 +5,10 @@ import {
   type Model,
   type OpenAICodexResponsesOptions,
   type Provider,
+  Type,
 } from "@earendil-works/pi-ai";
 import { test } from "vitest";
-import { requestRemoteCompaction } from "../src/remote.js";
+import { contextForProvider, requestRemoteCompaction } from "../src/remote.js";
 
 const model = {
   id: "gpt-5.6",
@@ -32,7 +33,7 @@ const usage = {
 };
 
 function fakeProvider(
-  observe: (payload: unknown, options: OpenAICodexResponsesOptions) => void,
+  observe: (payload: unknown, options: OpenAICodexResponsesOptions, context: Parameters<Provider["stream"]>[1]) => void,
   inputText = "current",
 ): Provider {
   return {
@@ -40,7 +41,7 @@ function fakeProvider(
     name: "OpenAI Codex",
     auth: {} as Provider["auth"],
     getModels: () => [model],
-    stream(_model, _context, options) {
+    stream(_model, context, options) {
       const stream = createAssistantMessageEventStream();
       void (async () => {
         try {
@@ -51,7 +52,7 @@ function fakeProvider(
             },
             model,
           );
-          observe(payload, options as OpenAICodexResponsesOptions);
+          observe(payload, options as OpenAICodexResponsesOptions, context);
           const response = await options?.fetch?.("https://example.test/codex/responses", {
             method: "POST",
           });
@@ -123,6 +124,37 @@ test("uses the public provider stream with SSE, bounded retry options, and a fin
   assert.equal(result.item.encrypted_content, "opaque");
   assert.deepEqual(result.usage, usage);
   assert.equal(result.promptInput.length, 1);
+});
+
+test("normalizes system prompt and tools before calling a Pi 0.87 provider", async () => {
+  const tools = [{ name: "inspect", description: "Inspect a path", parameters: Type.Object({ path: Type.String() }) }];
+  const user = { role: "user" as const, content: "inspect this", timestamp: 1 };
+  let providerContext: Parameters<Provider["stream"]>[1] | undefined;
+  await requestRemoteCompaction({
+    provider: fakeProvider((_payload, _options, context) => {
+      providerContext = context;
+    }),
+    model,
+    context: { systemPrompt: "You inspect files.", tools, messages: [user] },
+    signal: new AbortController().signal,
+    fetch: async () => responseSse(),
+  });
+  assert.ok(providerContext);
+  assert.deepEqual(providerContext.messages, [
+    { role: "system", content: "You inspect files.", toolsAdded: tools, timestamp: 0 },
+    user,
+  ]);
+  assert.equal("systemPrompt" in providerContext, false);
+  assert.equal("tools" in providerContext, false);
+});
+
+test("passes the original context unchanged to older providers without a normalizer", () => {
+  const context = {
+    systemPrompt: "legacy prompt",
+    tools: [{ name: "inspect", description: "Inspect a path", parameters: Type.Object({}) }],
+    messages: [{ role: "user" as const, content: "legacy", timestamp: 1 }],
+  } satisfies Context;
+  assert.strictEqual(contextForProvider(context, undefined), context);
 });
 
 test("expands a previous checkpoint before requesting repeated compaction", async () => {

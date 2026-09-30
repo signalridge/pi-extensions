@@ -22,6 +22,7 @@ import { runAgent, setDefaultModel } from "../src/agent-runner.js";
 import { setAgentTiersSettings } from "../src/agent-tiers.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRuntime } from "./helpers/model-runtime.js";
 
 const fast = { id: "fast", name: "Fast", provider: "test", reasoning: true };
 const models = [fast];
@@ -75,6 +76,7 @@ function makeCtx(script: Answer[]) {
         find: (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id),
         getAll: () => models,
         getAvailable: () => models,
+        runtime: mockParentRuntime,
       },
       scopedModels: [],
       sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },

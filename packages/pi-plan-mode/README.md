@@ -24,7 +24,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 
 ## Install
 
-Supports Pi `0.84.x` and `0.85.x`; tested with `0.85.1` — see the `peerDependencies` range.
+The declared Pi peer range covers `0.84.x`–`0.87.x` and `0.99.1+` within the 0.99 minor; the current development host is `0.99.1`. See the [compatibility review](https://github.com/signalridge/pi-extensions/blob/main/docs/pi-0.99-compatibility.md) for verification details.
 
 ```bash
 pi install npm:@signalridge/pi-plan-mode
@@ -112,7 +112,7 @@ mode; saved and active implementation menus close without changing their stored 
 
 When Plan mode is active, ask the agent to design the change. The agent may inspect files and run read-only commands, but it should not edit files or execute the implementation. It should explore first, then use structured questions when your preference or a tradeoff materially changes the plan. Configure persistent defaults or a one-workflow tool override before activation; Planning and ready menus deliberately keep those controls locked.
 
-By default, Plan mode manages only Pi's built-in tools: `read`, limited `bash`, available read-only built-ins such as `grep`, `find`, and `ls`, plus the required `plan_mode_question` and `plan_mode_complete` tools. Built-in `edit` and `write` are blocked. `update_plan` is also blocked because it tracks execution progress rather than conversational planning. Extension and custom tools are disabled by default because Pi tools do not expose standardized mutability metadata; enable them before starting from Settings or the staged workflow selector only when you accept the risk. For example, you can opt into `firecrawl_scrape`, `firecrawl_search`, or `lsp_diagnostics` if those extensions are loaded and you want to use them during planning.
+By default, Plan mode manages only Pi's built-in tools: `read`, limited `bash`, available read-only built-ins such as `grep`, `find`, and `ls`, plus the required `plan_mode_question` and `plan_mode_complete` tools. Built-in `edit` and `write` are blocked. `update_plan` is also blocked because it tracks execution progress rather than conversational planning. Extension and custom tools are disabled by default because Pi tools do not expose standardized mutability metadata; enable them before starting from Settings or the staged workflow selector only when you accept the risk. For example, you can opt into `firecrawl_scrape`, `firecrawl_search`, or `lsp_diagnostics` if those extensions are loaded and you want to use them during planning. Opting into an `Agent` delegation tool also grants its child the child's own tool policy: Plan mode cannot enforce read-only execution inside that child, so leave it disabled for strictly read-only planning.
 
 Limited `bash` uses a fail-closed policy, including when an extension overrides the canonical `bash` tool name. It accepts one direct argv-style inspection command at a time: common inspection commands, read-only Git queries, and explicitly validated `gh` read paths. Shell pipelines, command lists, redirects, substitutions, globbing, assignments, background jobs, mutating flags, dependency installs, editors, and unknown commands are rejected before command-specific validation. Tests and builds may still write ignored caches or build artifacts and may execute project-defined hooks; enable or invoke them only when the repository is trusted. This is extension-level risk reduction, not an OS sandbox.
 

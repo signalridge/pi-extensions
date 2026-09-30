@@ -1,6 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Context, Model, Tool } from "@earendil-works/pi-ai";
-import { hasApi } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
+import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   buildContextEntries,
   buildSessionContext,
@@ -59,7 +60,7 @@ const EXPERIMENTAL_WARNING =
   "Experimental: Codex Remote Compaction V2 uses an opaque, provider-specific checkpoint. Sessions require this extension and openai-codex for full replay.";
 
 function isSupportedModel(model: Model<Api> | undefined): model is Model<"openai-codex-responses"> {
-  return model?.provider === "openai-codex" && hasApi(model, "openai-codex-responses");
+  return model?.provider === "openai-codex" && piAi.hasApi(model, "openai-codex-responses");
 }
 
 function activeCompaction(entries: SessionEntry[]) {
@@ -83,13 +84,35 @@ function isCheckpointCompatible(
   return isSupportedModel(model) && model.id === details.modelId;
 }
 
+// Pi 0.87 exposes the canonical context-edit projection; older supported hosts
+// have only raw context entries and must continue using that legacy path.
+const piCodingAgentCompat: { buildSessionProjection?: typeof piCodingAgent.buildSessionProjection } = piCodingAgent;
+const piAiCompat: {
+  getCurrentSystemPrompt?: typeof piAi.getCurrentSystemPrompt;
+  getCurrentTools?: typeof piAi.getCurrentTools;
+  getToolStateChanges?: typeof piAi.getToolStateChanges;
+} = piAi;
+
 function keptMessages(event: SessionBeforeCompactEvent): AgentMessage[] {
   const leafId = event.branchEntries.at(-1)?.id ?? null;
+  const projection = piCodingAgentCompat.buildSessionProjection?.(event.branchEntries, leafId);
+  if (projection) {
+    // The cut point is a raw entry ID even when its model-visible contribution
+    // was omitted or replaced. Keep its position; fingerprint only projected messages.
+    const keptIndex = projection.entries.findIndex(
+      (entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId,
+    );
+    if (keptIndex < 0) throw new Error("Pi compaction cut point is not present in the active context");
+    // appendCompaction snapshots the resolved system state on the new compaction
+    // entry; it does not retain earlier system entries from this raw cut point.
+    return projection.entries
+      .slice(keptIndex)
+      .flatMap((entry) => entry.messages)
+      .filter((message) => message.role !== "system");
+  }
   const contextEntries = buildContextEntries(event.branchEntries, leafId);
   const keptIndex = contextEntries.findIndex((entry) => entry.id === event.preparation.firstKeptEntryId);
-  if (keptIndex < 0) {
-    throw new Error("Pi compaction cut point is not present in the active context");
-  }
+  if (keptIndex < 0) throw new Error("Pi compaction cut point is not present in the active context");
   return contextEntries.slice(keptIndex).flatMap(sessionEntryToContextMessages);
 }
 
@@ -105,10 +128,45 @@ function activeTools(pi: ExtensionAPI): Tool[] {
     }));
 }
 
+function transcriptMatchesLiveState(messages: AgentMessage[], pi: ExtensionAPI, ctx: ExtensionContext): boolean {
+  // Older Pi hosts have no persisted system/tool projection: their provider
+  // still uses the live shorthand, so retain that legacy compaction path.
+  if (!piCodingAgentCompat.buildSessionProjection) return true;
+  const { getCurrentSystemPrompt, getCurrentTools, getToolStateChanges } = piAiCompat;
+  if (!getCurrentSystemPrompt || !getCurrentTools || !getToolStateChanges) return false;
+  // The extension API's getAllTools() omits constrainedSampling even when the
+  // persisted declaration carries it. Compare the fields both surfaces expose
+  // rather than treating every built-in sampled tool as a pending change.
+  const recorded = getCurrentTools(messages).map(({ name, description, parameters }) => ({
+    name,
+    description,
+    parameters,
+  }));
+  const { toolsAdded, toolsRemoved } = getToolStateChanges(recorded, activeTools(pi));
+  return (
+    getCurrentSystemPrompt(messages) === ctx.getSystemPrompt() && toolsAdded.length === 0 && toolsRemoved.length === 0
+  );
+}
+
+function sessionStateMatchesRequest(
+  messages: AgentMessage[],
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  expectedLeafId: string | null,
+): boolean {
+  if (!transcriptMatchesLiveState(messages, pi, ctx)) return false;
+  if (!piCodingAgentCompat.buildSessionProjection) return true;
+  const branch = ctx.sessionManager.getBranch();
+  const currentLeafId = ctx.sessionManager.getLeafId?.() ?? branch.at(-1)?.id ?? null;
+  if (currentLeafId !== expectedLeafId) return false;
+  const latest = buildSessionContext(branch, currentLeafId).messages;
+  return transcriptMatchesLiveState(latest, pi, ctx);
+}
+
 function projectedCurrentMessages(
   event: SessionBeforeCompactEvent,
   model: Model<"openai-codex-responses">,
-): { messages: AgentMessage[]; prior?: CodexCheckpointDetails } {
+): { messages: AgentMessage[]; transcript: AgentMessage[]; prior?: CodexCheckpointDetails } {
   const leafId = event.branchEntries.at(-1)?.id ?? null;
   const session = buildSessionContext(event.branchEntries, leafId);
   const compaction = activeCompaction(event.branchEntries);
@@ -121,7 +179,7 @@ function projectedCurrentMessages(
     ) {
       throw new Error("The active opaque checkpoint is malformed");
     }
-    return { messages: session.messages };
+    return { messages: session.messages, transcript: session.messages };
   }
   if (prior.modelId !== model.id) {
     throw new Error("The active opaque checkpoint belongs to a different Codex model");
@@ -130,7 +188,7 @@ function projectedCurrentMessages(
   if (!projected) {
     throw new Error("The previous opaque checkpoint could not be projected safely");
   }
-  return { messages: projected, prior };
+  return { messages: projected, transcript: session.messages, prior };
 }
 
 function notifyFailure(ctx: ExtensionContext, error: unknown, settings: CodexCompactSettings): void {
@@ -163,6 +221,10 @@ async function compactRemotely(
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw new Error("OpenAI Codex provider is unavailable");
     const current = projectedCurrentMessages(event, model);
+    const sourceLeafId = event.branchEntries.at(-1)?.id ?? null;
+    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId)) {
+      throw new Error("Live prompt or tools differ from the persisted transcript");
+    }
     const context: Context = {
       systemPrompt: ctx.getSystemPrompt(),
       messages: convertToLlm(current.messages),
@@ -187,6 +249,11 @@ async function compactRemotely(
       fetch,
     });
     if (!sessionStillOwned(ctx, sessionId, event.signal)) return { cancel: true };
+    // appendCompaction will snapshot the session's resolved system/tool state;
+    // never persist a checkpoint for a request that became stale while in flight.
+    if (!sessionStateMatchesRequest(current.transcript, pi, ctx, sourceLeafId)) {
+      throw new Error("Live prompt, tools, or session branch changed during remote compaction");
+    }
     const replacementHistory = buildReplacementHistory(response.promptInput, response.item, {
       tokenBudget: settings.replacementTokenBudget,
     });

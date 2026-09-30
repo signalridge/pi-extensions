@@ -36,6 +36,8 @@ import {
 } from "@earendil-works/pi-tui";
 
 const MAX_MESSAGES = 100;
+/** Repeat presses while the history scan is pending cannot grow without bound. */
+const MAX_QUEUED_STEPS = 100;
 
 /** Popup footprint, as a fraction of the terminal. */
 const POPUP_WIDTH = "90%";
@@ -63,15 +65,33 @@ export interface HistoryEntry {
   timestamp?: number;
 }
 
+interface ShortcutSearch {
+  queuedSteps: number;
+  popup?: HistoryPopupComponent;
+  cancel?: () => void;
+  cancelWait?: () => void;
+}
+
 // ─── Extension Entry ───────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   let historyCache: HistoryEntry[] = [];
   let historyReady: Promise<void> = Promise.resolve();
   let loadGeneration = 0;
+  let shortcutOwner: ShortcutSearch | undefined;
+
+  const retireShortcut = () => {
+    const owner = shortcutOwner;
+    shortcutOwner = undefined;
+    // Pi's resetExtensionUI hides an overlay without resolving ui.custom().
+    // Close it via Pi's done callback while the old session still owns it.
+    owner?.cancelWait?.();
+    owner?.cancel?.();
+  };
 
   pi.on("session_start", (_event, ctx) => {
     const generation = ++loadGeneration;
+    retireShortcut();
     historyCache = [];
 
     // Do not block later session_start handlers: the replacement editor must
@@ -95,8 +115,16 @@ export default function (pi: ExtensionAPI) {
       .catch(() => undefined);
   });
 
+  pi.on("session_tree", () => {
+    // A committed branch change invalidates the pending search, not the cross-session scan.
+    // session_before_tree may still be cancelled, so retire only after navigation.
+    retireShortcut();
+  });
+
   pi.on("session_shutdown", () => {
     loadGeneration++;
+    retireShortcut();
+    historyCache = [];
     historyReady = Promise.resolve();
   });
 
@@ -104,35 +132,65 @@ export default function (pi: ExtensionAPI) {
   pi.registerShortcut("ctrl+r", {
     description: "Fuzzy popup search through prompt history",
     handler: async (ctx) => {
-      // If invoked during startup, wait for the background history scan rather
-      // than briefly reporting an empty history.
-      await historyReady;
-      // Merge cached history with current session's branch history
-      const branchHistory = collectBranchHistory(ctx);
-      const merged = mergeHistory(branchHistory, historyCache);
-
-      if (merged.length === 0) {
-        ctx.ui.notify("No prompt history yet.", "info");
+      if (ctx.mode !== "tui" || !ctx.hasUI) return;
+      // Own the entire scan → overlay → editor update. During the scan, repeat
+      // presses become navigation steps; once open, Pi routes keys to the popup.
+      if (shortcutOwner) {
+        if (shortcutOwner.popup) shortcutOwner.popup.handleInput("\x12");
+        else shortcutOwner.queuedSteps = Math.min(shortcutOwner.queuedSteps + 1, MAX_QUEUED_STEPS);
         return;
       }
+      const owner: ShortcutSearch = { queuedSteps: 0 };
+      shortcutOwner = owner;
+      const generation = loadGeneration;
+      const ready = historyReady;
+      const cancelled = new Promise<void>((resolve) => {
+        owner.cancelWait = resolve;
+      });
 
-      const selected = await ctx.ui.custom<string | null>(
-        (tui, theme, _kb, done) => {
-          return new HistoryPopupComponent(tui, theme, merged, done);
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            anchor: "center",
-            width: POPUP_WIDTH,
-            minWidth: 40,
-            maxHeight: POPUP_MAX_HEIGHT,
+      try {
+        // If invoked during startup, wait for the background history scan rather
+        // than briefly reporting an empty history. A switched session owns a new
+        // scan; never merge its branch with an old scan's partial cache.
+        await Promise.race([ready, cancelled]);
+        if (generation !== loadGeneration || shortcutOwner !== owner) return;
+
+        const branchHistory = collectBranchHistory(ctx);
+        const merged = mergeHistory(branchHistory, historyCache);
+
+        if (merged.length === 0) {
+          ctx.ui.notify("No prompt history yet.", "info");
+          return;
+        }
+
+        let overlayTui: TUI | undefined;
+        const selected = await ctx.ui.custom<string | null>(
+          (tui, theme, _kb, done) => {
+            overlayTui = tui;
+            owner.cancel = () => done(null);
+            owner.popup = new HistoryPopupComponent(tui, theme, merged, done, owner.queuedSteps);
+            return owner.popup;
           },
-        },
-      );
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              width: POPUP_WIDTH,
+              minWidth: 40,
+              maxHeight: POPUP_MAX_HEIGHT,
+            },
+          },
+        );
 
-      if (selected === null) return;
-      ctx.ui.setEditorText(selected);
+        if (generation !== loadGeneration || shortcutOwner !== owner || selected === null) return;
+        ctx.ui.setEditorText(selected);
+        // Closing the overlay requests a render before this continuation updates the editor.
+        // The editor setter only mutates text, so request another frame afterward.
+        overlayTui?.requestRender();
+      } finally {
+        // An old scan or overlay must not release a newer session's shortcut.
+        if (shortcutOwner === owner) shortcutOwner = undefined;
+      }
     },
   });
 }
@@ -256,12 +314,14 @@ export class HistoryPopupComponent implements Component, Focusable {
     private readonly theme: Theme,
     private readonly history: HistoryEntry[],
     private readonly done: Done,
+    initialSelection = 0,
   ) {
     this.input.onEscape = () => this.done(null);
     this.input.onSubmit = () => {
       this.done(this.getCurrentEntry()?.text ?? null);
     };
     this.recomputeMatches(true);
+    this.matchPointer = Math.min(initialSelection, Math.max(0, this.matchIndices.length - 1));
   }
 
   get focused(): boolean {

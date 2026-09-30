@@ -4,14 +4,20 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+
+import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
 import {
   type CachedFileState,
@@ -56,9 +62,11 @@ function usage({ cost = 1, input = 100, output = 50, cacheRead = 0, cacheWrite =
 
 function assistantLine({
   id = "m1",
+  parentId = null,
   ts,
   provider = "anthropic",
   model = "claude-fable-5",
+  responseModel,
   cost = 1,
   input = 100,
   output = 50,
@@ -69,24 +77,25 @@ function assistantLine({
   return JSON.stringify({
     type: "message",
     id,
-    parentId: null,
+    parentId,
     timestamp: new Date(ts).toISOString(),
     message: {
       role: "assistant",
       content: [{ type: "text", text: "hi" }],
       provider,
       model,
+      ...(responseModel ? { responseModel } : {}),
       usage: usage({ cost, input, output, cacheRead, cacheWrite, reasoning }),
       timestamp: ts,
     },
   });
 }
 
-function toolResultLine({ id = "tool1", ts, ...usageValues }) {
+function toolResultLine({ id = "tool1", parentId = null, ts, ...usageValues }) {
   return JSON.stringify({
     type: "message",
     id,
-    parentId: null,
+    parentId,
     timestamp: new Date(ts).toISOString(),
     message: {
       role: "toolResult",
@@ -142,14 +151,46 @@ function nestedToolResultLine({
   });
 }
 
-function compactionLine({ id = "compact1", ts, ...usageValues }) {
+function usageEntryLine({
+  id = "usage1",
+  parentId = null,
+  ts,
+  kind = "cache_warm",
+  provider = "anthropic",
+  model = "claude-fable-5",
+  ...usageValues
+}) {
+  return JSON.stringify({
+    type: "usage",
+    id,
+    parentId,
+    timestamp: new Date(ts).toISOString(),
+    kind,
+    provider,
+    model,
+    usage: usage(usageValues),
+  });
+}
+
+function contextEditLine(id: string, ts: number, targetId: string, parentId = targetId, replacement = null) {
+  return JSON.stringify({
+    type: "context_edit",
+    id,
+    parentId,
+    timestamp: new Date(ts).toISOString(),
+    targetId,
+    replacement,
+  });
+}
+
+function compactionLine({ id = "compact1", parentId = null, firstKeptEntryId = "kept", ts, ...usageValues }) {
   return JSON.stringify({
     type: "compaction",
     id,
-    parentId: null,
+    parentId,
     timestamp: new Date(ts).toISOString(),
     summary: "summary",
-    firstKeptEntryId: "kept",
+    firstKeptEntryId,
     tokensBefore: 1000,
     usage: usage(usageValues),
   });
@@ -174,6 +215,12 @@ function thinkingLine(level, ts) {
     timestamp: new Date(ts).toISOString(),
     thinkingLevel: level,
   });
+}
+
+function withoutParentLink(line: string): string {
+  const entry = JSON.parse(line);
+  delete entry.parentId;
+  return JSON.stringify(entry);
 }
 
 function userLine(ts, text = "hello") {
@@ -217,6 +264,7 @@ test("parseSessionBuffer extracts session id and assistant messages from compact
     reasoning: 0,
     timestamp: TS_TODAY,
     afterCompaction: false,
+    previousAssistantId: "",
   });
   assert.equal(parsed.cwd, "/tmp");
 });
@@ -224,9 +272,10 @@ test("parseSessionBuffer extracts session id and assistant messages from compact
 test("parseSessionBuffer extracts Pi 0.81 tool and summary usage without consuming compaction state", async () => {
   const content = [
     sessionLine("s1", TS_TODAY),
-    assistantLine({ ts: TS_TODAY, cost: 1 }),
+    assistantLine({ id: "first", ts: TS_TODAY, cost: 1 }),
     toolResultLine({
       id: "tool-usage",
+      parentId: "first",
       ts: TS_TODAY + 1000,
       cost: 2,
       input: 20,
@@ -235,10 +284,10 @@ test("parseSessionBuffer extracts Pi 0.81 tool and summary usage without consumi
       cacheWrite: 4,
       reasoning: 1,
     }),
-    compactionLine({ id: "compact-usage", ts: TS_TODAY + 2000, cost: 3, input: 30, output: 3 }),
+    compactionLine({ id: "compact-usage", parentId: "tool-usage", ts: TS_TODAY + 2000, cost: 3, input: 30, output: 3 }),
     // Python-style spacing exercises the branch-summary pre-filter variant.
-    `{"type": "branch_summary", "id": "branch-usage", "timestamp": "${new Date(TS_TODAY + 3000).toISOString()}", "fromId": "old", "summary": "branch", "usage": ${JSON.stringify(usage({ cost: 4, input: 40, output: 4 }))}}`,
-    assistantLine({ ts: TS_TODAY + 4000, cost: 5 }),
+    `{"type": "branch_summary", "id": "branch-usage", "parentId": "compact-usage", "timestamp": "${new Date(TS_TODAY + 3000).toISOString()}", "fromId": "old", "summary": "branch", "usage": ${JSON.stringify(usage({ cost: 4, input: 40, output: 4 }))}}`,
+    assistantLine({ id: "second", parentId: "branch-usage", ts: TS_TODAY + 4000, cost: 5 }),
   ].join("\n");
 
   const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
@@ -274,17 +323,177 @@ test("parseSessionBuffer extracts Pi 0.81 tool and summary usage without consumi
   );
 });
 
-test("parseSessionBuffer flags the first assistant message after a compaction entry", async () => {
-  const compaction = (spaced) =>
-    spaced ? '{"type": "compaction", "id": "c1", "summary": "..."}' : '{"type":"compaction","id":"c2","summary":"..."}';
+test("parseSessionBuffer reads model-attributed standalone usage without inventing assistant turns", async () => {
   const content = [
     sessionLine("s1", TS_TODAY),
-    assistantLine({ ts: TS_TODAY, cost: 1 }),
-    compaction(false),
-    assistantLine({ ts: TS_TODAY + 1000, cost: 2 }),
-    assistantLine({ ts: TS_TODAY + 2000, cost: 3 }),
-    compaction(true),
-    assistantLine({ ts: TS_TODAY + 3000, cost: 4 }),
+    thinkingLine("high", TS_TODAY),
+    withoutParentLink(
+      usageEntryLine({ id: "warm-a", ts: TS_TODAY + 1000, input: 0, output: 0, cacheRead: 50_000, cost: 0.015 }),
+    ),
+    // Unknown kinds are still usage; spaced JSON exercises the other pre-filter.
+    `{"type": "usage", "id": "other", "timestamp": "${new Date(TS_TODAY + 2000).toISOString()}", "kind": "future_kind", "provider": "openai", "model": "gpt-5", "usage": ${JSON.stringify(usage({ cost: 2, input: 20 }))}}`,
+    // No model attribution or accounting data means no fabricated usage record.
+    `{"type":"usage","id":"missing-model","provider":"anthropic","usage":${JSON.stringify(usage({ cost: 99 }))}}`,
+    '{"type":"usage","id":"empty","provider":"anthropic","model":"m","usage":{"cost":{"total":0}}}',
+  ].join("\n");
+
+  const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
+  assert.equal(parsed.messages.length, 2);
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.source, m.sourceId, m.provider, m.model, m.thinkingLevel, m.cost]),
+    [
+      ["usage", "warm-a", "anthropic", "claude-fable-5", "high", 0.015],
+      ["usage", "other", "openai", "gpt-5", "high", 2],
+    ],
+  );
+  assert.equal(parsed.messages[0].cacheRead, 50_000);
+  assert.equal(parsed.messages[0].cacheWarm, true);
+  assert.equal(parsed.messages[1].cacheWarm, undefined, "other usage kinds must not refresh cache TTL");
+});
+
+test("parseSessionBuffer keeps context edits pending across non-message usage", async () => {
+  const content = [
+    sessionLine("s1", TS_TODAY),
+    assistantLine({ id: "m0", ts: TS_TODAY, cost: 1 }),
+    contextEditLine("edit-a", TS_TODAY + 1000, "m0"),
+    usageEntryLine({ id: "warm-a", parentId: "edit-a", ts: TS_TODAY + 2000, cost: 0.5 }),
+    assistantLine({ id: "m1", parentId: "warm-a", ts: TS_TODAY + 3000, cost: 2 }),
+    assistantLine({ id: "m2", parentId: "m1", ts: TS_TODAY + 4000, cost: 3 }),
+    // Spaced context_edit is also recognized.
+    `{"type": "context_edit", "id": "edit-b", "parentId": "m2", "targetId": "m2", "replacement": null}`,
+    assistantLine({ id: "m3", parentId: "edit-b", ts: TS_TODAY + 5000, cost: 4 }),
+  ].join("\n");
+
+  const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
+  assert.deepEqual(
+    parsed.messages.filter((m) => m.source === "assistant").map((m) => Boolean(m.afterContextEdit)),
+    [false, true, false, true],
+  );
+  assert.equal(parsed.messages[1].source, "usage", "cache warming must not consume the context-edit boundary");
+});
+
+test("edits follow Pi custom entry order through nested and large content, not sibling branches", async () => {
+  const custom = JSON.stringify({
+    type: "custom",
+    customType: "extension",
+    data: { id: "nested-id", parentId: "sibling", content: "x".repeat(100_000) },
+    id: "custom",
+    parentId: "edit",
+    timestamp: new Date(TS_TODAY + 2000).toISOString(),
+  });
+  const customMessage = JSON.stringify({
+    type: "custom_message",
+    customType: "extension",
+    content: [{ type: "text", text: "data" }],
+    display: false,
+    details: { parentId: "sibling" },
+    id: "custom-message",
+    parentId: "custom",
+    timestamp: new Date(TS_TODAY + 3000).toISOString(),
+  });
+  const lines = [
+    sessionLine("s1", TS_TODAY),
+    assistantLine({ id: "common", ts: TS_TODAY }),
+    contextEditLine("edit", TS_TODAY + 1000, "common"),
+    assistantLine({ id: "sibling", parentId: "common", ts: TS_TODAY + 1500 }),
+    custom,
+    customMessage,
+    assistantLine({ id: "edited", parentId: "custom-message", ts: TS_TODAY + 4000 }),
+    assistantLine({ id: "later", parentId: "edited", ts: TS_TODAY + 5000 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => Boolean(m.afterContextEdit)),
+    [false, false, true, false],
+  );
+});
+
+test("skipped user lineage follows Pi's decoded, last-wins entry id", async (t) => {
+  const { sessionsDir } = fixture(t);
+  for (const [name, idProperties] of [
+    ["duplicate", '"id":"other","id":"user"'],
+    ["escaped", '"i\\u0064":"user"'],
+  ]) {
+    for (const size of ["small", "large"]) {
+      const user = `{"type":"message",${idProperties},"parentId":null,"message":{"role":"user","content":[{"type":"text","text":"${"x".repeat(size === "large" ? 70 * 1024 : 5)}"}]}}`;
+      const lines = [
+        sessionLine(`${name}-${size}`, TS_TODAY),
+        user,
+        assistantLine({ id: "first", parentId: "user", ts: TS_TODAY + 100, cost: 1 }),
+        contextEditLine("edit", TS_TODAY + 200, "user", "first"),
+        assistantLine({ id: "second", parentId: "edit", ts: TS_TODAY + 300, cost: 5 }),
+      ];
+      const file = join(sessionsDir, `${name}-${size}.jsonl`);
+      const jsonl = `${lines.join("\n")}\n`;
+      writeFileSync(file, jsonl);
+
+      // Pi's on-disk loader uses JSON.parse; its real projection is the
+      // reference for which user entry the edit removes from model context.
+      const pi = SessionManager.open(file);
+      pi.branch("first");
+      assert.deepEqual(
+        pi.buildSessionProjection().messages.map((message) => message.role),
+        ["user", "assistant"],
+      );
+      pi.branch("second");
+      assert.deepEqual(
+        pi.buildSessionProjection().messages.map((message) => message.role),
+        ["assistant", "assistant"],
+      );
+      assert.deepEqual(
+        pi
+          .buildSessionProjection()
+          .entries.map(({ sourceEntry, messages }) => [sourceEntry.id, messages.map((m) => m.role)]),
+        [
+          ["user", []],
+          ["first", ["assistant"]],
+          ["edit", []],
+          ["second", ["assistant"]],
+        ],
+      );
+
+      const parsed = await parseSessionBuffer(Buffer.from(jsonl));
+      assert.deepEqual(
+        parsed.messages.map((message) => [
+          message.sourceId,
+          message.previousAssistantId,
+          Boolean(message.afterContextEdit),
+        ]),
+        [
+          ["first", "", false],
+          ["second", "first", true],
+        ],
+        `${name} ${size}`,
+      );
+    }
+  }
+});
+
+test("compaction markers follow only their own branch", async () => {
+  const lines = [
+    sessionLine("s1", TS_TODAY),
+    assistantLine({ id: "common", ts: TS_TODAY }),
+    compactionLine({ id: "compact", parentId: "common", ts: TS_TODAY + 1000 }),
+    assistantLine({ id: "sibling", parentId: "common", ts: TS_TODAY + 2000 }),
+    assistantLine({ id: "compacted", parentId: "compact", ts: TS_TODAY + 3000 }),
+    assistantLine({ id: "later", parentId: "compacted", ts: TS_TODAY + 4000 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.filter((m) => m.source === "assistant").map((m) => m.afterCompaction),
+    [false, false, true, false],
+  );
+});
+
+test("parseSessionBuffer flags the first assistant message after a compaction entry", async () => {
+  const content = [
+    sessionLine("s1", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, cost: 1 }),
+    '{"type":"compaction","id":"c2","parentId":"first","summary":"..."}',
+    assistantLine({ id: "second", parentId: "c2", ts: TS_TODAY + 1000, cost: 2 }),
+    assistantLine({ id: "third", parentId: "second", ts: TS_TODAY + 2000, cost: 3 }),
+    '{"type": "compaction", "id": "c1", "parentId": "third", "summary": "..."}',
+    assistantLine({ id: "fourth", parentId: "c1", ts: TS_TODAY + 3000, cost: 4 }),
   ].join("\n");
 
   const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
@@ -294,14 +503,14 @@ test("parseSessionBuffer flags the first assistant message after a compaction en
   );
 });
 
-test("parseSessionBuffer attributes thinking levels by replaying change entries", async () => {
+test("imported entries without parent links replay thinking changes in append order", async () => {
   const content = [
     sessionLine("s1", TS_TODAY),
     thinkingLine("high", TS_TODAY),
-    assistantLine({ ts: TS_TODAY, cost: 1 }),
+    withoutParentLink(assistantLine({ ts: TS_TODAY, cost: 1 })),
     thinkingLine("xhigh", TS_TODAY + 1000),
-    assistantLine({ ts: TS_TODAY + 2000, cost: 2, reasoning: 55 }),
-    assistantLine({ ts: TS_TODAY + 3000, cost: 3 }),
+    withoutParentLink(assistantLine({ ts: TS_TODAY + 2000, cost: 2, reasoning: 55 })),
+    withoutParentLink(assistantLine({ ts: TS_TODAY + 3000, cost: 3 })),
   ].join("\n");
 
   const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
@@ -312,13 +521,69 @@ test("parseSessionBuffer attributes thinking levels by replaying change entries"
   assert.equal(parsed.messages[1].reasoning, 55);
 });
 
-test("parseSessionBuffer handles spaced thinking_level_change entries and messages before any change", async () => {
+test("Pi root forks reset thinking for independent assistant and usage entries", async () => {
+  const session = SessionManager.inMemory("/tmp");
+  const highId = session.appendThinkingLevelChange("high");
+  const firstId = session.appendMessage(JSON.parse(assistantLine({ ts: TS_TODAY, cost: 1 })).message);
+  session.resetLeaf();
+  const secondId = session.appendMessage(JSON.parse(assistantLine({ ts: TS_TODAY + 1000, cost: 2 })).message);
+  session.resetLeaf();
+  const warm = session.appendUsage("cache_warm", "anthropic", "claude-fable-5", {
+    input: 0,
+    output: 0,
+    cacheRead: 50_000,
+    cacheWrite: 0,
+    cost: { input: 0, output: 0, cacheRead: 0.5, cacheWrite: 0, total: 0.5 },
+  });
+
+  assert.equal(session.getEntry(highId)?.parentId, null);
+  assert.equal(session.getEntry(firstId)?.parentId, highId);
+  assert.equal(session.getEntry(secondId)?.parentId, null);
+  assert.equal(warm.parentId, null);
+  session.branch(firstId);
+  assert.equal(session.buildSessionProjection().thinkingLevel, "high");
+  session.branch(secondId);
+  assert.equal(session.buildSessionProjection().thinkingLevel, "off");
+
+  const lines = [session.getHeader(), ...session.getEntries()].map((entry) => JSON.stringify(entry));
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.source, m.thinkingLevel, m.cost]),
+    [
+      ["assistant", "high", 1],
+      ["assistant", "", 2],
+      ["usage", "", 0.5],
+    ],
+  );
+  assert.equal(
+    parsed.messages.reduce((total, message) => total + message.cost, 0),
+    3.5,
+  );
+});
+
+test("thinking levels follow the assistant's branch rather than a later sibling change", async () => {
+  const lines = [
+    sessionLine("thinking-branches", TS_TODAY),
+    JSON.stringify({ type: "message", id: "root", parentId: null, message: { role: "user", content: "task" } }),
+    JSON.stringify({ type: "thinking_level_change", id: "low", parentId: "root", thinkingLevel: "low" }),
+    assistantLine({ id: "first", parentId: "low", ts: TS_TODAY, cost: 1 }),
+    JSON.stringify({ type: "thinking_level_change", id: "high", parentId: "root", thinkingLevel: "xhigh" }),
+    assistantLine({ id: "second", parentId: "first", ts: TS_TODAY + 1000, cost: 2 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => m.thinkingLevel),
+    ["low", "low"],
+  );
+});
+
+test("parseSessionBuffer handles spaced imported thinking changes and messages before any change", async () => {
   const iso = new Date(TS_TODAY).toISOString();
   const content = [
     sessionLine("s1", TS_TODAY),
-    assistantLine({ ts: TS_TODAY, cost: 1 }), // before any change → unknown ("")
+    withoutParentLink(assistantLine({ ts: TS_TODAY, cost: 1 })), // before any change → unknown ("")
     `{"type": "thinking_level_change", "id": "t", "timestamp": "${iso}", "thinkingLevel": "medium"}`,
-    assistantLine({ ts: TS_TODAY + 1000, cost: 2 }),
+    withoutParentLink(assistantLine({ ts: TS_TODAY + 1000, cost: 2 })),
   ].join("\n");
 
   const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
@@ -356,6 +621,38 @@ test("parseSessionBuffer ignores pre-filter false positives and messages without
   const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
   assert.equal(parsed.sessionId, "s1");
   assert.equal(parsed.messages.length, 0);
+});
+
+test("malformed skipped entries cannot bridge a context edit through phantom lineage", async () => {
+  const large = JSON.stringify({
+    type: "message",
+    id: "broken",
+    parentId: "edit",
+    message: { role: "toolResult", content: [{ type: "text", text: "x".repeat(70 * 1024) }] },
+  });
+  for (const malformed of [
+    '{"type":"custom","id":"broken","parentId":"edit","data":',
+    '{"type":"custom","id":"broken","parentId":"edit","data":oops}',
+    large.slice(0, -2),
+    large.replace(/\}\}$/, "invalid}}"),
+  ]) {
+    const lines = [
+      sessionLine("malformed", TS_TODAY),
+      assistantLine({ id: "first", ts: TS_TODAY }),
+      contextEditLine("edit", TS_TODAY + 100, "first"),
+      malformed,
+      assistantLine({ id: "next", parentId: "broken", ts: TS_TODAY + 200 }),
+    ];
+    const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+    assert.deepEqual(
+      parsed.messages.map((m) => [m.sourceId, m.previousAssistantId, Boolean(m.afterContextEdit)]),
+      [
+        ["first", "", false],
+        ["next", "", false],
+      ],
+      malformed.length > 65_536 ? "large malformed tool result" : "small malformed entry",
+    );
+  }
 });
 
 test("parseSessionBuffer falls back to the entry timestamp when the message has none", async () => {
@@ -537,6 +834,52 @@ test("collectUsageData includes tool and summary usage without inflating assista
   assert.ok(overhead);
   assert.equal(overhead.kind, "structure");
   assert.equal(overhead.stat, "90%");
+});
+
+test("collectUsageData counts cache warming once across copied history and a warm cache", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const original = join(sessionsDir, "original.jsonl");
+  const copy = join(sessionsDir, "copy.jsonl");
+  const warm = usageEntryLine({
+    id: "shared-warm",
+    ts: TS_TODAY + 1000,
+    cost: 0.25,
+    input: 0,
+    output: 0,
+    cacheRead: 50_000,
+  });
+  const sameAmountDifferentCall = usageEntryLine({
+    id: "second-warm",
+    ts: TS_TODAY + 1000,
+    cost: 0.25,
+    input: 0,
+    output: 0,
+    cacheRead: 50_000,
+  });
+  writeFileSync(original, `${[sessionLine("original", TS_TODAY), warm].join("\n")}\n`);
+  writeFileSync(
+    copy,
+    `${[sessionLine("copy", TS_TODAY, "/tmp", original), warm, sameAmountDifferentCall].join("\n")}\n`,
+  );
+
+  for (const filesToParse of [2, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.cost, 0.5, "the copied entry dedupes, but a distinct identical call survives");
+    assert.equal(data.today.totals.messages, 0, "standalone usage is not an assistant message");
+    assert.equal(data.today.totals.sessions, 1, "only the file with unique usage contributes after dedupe");
+    assert.equal(data.today.totals.tokens.cacheRead, 100_000);
+    assert.equal(data.today.totals.tokens.total, 0, "cached tokens are not fresh tokens");
+    const provider = data.today.providers.get("anthropic");
+    assert.equal(provider.cost, 0.5);
+    assert.equal(provider.messages, 0);
+    assert.equal(provider.models.get("claude-fable-5").cost, 0.5);
+    assert.equal(data.today.providers.has("Tools"), false);
+    const bucket = data.hourly.get(Math.floor(TS_TODAY / 3_600_000) * 3_600_000);
+    assert.equal(bucket.get("anthropic\u0000claude-fable-5\u0000").cost, 0.5);
+    assert.equal(bucket.get("anthropic\u0000claude-fable-5\u0000").messages, 0);
+  }
 });
 
 test("collectUsageData suppresses canonical tool usage already present in a linked child session", async (t) => {
@@ -807,6 +1150,146 @@ test("collectUsageData returns null when aborted", async (t) => {
   assert.equal(data, null);
 });
 
+test("collectUsageData forwards cancellation into the initial cache decode", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const prior = JSON.stringify({
+    version: 11,
+    names: ["provider", "model", "thinking", "source"],
+    files: {
+      [join(sessionsDir, "cached.jsonl")]: {
+        size: 1,
+        mtimeMs: 1,
+        sessionId: "cached",
+        cwd: "/tmp",
+        parentSession: "",
+        messages: Array.from({ length: 100 }, () => [0, 1, 1, 2, 3, 4, 5, 6, 2, 0, 0, 0, 3, 0, 0, -1, 0, -1]),
+        toolUsages: [],
+      },
+    },
+  });
+  writeFileSync(cachePath, prior);
+  const controller = new AbortController();
+  const check = controller.signal.throwIfAborted.bind(controller.signal);
+  let decodeChecks = 0;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (++decodeChecks === 40) controller.abort();
+      check();
+    },
+  });
+  let progressReported = false;
+  const data = await collectUsageData({
+    sessionsDir,
+    cachePath,
+    now: NOW,
+    signal: controller.signal,
+    onProgress: () => {
+      progressReported = true;
+    },
+  });
+  assert.equal(data, null);
+  assert.ok(decodeChecks >= 40, "initial cache load checks abort inside its tuple loop");
+  assert.equal(progressReported, false, "scan stops before parsing or reporting a cache rebuild");
+  assert.equal(readFileSync(cachePath, "utf8"), prior);
+  assert.equal(existsSync(`${cachePath}.lock`), false);
+});
+
+test("collectUsageData aborts a blocked cache save without leaving a waiter or later write", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  writeFileSync(
+    join(sessionsDir, "a.jsonl"),
+    `${[sessionLine("s1", TS_TODAY), assistantLine({ ts: TS_TODAY, cost: 1 })].join("\n")}\n`,
+  );
+  const controller = new AbortController();
+  const lockPath = `${cachePath}.lock`;
+  t.after(() => rmSync(lockPath, { force: true }));
+  let abortTimer: ReturnType<typeof setTimeout> | undefined;
+  t.after(() => clearTimeout(abortTimer));
+  const started = Date.now();
+  const data = await collectUsageData({
+    sessionsDir,
+    cachePath,
+    now: NOW,
+    signal: controller.signal,
+    onProgress: (progress) => {
+      if (progress.filesParsed !== 1) return;
+      writeFileSync(lockPath, "held by another scanner");
+      abortTimer = setTimeout(() => controller.abort(), 40);
+    },
+  });
+  assert.equal(data, null);
+  assert.ok(Date.now() - started < 1_000, "worker settles on abort, not the five-second lock timeout");
+  assert.equal(existsSync(lockPath), true, "the other scanner still owns its lock");
+  assert.equal(existsSync(cachePath), false);
+  rmSync(lockPath);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(existsSync(cachePath), false, "aborted save cannot write after the lock becomes free");
+});
+
+test("collectUsageData skips partial cache writes on cancellation even with a free lock", async (t) => {
+  const { root, sessionsDir, cachePath } = fixture(t);
+  for (let i = 0; i < 101; i++) {
+    writeFileSync(join(sessionsDir, `${String(i).padStart(3, "0")}.jsonl`), `${sessionLine(`s${i}`, TS_TODAY)}\n`);
+  }
+  // The initial load happens before cancellation; the old partial-save path
+  // unnecessarily re-read and serialized this large cache after cancellation.
+  const prior = JSON.stringify({ version: 11, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
+  writeFileSync(cachePath, prior);
+  const controller = new AbortController();
+  let cancelledAt = 0;
+  const data = await collectUsageData({
+    sessionsDir,
+    cachePath,
+    now: NOW,
+    parseConcurrency: 1,
+    signal: controller.signal,
+    onProgress: (progress) => {
+      if (progress.filesParsed === 100) {
+        cancelledAt = Date.now();
+        controller.abort();
+      }
+    },
+  });
+  assert.equal(data, null);
+  assert.ok(Date.now() - cancelledAt < 500, "cancelled scan does not perform a second large cache read/write");
+  assert.equal(readFileSync(cachePath, "utf8"), prior);
+  assert.equal(existsSync(`${cachePath}.lock`), false);
+  assert.deepEqual(
+    readdirSync(root).filter((name) => name.endsWith(".tmp")),
+    [],
+  );
+});
+
+test("collectUsageData skips locked partial cache warm instead of waiting to write after cancellation", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  for (let i = 0; i < 101; i++) {
+    writeFileSync(join(sessionsDir, `${String(i).padStart(3, "0")}.jsonl`), `${sessionLine(`s${i}`, TS_TODAY)}\n`);
+  }
+  const controller = new AbortController();
+  const lockPath = `${cachePath}.lock`;
+  t.after(() => rmSync(lockPath, { force: true }));
+  let lockHeldAt = 0;
+  const data = await collectUsageData({
+    sessionsDir,
+    cachePath,
+    now: NOW,
+    parseConcurrency: 1,
+    signal: controller.signal,
+    onProgress: (progress) => {
+      if (progress.filesParsed !== 100) return;
+      writeFileSync(lockPath, "held by another scanner");
+      lockHeldAt = Date.now();
+      controller.abort();
+    },
+  });
+  assert.equal(data, null);
+  assert.ok(Date.now() - lockHeldAt < 1_000, "cancelled warm only tries the lock once");
+  assert.equal(existsSync(cachePath), false);
+  rmSync(lockPath);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(existsSync(cachePath), false, "no orphan waiter writes after returning");
+});
+
 // =============================================================================
 // collectUsageData — caching
 // =============================================================================
@@ -875,7 +1358,7 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 
   // Cache was rebuilt.
   const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-  assert.equal(cacheJson.version, 7);
+  assert.equal(cacheJson.version, 11);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -910,6 +1393,7 @@ test("saveUsageCache/loadUsageCache round-trips file states", async (t) => {
             {
               provider: "anthropic",
               model: "claude-fable-5",
+              responseModel: "claude-fable-5-20260930",
               thinkingLevel: "xhigh",
               source: "assistant",
               sourceId: "assistant-a",
@@ -921,6 +1405,25 @@ test("saveUsageCache/loadUsageCache round-trips file states", async (t) => {
               reasoning: 7,
               timestamp: TS_TODAY,
               afterCompaction: true,
+              afterContextEdit: true,
+              previousAssistantId: "earlier-assistant",
+              branchWarmAt: TS_TODAY - 1000,
+            },
+            {
+              provider: "anthropic",
+              model: "claude-fable-5",
+              thinkingLevel: "xhigh",
+              source: "usage",
+              sourceId: "warm-a",
+              cost: 0.25,
+              input: 0,
+              output: 0,
+              cacheRead: 50_000,
+              cacheWrite: 0,
+              reasoning: 0,
+              timestamp: TS_TODAY + 1,
+              afterCompaction: false,
+              cacheWarm: true,
             },
             {
               provider: "Tools",
@@ -1002,6 +1505,353 @@ test("concurrent cache saves preserve still-current files from both scanners", a
   assert.equal(loaded.get(fileB)?.parsed.sessionId, "session-b");
 });
 
+test("A/B/C saves serialize even after A's lock appears older than 30 seconds", async (t) => {
+  const { root, cachePath } = fixture(t);
+  const paths = ["a", "b", "c"].map((name) => join(root, `${name}.jsonl`));
+  for (const path of paths) writeFileSync(path, path);
+  const state = (path: string): CachedFileState => {
+    const st = statSync(path);
+    return {
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      parsed: { sessionId: path, cwd: "/tmp", parentSession: "", messages: [], toolUsages: [] },
+    };
+  };
+  const clock = Date.now;
+  let clockOffset = 0;
+  Date.now = () => clock() + clockOffset;
+  const controller = new AbortController();
+  const check = controller.signal.throwIfAborted.bind(controller.signal);
+  let b: Promise<void> | undefined;
+  let c: Promise<void> | undefined;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (!b && existsSync(`${cachePath}.lock`)) {
+        // Writer A is inside the critical section; make its lock look old
+        // before B and C begin their writes, without waiting 30 real seconds.
+        clockOffset += 31_000;
+        const waitLimit = AbortSignal.timeout(2_000);
+        b = saveUsageCache(cachePath, new Map([[paths[1], state(paths[1])]]), { signal: waitLimit });
+        c = saveUsageCache(cachePath, new Map([[paths[2], state(paths[2])]]), { signal: waitLimit });
+      }
+      check();
+    },
+  });
+  try {
+    await saveUsageCache(cachePath, new Map([[paths[0], state(paths[0])]]), { signal: controller.signal });
+    assert.ok(b && c, "B and C start while A holds its lock");
+    await Promise.all([b, c]);
+    const loaded = await loadUsageCache(cachePath);
+    assert.deepEqual(
+      paths.map((path) => loaded.get(path)?.parsed.sessionId),
+      paths,
+      "all three writes survive the lock handoffs",
+    );
+    assert.equal(existsSync(`${cachePath}.lock`), false);
+  } finally {
+    Date.now = clock;
+  }
+});
+
+test("release does not unlink a manually replaced successor lock", async (t) => {
+  const { root, cachePath } = fixture(t);
+  const lockPath = `${cachePath}.lock`;
+  const controller = new AbortController();
+  const check = controller.signal.throwIfAborted.bind(controller.signal);
+  let replaced = false;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (!replaced && existsSync(lockPath)) {
+        replaced = true;
+        unlinkSync(lockPath);
+        writeFileSync(lockPath, "replacement owner");
+      }
+      check();
+    },
+  });
+  const fileA = join(root, "a.jsonl");
+  writeFileSync(fileA, "a");
+  const st = statSync(fileA);
+  const state: CachedFileState = {
+    size: st.size,
+    mtimeMs: st.mtimeMs,
+    parsed: { sessionId: "A", cwd: "/tmp", parentSession: "", messages: [], toolUsages: [] },
+  };
+  await saveUsageCache(cachePath, new Map([[fileA, state]]), { signal: controller.signal });
+  assert.equal(replaced, true);
+  assert.equal(readFileSync(lockPath, "utf8"), "replacement owner");
+  await saveUsageCache(cachePath, new Map(), { waitForLock: false });
+  assert.equal(readFileSync(lockPath, "utf8"), "replacement owner");
+  unlinkSync(lockPath);
+  await saveUsageCache(cachePath, new Map());
+  assert.equal((await loadUsageCache(cachePath)).get(fileA)?.parsed.sessionId, "A");
+});
+
+test("abort after cache lock acquisition removes the temporary file and leaves prior cache intact", async (t) => {
+  const { root, cachePath } = fixture(t);
+  const state = (sessionId: string): CachedFileState => ({
+    size: 1,
+    mtimeMs: 1,
+    parsed: { sessionId, cwd: "/tmp", parentSession: "", messages: [], toolUsages: [] },
+  });
+  await saveUsageCache(cachePath, new Map([["/tmp/old.jsonl", state("old")]]));
+  const prior = readFileSync(cachePath, "utf8");
+  const controller = new AbortController();
+  const originalCheck = controller.signal.throwIfAborted.bind(controller.signal);
+  let cancelledAfterTemp = false;
+  // Trigger cancellation at the post-write checkpoint, while both the lock
+  // and completed temporary file exist, without relying on filesystem timing.
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (readdirSync(root).some((name) => name.startsWith(".usage-cache-") && name.endsWith(".tmp"))) {
+        assert.equal(existsSync(`${cachePath}.lock`), true);
+        cancelledAfterTemp = true;
+        controller.abort();
+      }
+      originalCheck();
+    },
+  });
+  await assert.rejects(
+    saveUsageCache(cachePath, new Map([["/tmp/new.jsonl", state("new")]]), { signal: controller.signal }),
+    { name: "AbortError" },
+  );
+  assert.equal(cancelledAfterTemp, true);
+  assert.equal(readFileSync(cachePath, "utf8"), prior);
+  assert.equal(existsSync(`${cachePath}.lock`), false);
+  assert.deepEqual(
+    readdirSync(root).filter((name) => name.endsWith(".tmp")),
+    [],
+  );
+});
+
+test("abort during locked cache read releases lock without a late write", async (t) => {
+  const { root, cachePath } = fixture(t);
+  const prior = JSON.stringify({ version: 11, names: [], files: {}, padding: "x".repeat(22 * 1024 * 1024) });
+  writeFileSync(cachePath, prior);
+  const controller = new AbortController();
+  const check = controller.signal.throwIfAborted.bind(controller.signal);
+  let lockedChecks = 0;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (existsSync(`${cachePath}.lock`) && ++lockedChecks === 3) controller.abort();
+      check();
+    },
+  });
+  await assert.rejects(saveUsageCache(cachePath, new Map(), { signal: controller.signal }), {
+    name: "AbortError",
+  });
+  assert.ok(lockedChecks >= 3, "cancellation reaches the post-read checkpoint under the lock");
+  assert.equal(existsSync(`${cachePath}.lock`), false);
+  assert.equal(readFileSync(cachePath, "utf8"), prior);
+  assert.deepEqual(
+    readdirSync(root).filter((name) => name.endsWith(".tmp")),
+    [],
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(readFileSync(cachePath, "utf8"), prior, "no continuation writes after rejection");
+});
+
+test("abort during cache tuple decoding releases the lock", async (t) => {
+  const { root, cachePath } = fixture(t);
+  const filePath = join(root, "source.jsonl");
+  const tuple = [0, 1, 1, 2, 3, 4, 5, 6, 2, 0, 0, 0, 3, 0, 0, -1, 0, -1];
+  const prior = JSON.stringify({
+    version: 11,
+    names: ["provider", "model", "thinking", "source"],
+    files: {
+      [filePath]: {
+        size: 1,
+        mtimeMs: 1,
+        sessionId: "session",
+        cwd: "/tmp",
+        parentSession: "",
+        messages: Array.from({ length: 100 }, () => tuple),
+        toolUsages: [],
+      },
+    },
+  });
+  writeFileSync(cachePath, prior);
+  const controller = new AbortController();
+  const check = controller.signal.throwIfAborted.bind(controller.signal);
+  let lockedChecks = 0;
+  Object.defineProperty(controller.signal, "throwIfAborted", {
+    value: () => {
+      if (existsSync(`${cachePath}.lock`) && ++lockedChecks === 40) controller.abort();
+      check();
+    },
+  });
+  await assert.rejects(saveUsageCache(cachePath, new Map(), { signal: controller.signal }), {
+    name: "AbortError",
+  });
+  assert.ok(lockedChecks >= 40, "abort occurred inside the tuple loop");
+  assert.equal(existsSync(`${cachePath}.lock`), false);
+  assert.equal(readFileSync(cachePath, "utf8"), prior);
+  assert.deepEqual(
+    readdirSync(root).filter((name) => name.endsWith(".tmp")),
+    [],
+  );
+});
+
+test("an old lock is not stolen; timeout explains manual recovery", async (t) => {
+  const { cachePath } = fixture(t);
+  const lockPath = `${cachePath}.lock`;
+  writeFileSync(lockPath, "orphaned lock");
+  const actualNow = Date.now;
+  const clock = actualNow();
+  const stale = new Date(clock - 31_000);
+  utimesSync(lockPath, stale, stale);
+  let elapsed = 0;
+  Date.now = () => {
+    elapsed += 1_000;
+    return clock + elapsed;
+  };
+  try {
+    await assert.rejects(saveUsageCache(cachePath, new Map()), (error: Error) => {
+      assert.match(error.message, /usage cache lock busy/);
+      assert.ok(error.message.includes(lockPath));
+      assert.match(error.message, /no \/usage writer is active.*remove this orphaned lock manually/);
+      return true;
+    });
+  } finally {
+    Date.now = actualNow;
+  }
+  assert.equal(readFileSync(lockPath, "utf8"), "orphaned lock");
+  assert.equal(existsSync(cachePath), false);
+});
+
+test("a matching v7 cache rebuilds to ingest previously omitted standalone usage", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const filePath = join(sessionsDir, "old.jsonl");
+  writeFileSync(
+    filePath,
+    `${[
+      sessionLine("old", TS_TODAY),
+      assistantLine({ id: "a", ts: TS_TODAY, cost: 1 }),
+      usageEntryLine({ id: "warm", ts: TS_TODAY + 1000, cost: 2 }),
+    ].join("\n")}\n`,
+  );
+  const file = statSync(filePath);
+  writeFileSync(
+    cachePath,
+    JSON.stringify({
+      version: 7,
+      names: ["anthropic", "claude-fable-5", "", "a"],
+      files: {
+        [filePath]: {
+          size: file.size,
+          mtimeMs: file.mtimeMs,
+          sessionId: "old",
+          cwd: "/tmp",
+          parentSession: "",
+          messages: [[0, 1, 1, 100, 50, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]],
+          toolUsages: [],
+        },
+      },
+    }),
+  );
+
+  const progress = [];
+  const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+  assert.equal(progress[0].mode, "rebuild");
+  assert.equal(progress[0].filesToParse, 1);
+  assert.equal(data.today.totals.cost, 3);
+  assert.equal(data.today.totals.messages, 1);
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  assert.equal((await loadUsageCache(cachePath)).get(filePath)?.parsed.messages[1].source, "usage");
+});
+
+test("a matching v9 cache rebuilds branch-aware TTL metadata", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const filePath = join(sessionsDir, "old.jsonl");
+  writeFileSync(
+    filePath,
+    `${[
+      sessionLine("old", TS_TODAY),
+      assistantLine({ id: "first", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+      usageEntryLine({ id: "warm", parentId: "first", ts: TS_TODAY + 4.5 * 60_000, cost: 0.5 }),
+      assistantLine({ id: "sibling", parentId: "first", ts: TS_TODAY + 6 * 60_000, cost: 5, input: 100_000 }),
+    ].join("\n")}\n`,
+  );
+  const file = statSync(filePath);
+  writeFileSync(
+    cachePath,
+    JSON.stringify({
+      version: 9,
+      names: ["anthropic", "claude-fable-5", "", "first", "warm", "sibling"],
+      files: {
+        [filePath]: {
+          size: file.size,
+          mtimeMs: file.mtimeMs,
+          sessionId: "old",
+          cwd: "/tmp",
+          parentSession: "",
+          messages: [
+            [0, 1, 1, 1000, 50, 100_000, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0],
+            [0, 1, 0.5, 100, 50, 0, 0, TS_TODAY + 4.5 * 60_000, 2, 0, 0, 2, 4, 0, 1],
+            [0, 1, 5, 100_000, 50, 0, 0, TS_TODAY + 6 * 60_000, 2, 0, 0, 0, 5, 0, 0],
+          ],
+          toolUsages: [],
+        },
+      },
+    }),
+  );
+  const progress = [];
+  const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+  assert.equal(progress[0].mode, "rebuild");
+  assert.equal(progress[0].filesToParse, 1);
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$5.00");
+  assert.equal((await loadUsageCache(cachePath)).get(filePath)?.parsed.messages.at(-1)?.previousAssistantId, "first");
+});
+
+test("a matching v10 cache rebuilds concrete-model and zero-warm timing metadata", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const filePath = join(sessionsDir, "v10.jsonl");
+  const concrete = "claude-fable-5-20260930";
+  writeFileSync(
+    filePath,
+    `${[
+      sessionLine("v10", TS_TODAY),
+      assistantLine({ id: "first", ts: TS_TODAY, responseModel: concrete, input: 1000, cacheRead: 100_000 }),
+      usageEntryLine({
+        id: "zero-warm",
+        parentId: "first",
+        ts: TS_TODAY + 4.5 * 60_000,
+        model: concrete,
+        cost: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+      }),
+      assistantLine({
+        id: "next",
+        parentId: "zero-warm",
+        ts: TS_TODAY + 6 * 60_000,
+        responseModel: concrete,
+        cost: 5,
+        input: 100_000,
+      }),
+    ].join("\n")}\n`,
+  );
+  await collectUsageData({ sessionsDir, cachePath, now: NOW });
+  const old = JSON.parse(readFileSync(cachePath, "utf8"));
+  old.version = 10;
+  old.files[filePath].messages = old.files[filePath].messages.map((tuple: number[]) => tuple.slice(0, 17));
+  old.files[filePath].messages[1][2] = 99; // A false warm-cache hit would surface the poisoned cost.
+  writeFileSync(cachePath, JSON.stringify(old));
+
+  const progress = [];
+  const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+  assert.equal(progress[0].mode, "rebuild");
+  assert.equal(progress[0].filesToParse, 1);
+  assert.equal(data.today.totals.cost, 6);
+  assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
+  assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 11);
+  const messages = (await loadUsageCache(cachePath)).get(filePath)?.parsed.messages;
+  assert.equal(messages?.[1].responseModel, concrete);
+  assert.equal(messages?.[1].branchWarmAt, TS_TODAY + 4.5 * 60_000);
+});
+
 test("loadUsageCache rejects wrong versions and malformed entries", async (t) => {
   const { root } = fixture(t);
   const cachePath = join(root, "bad.json");
@@ -1057,10 +1907,26 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
   writeFileSync(cachePath, JSON.stringify({ version: 4, names: [], files: {} }));
   assert.equal((await loadUsageCache(cachePath)).size, 0);
 
+  // v7 cached records predate standalone usage and context-edit boundaries.
+  writeFileSync(cachePath, JSON.stringify({ version: 7, names: [], files: {} }));
+  assert.equal((await loadUsageCache(cachePath)).size, 0);
+
+  // v8's append-order edit markers and missing usage kind must be rebuilt.
+  writeFileSync(cachePath, JSON.stringify({ version: 8, names: [], files: {} }));
+  assert.equal((await loadUsageCache(cachePath)).size, 0);
+
+  // v9 did not retain branch-specific warm and previous-assistant ancestry.
+  writeFileSync(cachePath, JSON.stringify({ version: 9, names: [], files: {} }));
+  assert.equal((await loadUsageCache(cachePath)).size, 0);
+
+  // v10 lacks concrete response-model metadata and must be rebuilt.
+  writeFileSync(cachePath, JSON.stringify({ version: 10, names: [], files: {} }));
+  assert.equal((await loadUsageCache(cachePath)).size, 0);
+
   writeFileSync(
     cachePath,
     JSON.stringify({
-      version: 7,
+      version: 11,
       names: ["p", "m", "high", "entry-a"],
       files: {
         "/ok.jsonl": {
@@ -1069,7 +1935,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           sessionId: "s",
           cwd: "/w",
           parentSession: "",
-          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3]],
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3, 1, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-tuple.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1]], toolUsages: [] },
@@ -1078,7 +1944,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           mtimeMs: 2,
           sessionId: "s",
           cwd: "/w",
-          messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]],
+          messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-level-idx.jsonl": {
@@ -1086,7 +1952,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           mtimeMs: 2,
           sessionId: "s",
           cwd: "/w",
-          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3]],
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3, 0, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-source.jsonl": {
@@ -1094,7 +1960,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           mtimeMs: 2,
           sessionId: "s",
           cwd: "/w",
-          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3]],
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3, 0, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-source-id.jsonl": {
@@ -1102,7 +1968,16 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           mtimeMs: 2,
           sessionId: "s",
           cwd: "/w",
-          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9]],
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9, 0, 0, -1, 0, -1]],
+          toolUsages: [],
+        },
+        "/bad-edit-marker.jsonl": {
+          size: 1,
+          mtimeMs: 2,
+          sessionId: "s",
+          cwd: "/w",
+          parentSession: "",
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 7, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-tool.jsonl": {
@@ -1117,7 +1992,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
           size: 1,
           mtimeMs: 2,
           sessionId: "s",
-          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]],
+          messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, -1, 0, -1]],
           toolUsages: [],
         },
         "/bad-shape.jsonl": { size: "x", mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [], toolUsages: [] },
@@ -1129,6 +2004,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
   assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].thinkingLevel, "high");
   assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].reasoning, 5);
   assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterCompaction, true);
+  assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterContextEdit, true);
   assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].source, "auxiliary");
   assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].sourceId, "entry-a");
   assert.equal(loaded.get("/ok.jsonl").parsed.cwd, "/w");
@@ -1148,19 +2024,55 @@ test("insights classify resume vs model-switch vs prefix misses and exclude comp
     `${[
       sessionLine("s1", TS_TODAY),
       // Establishes a large previous context.
-      assistantLine({ ts: TS_TODAY, cost: 1, input: 1000, cacheRead: 100000 }),
+      assistantLine({ id: "first", ts: TS_TODAY, cost: 1, input: 1000, cacheRead: 100000 }),
       // Interleaved auxiliary usage must not replace the previous assistant or
       // dilute the percentages for assistant-turn/cache insights.
-      toolResultLine({ id: "nested-between-turns", ts: TS_TODAY + 1000, cost: 100, input: 1, output: 1 }),
+      toolResultLine({
+        id: "nested-between-turns",
+        parentId: "first",
+        ts: TS_TODAY + 1000,
+        cost: 100,
+        input: 1,
+        output: 1,
+      }),
       // >5min idle, cacheRead ~0 → resume-after-break (TTL) miss.
-      assistantLine({ ts: TS_TODAY + SIX_MIN, cost: 10, input: 100000, cacheRead: 0 }),
+      assistantLine({
+        id: "ttl",
+        parentId: "nested-between-turns",
+        ts: TS_TODAY + SIX_MIN,
+        cost: 10,
+        input: 100000,
+        cacheRead: 0,
+      }),
       // Short gap, cacheRead ~0 → true prefix-change miss.
-      assistantLine({ ts: TS_TODAY + SIX_MIN + 10_000, cost: 5, input: 100000, cacheRead: 0 }),
+      assistantLine({
+        id: "prefix",
+        parentId: "ttl",
+        ts: TS_TODAY + SIX_MIN + 10_000,
+        cost: 5,
+        input: 100000,
+        cacheRead: 0,
+      }),
       // Compaction between messages → excluded from prefix accounting.
-      '{"type":"compaction","id":"c1"}',
-      assistantLine({ ts: TS_TODAY + SIX_MIN + 20_000, cost: 7, input: 100000, cacheRead: 0 }),
+      '{"type":"compaction","id":"c1","parentId":"prefix"}',
+      assistantLine({
+        id: "compacted",
+        parentId: "c1",
+        ts: TS_TODAY + SIX_MIN + 20_000,
+        cost: 7,
+        input: 100000,
+        cacheRead: 0,
+      }),
       // Short gap but a different model → model-switch miss, not prefix.
-      assistantLine({ ts: TS_TODAY + SIX_MIN + 30_000, cost: 60, input: 100000, cacheRead: 0, model: "gpt-5.6-sol" }),
+      assistantLine({
+        id: "switched",
+        parentId: "compacted",
+        ts: TS_TODAY + SIX_MIN + 30_000,
+        cost: 60,
+        input: 100000,
+        cacheRead: 0,
+        model: "gpt-5.6-sol",
+      }),
     ].join("\n")}\n`,
   );
 
@@ -1178,6 +2090,691 @@ test("insights classify resume vs model-switch vs prefix misses and exclude comp
   assert.ok(sw, "model-switch alarm fires");
   assert.equal(sw.stat, "$60.00");
   assert.match(sw.headline, /72% of assistant-message cost/);
+});
+
+test("context edits on a branch explain only the next miss, including after cache warming", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const original = join(sessionsDir, "a.jsonl");
+  const common = assistantLine({ id: "common", ts: TS_TODAY, cost: 1, input: 1000, cacheRead: 100_000 });
+  writeFileSync(
+    original,
+    `${[sessionLine("original", TS_TODAY), common, assistantLine({ id: "real-miss", parentId: "common", ts: TS_TODAY + 1000, cost: 5, input: 100_000, cacheRead: 0 })].join("\n")}\n`,
+  );
+  writeFileSync(
+    join(sessionsDir, "b.jsonl"),
+    `${[
+      sessionLine("branch", TS_TODAY, "/tmp", original),
+      common,
+      contextEditLine("edit", TS_TODAY + 1000, "common"),
+      usageEntryLine({
+        id: "warm",
+        parentId: "edit",
+        ts: TS_TODAY + 1500,
+        cost: 1,
+        input: 0,
+        output: 0,
+        cacheRead: 50_000,
+      }),
+      assistantLine({
+        id: "edited-miss",
+        parentId: "warm",
+        ts: TS_TODAY + 2000,
+        cost: 7,
+        input: 100_000,
+        cacheRead: 0,
+      }),
+      assistantLine({
+        id: "later-miss",
+        parentId: "edited-miss",
+        ts: TS_TODAY + 3000,
+        cost: 3,
+        input: 100_000,
+        cacheRead: 0,
+      }),
+    ].join("\n")}\n`,
+  );
+
+  for (const filesToParse of [2, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.cost, 17, "one copied assistant plus a separately billed warm call");
+    assert.equal(data.today.totals.messages, 4, "context edits and cache warming are not assistant turns");
+    assert.equal(data.today.providers.get("anthropic").cost, 17);
+    const prefix = findInsight(data, "today", /re-sending conversations mid-session/);
+    assert.equal(prefix.stat, "$8.00", "the edited request is explained, but later and unedited misses still count");
+    assert.match(prefix.headline, /50% of assistant-message cost/);
+    assert.match(prefix.advice, /context edit/);
+  }
+});
+
+test("editing a new user message leaves a genuine cached-prefix miss visible", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const lines = [
+    sessionLine("new-user-edit", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, cost: 1, input: 1000, cacheRead: 100_000 }),
+    JSON.stringify({
+      type: "message",
+      id: "new-user",
+      parentId: "first",
+      message: { role: "user", content: [{ type: "text", text: "new prompt" }] },
+    }),
+    contextEditLine("edit-new-user", TS_TODAY + 1000, "new-user", "new-user"),
+    assistantLine({ id: "second", parentId: "edit-new-user", ts: TS_TODAY + 2000, cost: 5, input: 100_000 }),
+  ];
+  const filePath = join(sessionsDir, "new-user.jsonl");
+  writeFileSync(filePath, `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, m.previousAssistantId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", "", false],
+      ["second", "first", false],
+    ],
+  );
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.cost, 6);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/)?.stat, "$5.00");
+  }
+});
+
+test("a sibling of a context edit keeps its real prefix miss, even across a large tool result", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const file = join(sessionsDir, "branched.jsonl");
+  const lines = [
+    sessionLine("branched", TS_TODAY),
+    assistantLine({ id: "common", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    contextEditLine("edit", TS_TODAY + 1000, "common"),
+    // Append order is not ancestry: this request branched from before the edit.
+    assistantLine({ id: "sibling", parentId: "common", ts: TS_TODAY + 2000, cost: 5, input: 100_000 }),
+    JSON.stringify({
+      type: "message",
+      id: "big-tool",
+      parentId: "edit",
+      timestamp: new Date(TS_TODAY + 2500).toISOString(),
+      message: { role: "toolResult", content: [{ type: "text", text: "x".repeat(100_000) }] },
+    }).replace(/^/, "  "), // Valid leading whitespace must not hide id/parentId in a skipped large entry.
+    assistantLine({ id: "edited", parentId: "big-tool", ts: TS_TODAY + 3000, cost: 7, input: 100_000 }),
+    assistantLine({ id: "later", parentId: "edited", ts: TS_TODAY + 4000, cost: 3, input: 100_000 }),
+  ];
+  writeFileSync(file, `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => Boolean(m.afterContextEdit)),
+    [false, false, true, false],
+  );
+
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.messages, 4);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$8.00");
+  }
+});
+
+test("cache warming refreshes only its branch, and assistant context follows parent ancestry", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const lines = [
+    sessionLine("branched", TS_TODAY),
+    assistantLine({ id: "common", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    usageEntryLine({ id: "warm", parentId: "common", ts: TS_TODAY + 4.5 * 60_000, cost: 0.5 }),
+    assistantLine({
+      id: "recent-sibling",
+      parentId: "common",
+      ts: TS_TODAY + 5 * 60_000,
+      cost: 2,
+      cacheRead: 100_000,
+    }),
+    assistantLine({ id: "unwarmed", parentId: "common", ts: TS_TODAY + 6 * 60_000, cost: 5, input: 100_000 }),
+    assistantLine({ id: "warmed", parentId: "warm", ts: TS_TODAY + 6 * 60_000 + 1000, cost: 7, input: 100_000 }),
+  ];
+  writeFileSync(join(sessionsDir, "branched.jsonl"), `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.equal(parsed.messages.at(-2)?.previousAssistantId, "common");
+  assert.equal(parsed.messages.at(-2)?.branchWarmAt, undefined);
+  assert.equal(parsed.messages.at(-1)?.previousAssistantId, "common");
+  assert.equal(parsed.messages.at(-1)?.branchWarmAt, TS_TODAY + 4.5 * 60_000);
+
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.messages, 4);
+    assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$5.00");
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$7.00");
+  }
+});
+
+test("editing a target discarded by compaction does not explain a later cache miss", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const lines = [
+    sessionLine("compacted", TS_TODAY),
+    assistantLine({ id: "common", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    JSON.stringify({
+      type: "message",
+      id: "old",
+      parentId: "common",
+      timestamp: new Date(TS_TODAY + 1000).toISOString(),
+      message: { role: "user", content: [{ type: "text", text: "old" }] },
+    }),
+    compactionLine({ id: "drop", parentId: "old", firstKeptEntryId: "drop", ts: TS_TODAY + 2000 }),
+    assistantLine({ id: "after-drop", parentId: "drop", ts: TS_TODAY + 3000, cacheRead: 100_000 }),
+    contextEditLine("edit-drop", TS_TODAY + 4000, "old", "after-drop"),
+    assistantLine({ id: "miss-drop", parentId: "edit-drop", ts: TS_TODAY + 5000, cost: 5, input: 100_000 }),
+    compactionLine({ id: "keep", parentId: "old", firstKeptEntryId: "old", ts: TS_TODAY + 2000 }),
+    assistantLine({ id: "after-keep", parentId: "keep", ts: TS_TODAY + 3000, cacheRead: 100_000 }),
+    contextEditLine("edit-keep", TS_TODAY + 4000, "old", "after-keep"),
+    assistantLine({ id: "miss-keep", parentId: "edit-keep", ts: TS_TODAY + 5000, cost: 7, input: 100_000 }),
+  ];
+  writeFileSync(join(sessionsDir, "compacted.jsonl"), `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.filter((m) => m.source === "assistant").map((m) => Boolean(m.afterContextEdit)),
+    [false, false, false, false, true],
+  );
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
+  }
+});
+
+test("editing an aborted assistant does not change Pi's provider-visible context", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const aborted = JSON.parse(
+    assistantLine({ id: "aborted", parentId: "first", ts: TS_TODAY + 100, cost: 2, cacheRead: 100_000 }),
+  );
+  aborted.message.stopReason = "aborted";
+  const lines = [
+    sessionLine("aborted-edit", TS_TODAY),
+    userLine(TS_TODAY),
+    assistantLine({ id: "first", parentId: "u1", ts: TS_TODAY, cost: 1, cacheRead: 100_000 }),
+    JSON.stringify(aborted),
+    contextEditLine("edit-aborted", TS_TODAY + 200, "aborted", "aborted"),
+    assistantLine({ id: "next", parentId: "edit-aborted", ts: TS_TODAY + 300, cost: 5, input: 100_000 }),
+  ];
+  const jsonl = `${lines.join("\n")}\n`;
+  const file = join(sessionsDir, "aborted-edit.jsonl");
+  writeFileSync(file, jsonl);
+  const pi = SessionManager.open(file);
+  const providerModel = { provider: "anthropic", api: "anthropic-messages", id: "claude-fable-5", input: ["text"] };
+  pi.branch("aborted");
+  const before = transformMessages(pi.buildSessionProjection().messages, providerModel).map((m) => m.role);
+  pi.branch("edit-aborted");
+  const after = transformMessages(pi.buildSessionProjection().messages, providerModel).map((m) => m.role);
+  assert.deepEqual(
+    [before, after],
+    [
+      ["user", "assistant"],
+      ["user", "assistant"],
+    ],
+  );
+
+  const parsed = await parseSessionBuffer(Buffer.from(jsonl));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, m.previousAssistantId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", "", false],
+      ["aborted", "first", false],
+      ["next", "aborted", false],
+    ],
+  );
+  const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+  assert.equal(findInsight(data, "today", /re-sending conversations mid-session/)?.stat, "$5.00");
+});
+
+test("a later compaction resurrects a hidden edit as Pi projects it", async (t) => {
+  const { sessionsDir } = fixture(t);
+  const replacement = { content: [{ type: "text", text: "new" }] };
+  const lines = [
+    sessionLine("resurrect-hidden-edit", TS_TODAY),
+    userLine(TS_TODAY, "old"),
+    assistantLine({ id: "first", parentId: "u1", ts: TS_TODAY, cost: 1 }),
+    compactionLine({ id: "drop", parentId: "first", firstKeptEntryId: "drop", ts: TS_TODAY + 100 }),
+    assistantLine({ id: "second", parentId: "drop", ts: TS_TODAY + 200, cost: 2 }),
+    contextEditLine("hidden-edit", TS_TODAY + 300, "u1", "second", replacement),
+    compactionLine({ id: "resurrect", parentId: "hidden-edit", firstKeptEntryId: "u1", ts: TS_TODAY + 400 }),
+    assistantLine({ id: "third", parentId: "resurrect", ts: TS_TODAY + 500, cost: 3 }),
+    contextEditLine("same-edit", TS_TODAY + 600, "u1", "third", replacement),
+    assistantLine({ id: "fourth", parentId: "same-edit", ts: TS_TODAY + 700, cost: 5 }),
+  ];
+  const jsonl = `${lines.join("\n")}\n`;
+  const file = join(sessionsDir, "resurrect-hidden-edit.jsonl");
+  writeFileSync(file, jsonl);
+  const pi = SessionManager.open(file);
+  const projectedUser = (leaf: string) => {
+    pi.branch(leaf);
+    return pi.buildSessionProjection().entries.find(({ sourceEntry }) => sourceEntry.id === "u1")?.messages;
+  };
+  pi.branch("second");
+  assert.deepEqual(
+    pi.buildSessionProjection().entries.map(({ sourceEntry }) => sourceEntry.id),
+    ["drop", "second"],
+  );
+  assert.deepEqual(
+    projectedUser("third")?.map((m) => m.content),
+    [replacement.content],
+  );
+  assert.deepEqual(
+    projectedUser("fourth")?.map((m) => m.content),
+    [replacement.content],
+  );
+
+  const parsed = await parseSessionBuffer(Buffer.from(jsonl));
+  assert.deepEqual(
+    parsed.messages
+      .filter((m) => m.source === "assistant")
+      .map((m) => [m.sourceId, Boolean(m.afterContextEdit), m.afterCompaction]),
+    [
+      ["first", false, false],
+      ["second", false, true],
+      ["third", false, true],
+      ["fourth", false, false],
+    ],
+  );
+});
+
+test("an edit resurrected by a later compaction does not rewrite the prior assistant context", async () => {
+  const oldUser = JSON.stringify({
+    type: "message",
+    id: "old",
+    parentId: "first",
+    message: { role: "user", content: [{ type: "text", text: "old context" }] },
+  });
+  const lines = [
+    sessionLine("resurrected", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY }),
+    oldUser,
+    compactionLine({ id: "drop", parentId: "old", firstKeptEntryId: "drop", ts: TS_TODAY + 100 }),
+    assistantLine({ id: "second", parentId: "drop", ts: TS_TODAY + 200 }),
+    compactionLine({ id: "resurrect", parentId: "second", firstKeptEntryId: "old", ts: TS_TODAY + 300 }),
+    contextEditLine("newly-visible", TS_TODAY + 400, "old", "resurrect"),
+    assistantLine({ id: "third", parentId: "newly-visible", ts: TS_TODAY + 500 }),
+    contextEditLine("restore", TS_TODAY + 600, "old", "third", {
+      content: [{ type: "text", text: "old context" }],
+    }),
+    assistantLine({ id: "fourth", parentId: "restore", ts: TS_TODAY + 700 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages
+      .filter((m) => m.source === "assistant")
+      .map((m) => [m.sourceId, Boolean(m.afterContextEdit), m.afterCompaction]),
+    [
+      ["first", false, false],
+      ["second", false, true],
+      ["third", false, true],
+      ["fourth", true, false],
+    ],
+  );
+});
+
+test("matching cache warming at 4m30 refreshes TTL before the assistant at 6m", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const warmAt = TS_TODAY + 4.5 * 60_000;
+  const assistantAt = TS_TODAY + 6 * 60_000;
+  for (const [id, kind, provider, model, cost] of [
+    ["matching", "cache_warm", "anthropic", "claude-fable-5", 5],
+    ["other-model", "cache_warm", "anthropic", "other-model", 7],
+    ["other-provider", "cache_warm", "openai", "claude-fable-5", 11],
+    ["other-kind", "future_kind", "anthropic", "claude-fable-5", 9],
+  ] as const) {
+    writeFileSync(
+      join(sessionsDir, `${id}.jsonl`),
+      `${[
+        sessionLine(id, TS_TODAY),
+        assistantLine({ id: `${id}-first`, ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+        usageEntryLine({
+          id: `${id}-warm`,
+          parentId: `${id}-first`,
+          ts: warmAt,
+          kind,
+          provider,
+          model,
+          cost: 0.5,
+          cacheRead: 50_000,
+        }),
+        assistantLine({ id: `${id}-next`, parentId: `${id}-warm`, ts: assistantAt, cost, input: 100_000 }),
+      ].join("\n")}\n`,
+    );
+  }
+
+  for (const filesToParse of [4, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.messages, 8);
+    assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$27.00");
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
+  }
+});
+
+test("Pi response-model cache warms match an alias without hiding a concrete model switch", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const alias = "claude-fable-5";
+  const concrete = "claude-fable-5-20260930";
+  const switched = "claude-fable-5-20261001";
+  const lines = [
+    sessionLine("alias", TS_TODAY),
+    assistantLine({
+      id: "first",
+      ts: TS_TODAY,
+      model: alias,
+      responseModel: concrete,
+      input: 1000,
+      cacheRead: 100_000,
+    }),
+    // Pi appends the concrete responseModel as usage.model, not the request alias.
+    usageEntryLine({ id: "warm", parentId: "first", ts: TS_TODAY + 4.5 * 60_000, model: concrete, cost: 0.25 }),
+    assistantLine({
+      id: "same",
+      parentId: "warm",
+      ts: TS_TODAY + 6 * 60_000,
+      model: alias,
+      responseModel: concrete,
+      cost: 3,
+      input: 100_000,
+    }),
+    assistantLine({
+      id: "changed",
+      parentId: "warm",
+      ts: TS_TODAY + 6 * 60_000,
+      model: alias,
+      responseModel: switched,
+      cost: 5,
+      input: 100_000,
+    }),
+    assistantLine({
+      id: "quick-switch",
+      parentId: "first",
+      ts: TS_TODAY + 60_000,
+      model: alias,
+      responseModel: switched,
+      cost: 7,
+      input: 100_000,
+    }),
+  ];
+  const filePath = join(sessionsDir, "alias.jsonl");
+  writeFileSync(filePath, `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.filter((m) => m.source === "assistant").map((m) => [m.responseModel, m.branchWarmAt]),
+    [
+      [concrete, undefined],
+      [concrete, TS_TODAY + 4.5 * 60_000],
+      [switched, undefined],
+      [switched, undefined],
+    ],
+  );
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.cost, 16.25);
+    assert.equal(data.today.totals.messages, 4);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$3.00");
+    assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$5.00");
+    assert.equal(findInsight(data, "today", /switching models mid-conversation/).stat, "$7.00");
+    assert.equal(data.today.providers.get("anthropic").models.get(alias).cost, 16);
+    assert.equal(data.today.providers.get("anthropic").models.get(concrete).cost, 0.25);
+  }
+});
+
+test("zero-usage warm refreshes branch TTL without inventing cost, tokens, or a turn", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const lines = [
+    sessionLine("zero", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    usageEntryLine({
+      id: "zero-warm",
+      parentId: "first",
+      ts: TS_TODAY + 4.5 * 60_000,
+      cost: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+    }),
+    assistantLine({ id: "warmed", parentId: "zero-warm", ts: TS_TODAY + 6 * 60_000, cost: 5, input: 100_000 }),
+    assistantLine({ id: "sibling", parentId: "first", ts: TS_TODAY + 6 * 60_000, cost: 7, input: 100_000 }),
+  ];
+  writeFileSync(join(sessionsDir, "zero.jsonl"), `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.equal(parsed.messages.length, 3);
+  assert.equal(parsed.messages[1].branchWarmAt, TS_TODAY + 4.5 * 60_000);
+  assert.equal(parsed.messages[2].branchWarmAt, undefined);
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.cost, 13);
+    assert.equal(data.today.totals.messages, 3);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
+    assert.equal(findInsight(data, "today", /resuming conversations after a break/).stat, "$7.00");
+  }
+});
+
+test("no-op replacements, repeated edits, omissions, and reverts preserve real prefix misses", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const original = [{ type: "text", text: "hi" }];
+  const changed = [{ type: "text", text: "changed" }];
+  const lines = [
+    sessionLine("edits", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    contextEditLine("same-original", TS_TODAY + 100, "first", "first", { content: original }),
+    assistantLine({ id: "miss-original", parentId: "same-original", ts: TS_TODAY + 200, cost: 2, input: 100_000 }),
+    contextEditLine("change", TS_TODAY + 300, "first", "miss-original", { content: changed }),
+    assistantLine({ id: "changed-hit", parentId: "change", ts: TS_TODAY + 400, cacheRead: 100_000 }),
+    contextEditLine("repeat", TS_TODAY + 500, "first", "changed-hit", { content: changed }),
+    assistantLine({ id: "miss-repeat", parentId: "repeat", ts: TS_TODAY + 600, cost: 3, input: 100_000 }),
+    contextEditLine("omit", TS_TODAY + 700, "first", "miss-repeat"),
+    assistantLine({ id: "omit-hit", parentId: "omit", ts: TS_TODAY + 800, cacheRead: 100_000 }),
+    contextEditLine("repeat-omit", TS_TODAY + 900, "first", "omit-hit"),
+    assistantLine({ id: "miss-omit", parentId: "repeat-omit", ts: TS_TODAY + 1000, cost: 5, input: 100_000 }),
+    contextEditLine("restore", TS_TODAY + 1100, "first", "miss-omit", { content: changed }),
+    contextEditLine("revert", TS_TODAY + 1200, "first", "restore"),
+    assistantLine({ id: "miss-revert", parentId: "revert", ts: TS_TODAY + 1300, cost: 7, input: 100_000 }),
+  ];
+  writeFileSync(join(sessionsDir, "edits.jsonl"), `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => Boolean(m.afterContextEdit)),
+    [false, false, true, false, true, false, false],
+  );
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(data.today.totals.messages, 7);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$17.00");
+  }
+});
+
+test("a kept edit remains effective through compaction and an identical later edit is a no-op", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  const replacement = { content: "new context" };
+  const lines = [
+    sessionLine("compact-edit", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, input: 1000, cacheRead: 100_000 }),
+    contextEditLine("changed", TS_TODAY + 100, "first", "first", replacement),
+    compactionLine({
+      id: "compact",
+      parentId: "changed",
+      firstKeptEntryId: "first",
+      ts: TS_TODAY + 200,
+      cost: 0,
+      input: 0,
+      output: 0,
+    }),
+    assistantLine({ id: "after-compact", parentId: "compact", ts: TS_TODAY + 300, cacheRead: 100_000 }),
+    contextEditLine("same", TS_TODAY + 400, "first", "after-compact", replacement),
+    assistantLine({ id: "miss", parentId: "same", ts: TS_TODAY + 500, cost: 5, input: 100_000 }),
+  ];
+  writeFileSync(join(sessionsDir, "compact-edit.jsonl"), `${lines.join("\n")}\n`);
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => Boolean(m.afterContextEdit)),
+    [false, false, false],
+  );
+  for (const filesToParse of [1, 0]) {
+    const progress = [];
+    const data = await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => progress.push(p) });
+    assert.equal(progress[0].filesToParse, filesToParse);
+    assert.equal(findInsight(data, "today", /re-sending conversations mid-session/).stat, "$5.00");
+  }
+});
+
+test("sibling edits of the same target keep independent effective content and baselines", async () => {
+  const original = { content: [{ type: "text", text: "hi" }] };
+  const changed = { content: "changed" };
+  const lines = [
+    sessionLine("sibling-edits", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY }),
+    contextEditLine("left", TS_TODAY + 100, "first", "first", changed),
+    contextEditLine("left-again", TS_TODAY + 200, "first", "left", changed),
+    assistantLine({ id: "left-answer", parentId: "left-again", ts: TS_TODAY + 300 }),
+    contextEditLine("right-noop", TS_TODAY + 400, "first", "first", original),
+    assistantLine({ id: "right-answer", parentId: "right-noop", ts: TS_TODAY + 500 }),
+    contextEditLine("right-omit", TS_TODAY + 600, "first", "first"),
+    assistantLine({ id: "right-omitted", parentId: "right-omit", ts: TS_TODAY + 700 }),
+    contextEditLine("left-revert", TS_TODAY + 800, "first", "left-again", original),
+    assistantLine({ id: "left-restored", parentId: "left-revert", ts: TS_TODAY + 900 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", false],
+      ["left-answer", true],
+      ["right-answer", false],
+      ["right-omitted", true],
+      ["left-restored", false],
+    ],
+  );
+});
+
+test("many distinct targets can all revert without changing a sibling branch", async () => {
+  const original = [{ type: "text", text: "before" }];
+  const lines = [sessionLine("distinct-reverts", TS_TODAY), assistantLine({ id: "first", ts: TS_TODAY })];
+  let parentId = "first";
+  const targets: string[] = [];
+  for (let index = 0; index < 127; index++) {
+    const targetId = `target-${String(index).padStart(3, "0")}`;
+    targets.push(targetId);
+    lines.push(
+      JSON.stringify({ type: "message", id: targetId, parentId, message: { role: "user", content: original } }),
+    );
+    const editId = `omit-${index}`;
+    lines.push(contextEditLine(editId, TS_TODAY + index, targetId, targetId));
+    parentId = editId;
+  }
+  lines.push(assistantLine({ id: "omitted", parentId, ts: TS_TODAY + 1000 }));
+  // Delete keys from both ends and the middle of the shared AVL tree.
+  for (let index = 0; index < targets.length; index++) {
+    const targetId = targets[index % 2 === 0 ? index / 2 : targets.length - 1 - (index - 1) / 2];
+    const editId = `restore-${index}`;
+    lines.push(contextEditLine(editId, TS_TODAY + 1100 + index, targetId, parentId, { content: original }));
+    parentId = editId;
+  }
+  lines.push(assistantLine({ id: "restored", parentId, ts: TS_TODAY + 2000 }));
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", false],
+      ["omitted", false], // Those users arrived after the prior assistant, outside its cached prefix.
+      ["restored", false],
+    ],
+  );
+});
+
+test("compaction retains a kept edit, clears pending changes, and resets the next baseline", async () => {
+  const replacement = { content: "new context" };
+  const original = { content: [{ type: "text", text: "hi" }] };
+  const lines = [
+    sessionLine("compaction-baseline", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY }),
+    contextEditLine("changed", TS_TODAY + 100, "first", "first", replacement),
+    compactionLine({
+      id: "compact",
+      parentId: "changed",
+      firstKeptEntryId: "first",
+      ts: TS_TODAY + 200,
+      cost: 0,
+      input: 0,
+      output: 0,
+    }),
+    contextEditLine("same", TS_TODAY + 300, "first", "compact", replacement),
+    assistantLine({ id: "after-compact", parentId: "same", ts: TS_TODAY + 400 }),
+    contextEditLine("restore", TS_TODAY + 500, "first", "after-compact", original),
+    assistantLine({ id: "restored", parentId: "restore", ts: TS_TODAY + 600 }),
+    contextEditLine("change-again", TS_TODAY + 700, "first", "restored", replacement),
+    assistantLine({ id: "changed-again", parentId: "change-again", ts: TS_TODAY + 800 }),
+    contextEditLine("repeat", TS_TODAY + 900, "first", "changed-again", replacement),
+    assistantLine({ id: "no-op", parentId: "repeat", ts: TS_TODAY + 1000 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, Boolean(m.afterContextEdit), m.afterCompaction]),
+    [
+      ["first", false, false],
+      ["after-compact", false, true],
+      ["restored", true, false],
+      ["changed-again", true, false],
+      ["no-op", false, false],
+    ],
+  );
+});
+
+test("late and duplicate lineage ids use the bounded ancestry walk", async () => {
+  const user = (id: string, parentId: string | null) =>
+    JSON.stringify({ type: "message", id, parentId, message: { role: "user", content: "user" } });
+  const lines = [
+    sessionLine("malformed-lineage", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY }),
+    user("orphan", "future"), // Parent appears only after the child was indexed.
+    user("future", "first"),
+    contextEditLine("late-edit", TS_TODAY + 100, "first", "orphan"),
+    assistantLine({ id: "late", parentId: "late-edit", ts: TS_TODAY + 200 }),
+    user("mid", "first"),
+    user("leaf", "mid"),
+    user("other-root", null),
+    user("mid", "other-root"), // Invalidates the canonical path cached for leaf.
+    contextEditLine("not-ancestor", TS_TODAY + 300, "first", "leaf"),
+    assistantLine({ id: "duplicate", parentId: "not-ancestor", ts: TS_TODAY + 400 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", false],
+      ["late", false], // The unresolved parent did not carry a known previous assistant request.
+      ["duplicate", false],
+    ],
+  );
+});
+
+test("cyclic imported lineage stops at a repeated id while preserving independent accounting", async () => {
+  const lines = [
+    sessionLine("cyclic", TS_TODAY),
+    assistantLine({ id: "first", ts: TS_TODAY, cost: 2 }),
+    JSON.stringify({ type: "message", id: "cycle-a", parentId: "cycle-b", message: { role: "user", content: [] } }),
+    JSON.stringify({ type: "message", id: "cycle-b", parentId: "cycle-a", message: { role: "user", content: [] } }),
+    contextEditLine("edit", TS_TODAY + 100, "first", "cycle-b"),
+    assistantLine({ id: "second", parentId: "edit", ts: TS_TODAY + 200, cost: 3 }),
+  ];
+  const parsed = await parseSessionBuffer(Buffer.from(lines.join("\n")));
+  assert.deepEqual(
+    parsed.messages.map((m) => [m.sourceId, m.cost, m.previousAssistantId, Boolean(m.afterContextEdit)]),
+    [
+      ["first", 2, "", false],
+      ["second", 3, "", false],
+    ],
+  );
 });
 
 test("pi test providers are excluded from all stats", async (t) => {

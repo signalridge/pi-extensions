@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -23,7 +24,7 @@ vi.mock("../src/worktree.js", () => ({
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
 
 const mockPi = {} as any;
-const mockCtx = { cwd: "/tmp" } as any;
+const mockCtx = { cwd: "/tmp", modelRegistry: mockParentRegistry } as any;
 
 const mockSession = (sessionFile?: string) => ({ dispose: vi.fn(), sessionFile } as any);
 
@@ -34,6 +35,32 @@ const resolvedRun = () =>
     aborted: false,
     steered: false,
   });
+
+describe("AgentManager — synchronous runtime admission", () => {
+  it("does not allocate a child or consume its branch budget when the runtime is missing", async () => {
+    let finish!: (value: unknown) => void;
+    vi.mocked(runAgent).mockImplementation(() => new Promise((resolve) => { finish = resolve; }) as never);
+    const created = vi.fn();
+    const manager = new AgentManager(undefined, 4, undefined, undefined, created);
+    try {
+      const parentId = manager.spawn(mockPi, mockCtx, "general-purpose", "parent", {
+        description: "parent", isBackground: true,
+      });
+      const publicFacadeCtx = { cwd: "/tmp", modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) } } as any;
+      expect(() => manager.spawn(mockPi, publicFacadeCtx, "scout", "child", {
+        description: "child", isBackground: true, parentAgentId: parentId,
+      })).toThrow(/parent's model runtime is unavailable or incompatible/);
+      expect(manager.listAgents()).toHaveLength(1);
+      expect((manager as any).branchSpawnCounts.get(parentId)).toBeUndefined();
+      expect(created).toHaveBeenCalledOnce();
+      expect(runAgent).toHaveBeenCalledOnce();
+      finish({ responseText: "parent", session: mockSession(), aborted: false, steered: false });
+      await manager.getRecordMutable(parentId)?.promise;
+    } finally {
+      await manager.dispose();
+    }
+  });
+});
 
 describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)", () => {
   let manager: AgentManager;
@@ -334,6 +361,22 @@ describe("AgentManager — pool and parent-signal settlement", () => {
     finishRunning({ responseText: "late", session: mockSession(), aborted: false, steered: false });
   });
 
+  it("seals all journal owners before any committed-branch abort listener runs", () => {
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    manager = new AgentManager(undefined, 2);
+    const first = manager.spawn(mockPi, mockCtx, "X", "first", { description: "first", isBackground: true });
+    const second = manager.spawn(mockPi, mockCtx, "Y", "second", { description: "second", isBackground: true });
+    let secondDetachedAtAbort: boolean | undefined;
+    manager.getRecordMutable(first)!.abortController!.signal.addEventListener("abort", () => {
+      secondDetachedAtAbort = manager.getRecordMutable(second)?.detached;
+      manager.abort(second);
+    });
+
+    manager.detachForBranchChange();
+
+    expect(secondDetachedAtAbort).toBe(true);
+    expect(manager.getRecordMutable(second)?.detached).toBe(true);
+  });
 
   it("continues draining after a detached queued record", async () => {
     let finishRunning!: (value: unknown) => void;
@@ -408,7 +451,7 @@ describe("AgentManager — nested runtime propagation", () => {
     let childId: string | undefined;
     manager = new AgentManager(undefined, 4, (record) => {
       if (record.type !== "general-purpose") return;
-      childId = manager.spawn(mockPi, { cwd: record.worktree?.path } as any, "scout", "child", {
+      childId = manager.spawn(mockPi, { ...mockCtx, cwd: record.worktree?.path } as any, "scout", "child", {
         description: "child",
         isBackground: true,
         parentAgentId: record.id,
@@ -602,7 +645,7 @@ describe("AgentManager — nested runtime propagation", () => {
       isBackground: true,
       isolation: "worktree",
     });
-    const childId = manager.spawn(mockPi, { cwd: parentPath } as any, "scout", "child", {
+    const childId = manager.spawn(mockPi, { ...mockCtx, cwd: parentPath } as any, "scout", "child", {
       description: "child",
       isBackground: true,
       depth: 2,
@@ -976,13 +1019,13 @@ describe("AgentManager — nested runtime propagation", () => {
         isBackground: true,
         isolation: "worktree",
       });
-      const childId = manager.spawn(mockPi, { cwd: rootPath } as any, "scout", "child", {
+      const childId = manager.spawn(mockPi, { ...mockCtx, cwd: rootPath } as any, "scout", "child", {
         description: "child",
         isBackground: true,
         parentAgentId: rootId,
         isolation: "worktree",
       });
-      const grandchildId = manager.spawn(mockPi, { cwd: childPath } as any, "scout", "grandchild", {
+      const grandchildId = manager.spawn(mockPi, { ...mockCtx, cwd: childPath } as any, "scout", "grandchild", {
         description: "grandchild",
         isBackground: true,
         parentAgentId: childId,
@@ -1101,7 +1144,7 @@ describe("AgentManager — nested runtime propagation", () => {
         isBackground: true,
         isolation: "worktree",
       });
-      const childId = manager.spawn(mockPi, { cwd: parentPath } as any, "scout", "child", {
+      const childId = manager.spawn(mockPi, { ...mockCtx, cwd: parentPath } as any, "scout", "child", {
         description: "child",
         isBackground: true,
         parentAgentId: parentId,
@@ -1163,7 +1206,7 @@ describe("AgentManager — nested runtime propagation", () => {
         isBackground: true,
         isolation: "worktree",
       });
-      const childId = manager.spawn(mockPi, { cwd: parentPath } as any, "scout", "child", {
+      const childId = manager.spawn(mockPi, { ...mockCtx, cwd: parentPath } as any, "scout", "child", {
         description: "child",
         isBackground: true,
         parentAgentId: parentId,
@@ -1220,13 +1263,13 @@ describe("AgentManager — nested runtime propagation", () => {
         isBackground: true,
         isolation: "worktree",
       });
-      const childId = manager.spawn(mockPi, { cwd: parentPath } as any, "scout", "child", {
+      const childId = manager.spawn(mockPi, { ...mockCtx, cwd: parentPath } as any, "scout", "child", {
         description: "child",
         isBackground: true,
         parentAgentId: rootId,
         isolation: "worktree",
       });
-      const grandchildId = manager.spawn(mockPi, { cwd: childPath } as any, "scout", "grandchild", {
+      const grandchildId = manager.spawn(mockPi, { ...mockCtx, cwd: childPath } as any, "scout", "grandchild", {
         description: "grandchild",
         isBackground: true,
         parentAgentId: childId,

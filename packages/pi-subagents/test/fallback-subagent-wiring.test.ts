@@ -22,6 +22,7 @@ vi.mock("../src/agent-runner.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import { getAllTypes, getAvailableTypes, NO_FALLBACK, registerAgents, setFallbackSubagent } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRuntime } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -60,7 +61,7 @@ function ctx() {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), runtime: mockParentRuntime },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

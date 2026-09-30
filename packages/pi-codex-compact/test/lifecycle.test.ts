@@ -1,16 +1,30 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getCurrentSystemPrompt,
+  getCurrentTools,
   type Model,
   type OpenAICodexResponsesOptions,
   type Provider,
+  Type,
 } from "@earendil-works/pi-ai";
-import { type SessionBeforeCompactEvent, type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import {
+  buildSessionProjection,
+  type SessionBeforeCompactEvent,
+  type SessionEntry,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import {
   checkpointMarker,
   createCheckpointDetails,
   fallbackSummary,
+  fingerprintMessage,
   parseCheckpointDetails,
 } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
@@ -78,11 +92,13 @@ function fakeProvider(
       const stream = createAssistantMessageEventStream();
       void (async () => {
         try {
-          const input = context.messages.map((message) => {
-            const content = typeof message.content === "string" ? message.content : message.content[0];
-            const text = typeof content === "string" ? content : "text" in content ? content.text : "image";
-            return { role: "user", content: [{ type: "input_text", text }] };
-          });
+          const input = context.messages
+            .filter((message) => message.role !== "system")
+            .map((message) => {
+              const content = typeof message.content === "string" ? message.content : message.content[0];
+              const text = typeof content === "string" ? content : "text" in content ? content.text : "image";
+              return { role: "user", content: [{ type: "input_text", text }] };
+            });
           const payload = await options?.onPayload?.({ model: model.id, input }, model);
           onPayload?.(payload);
           assert.deepEqual((payload as { input: unknown[] }).input.at(-1), {
@@ -223,7 +239,7 @@ test("effective checkpoint selection recovers remote -> native -> remote and fai
     const { ctx, notifications, statuses } = createMockContext({
       model,
       hasUI: true,
-      getSystemPrompt: () => "system",
+      getSystemPrompt: () => "",
       sessionManager: session,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake-test-key" }),
@@ -276,7 +292,8 @@ test("effective checkpoint selection recovers remote -> native -> remote and fai
 function sseResponse() {
   const item = { type: "compaction", encrypted_content: "opaque" };
   return new Response(
-    `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { output: [item] } })}\n\n`,
+    `data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [item] } })}\n\n`,
+    { status: 200, headers: { "content-type": "text/event-stream" } },
   );
 }
 
@@ -291,7 +308,7 @@ test("registers the settings command and returns a versioned Remote V2 compactio
   const entries = branch();
   const { ctx, statuses } = createMockContext({
     model,
-    getSystemPrompt: () => "system",
+    getSystemPrompt: () => "",
     sessionManager: {
       getSessionId: () => "session",
       getBranch: () => entries,
@@ -391,7 +408,7 @@ test("overflow hook derives retry proof from the actual retained assistant, and 
     createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch: async () => sseResponse() })(mock.pi);
     const { ctx } = createMockContext({
       model,
-      getSystemPrompt: () => "system",
+      getSystemPrompt: () => "",
       sessionManager: session,
       modelRegistry: {
         getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake" }),
@@ -426,6 +443,469 @@ test("overflow hook derives retry proof from the actual retained assistant, and 
     }
   }
 });
+
+for (const edit of ["omit", "replace"] as const) {
+  test(`real Pi ${edit} edit at the cut point fingerprints only projected kept messages and replays after reload`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-projection-"));
+    try {
+      const session = SessionManager.create(directory, directory);
+      session.appendMessage({ role: "user", content: "earlier context ".repeat(30), timestamp: 1 });
+      if (edit === "omit") {
+        session.appendMessage({ role: "user", content: "recovered input ".repeat(30), timestamp: 2 });
+      }
+      const privateTail = {
+        role: "assistant" as const,
+        content: [{ type: "text" as const, text: "private abandoned attempt" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage,
+        stopReason: "error" as const,
+        timestamp: 3,
+      };
+      const cutpointId = session.appendMessage(privateTail);
+      session.appendContextEdit(
+        cutpointId,
+        edit === "omit" ? null : { content: [{ type: "text", text: "public retry tail" }] },
+      );
+      const branchEntries = session.getBranch();
+      const preparation = { ...event().preparation, firstKeptEntryId: cutpointId };
+      const projection = buildSessionProjection(branchEntries);
+      const keptIndex = projection.entries.findIndex((entry) => entry.sourceEntry.id === cutpointId);
+      const visibleKept = projection.entries.slice(keptIndex).flatMap((entry) => entry.messages);
+      assert.equal(visibleKept.length, edit === "omit" ? 0 : 1);
+      const mock = createMockPi();
+      createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch: async () => sseResponse() })(mock.pi);
+      const { ctx } = createMockContext({
+        model,
+        getSystemPrompt: () => "",
+        sessionManager: session,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "fake" }),
+          getProvider: () => fakeProvider(),
+        },
+      });
+      const result = (await mock.events.get("session_before_compact")?.[0](
+        { ...event(), reason: "overflow", willRetry: true, branchEntries, preparation },
+        ctx,
+      )) as { compaction: { summary: string; firstKeptEntryId: string; details: unknown } } | undefined;
+      assert.ok(result);
+      assert.equal(result.compaction.firstKeptEntryId, cutpointId);
+      const details = parseCheckpointDetails(result.compaction.details);
+      assert.ok(details);
+      assert.deepEqual(details.keptMessageFingerprints, visibleKept.map(fingerprintMessage));
+      assert.deepEqual(details.retryTrimmedTail, edit === "omit" ? undefined : visibleKept[0]);
+      assert.doesNotMatch(JSON.stringify(details), /private abandoned attempt/);
+
+      session.appendCompaction(result.compaction.summary, cutpointId, preparation.tokensBefore, details, true);
+      const persisted = session.buildSessionContext().messages;
+      if (edit === "omit") {
+        const afterCompaction = await mock.events.get("context")?.[0]({ messages: persisted }, ctx);
+        assert.ok(afterCompaction, "omitted cut point has no retry proof and replays immediately");
+        assert.match(JSON.stringify(afterCompaction), /PI_CODEX_REMOTE_CHECKPOINT/);
+      } else {
+        assert.deepEqual(persisted.at(-1), visibleKept[0]);
+      }
+      assert.doesNotMatch(JSON.stringify(persisted), /private abandoned attempt/);
+      await mock.events.get("session_compact")?.[0](
+        { willRetry: true, compactionEntry: session.getBranch().at(-1) },
+        ctx,
+      );
+      const runtime = edit === "replace" ? persisted.slice(0, -1) : persisted;
+      const retried = await mock.events.get("context")?.[0]({ messages: runtime }, ctx);
+      assert.ok(retried, "retry context replays when Pi trims the edited error tail");
+      await mock.events.get("session_shutdown")?.[0]({ reason: "reload" }, ctx);
+      const reloadedMock = createMockPi();
+      createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reloadedMock.pi);
+      await reloadedMock.events.get("session_start")?.[0]({ reason: "reload" }, ctx);
+      assert.ok(await reloadedMock.events.get("context")?.[0]({ messages: runtime }, ctx));
+
+      const sessionFile = session.getSessionFile();
+      assert.ok(sessionFile);
+      const reopened = SessionManager.open(sessionFile);
+      const reopenedMock = createMockPi();
+      createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reopenedMock.pi);
+      const reopenedContext = createMockContext({ model, sessionManager: reopened }).ctx;
+      await reopenedMock.events.get("session_start")?.[0]({ reason: "startup" }, reopenedContext);
+      const fromDisk = await reopenedMock.events.get("context")?.[0](
+        { messages: reopened.buildSessionContext().messages },
+        reopenedContext,
+      );
+      assert.ok(fromDisk, "persisted checkpoint replays after reopening the session file");
+      assert.match(JSON.stringify(fromDisk), /PI_CODEX_REMOTE_CHECKPOINT/);
+      assert.doesNotMatch(JSON.stringify(fromDisk), /private abandoned attempt/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+test("real Pi transcript and Codex provider keep current prompt, tools, and replay lineage across compactions", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-transcript-"));
+  try {
+    const session = SessionManager.create(directory, directory);
+    const oldTool = { name: "old-tool", description: "Old tool", parameters: Type.Object({}) };
+    const newTool = { name: "new-tool", description: "New tool", parameters: Type.Object({}) };
+    session.appendMessage({
+      role: "system",
+      content: "Original instructions",
+      sections: { policy: "<policy>old</policy>" },
+      toolsAdded: [oldTool],
+      timestamp: 1,
+    });
+    session.appendMessage({ role: "user", content: "Earlier request", timestamp: 2 });
+    const keptId = session.appendMessage({ role: "user", content: "Read the file", timestamp: 3 });
+    session.appendMessage({
+      role: "assistant",
+      content: [
+        { type: "text", text: "Inspecting" },
+        { type: "toolCall", id: "call-1", name: "old-tool", arguments: {} },
+      ],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage,
+      stopReason: "toolUse",
+      timestamp: 4,
+    });
+    session.appendMessage({
+      role: "toolResult",
+      toolCallId: "call-1",
+      toolName: "old-tool",
+      content: [{ type: "text", text: "File contents" }],
+      isError: false,
+      timestamp: 5,
+    });
+    session.appendMessage({
+      role: "system",
+      content: "Updated instructions",
+      sections: { policy: "<policy>new</policy>" },
+      toolsRemoved: [{ name: oldTool.name }],
+      toolsAdded: [newTool],
+      timestamp: 6,
+    });
+    session.appendMessage({ role: "user", content: "Continue with the new tool", timestamp: 7 });
+
+    const actualProvider = openaiCodexProvider();
+    const payloads: Array<{ instructions: string; tools: Array<{ name: string }>; input: unknown[] }> = [];
+    const provider: Provider = {
+      ...actualProvider,
+      stream(requestModel, context, options) {
+        return actualProvider.stream(requestModel, context, {
+          ...options,
+          onPayload: async (payload, payloadModel) => {
+            const prepared = await options?.onPayload?.(payload, payloadModel);
+            payloads.push(structuredClone(prepared ?? payload) as (typeof payloads)[number]);
+            return prepared;
+          },
+        });
+      },
+    };
+    const mock = createMockPi({ activeTools: [newTool.name], allTools: [oldTool, newTool] });
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime(), fetch: async () => sseResponse() })(mock.pi);
+    const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+    const { ctx } = createMockContext({
+      model,
+      getSystemPrompt: () => getCurrentSystemPrompt(buildSessionProjection(session.getBranch()).messages),
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+        getProvider: () => provider,
+      },
+    });
+    const firstBranch = session.getBranch();
+    const projected = buildSessionProjection(firstBranch);
+    const keptIndex = projected.entries.findIndex((entry) => entry.sourceEntry.id === keptId);
+    const retained = projected.entries
+      .slice(keptIndex)
+      .flatMap((entry) => entry.messages)
+      .filter((message) => message.role !== "system");
+    const first = (await mock.events.get("session_before_compact")?.[0](
+      { ...event(), branchEntries: firstBranch, preparation: { ...event().preparation, firstKeptEntryId: keptId } },
+      ctx,
+    )) as { compaction: { summary: string; firstKeptEntryId: string; details: unknown } } | undefined;
+    assert.ok(first);
+    assert.equal(first.compaction.firstKeptEntryId, keptId);
+    const firstDetails = parseCheckpointDetails(first.compaction.details);
+    assert.ok(firstDetails);
+    assert.deepEqual(firstDetails.keptMessageFingerprints, retained.map(fingerprintMessage));
+    assert.equal(payloads.length, 1);
+    assert.equal(payloads[0].instructions.includes("Stale shorthand"), false);
+    assert.equal(payloads[0].instructions.match(/Original instructions/g)?.length, 1);
+    assert.equal(payloads[0].instructions.match(/Updated instructions/g)?.length, 1);
+    assert.match(payloads[0].instructions, /<policy>new<\/policy>/);
+    assert.doesNotMatch(payloads[0].instructions, /<policy>old<\/policy>/);
+    assert.deepEqual(
+      payloads[0].tools.map((tool) => tool.name),
+      [newTool.name],
+    );
+    assert.match(JSON.stringify(payloads[0].input), /Read the file/);
+    assert.match(JSON.stringify(payloads[0].input), /Inspecting/);
+    assert.match(JSON.stringify(payloads[0].input), /File contents/);
+    session.appendCompaction(first.compaction.summary, keptId, 100, firstDetails, true);
+    const persisted = session.buildSessionContext().messages;
+    assert.deepEqual(persisted.slice(2), retained);
+    assert.deepEqual(
+      getCurrentSystemMessage(persisted)?.toolsAdded?.map((tool) => tool.name),
+      [newTool.name],
+    );
+    assert.ok(await mock.events.get("context")?.[0]({ messages: persisted }, ctx));
+
+    const laterId = session.appendMessage({ role: "user", content: "One more task", timestamp: 8 });
+    const second = (await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: laterId },
+      },
+      ctx,
+    )) as { compaction: { summary: string; firstKeptEntryId: string; details: unknown } } | undefined;
+    assert.ok(second);
+    assert.equal(second.compaction.firstKeptEntryId, laterId);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[1].instructions.match(/Original instructions/g)?.length, 1);
+    assert.equal(payloads[1].instructions.match(/Updated instructions/g)?.length, 1);
+    assert.doesNotMatch(payloads[1].instructions, /Stale shorthand/);
+    assert.deepEqual(
+      payloads[1].tools.map((tool) => tool.name),
+      [newTool.name],
+    );
+    assert.match(JSON.stringify(payloads[1].input), /opaque/);
+    const secondDetails = parseCheckpointDetails(second.compaction.details);
+    assert.ok(secondDetails);
+    session.appendCompaction(second.compaction.summary, laterId, 100, secondDetails, true);
+    const sessionFile = session.getSessionFile();
+    assert.ok(sessionFile);
+    const reopened = SessionManager.open(sessionFile);
+    const reopenedMock = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reopenedMock.pi);
+    const reopenedContext = createMockContext({ model, sessionManager: reopened }).ctx;
+    await reopenedMock.events.get("session_start")?.[0]({ reason: "startup" }, reopenedContext);
+    const replayed = await reopenedMock.events.get("context")?.[0](
+      { messages: reopened.buildSessionContext().messages },
+      reopenedContext,
+    );
+    assert.ok(replayed, "the newest checkpoint must replay from the persisted system snapshot and retained tail");
+    assert.match(JSON.stringify(replayed), /PI_CODEX_REMOTE_CHECKPOINT/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const change of ["prompt", "tools"] as const) {
+  test(`real Pi rejects pending ${change} changes, then compacts their next persisted turn and replays after reload`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "pi-codex-compact-pending-system-"));
+    try {
+      const session = SessionManager.create(directory, directory);
+      const originalTool = {
+        name: "inspect",
+        description: "Inspect a path",
+        parameters: Type.Object({ path: Type.String() }),
+        constrainedSampling: true,
+      };
+      const nextTool = {
+        name: "search",
+        description: "Search files",
+        parameters: Type.Object({ query: Type.String() }),
+      };
+      session.appendMessage({
+        role: "system",
+        content: "Original instructions",
+        toolsAdded: [originalTool],
+        timestamp: 1,
+      });
+      const originalTurnId = session.appendMessage({ role: "user", content: "Original task", timestamp: 2 });
+      session.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "Initial answer" }],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage,
+        stopReason: "stop",
+        timestamp: 3,
+      });
+      // Pi's live ToolInfo and persisted declaration have distinct TypeBox symbols
+      // and object identities even though their model-visible schemas are equal.
+      const mock = createMockPi({
+        activeTools: [originalTool.name],
+        allTools: [{ ...originalTool, parameters: Type.Object({ path: Type.String() }) }, nextTool],
+      });
+      const payloads: Array<{ instructions: string; tools: Array<{ name: string }>; input: unknown[] }> = [];
+      const actualProvider = openaiCodexProvider();
+      const provider: Provider = {
+        ...actualProvider,
+        stream(requestModel, context, options) {
+          return actualProvider.stream(requestModel, context, {
+            ...options,
+            onPayload: async (payload, payloadModel) => {
+              const prepared = await options?.onPayload?.(payload, payloadModel);
+              payloads.push(structuredClone(prepared ?? payload) as (typeof payloads)[number]);
+              return prepared;
+            },
+          });
+        },
+      };
+      let fetches = 0;
+      createCodexCompactExtension({
+        settingsRuntime: settingsRuntime(),
+        fetch: async () => {
+          fetches += 1;
+          return sseResponse();
+        },
+      })(mock.pi);
+      const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+      let livePrompt = "Original instructions";
+      const { ctx, notifications } = createMockContext({
+        model,
+        getSystemPrompt: () => livePrompt,
+        sessionManager: session,
+        modelRegistry: {
+          getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+          getProvider: () => provider,
+        },
+        hasUI: true,
+      });
+      if (change === "prompt") livePrompt = "Original instructions\n\nNew instructions";
+      else mock.pi.setActiveTools([nextTool.name]);
+      const handler = mock.events.get("session_before_compact")?.[0];
+      const pending = await handler?.(
+        {
+          ...event(),
+          branchEntries: session.getBranch(),
+          preparation: { ...event().preparation, firstKeptEntryId: originalTurnId },
+        },
+        ctx,
+      );
+      assert.equal(pending, undefined, "an unsent live change must use Pi native compaction");
+      assert.equal(fetches, 0);
+      assert.equal(payloads.length, 0);
+      assert.match(notifications.at(-1)?.message ?? "", /using Pi compaction/);
+
+      session.appendMessage({
+        role: "system",
+        content: change === "prompt" ? "New instructions" : "",
+        ...(change === "tools" ? { toolsRemoved: [{ name: originalTool.name }], toolsAdded: [nextTool] } : {}),
+        timestamp: 4,
+      });
+      const nextTurnId = session.appendMessage({ role: "user", content: "Next task", timestamp: 5 });
+      const transcript = buildSessionProjection(session.getBranch()).messages;
+      assert.equal(getCurrentSystemPrompt(transcript), livePrompt);
+      assert.deepEqual(
+        getCurrentTools(transcript).map((tool) => tool.name),
+        [change === "tools" ? nextTool.name : originalTool.name],
+      );
+      const result = (await handler?.(
+        {
+          ...event(),
+          branchEntries: session.getBranch(),
+          preparation: { ...event().preparation, firstKeptEntryId: nextTurnId },
+        },
+        ctx,
+      )) as { compaction: { summary: string; details: unknown } } | undefined;
+      assert.ok(result, "persisted changes can be sent to Codex");
+      assert.equal(fetches, 1);
+      assert.equal(payloads.length, 1);
+      assert.equal(payloads[0].instructions, livePrompt);
+      assert.deepEqual(
+        payloads[0].tools.map((tool) => tool.name),
+        [change === "tools" ? nextTool.name : originalTool.name],
+      );
+      assert.match(JSON.stringify(payloads[0].input), /Next task/);
+      const details = parseCheckpointDetails(result.compaction.details);
+      assert.ok(details);
+      session.appendCompaction(result.compaction.summary, nextTurnId, 100, details, true);
+      assert.equal(getCurrentSystemPrompt(session.buildSessionContext().messages), livePrompt);
+      const sessionFile = session.getSessionFile();
+      assert.ok(sessionFile);
+      const reopened = SessionManager.open(sessionFile);
+      assert.deepEqual(
+        reopened.getBranch().map((entry) => entry.type),
+        session.getBranch().map((entry) => entry.type),
+      );
+      const reopenedMock = createMockPi();
+      createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(reopenedMock.pi);
+      const reopenedContext = createMockContext({ model, sessionManager: reopened }).ctx;
+      await reopenedMock.events.get("session_start")?.[0]({ reason: "startup" }, reopenedContext);
+      const persisted = reopened.buildSessionContext().messages;
+      assert.equal(getCurrentSystemPrompt(persisted), livePrompt);
+      assert.deepEqual(
+        getCurrentTools(persisted).map((tool) => tool.name),
+        [change === "tools" ? nextTool.name : originalTool.name],
+      );
+      const replayed = await reopenedMock.events.get("context")?.[0]({ messages: persisted }, reopenedContext);
+      assert.ok(replayed);
+      assert.match(JSON.stringify(replayed), /PI_CODEX_REMOTE_CHECKPOINT/);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const change of ["prompt", "tools", "context edit"] as const) {
+  test(`real Codex response is discarded if live ${change} changes during the request`, async () => {
+    const session = SessionManager.inMemory();
+    const originalTool = { name: "inspect", description: "Inspect a path", parameters: Type.Object({}) };
+    const nextTool = { name: "search", description: "Search files", parameters: Type.Object({}) };
+    session.appendMessage({
+      role: "system",
+      content: "Initial instructions",
+      toolsAdded: [originalTool],
+      timestamp: 1,
+    });
+    const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 2 });
+    const mock = createMockPi({ activeTools: [originalTool.name], allTools: [originalTool, nextTool] });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let dispatched!: () => void;
+    const sent = new Promise<void>((resolve) => {
+      dispatched = resolve;
+    });
+    let fetches = 0;
+    createCodexCompactExtension({
+      settingsRuntime: settingsRuntime(),
+      fetch: async () => {
+        fetches += 1;
+        dispatched();
+        await blocked;
+        return sseResponse();
+      },
+    })(mock.pi);
+    const apiKey = `x.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "test" } })).toString("base64")}.x`;
+    let livePrompt = "Initial instructions";
+    const { ctx, statuses } = createMockContext({
+      model,
+      getSystemPrompt: () => livePrompt,
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => ({ ok: true, apiKey }),
+        getProvider: () => openaiCodexProvider(),
+      },
+    });
+    const inFlight = mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    );
+    await sent;
+    if (change === "prompt") livePrompt = "Changed while awaiting Codex";
+    else if (change === "tools") mock.pi.setActiveTools([nextTool.name]);
+    else session.appendContextEdit(keptId, { content: "Changed after request started" });
+    release();
+    assert.equal(await inFlight, undefined);
+    assert.equal(fetches, 1);
+    assert.equal(statuses.get("codex-compact"), undefined);
+    assert.equal(
+      session.getBranch().some((entry) => entry.type === "compaction"),
+      false,
+    );
+  });
+}
 
 test("session lifecycle reloads settings, warns once current, and drops stale reload continuations", async () => {
   const mock = createMockPi();
@@ -481,7 +961,7 @@ test("disabled, unsupported, auth-failed, and aborted compaction paths remain sa
     const handler = mock.events.get("session_before_compact")?.[0];
     const { ctx, notifications, statuses } = createMockContext({
       model: options.model ?? model,
-      getSystemPrompt: () => "system",
+      getSystemPrompt: () => "",
       sessionManager: { getSessionId: () => "session", getBranch: () => branch() },
       modelRegistry: {
         getApiKeyAndHeaders: async () => options.auth ?? { ok: false, error: "missing auth" },

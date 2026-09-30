@@ -7,6 +7,7 @@ import {
 } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
+import { WorkflowEngine } from "../src/engine.js";
 import piWorkflows from "../src/index.js";
 
 // Deliberately none of the names the built-in workflows use: a host is free to
@@ -100,15 +101,20 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
     mode: "print" as "print" | "rpc" | "tui",
     ui: {
       setWidget: (_key: string, content: string[] | undefined) => widgetUpdates.push(content),
+      notify: vi.fn(),
       confirm: vi.fn(async () => true),
       input: vi.fn(async () => "input"),
       select: vi.fn(async () => "choice"),
     },
     sessionManager: {
+      getLeafId: () => (entries.length ? `entry-${entries.length}` : null),
       getBranch: () =>
-        entries.map((entry) => {
-          const shaped = entry as { type?: unknown };
-          return shaped.type ? entry : { type: "custom", customType: "pi-workflows:journal", data: entry };
+        entries.map((entry, index) => {
+          const shaped = entry as { type?: unknown; id?: string };
+          const id = shaped.id ?? `entry-${index + 1}`;
+          return shaped.type
+            ? { ...shaped, id }
+            : { id, type: "custom", customType: "pi-workflows:journal", data: entry };
         }),
     },
   };
@@ -476,6 +482,30 @@ describe("pi-workflows loader context isolation", () => {
 
   it("does not let a built-in command retain a disposed session engine", async () => {
     const fixture = createPi(false);
+    // A live managed peer acknowledges the built-in's background spawn during
+    // shutdown; otherwise the mock waits for the protocol's five-second timeout.
+    fixture.bus.on("subagents:rpc:spawn-managed", (raw) => {
+      const { requestId } = raw as { requestId: string };
+      fixture.bus.emit(`subagents:rpc:spawn-managed:reply:${requestId}`, {
+        success: true,
+        data: {
+          id: "instant-child",
+          state: "completed",
+          terminal: { status: "completed", result: "{}", compactionCount: 0, completedAt: Date.now() },
+        },
+      });
+    });
+    fixture.bus.on("subagents:rpc:quiesce-owned", (raw) => {
+      const { requestId } = raw as { requestId: string };
+      fixture.bus.emit(`subagents:rpc:quiesce-owned:reply:${requestId}`, {
+        success: true,
+        data: { settled: true, pending: [] },
+      });
+    });
+    fixture.bus.on("subagents:rpc:reconcile-managed", (raw) => {
+      const { requestId } = raw as { requestId: string };
+      fixture.bus.emit(`subagents:rpc:reconcile-managed:reply:${requestId}`, { success: true, data: null });
+    });
     piWorkflows(fixture.pi as never);
     const sessionStart = fixture.lifecycle.get("session_start");
     const sessionShutdown = fixture.lifecycle.get("session_shutdown");
@@ -506,6 +536,133 @@ describe("pi-workflows loader context isolation", () => {
     });
     expect(shutdownNotices.join("\n")).toContain("not active in this session context");
     expect(fixture.entries.filter((entry) => (entry as { kind?: unknown }).kind === "run_created")).toHaveLength(after);
+  });
+
+  it("does not quiesce on either a native or bus before-tree attempt", async () => {
+    const fixture = createPi(false);
+    const quiesce = vi.spyOn(WorkflowEngine.prototype, "quiesceForBranchChange");
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    try {
+      const first = new AbortController().signal;
+      const second = new AbortController().signal;
+      fixture.bus.emit("subagents:session_before_tree", { signal: first });
+      await fixture.lifecycle.get("session_before_tree")?.({ type: "session_before_tree", signal: first }, fixture.ctx);
+      fixture.bus.emit("subagents:session_before_tree", { signal: second });
+      await fixture.lifecycle.get("session_before_tree")?.(
+        { type: "session_before_tree", signal: second },
+        fixture.ctx,
+      );
+      expect(quiesce).not.toHaveBeenCalled();
+    } finally {
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      quiesce.mockRestore();
+    }
+  });
+
+  it("vetoes a running workflow with a managed child without stopping the child", async () => {
+    const fixture = createPi(false);
+    fixture.ctx.hasUI = true;
+    let childOwner: Record<string, string> | undefined;
+    let stopCalls = 0;
+    fixture.bus.on("subagents:rpc:spawn-managed", (raw) => {
+      const request = raw as { requestId: string; owner: Record<string, string> };
+      childOwner = request.owner;
+      fixture.bus.emit(`subagents:rpc:spawn-managed:reply:${request.requestId}`, {
+        success: true,
+        data: { id: "managed-child", state: "running" },
+      });
+    });
+    fixture.bus.on("subagents:rpc:stop-owned", (raw) => {
+      stopCalls++;
+      const request = raw as { requestId: string };
+      fixture.bus.emit(`subagents:rpc:stop-owned:reply:${request.requestId}`, { success: true });
+    });
+    fixture.bus.on("subagents:rpc:quiesce-owned", (raw) => {
+      const request = raw as { requestId: string };
+      fixture.bus.emit(`subagents:rpc:quiesce-owned:reply:${request.requestId}`, {
+        success: true,
+        data: { settled: true, pending: [] },
+      });
+    });
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const started = await workflowTool(fixture).execute(
+      "managed",
+      {
+        script: 'export const meta = { name: "managed", description: "test" }; return await agent("work");',
+        background: true,
+      },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    await vi.waitFor(() => expect(childOwner).toBeDefined());
+    expect(fixture.lifecycle.get("session_before_tree")?.({}, fixture.ctx)).toEqual({ cancel: true });
+    expect(fixture.lifecycle.get("session_before_switch")?.({}, fixture.ctx)).toEqual({ cancel: true });
+    expect(fixture.ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("stop them explicitly"), "warning");
+    expect(stopCalls).toBe(0);
+    fixture.bus.emit("subagents:completed", {
+      id: "managed-child",
+      status: "completed",
+      result: "finished",
+      owner: childOwner,
+    });
+    await vi.waitFor(() =>
+      expect(
+        fixture.entries.some(
+          (entry) =>
+            (entry as { kind?: string; status?: string }).kind === "workflow_transition" &&
+            (entry as { status?: string }).status === "completed",
+        ),
+      ).toBe(true),
+    );
+    expect(started.details.runId).toBeTruthy();
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
+
+  it.each(["subagents-first", "workflows-first"])("does not re-fence a committed tree in %s order", async (order) => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const event = { type: "session_tree", oldLeafId: "old", newLeafId: "new" };
+    if (order === "subagents-first") fixture.bus.emit("subagents:session_tree_committed", { event });
+    fixture.lifecycle.get("session_tree")?.(event, fixture.ctx);
+    if (order === "workflows-first") fixture.bus.emit("subagents:session_tree_committed", { event });
+    const result = await workflowTool(fixture).execute(
+      "after-tree",
+      {
+        script: 'export const meta = { name: "after", description: "test" }; return 1;',
+        background: false,
+      },
+      undefined,
+      undefined,
+      fixture.ctx,
+    );
+    expect(result.details.status).toBe("completed");
+    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+  });
+
+  it("times out shutdown quiescence with a diagnostic instead of waiting forever", async () => {
+    const fixture = createPi(false);
+    piWorkflows(fixture.pi as never);
+    await fixture.lifecycle.get("session_start")?.({}, fixture.ctx);
+    const quiesce = vi
+      .spyOn(WorkflowEngine.prototype, "quiesceForBranchChange")
+      .mockImplementation(() => new Promise(() => {}));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.useFakeTimers();
+    try {
+      const shutdown = fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      await vi.advanceTimersByTimeAsync(6_000);
+      await shutdown;
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("shutdown quiescence timed out"));
+      expect(quiesce).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+      warning.mockRestore();
+      quiesce.mockRestore();
+    }
   });
 
   it("quarantines a pre-schema-v4 journal instead of replaying it", async () => {

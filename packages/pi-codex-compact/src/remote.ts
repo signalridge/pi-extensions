@@ -1,4 +1,5 @@
 import type { Context, Model, Provider, ProviderHeaders, Usage } from "@earendil-works/pi-ai";
+import * as piAi from "@earendil-works/pi-ai";
 import {
   CodexCompactionProtocolError,
   type CollectedCompaction,
@@ -41,6 +42,23 @@ const EMPTY_USAGE: Usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+// Pi 0.87 requires a normalized transcript at the provider boundary; 0.84/0.85
+// have no normalizeContext export and still accept the original Context there.
+type ProviderContext = Parameters<Provider["stream"]>[1];
+type ContextNormalizer = (context: Context) => ProviderContext;
+const piAiCompat = piAi as typeof piAi & { normalizeContext?: ContextNormalizer };
+
+export function contextForProvider(context: Context, normalize: ContextNormalizer | undefined): ProviderContext {
+  if (!normalize) return context as ProviderContext;
+  // The session transcript already carries the current prompt and tool loadout.
+  // Adding the legacy shorthand here would replay the prompt twice and could
+  // restore tools that a later system message removed.
+  const canonical = context.messages.some((message) => message.role === "system")
+    ? { messages: context.messages }
+    : context;
+  return normalize(canonical);
+}
+
 function isObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -70,25 +88,29 @@ export async function requestRemoteCompaction(request: RemoteCompactionRequest):
     });
   };
 
-  const stream = request.provider.stream(request.model, request.context, {
-    apiKey: request.apiKey,
-    headers: request.headers,
-    env: request.env,
-    signal: request.signal,
-    transport: "sse",
-    cacheRetention: "none",
-    timeoutMs: request.requestTimeoutMs ?? 5 * 60 * 1000,
-    maxRetries: request.maxRetries ?? 2,
-    fetch: inspectedFetch,
-    onPayload: (payload) => {
-      const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint);
-      if (!Array.isArray(prepared.input) || !prepared.input.every(isObject)) {
-        throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");
-      }
-      sentInput = structuredClone(prepared.input.slice(0, -1)) as JsonObject[];
-      return prepared;
+  const stream = request.provider.stream(
+    request.model,
+    contextForProvider(request.context, piAiCompat.normalizeContext),
+    {
+      apiKey: request.apiKey,
+      headers: request.headers,
+      env: request.env,
+      signal: request.signal,
+      transport: "sse",
+      cacheRetention: "none",
+      timeoutMs: request.requestTimeoutMs ?? 5 * 60 * 1000,
+      maxRetries: request.maxRetries ?? 2,
+      fetch: inspectedFetch,
+      onPayload: (payload) => {
+        const prepared = prepareRemoteCompactionPayload(payload, request.priorCheckpoint);
+        if (!Array.isArray(prepared.input) || !prepared.input.every(isObject)) {
+          throw new CodexCompactionProtocolError("Prepared compaction payload has invalid input items");
+        }
+        sentInput = structuredClone(prepared.input.slice(0, -1)) as JsonObject[];
+        return prepared;
+      },
     },
-  });
+  );
 
   let usage = EMPTY_USAGE;
   for await (const event of stream) {

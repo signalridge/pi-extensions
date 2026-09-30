@@ -198,6 +198,12 @@ ceilings are intentionally not configurable.
   exposes only the portability fallback marker and Pi-retained recent messages.
 - The package does not reproduce Codex core's context-window UUID/number lineage, previous-model
   compatibility fallback, exact pre-turn ordering, or exact mid-turn model-session ownership.
+- A live prompt or tool change that has not been written into Pi's transcript causes a native
+  compaction fallback; an opaque checkpoint must match the system state Pi will persist.
+- Pi invokes `session_before_compact` handlers in registration order. Another extension that mutates
+  prompt, tools, or context **after this handler returns** can invalidate an already prepared opaque
+  checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
+  that combination; the extension cannot inspect later handlers' changes.
 - Remote failure falls back to Pi's plaintext summary, so a session can contain both remote opaque
   and native compaction entries over time.
 - Settings concurrency is coordinated only within one Pi process; separate processes rely on the

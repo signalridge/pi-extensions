@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentManager,
   MANAGED_SPAWN_ENTRY_TYPE,
@@ -7,8 +7,10 @@ import {
 } from "../src/agent-manager.js";
 import { runAgent } from "../src/agent-runner.js";
 import { setAgentTiersSettings } from "../src/agent-tiers.js";
+import { registerAgents } from "../src/agent-types.js";
 import { validateManagedSpawnRequest } from "../src/cross-extension-rpc.js";
 import { INTERNAL_PARENT_POLICY_SNAPSHOT } from "../src/internal-run.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -31,13 +33,24 @@ const request = {
 };
 
 const pi = {} as never;
-const ctx = { cwd: "/tmp" } as never;
+const ctx = { cwd: "/tmp", modelRegistry: mockParentRegistry } as never;
+const registryWithModels = (
+  ...models: Array<{ provider: string; id: string }>
+) => ({
+  ...mockParentRegistry,
+  runtime: {
+    ...mockParentRegistry.runtime,
+    getModel: (provider: string, id: string) =>
+      models.find((model) => model.provider === provider && model.id === id),
+  },
+});
 
 const managedPolicy: ManagedSpawnPolicy = {};
 
 describe("managed spawn protocol", () => {
   let manager: AgentManager | undefined;
   let restoredManager: AgentManager | undefined;
+  beforeEach(() => registerAgents(new Map()));
   afterEach(async () => {
     await manager?.dispose();
     await restoredManager?.dispose();
@@ -46,17 +59,33 @@ describe("managed spawn protocol", () => {
 
   it("accepts managed policy hints and rejects invalid owners", () => {
     expect(
-      validateManagedSpawnRequest({ ...request, tier: "cheap", excludeTools: ["workflow"], isolation: "worktree" }),
+      validateManagedSpawnRequest({
+        ...request,
+        tier: "cheap",
+        excludeTools: ["workflow"],
+        isolation: "worktree",
+      }),
     ).toMatchObject({ tier: "cheap", isolation: "worktree" });
-    expect(() => validateManagedSpawnRequest({ ...request, owner: { ...owner, extension: "other" } })).toThrow(/owner.extension/);
-    expect(() => validateManagedSpawnRequest({ ...request, prompt: "" })).toThrow(/prompt/);
+    expect(() =>
+      validateManagedSpawnRequest({
+        ...request,
+        owner: { ...owner, extension: "other" },
+      }),
+    ).toThrow(/owner.extension/);
+    expect(() =>
+      validateManagedSpawnRequest({ ...request, prompt: "" }),
+    ).toThrow(/prompt/);
   });
 
   it("refuses a per-call model or thinking selector on the managed wire", () => {
     // There is exactly one model policy a workflow can express — a tier. A
     // second selector could only ever silently win or be silently ignored.
-    expect(() => validateManagedSpawnRequest({ ...request, model: "provider/model" })).toThrow(/"model"/);
-    expect(() => validateManagedSpawnRequest({ ...request, thinking: "medium" })).toThrow(/"thinking"/);
+    expect(() =>
+      validateManagedSpawnRequest({ ...request, model: "provider/model" }),
+    ).toThrow(/"model"/);
+    expect(() =>
+      validateManagedSpawnRequest({ ...request, thinking: "medium" }),
+    ).toThrow(/"thinking"/);
   });
 
   it("publishes a synchronous managed startup failure exactly once", () => {
@@ -71,7 +100,13 @@ describe("managed spawn protocol", () => {
 
     const result = manager.spawnManaged(pi, ctx, request, managedPolicy);
 
-    expect(result).toEqual(expect.objectContaining({ id: result.id, state: "failed", created: true }));
+    expect(result).toEqual(
+      expect.objectContaining({
+        id: result.id,
+        state: "failed",
+        created: true,
+      }),
+    );
     expect(result.terminal?.error).toBe("runner startup failed");
     expect(complete).toHaveBeenCalledOnce();
     expect(entries.filter((entry) => entry.state === "failed")).toHaveLength(1);
@@ -81,29 +116,87 @@ describe("managed spawn protocol", () => {
   it("fails closed when managed allocation has no persistence seam", () => {
     manager = new AgentManager(undefined, 1);
     vi.mocked(runAgent).mockClear();
-    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(/persistence is unavailable/);
+    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(
+      /persistence is unavailable/,
+    );
     expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("is idempotent for the same key and rejects conflicting requests", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     const first = manager.spawnManaged(pi, ctx, request, managedPolicy);
-    expect(manager.spawnManaged(pi, ctx, request, managedPolicy).id).toBe(first.id);
-    expect(() => manager.spawnManaged(pi, ctx, { ...request, prompt: "different" }, managedPolicy)).toThrow(/conflict/);
+    expect(manager.spawnManaged(pi, ctx, request, managedPolicy).id).toBe(
+      first.id,
+    );
+    expect(() =>
+      manager.spawnManaged(
+        pi,
+        ctx,
+        { ...request, prompt: "different" },
+        managedPolicy,
+      ),
+    ).toThrow(/conflict/);
     expect(manager.getRecord(first.id)?.owner).toEqual(owner);
+  });
+
+  it("refuses a new key without the parent runtime but keeps cached managed identity readable", async () => {
+    const entries: ManagedSpawnTombstone[] = [];
+    vi.mocked(runAgent).mockClear();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "already completed",
+      session: { dispose: vi.fn() } as never,
+      aborted: false,
+      steered: false,
+    });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: (tombstone) => entries.push(tombstone),
+    });
+    const first = manager.spawnManaged(pi, ctx, request, managedPolicy);
+    await manager.getRecordMutable(first.id)?.promise;
+    const count = entries.length;
+    const publicFacadeCtx = {
+      ...ctx,
+      modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    } as never;
+
+    expect(
+      manager.spawnManaged(pi, publicFacadeCtx, request, managedPolicy),
+    ).toMatchObject({ id: first.id, created: false });
+    const next = {
+      ...request,
+      requestId: "request-2",
+      spawnKey: "run-1:b",
+      owner: { ...owner, nodeId: "b" },
+    };
+    expect(() =>
+      manager?.spawnManaged(pi, publicFacadeCtx, next, managedPolicy),
+    ).toThrow(/parent's model runtime is unavailable or incompatible/);
+    expect(manager.getManagedSpawn(next.spawnKey)).toBeUndefined();
+    expect(entries).toHaveLength(count);
+    expect(runAgent).toHaveBeenCalledOnce();
   });
 
   it("retires an in-flight managed key across a session reset", () => {
     vi.mocked(runAgent).mockClear();
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
 
     const first = manager.spawnManaged(pi, ctx, request, managedPolicy);
     manager.resetManagedSpawns();
     manager.restoreManagedSpawns([], { dropActive: true });
 
-    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(/quarantined/);
+    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(
+      /quarantined/,
+    );
     expect(manager.getManagedSpawn(request.spawnKey)).toBeUndefined();
     expect(runAgent).toHaveBeenCalledOnce();
     void first;
@@ -123,13 +216,24 @@ describe("managed spawn protocol", () => {
       createdAt: 1,
       updatedAt: 2,
       compactionCount: 0,
-      terminal: { status: "completed", result: "legacy", compactionCount: 0, completedAt: 2 },
+      terminal: {
+        status: "completed",
+        result: "legacy",
+        compactionCount: 0,
+        completedAt: 2,
+      },
     };
     vi.mocked(runAgent).mockClear();
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
-    manager.restoreManagedSpawns([{ type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: tombstone }]);
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
+    manager.restoreManagedSpawns([
+      { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: tombstone },
+    ]);
     expect(manager.getManagedSpawn(request.spawnKey)).toBeUndefined();
-    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(/quarantined/);
+    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(
+      /quarantined/,
+    );
     expect(runAgent).not.toHaveBeenCalled();
   });
 
@@ -147,24 +251,38 @@ describe("managed spawn protocol", () => {
       createdAt: 1,
       updatedAt: 2,
       compactionCount: 0,
-      terminal: { status: "completed", result: "current", compactionCount: 0, completedAt: 2 },
+      terminal: {
+        status: "completed",
+        result: "current",
+        compactionCount: 0,
+        completedAt: 2,
+      },
     };
     const legacy = { ...current, schemaVersion: 1 };
 
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     manager.restoreManagedSpawns([
       { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: current },
       { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: legacy },
     ]);
 
     expect(manager.getManagedSpawn(request.spawnKey)).toBeUndefined();
-    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(/quarantined/);
+    expect(() => manager.spawnManaged(pi, ctx, request, managedPolicy)).toThrow(
+      /quarantined/,
+    );
   });
 
   it("retries one transient terminal persistence failure without failing the agent", async () => {
     let appendCalls = 0;
     const entries: ManagedSpawnTombstone[] = [];
-    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: { dispose: vi.fn() } as never,
+      aborted: false,
+      steered: false,
+    });
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
       append: (entry) => {
         appendCalls += 1;
@@ -172,7 +290,12 @@ describe("managed spawn protocol", () => {
         entries.push(entry);
       },
     });
-    const result = manager.spawnManaged(pi, ctx, { ...request, spawnKey: "run-1:retry" }, managedPolicy);
+    const result = manager.spawnManaged(
+      pi,
+      ctx,
+      { ...request, spawnKey: "run-1:retry" },
+      managedPolicy,
+    );
     await manager.getRecordMutable(result.id)?.promise;
     await vi.waitFor(() => expect(appendCalls).toBeGreaterThanOrEqual(3));
     expect(manager.getRecordMutable(result.id)?.status).toBe("completed");
@@ -181,44 +304,84 @@ describe("managed spawn protocol", () => {
 
   it("does not reject the agent promise when terminal persistence stays unavailable", async () => {
     let appendCalls = 0;
-    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "done",
+      session: { dispose: vi.fn() } as never,
+      aborted: false,
+      steered: false,
+    });
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
       append: () => {
         appendCalls += 1;
         if (appendCalls > 1) throw new Error("permanent journal failure");
       },
     });
-    const result = manager.spawnManaged(pi, ctx, { ...request, spawnKey: "run-1:permanent" }, managedPolicy);
-    await expect(manager.getRecordMutable(result.id)?.promise).resolves.toBe("done");
+    const result = manager.spawnManaged(
+      pi,
+      ctx,
+      { ...request, spawnKey: "run-1:permanent" },
+      managedPolicy,
+    );
+    await expect(manager.getRecordMutable(result.id)?.promise).resolves.toBe(
+      "done",
+    );
     expect(manager.getRecordMutable(result.id)?.status).toBe("completed");
   });
-
 
   it("passes the required execution policy to runAgent", () => {
     const policy: ManagedSpawnPolicy = {
       maxTurns: 7,
       isolated: true,
-      inheritContext: true,
+      inheritContext: false,
     };
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
 
-    const id = manager.spawnManaged(pi, ctx, { ...request, spawnKey: "run-1:policy" }, policy).id;
+    const id = manager.spawnManaged(
+      pi,
+      ctx,
+      { ...request, spawnKey: "run-1:policy" },
+      policy,
+    ).id;
     const call = vi.mocked(runAgent).mock.calls.at(-1);
     if (!call) throw new Error("managed spawn did not start an agent");
 
-    expect(call[3]).toEqual(expect.objectContaining({
-      maxTurns: 7,
-      isolated: true,
-      inheritContext: true,
-      requireAgentTier: true,
-    }));
+    expect(call[3]).toEqual(
+      expect.objectContaining({
+        maxTurns: 7,
+        isolated: true,
+        inheritContext: false,
+        requireAgentTier: true,
+      }),
+    );
     manager.abort(id);
   });
 
+  it("rejects raw inherited history before allocating a managed tombstone", () => {
+    const append = vi.fn();
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append,
+    });
+    vi.mocked(runAgent).mockClear();
+
+    expect(() =>
+      manager!.spawnManaged(pi, ctx, request, { inheritContext: true }),
+    ).toThrow(/inherit_context: true.*unavailable/);
+    expect(append).not.toHaveBeenCalled();
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
   it("passes the requested Agent tier straight to the runner", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
 
     const result = manager.spawnManaged(
       pi,
@@ -230,26 +393,37 @@ describe("managed spawn protocol", () => {
     if (!call) throw new Error("managed spawn did not start an agent");
     // No mapping and no second field: the workflow named a tier from the host's
     // own catalogue, and that is what the runner resolves.
-    expect(call[3]).toEqual(expect.objectContaining({ agentTier: "low", requireAgentTier: true }));
+    expect(call[3]).toEqual(
+      expect.objectContaining({ agentTier: "low", requireAgentTier: true }),
+    );
     expect(call[3]).not.toHaveProperty("tier");
     manager.abort(result.id);
   });
 
   it("rejects a changed model or denylist policy when reusing a managed thread", async () => {
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      options.onSessionCreated?.({ dispose: vi.fn() } as never);
-      return {
-        responseText: "done",
-        session: { dispose: vi.fn() } as never,
-        aborted: false,
-        steered: false,
-      };
+    vi.mocked(runAgent).mockImplementation(
+      async (_ctx, _type, _prompt, options) => {
+        options.onSessionCreated?.({ dispose: vi.fn() } as never);
+        return {
+          responseText: "done",
+          session: { dispose: vi.fn() } as never,
+          aborted: false,
+          steered: false,
+        };
+      },
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
     const first = manager.spawnManaged(
       pi,
       ctx,
-      { ...request, thread: "review", excludeTools: ["workflow"], spawnKey: "run-1:thread-1" },
+      {
+        ...request,
+        thread: "review",
+        excludeTools: ["workflow"],
+        spawnKey: "run-1:thread-1",
+      },
       managedPolicy,
     );
     await manager.getRecordMutable(first.id)?.promise;
@@ -270,8 +444,12 @@ describe("managed spawn protocol", () => {
   });
 
   it("rejects managed thread reuse when the effective Agent tier changes", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     const first = manager.spawnManaged(
       pi,
       ctx,
@@ -296,15 +474,23 @@ describe("managed spawn protocol", () => {
   });
 
   it("rejects managed thread reuse when an Agent-tier profile changes", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     setAgentTiersSettings({
       profiles: { cheap: { model: "provider/one", thinking: "low" } },
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     manager.spawnManaged(
       pi,
       ctx,
-      { ...request, thread: "profile-review", spawnKey: "run-1:thread-profile-1" },
+      {
+        ...request,
+        thread: "profile-review",
+        spawnKey: "run-1:thread-profile-1",
+      },
       { ...managedPolicy, invocation: { agentTier: "cheap" } },
     );
 
@@ -327,19 +513,35 @@ describe("managed spawn protocol", () => {
   });
 
   it("rejects managed thread reuse when an inherited parent model changes", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     setAgentTiersSettings({
       profiles: { inherited: { model: "inherit", thinking: "low" } },
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     const parentModelA = { provider: "test", id: "model-a" };
     const parentModelB = { provider: "test", id: "model-b" };
-    const parentContext = (model: unknown) => ({ cwd: "/tmp", model }) as never;
-    const policy: ManagedSpawnPolicy = { ...managedPolicy, invocation: { agentTier: "inherited" } };
+    const parentContext = (model: unknown) =>
+      ({
+        ...ctx,
+        model,
+        modelRegistry: registryWithModels(parentModelA, parentModelB),
+      }) as never;
+    const policy: ManagedSpawnPolicy = {
+      ...managedPolicy,
+      invocation: { agentTier: "inherited" },
+    };
     const first = manager.spawnManaged(
       pi,
       parentContext(parentModelA),
-      { ...request, thread: "inherited-model", spawnKey: "run-1:inherited-model-1" },
+      {
+        ...request,
+        thread: "inherited-model",
+        spawnKey: "run-1:inherited-model-1",
+      },
       policy,
     );
 
@@ -360,19 +562,35 @@ describe("managed spawn protocol", () => {
   });
 
   it("rejects managed thread reuse when inherited parent thinking changes", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     setAgentTiersSettings({
       profiles: { inherited: { model: "inherit", thinking: "inherit" } },
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     let parentThinking: "low" | "high" = "low";
     const inheritedPi = { getThinkingLevel: () => parentThinking } as never;
-    const inheritedContext = { cwd: "/tmp", model: { provider: "test", id: "stable" } } as never;
-    const policy: ManagedSpawnPolicy = { ...managedPolicy, invocation: { agentTier: "inherited" } };
+    const model = { provider: "test", id: "stable" };
+    const inheritedContext = {
+      ...ctx,
+      model,
+      modelRegistry: registryWithModels(model),
+    } as never;
+    const policy: ManagedSpawnPolicy = {
+      ...managedPolicy,
+      invocation: { agentTier: "inherited" },
+    };
     const first = manager.spawnManaged(
       inheritedPi,
       inheritedContext,
-      { ...request, thread: "inherited-thinking", spawnKey: "run-1:inherited-thinking-1" },
+      {
+        ...request,
+        thread: "inherited-thinking",
+        spawnKey: "run-1:inherited-thinking-1",
+      },
       policy,
     );
     parentThinking = "high";
@@ -395,23 +613,25 @@ describe("managed spawn protocol", () => {
 
   it("preserves the resolved Agent tier when re-entering a managed thread", async () => {
     const entries: ManagedSpawnTombstone[] = [];
-    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
-      options.onSessionCreated?.({ dispose: vi.fn() } as never);
-      options.onAgentTierResolved?.({
-        tier: "cheap",
-        source: "default",
-        model: "test/fast",
-        thinking: "low",
-        configuredModel: "test/fast",
-        configuredThinking: "low",
-      });
-      return {
-        responseText: "done",
-        session: { dispose: vi.fn() } as never,
-        aborted: false,
-        steered: false,
-      };
-    });
+    vi.mocked(runAgent).mockImplementation(
+      async (_ctx, _type, _prompt, options) => {
+        options.onSessionCreated?.({ dispose: vi.fn() } as never);
+        options.onAgentTierResolved?.({
+          tier: "cheap",
+          source: "default",
+          model: "test/fast",
+          thinking: "low",
+          configuredModel: "test/fast",
+          configuredThinking: "low",
+        });
+        return {
+          responseText: "done",
+          session: { dispose: vi.fn() } as never,
+          aborted: false,
+          steered: false,
+        };
+      },
+    );
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
       append: (entry) => entries.push(entry),
     });
@@ -442,7 +662,9 @@ describe("managed spawn protocol", () => {
   });
 
   it("cleans a reserved thread when durable allocation fails", async () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
       append: () => {
         throw new Error("journal unavailable");
@@ -452,13 +674,19 @@ describe("managed spawn protocol", () => {
       manager.spawnManaged(
         pi,
         ctx,
-        { ...request, thread: "review", spawnKey: "run-1:thread-persist-failure" },
+        {
+          ...request,
+          thread: "review",
+          spawnKey: "run-1:thread-persist-failure",
+        },
         managedPolicy,
       ),
     ).toThrow(/journal unavailable/);
     await manager.dispose();
 
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     const retry = manager.spawnManaged(
       pi,
       ctx,
@@ -488,29 +716,44 @@ describe("managed spawn protocol", () => {
       append: (tombstone) => entries.push(tombstone),
     });
 
-    const tieredRequest = { ...request, tier: "medium" as const, spawnKey: "run-1:snapshot" };
+    const tieredRequest = {
+      ...request,
+      tier: "medium" as const,
+      spawnKey: "run-1:snapshot",
+    };
     const first = manager.spawnManaged(pi, ctx, tieredRequest, managedPolicy);
     const persisted = entries.at(-1);
     if (!persisted) throw new Error("workflow tombstone was not persisted");
     expect(first.id).toBe(persisted.id);
     expect(first).toMatchObject({ tier: "medium" });
     expect(persisted.tier).toBe("medium");
-    expect(persisted.tierSnapshot).toEqual(expect.objectContaining({
-      tier: "medium",
-      model: "test/fast",
-      thinking: "medium",
-      configuredThinking: "max",
-      clamped: true,
-    }));
+    expect(persisted.tierSnapshot).toEqual(
+      expect.objectContaining({
+        tier: "medium",
+        model: "test/fast",
+        thinking: "medium",
+        configuredThinking: "max",
+        clamped: true,
+      }),
+    );
 
-    restoredManager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
-      append: () => {},
-    });
+    restoredManager = new AgentManager(
+      undefined,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      {
+        append: () => {},
+      },
+    );
     const recovered = restoredManager.restoreManagedSpawns([
       { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: persisted },
     ]);
     expect(recovered[0]?.tierSnapshot).toEqual(persisted.tierSnapshot);
-    expect(restoredManager.getManagedSpawn(tieredRequest.spawnKey)?.tierSnapshot).toEqual(persisted.tierSnapshot);
+    expect(
+      restoredManager.getManagedSpawn(tieredRequest.spawnKey)?.tierSnapshot,
+    ).toEqual(persisted.tierSnapshot);
   });
 
   it("restores a terminal tombstone across a manager reload without spawning again", async () => {
@@ -531,22 +774,45 @@ describe("managed spawn protocol", () => {
     manager.clearCompleted();
     vi.mocked(runAgent).mockClear();
 
-    restoredManager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
-      append: (tombstone) => entries.push(tombstone),
-    });
+    restoredManager = new AgentManager(
+      undefined,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      {
+        append: (tombstone) => entries.push(tombstone),
+      },
+    );
     restoredManager.restoreManagedSpawns([
       { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: persisted },
     ]);
-    const restored = restoredManager.spawnManaged(pi, ctx, request, managedPolicy);
-    expect(restored).toEqual(expect.objectContaining({ id: first.id, state: "completed" }));
+    const restored = restoredManager.spawnManaged(
+      pi,
+      ctx,
+      request,
+      managedPolicy,
+    );
+    expect(restored).toEqual(
+      expect.objectContaining({ id: first.id, state: "completed" }),
+    );
     expect(restored.terminal?.result).toBe("persisted result");
     expect(runAgent).not.toHaveBeenCalled();
-    expect(() => restoredManager.spawnManaged(pi, ctx, { ...request, requestId: "retry", prompt: "changed" }, managedPolicy)).toThrow(/conflict/);
+    expect(() =>
+      restoredManager.spawnManaged(
+        pi,
+        ctx,
+        { ...request, requestId: "retry", prompt: "changed" },
+        managedPolicy,
+      ),
+    ).toThrow(/conflict/);
   });
 
   it("settles an active restored tombstone as interrupted instead of hanging or duplicating", async () => {
     const entries: ManagedSpawnTombstone[] = [];
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
       append: (tombstone) => entries.push(tombstone),
     });
@@ -560,22 +826,38 @@ describe("managed spawn protocol", () => {
     await manager.dispose();
     vi.mocked(runAgent).mockClear();
 
-    restoredManager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
-      append: (tombstone) => entries.push(tombstone),
-    });
+    restoredManager = new AgentManager(
+      undefined,
+      1,
+      undefined,
+      undefined,
+      undefined,
+      {
+        append: (tombstone) => entries.push(tombstone),
+      },
+    );
     const recovered = restoredManager.restoreManagedSpawns([
       { type: "custom", customType: MANAGED_SPAWN_ENTRY_TYPE, data: active },
     ]);
     expect(recovered[0]?.state).toBe("interrupted");
     expect(recovered[0]?.terminal?.compactionCount).toBe(1);
-    const result = restoredManager.spawnManaged(pi, ctx, request, managedPolicy);
-    expect(result).toEqual(expect.objectContaining({ id: first.id, state: "interrupted" }));
+    const result = restoredManager.spawnManaged(
+      pi,
+      ctx,
+      request,
+      managedPolicy,
+    );
+    expect(result).toEqual(
+      expect.objectContaining({ id: first.id, state: "interrupted" }),
+    );
     expect(result.terminal?.error).toMatch(/no live AgentSession/);
     expect(runAgent).not.toHaveBeenCalled();
   });
 
   it("does not let public spawn options assign owner metadata", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     manager = new AgentManager(undefined, 1);
     const id = manager.spawn(pi, ctx, "Explore", "public", {
       description: "public",
@@ -594,18 +876,27 @@ describe("managed spawn protocol", () => {
       aborted: false,
       steered: false,
     });
-    manager = new AgentManager((record) => {
-      completedOwner = record.owner;
-    }, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(
+      (record) => {
+        completedOwner = record.owner;
+      },
+      1,
+      undefined,
+      undefined,
+      undefined,
+      { append: () => {} },
+    );
 
     const id = manager.spawnManaged(pi, ctx, request, managedPolicy).id;
     const exposed = manager.getRecord(id);
-    if (!exposed?.owner) throw new Error("managed record owner was not exposed");
+    if (!exposed?.owner)
+      throw new Error("managed record owner was not exposed");
     expect(Object.isFrozen(exposed)).toBe(true);
     expect(Object.isFrozen(exposed.owner)).toBe(true);
 
     try {
-      (exposed as unknown as { owner: { runId: string } }).owner.runId = "tampered";
+      (exposed as unknown as { owner: { runId: string } }).owner.runId =
+        "tampered";
     } catch {
       // Frozen snapshots may reject mutation in strict mode.
     }
@@ -630,7 +921,9 @@ describe("managed spawn protocol", () => {
       aborted: false,
       steered: false,
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     const first = manager.spawnManaged(pi, ctx, request, managedPolicy);
     await new Promise((resolve) => setImmediate(resolve));
     const record = manager.getRecordMutable(first.id);
@@ -638,15 +931,26 @@ describe("managed spawn protocol", () => {
     record.resultConsumed = true;
     manager.clearCompleted();
     expect(manager.getRecord(first.id)).toBeUndefined();
-    expect(manager.spawnManaged(pi, ctx, request, managedPolicy).id).toBe(first.id);
-    expect(() => manager.spawnManaged(pi, ctx, {
-      ...request,
-      owner: { ...owner, runId: "run-2" },
-    }, managedPolicy)).toThrow(/conflict/);
+    expect(manager.spawnManaged(pi, ctx, request, managedPolicy).id).toBe(
+      first.id,
+    );
+    expect(() =>
+      manager.spawnManaged(
+        pi,
+        ctx,
+        {
+          ...request,
+          owner: { ...owner, runId: "run-2" },
+        },
+        managedPolicy,
+      ),
+    ).toThrow(/conflict/);
   });
 
   it("forwards activity, session, usage, and compaction callbacks", () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as never);
+    vi.mocked(runAgent).mockImplementation(
+      () => new Promise(() => {}) as never,
+    );
     const callbacks = {
       onToolActivity: vi.fn(),
       onTextDelta: vi.fn(),
@@ -655,7 +959,9 @@ describe("managed spawn protocol", () => {
       onAssistantUsage: vi.fn(),
       onCompaction: vi.fn(),
     };
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
     manager.spawnManaged(pi, ctx, request, managedPolicy, callbacks);
     const call = vi.mocked(runAgent).mock.calls.at(-1);
     if (!call) throw new Error("managed spawn did not start an agent");
@@ -674,8 +980,15 @@ describe("managed spawn protocol", () => {
     expect(callbacks.onToolActivity).toHaveBeenCalled();
     expect(callbacks.onTextDelta).toHaveBeenCalledWith("done", "done");
     expect(callbacks.onTurnEnd).toHaveBeenCalledWith(1);
-    expect(callbacks.onAssistantUsage).toHaveBeenCalledWith({ input: 1, output: 2, cacheWrite: 0 });
-    expect(callbacks.onCompaction).toHaveBeenCalledWith({ reason: "manual", tokensBefore: 10 });
+    expect(callbacks.onAssistantUsage).toHaveBeenCalledWith({
+      input: 1,
+      output: 2,
+      cacheWrite: 0,
+    });
+    expect(callbacks.onCompaction).toHaveBeenCalledWith({
+      reason: "manual",
+      tokensBefore: 10,
+    });
   });
 
   it("quarantines a timed-out running agent before its late completion", async () => {
@@ -686,9 +999,10 @@ describe("managed spawn protocol", () => {
       steered: boolean;
     }) => void;
     vi.mocked(runAgent).mockImplementation(
-      () => new Promise((resolve) => {
-        finish = resolve as typeof finish;
-      }) as never,
+      () =>
+        new Promise((resolve) => {
+          finish = resolve as typeof finish;
+        }) as never,
     );
     const complete = vi.fn();
     const entries: ManagedSpawnTombstone[] = [];
@@ -696,15 +1010,27 @@ describe("managed spawn protocol", () => {
       append: (entry) => entries.push(entry),
     });
     const id = manager.spawnManaged(pi, ctx, request, managedPolicy).id;
-    expect(await manager.quiesceOwned(owner.runId, [id], 1)).toEqual({ settled: false, pending: [id] });
-    expect(await manager.quiesceOwned(owner.runId, [id], 1, [{ ...owner, attemptId: "attempt-2" }])).toEqual({ settled: false, pending: [id] });
+    expect(await manager.quiesceOwned(owner.runId, [id], 1)).toEqual({
+      settled: false,
+      pending: [id],
+    });
+    expect(
+      await manager.quiesceOwned(owner.runId, [id], 1, [
+        { ...owner, attemptId: "attempt-2" },
+      ]),
+    ).toEqual({ settled: false, pending: [id] });
     expect(manager.getRecord(id)?.detached).toBeUndefined();
     const quiesced = await manager.quiesceOwned(owner.runId, [id], 1, [owner]);
     expect(quiesced).toEqual({ settled: false, pending: [id] });
     expect(manager.getRecord(id)?.detached).toBe(true);
     const persistedCount = entries.length;
 
-    finish({ responseText: "late result", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    finish({
+      responseText: "late result",
+      session: { dispose: vi.fn() } as never,
+      aborted: false,
+      steered: false,
+    });
     await manager.getRecordMutable(id)?.promise;
     expect(complete).not.toHaveBeenCalled();
     expect(entries).toHaveLength(persistedCount);
@@ -743,13 +1069,24 @@ describe("managed spawn protocol", () => {
       append: (entry) => entries.push(entry),
     });
 
-    const runningId = manager.spawnManaged(pi, ctx, request, managedPolicy, callbacks).id;
-    const queuedId = manager.spawnManaged(pi, ctx, {
-      ...request,
-      spawnKey: "run-1:__synthesis__",
-      owner: { ...owner, nodeId: "__synthesis__" },
-      requestId: "request-synthesis",
-    }, managedPolicy).id;
+    const runningId = manager.spawnManaged(
+      pi,
+      ctx,
+      request,
+      managedPolicy,
+      callbacks,
+    ).id;
+    const queuedId = manager.spawnManaged(
+      pi,
+      ctx,
+      {
+        ...request,
+        spawnKey: "run-1:__synthesis__",
+        owner: { ...owner, nodeId: "__synthesis__" },
+        requestId: "request-synthesis",
+      },
+      managedPolicy,
+    ).id;
     expect(manager.getRecord(queuedId)?.status).toBe("queued");
     expect(started).toHaveBeenCalledTimes(1);
     expect(created).toHaveBeenCalledTimes(2);
@@ -768,7 +1105,12 @@ describe("managed spawn protocol", () => {
     runOptions.onAssistantUsage?.({ input: 1, output: 2, cacheWrite: 3 });
     runOptions.onSessionCreated?.({ dispose: vi.fn() } as never);
     runOptions.onCompaction?.({ reason: "manual", tokensBefore: 10 });
-    finish({ responseText: "late result", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    finish({
+      responseText: "late result",
+      session: { dispose: vi.fn() } as never,
+      aborted: false,
+      steered: false,
+    });
     await manager.getRecordMutable(runningId)?.promise;
 
     expect(complete).not.toHaveBeenCalled();
@@ -795,14 +1137,32 @@ describe("managed spawn protocol", () => {
     const parentModelB = { provider: "test", id: "model-b" };
     let parentThinking: "low" | "high" = "low";
     const managedPi = { getThinkingLevel: () => parentThinking } as never;
-    const managedCtx = { cwd: "/tmp", model: parentModelA } as never;
-    const policy: ManagedSpawnPolicy = { ...managedPolicy, invocation: { agentTier: "inherited" } };
-    const finishers: Array<(value: { responseText: string; session: never; aborted: boolean; steered: boolean }) => void> = [];
+    const managedCtx = {
+      ...ctx,
+      model: parentModelA,
+      modelRegistry: registryWithModels(parentModelA, parentModelB),
+    } as never;
+    const policy: ManagedSpawnPolicy = {
+      ...managedPolicy,
+      invocation: { agentTier: "inherited" },
+    };
+    const finishers: Array<
+      (value: {
+        responseText: string;
+        session: never;
+        aborted: boolean;
+        steered: boolean;
+      }) => void
+    > = [];
     vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => {
       options.onSessionCreated?.({ dispose: vi.fn() } as never);
-      return new Promise((resolve) => finishers.push(resolve as typeof finishers[number])) as never;
+      return new Promise((resolve) =>
+        finishers.push(resolve as (typeof finishers)[number]),
+      ) as never;
     });
-    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, {
+      append: () => {},
+    });
 
     const first = manager.spawnManaged(
       managedPi,

@@ -23,6 +23,8 @@ import {
   agentToolResults,
   conversationText,
   invokedToolNames,
+  offeredSystemPrompt,
+  offeredToolNames,
   type PrintModeRun,
   routeBySession,
   runPrintMode,
@@ -33,6 +35,42 @@ import {
 vi.setConfig({ testTimeout: 30_000 });
 
 const LIVE = /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
+
+describe("faux provider context compatibility", () => {
+  it("reads legacy raw Context tools and system prompt", () => {
+    const context = {
+      messages: [],
+      tools: [{ name: "Agent" }, { name: "read" }],
+      systemPrompt: "legacy frontmatter marker",
+    } as Context;
+    expect(offeredToolNames(context)).toEqual(["Agent", "read"]);
+    expect(offeredSystemPrompt(context)).toContain("legacy frontmatter marker");
+  });
+
+  it("replays normalized TranscriptContext tool and prompt updates", () => {
+    const context = {
+      messages: [
+        {
+          role: "system",
+          content: "base instructions",
+          sections: { frontmatter: "old marker" },
+          toolsAdded: [{ name: "Agent" }, { name: "read" }],
+        },
+        {
+          role: "system",
+          content: "new instructions",
+          sections: { frontmatter: "updated marker" },
+          toolsRemoved: [{ name: "Agent" }],
+          toolsAdded: [{ name: "write" }],
+        },
+      ],
+    } as Context;
+    expect(offeredToolNames(context)).toEqual(["read", "write"]);
+    expect(offeredSystemPrompt(context)).toContain("updated marker");
+    expect(offeredSystemPrompt(context)).not.toContain("old marker");
+    expect(offeredSystemPrompt(context)).toContain("new instructions");
+  });
+});
 
 describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", () => {
   let run: PrintModeRun | undefined;
@@ -92,7 +130,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     //     finishes → the child's own model turn actually runs (≥3 calls).
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const respond = async (ctx: Context) => {
-      const isParent = (ctx.tools ?? []).some((t) => t.name === "Agent");
+      const isParent = offeredToolNames(ctx).includes("Agent");
       if (!isParent) {
         await sleep(80); // child takes long enough that a non-held parent exits first
         return "CHILD_BG_RAN";
@@ -124,6 +162,36 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(run.modelCalls).toBeGreaterThanOrEqual(3);
   });
 
+  it("refuses tool-requested and frontmatter raw inheritance without a child provider call", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "subagents-raw-inheritance-"));
+    tmpDirs.push(cwd);
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(join(cwd, ".pi", "agents", "legacy-inherit.md"),
+      "---\ndescription: Legacy inherited context\ninherit_context: true\n---\nOnly reply to the task.\n");
+    for (const [type, requestInheritance] of [["Explore", true], ["legacy-inherit", false]] as const) {
+      let childRequests = 0;
+      run = await runPrintMode({
+        cwd,
+        prompt: "Start the requested agent.",
+        respond: (context) => {
+          if (!offeredToolNames(context).includes("Agent")) {
+            childRequests++;
+            return "UNEXPECTED_CHILD_REQUEST";
+          }
+          if (context.messages.some((message) => message.role === "toolResult" && message.toolName === "Agent")) {
+            return "Parent received the refusal.";
+          }
+          return agentCall({ subagent_type: type, description: "inspect without history", prompt: "Only sanitized task", inherit_context: requestInheritance });
+        },
+      });
+      expect(agentToolResults(run.parentSession).join("\n")).toContain("inherit_context: true");
+      expect(childRequests).toBe(0);
+      expect(run.modelCalls).toBe(2);
+      await run.dispose();
+      run = undefined;
+    }
+  });
+
   it("spawns a FRONTMATTER-defined (.pi/agents/*.md) agent and its prompt reaches the child", async () => {
     // A project agent whose body is a distinctive system prompt. Proving the
     // child SAW it proves the full chain: the extension discovers the .md from
@@ -151,7 +219,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
         parentFinal: "Reported.",
         // The child reflects whether the frontmatter body reached its own prompt.
         subagent: (ctx: Context) =>
-          `child saw: ${ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING"}`,
+          `child saw: ${offeredSystemPrompt(ctx).includes(MARKER) ? MARKER : "MISSING"}`,
       }),
     });
 
@@ -185,7 +253,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
         }),
         parentFinal: "Reported.",
         subagent: (ctx: Context) =>
-          `child saw: ${ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING"}`,
+          `child saw: ${offeredSystemPrompt(ctx).includes(MARKER) ? MARKER : "MISSING"}`,
       }),
     });
 

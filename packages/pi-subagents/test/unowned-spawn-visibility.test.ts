@@ -21,6 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 const SESSION_ID = "s1";
 /** Short enough that a fire lands inside the poll window, long enough to arm first. */
@@ -70,7 +71,7 @@ function ctxWith(ui: ReturnType<typeof uiCtx>, hasUI = true) {
     ui,
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: () => SESSION_ID, getBranch: () => [] },
     getSystemPrompt: () => "parent",
   } as any;
@@ -129,12 +130,11 @@ describe("unowned spawn visibility (real extension lifecycle)", () => {
       }),
     );
     process.chdir(tmpDir);
-    // Creates a session, then never resolves: the record stays running with the
-    // session the fleet requires, so both surfaces have something to draw for the
-    // whole assertion window.
+    // Keep the session running for the assertions, but let shutdown abort it
+    // rather than waiting for the production quiescence timeout.
     vi.mocked(runAgent).mockImplementation(((_ctx: unknown, _type: unknown, _prompt: unknown, options: any) => {
       options.onSessionCreated?.(fakeSession());
-      return new Promise(() => {});
+      return new Promise((resolve) => options.signal.addEventListener("abort", () => resolve({ responseText: "", aborted: true, steered: false }), { once: true }));
     }) as any);
   });
 
@@ -246,7 +246,7 @@ describe("unowned spawn visibility (real extension lifecycle)", () => {
     vi.mocked(runAgent).mockImplementation(((_ctx: unknown, _type: unknown, _prompt: unknown, options: any) => {
       nested = options.nestedRuntime;
       options.onSessionCreated?.(fakeSession());
-      return new Promise(() => {});
+      return new Promise((resolve) => options.signal.addEventListener("abort", () => resolve({ responseText: "", aborted: true, steered: false }), { once: true }));
     }) as any);
 
     await tools.get("Agent").execute(

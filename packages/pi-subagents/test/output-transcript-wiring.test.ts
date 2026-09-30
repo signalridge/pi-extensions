@@ -23,6 +23,7 @@ vi.mock("../src/output-file.js", async () => {
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { createOutputFilePath, setOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -52,7 +53,7 @@ function makeCtx(cwd: string) {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: vi.fn(() => "session-1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

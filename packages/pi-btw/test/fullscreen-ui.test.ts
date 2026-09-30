@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import { type BtwFullscreenTuiFactory, runBtwFullscreen } from "../src/fullscreen-ui.js";
@@ -254,6 +255,70 @@ test("default fullscreen activates OSC-8 links through the configured URL opener
 
   assert.equal(await running, "closed");
   assert.deepEqual(openedBeforeClose, [url]);
+});
+
+test.each([
+  "new session before completion",
+  "new session after completion",
+  "tree navigation after completion",
+] as const)("fullscreen %s does not restore a cached obsolete draft", async (transitionAt) => {
+  const session = SessionManager.inMemory();
+  const earlier = session.appendMessage({ role: "user", content: "Earlier", timestamp: 1 });
+  session.appendMessage({ role: "user", content: "Later", timestamp: 2 });
+  const originalSessionId = session.getSessionId();
+  let generation = 0;
+  let liveEditor = "main draft";
+  let cachedEditor = "main draft";
+  const writes: string[] = [];
+  const replace = () => {
+    if (transitionAt === "tree navigation after completion") {
+      session.branch(earlier);
+      generation += 1;
+    } else {
+      session.newSession();
+    }
+    liveEditor = "replacement editor";
+    cachedEditor = "main draft"; // The old Pi UI proxy may still expose its cached draft.
+  };
+  const parent = { stop() {}, start() {}, renderNow() {} } as unknown as TUI;
+  const fullscreen = { start() {}, stop() {} } as unknown as TUI;
+  const ctx = {
+    sessionManager: session,
+    ui: {
+      getEditorText: () => cachedEditor,
+      setEditorText: (text: string) => {
+        writes.push(text);
+        liveEditor = text;
+        cachedEditor = text;
+      },
+      custom: (factory: (...args: never[]) => unknown) =>
+        new Promise((resolve) => {
+          factory(
+            parent as never,
+            { fg: (_color: string, text: string) => text } as never,
+            {} as never,
+            ((outcome: unknown) => {
+              if (transitionAt !== "new session before completion") replace();
+              resolve(outcome);
+            }) as never,
+          );
+        }),
+    },
+  } as never;
+  const result = await runBtwFullscreen(
+    ctx,
+    async (fullscreenCtx) => {
+      fullscreenCtx.ui.setEditorText("brought side draft");
+      if (transitionAt === "new session before completion") replace();
+      return "closed";
+    },
+    { createTui: () => fullscreen, isSessionCurrent: () => generation === 0 },
+  );
+
+  assert.equal(result, "closed");
+  assert.equal(session.getSessionId() === originalSessionId, transitionAt === "tree navigation after completion");
+  assert.equal(liveEditor, "replacement editor");
+  assert.deepEqual(writes, ["brought side draft"]);
 });
 
 test("dedicated fullscreen owns the terminal while side custom UI runs and restores it afterward", async () => {

@@ -12,6 +12,7 @@ import { runAgent } from "../src/agent-runner.js";
 import { getAgentConfig, getAllTypes, registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
 import { AGENT_DEFINITION_GENERATION_OVERRIDE, INTERNAL_AGENT_CONFIG_OVERRIDE } from "../src/internal-run.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 type Ui = {
   select: ReturnType<typeof vi.fn>;
@@ -45,7 +46,7 @@ function sessionContext(cwd: string) {
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []), ...mockParentRegistry },
     sessionManager: { getSessionId: vi.fn(() => undefined), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;

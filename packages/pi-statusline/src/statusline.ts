@@ -21,6 +21,7 @@ import { FooterUsageAccumulator } from "./usage.js";
 
 const STATUSLINE_KEY = "statusline";
 const GIT_STATUS_REFRESH_INTERVAL_MS = 30_000;
+const USAGE_REFRESH_INTERVAL_MS = 5_000;
 const GIT_STATUS_EVENT_DEBOUNCE_MS = 250;
 const EMPTY_EXTENSION_STATUS_ICON_ALIASES: ExtensionStatusIconAliasMap = new Map();
 
@@ -28,6 +29,7 @@ export default function statusline(pi: ExtensionAPI) {
   let loaded: LoadedStatuslineSettings | undefined;
   let previewPalettePreset: PalettePreset | undefined;
   let activeSessionManager: ExtensionContext["sessionManager"] | undefined;
+  let observedUsageLeafId: string | null = null;
   const footerUsage = new FooterUsageAccumulator();
   const runtime: RuntimeState = {
     turnCount: 0,
@@ -41,12 +43,24 @@ export default function statusline(pi: ExtensionAPI) {
 
   const rebuildFooterUsage = (ctx: ExtensionContext) => {
     footerUsage.reset(ctx.sessionManager.getEntries());
+    observedUsageLeafId = ctx.sessionManager.getLeafId();
     runtime.footerUsage = footerUsage.snapshot();
   };
 
   const updateFooterUsage = (message: Parameters<FooterUsageAccumulator["updateMessage"]>[0]) => {
     footerUsage.updateMessage(message);
     runtime.footerUsage = footerUsage.snapshot();
+  };
+
+  const showsUsage = () =>
+    loaded?.config.segments.some((segment) => segment === "tokens" || segment === "cache" || segment === "cost");
+  const refreshStandaloneUsage = (ctx: ExtensionContext) => {
+    const leafId = ctx.sessionManager.getLeafId();
+    if (leafId === observedUsageLeafId) return false;
+    observedUsageLeafId = leafId;
+    if (!footerUsage.updateUsageEntries(ctx.sessionManager.getEntries())) return false;
+    runtime.footerUsage = footerUsage.snapshot();
+    return true;
   };
 
   let sessionGeneration = 0;
@@ -175,11 +189,18 @@ export default function statusline(pi: ExtensionAPI) {
         refreshFooterGitStatus();
         tui.requestRender();
       }, GIT_STATUS_REFRESH_INTERVAL_MS);
+      // Pi persists standalone usage without a corresponding extension event.
+      // Its append-only leaf is a cheap change signal; getEntries() copies the entire history.
+      const usageClock = setInterval(() => {
+        if (!isActiveGitStatusTarget(cwd, generation) || !ownsRuntime(ctx) || !showsUsage()) return;
+        if (refreshStandaloneUsage(ctx)) tui.requestRender();
+      }, USAGE_REFRESH_INTERVAL_MS);
 
       return {
         dispose() {
           branchUnsubscribe();
           clearInterval(clock);
+          clearInterval(usageClock);
           if (isActiveGitStatusTarget(cwd, generation)) {
             activeGitStatusTarget = undefined;
             abortGitStatusRefresh("Statusline footer disposed");
@@ -223,6 +244,7 @@ export default function statusline(pi: ExtensionAPI) {
       if (ctx.sessionManager !== activeSessionManager) return;
       previewPalettePreset = undefined;
       loaded = next;
+      if (ctx.mode === "tui" && showsUsage()) refreshStandaloneUsage(ctx);
       refresh();
     },
     preview(palettePreset, ctx) {

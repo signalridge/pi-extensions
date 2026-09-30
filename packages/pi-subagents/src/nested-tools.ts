@@ -16,6 +16,7 @@ import {
   resolveEnabledTypeIn,
   resolveTypeIn,
 } from "./agent-types.js";
+import { INHERIT_CONTEXT_UNAVAILABLE } from "./context-boundary.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
@@ -176,7 +177,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       run_in_background: Type.Optional(Type.Boolean()),
       resume: Type.Optional(Type.String({ description: "Resume a nested agent owned by this parent." })),
       isolated: Type.Optional(Type.Boolean()),
-      inherit_context: Type.Optional(Type.Boolean()),
+      inherit_context: Type.Optional(Type.Boolean({ description: "Unavailable: true is rejected. Put an explicitly sanitized summary in the task prompt instead." })),
       isolation: Type.Optional(Type.Literal("worktree")),
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
@@ -228,6 +229,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         ...params,
         agentTiers: getAgentTiersSettings(),
       });
+      if (invocation.inheritContext) return textResult(INHERIT_CONTEXT_UNAVAILABLE, true);
       // Leave model/thinking unset whenever an Agent tier may apply. runAgent
       // is the sole final resolver; pre-resolving here would let a parent or
       // legacy field bypass the selected profile.

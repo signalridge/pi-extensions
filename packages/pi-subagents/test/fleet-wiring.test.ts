@@ -21,6 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -59,7 +60,7 @@ function ctxWith(ui: ReturnType<typeof uiCtx>) {
     ui,
     cwd: process.cwd(),
     model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
     sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
     getSystemPrompt: () => "parent",
   } as any;
@@ -150,7 +151,8 @@ describe("FleetView wiring (real extension lifecycle)", () => {
   });
 
   it("keeps queued background details truthful instead of rendering them as running", async () => {
-    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
+    vi.mocked(runAgent).mockImplementation(((_ctx: unknown, _type: unknown, _prompt: unknown, options: any) =>
+      new Promise((resolve) => options.signal.addEventListener("abort", () => resolve({ responseText: "", aborted: true, steered: false }), { once: true }))) as any);
 
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);

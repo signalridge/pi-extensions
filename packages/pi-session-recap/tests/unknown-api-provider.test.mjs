@@ -6,6 +6,7 @@ function makePi() {
   const flags = new Map();
   return {
     commands,
+    flags,
     on() {},
     registerCommand(name, command) {
       commands.set(name, command);
@@ -21,6 +22,8 @@ function makePi() {
 
 const pi = makePi();
 sessionRecap(pi);
+pi.flags.set("recap-allow-raw-history", true);
+pi.flags.set("recap-model", "bridge/bridge-model");
 
 const branch = [
   { type: "message", message: { role: "user", content: "Please fix the bridge integration." } },
@@ -50,9 +53,7 @@ const ctx = {
     maxTokens: 4096,
   },
   modelRegistry: {
-    getAvailable() {
-      return [];
-    },
+    find: (provider, id) => (provider === "bridge" && id === "bridge-model" ? ctx.model : undefined),
     getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "unused" }),
   },
   sessionManager: {
