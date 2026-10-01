@@ -172,15 +172,8 @@ body still come from the PR-head snapshot. The retained workflow queue serialize
 new version or force a tag to compensate for a transient failure. If a package name has never existed
 on npm, bootstrap that single package first, then configure OIDC and resume the release.
 
-For the interrupted Pi 0.99 release from Version Packages PR #34, a one-off recovery dispatch is available
-after its recovery workflow change reaches `main`:
-
-```bash
-gh workflow run publish-packages.yml --ref main -f recover_pi099=true
-```
-
-It accepts no caller-supplied SHA, package list, or tag. The publisher authenticates that merged PR and
-its fixed head snapshot, checks existing npm tarball integrity and `latest` tags, and creates missing
-GitHub releases against the original release merge commit. Do not rerun the old Actions attempt once
-`main` has moved to the recovery patch; the old Changesets action can target new tags at the later
-`main` revision. Remove the one-off entry point after the release is fully verified.
+A rerun always executes the publisher from that original SHA, so a publisher fix merged later cannot
+reach it. Rerun only while `main` still points at the release commit: the Changesets action creates
+missing tags against the current `main`, and a later commit there would tag the wrong revision. GitHub
+API reads in the publisher retry transport failures, 5xx responses, and rate limits (including
+secondary limits) with bounded backoff, so a transient GitHub outage no longer aborts a release midway.

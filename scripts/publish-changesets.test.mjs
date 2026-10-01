@@ -2,11 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assertDistTagDoesNotRegress,
-  assertPi099RecoveryDirectories,
-  assertPi099RecoveryDispatch,
-  assertPi099RecoveryPullRequest,
-  assertPi099RecoveryTransition,
-  assertPi099TagRef,
   buildGitHubReleasePayload,
   buildPublishArgs,
   classifyCurrentReleaseTransition,
@@ -21,7 +16,6 @@ import {
   isValidReleasePullRequestMetadata,
   isVersionPackagesReleaseSubject,
   orderPublishPackages,
-  PI_099_RECOVERY,
   packageDirectoryFromPath,
   parseRetryAfterMs,
   parseVersionsOutput,
@@ -318,97 +312,6 @@ test("orders changed packages after their changed local dependencies", () => {
   assert.deepEqual(orderPublishPackages([runtime, protocol]), [protocol, runtime]);
 });
 
-test("accepts only the fixed Pi 0.99 recovery dispatch on current main", () => {
-  const valid = {
-    eventName: "workflow_dispatch",
-    ref: "refs/heads/main",
-    repository: PI_099_RECOVERY.repository,
-    githubSha: "current-main-sha",
-    checkoutHead: "current-main-sha",
-    originMain: "current-main-sha",
-    directReleases: true,
-    tag: "latest",
-  };
-  assert.doesNotThrow(() => assertPi099RecoveryDispatch(valid));
-  for (const change of [{ eventName: "push" }, { ref: "refs/heads/feature" }, { repository: "someone/fork" }]) {
-    assert.throws(() => assertPi099RecoveryDispatch({ ...valid, ...change }), /requires a dispatch from/);
-  }
-  for (const change of [{ githubSha: "different" }, { checkoutHead: "different" }, { originMain: "different" }]) {
-    assert.throws(() => assertPi099RecoveryDispatch({ ...valid, ...change }), /current origin\/main checkout/);
-  }
-  for (const change of [{ directReleases: false }, { tag: "next" }]) {
-    assert.throws(
-      () => assertPi099RecoveryDispatch({ ...valid, ...change }),
-      /direct GitHub releases and the latest npm tag/,
-    );
-  }
-});
-
-test("authenticates the reviewed merge, PR head, and exact 28-package selection", () => {
-  const transition = { form: "head", releaseCommit: PI_099_RECOVERY.mergeSha };
-  const parents = [PI_099_RECOVERY.parentSha];
-  const pullRequest = {
-    number: PI_099_RECOVERY.pullRequestNumber,
-    merged_at: "2026-10-01T03:34:44Z",
-    merge_commit_sha: PI_099_RECOVERY.mergeSha,
-    head: {
-      ref: "changeset-release/main",
-      sha: PI_099_RECOVERY.headSha,
-      repo: { full_name: PI_099_RECOVERY.repository },
-    },
-    base: { ref: "main", repo: { full_name: PI_099_RECOVERY.repository } },
-  };
-  assert.doesNotThrow(() => assertPi099RecoveryTransition(transition, parents));
-  assert.equal(assertPi099RecoveryPullRequest(pullRequest), pullRequest);
-  assert.doesNotThrow(() => assertPi099RecoveryDirectories(new Set(PI_099_RECOVERY.directories)));
-  assert.throws(() => assertPi099RecoveryTransition(undefined, parents), /reviewed Version Packages transition/);
-  assert.throws(
-    () => assertPi099RecoveryTransition(transition, ["another-parent"]),
-    /reviewed Version Packages transition/,
-  );
-  assert.throws(
-    () => assertPi099RecoveryTransition({ ...transition, form: "second-parent" }, parents),
-    /reviewed Version Packages transition/,
-  );
-  assert.throws(
-    () => assertPi099RecoveryTransition({ ...transition, releaseCommit: "ordinary-head" }, parents),
-    /reviewed Version Packages transition/,
-  );
-  for (const change of [
-    { number: 35 },
-    { merged_at: null },
-    { merge_commit_sha: "another-merge" },
-    { head: { ...pullRequest.head, sha: "another-head" } },
-    { head: { ...pullRequest.head, ref: "feature" } },
-    { head: { ...pullRequest.head, repo: { full_name: "someone/fork" } } },
-    { base: { ...pullRequest.base, repo: { full_name: "someone/fork" } } },
-  ]) {
-    assert.throws(() => assertPi099RecoveryPullRequest({ ...pullRequest, ...change }), /merged release PR #34/);
-  }
-  assert.throws(
-    () => assertPi099RecoveryDirectories(new Set(PI_099_RECOVERY.directories.slice(1))),
-    /reviewed release transition/,
-  );
-  assert.throws(
-    () => assertPi099RecoveryDirectories(new Set([...PI_099_RECOVERY.directories, "pi-subagents-protocol"])),
-    /reviewed release transition/,
-  );
-});
-
-test("accepts only Git tag refs targeting the authenticated release merge", () => {
-  const tag = "@signalridge/pi-agent-guidance@1.2.4";
-  const reference = { ref: `refs/tags/${tag}`, object: { type: "commit", sha: PI_099_RECOVERY.mergeSha } };
-  assert.doesNotThrow(() => assertPi099TagRef(tag, reference));
-  assert.throws(
-    () => assertPi099TagRef(tag, { ...reference, object: { type: "commit", sha: "another-sha" } }),
-    /does not point to/,
-  );
-  assert.throws(
-    () => assertPi099TagRef(tag, { ...reference, object: { type: "tag", sha: PI_099_RECOVERY.mergeSha } }),
-    /does not point to/,
-  );
-});
-
 test("retries transient GitHub GET failures and preserves real HTTP outcomes", async () => {
   const url = "https://api.github.com/repos/signalridge/pi-extensions/releases/tags/test";
   const delays = [];
@@ -455,7 +358,7 @@ test("retries transient GitHub GET failures and preserves real HTTP outcomes", a
 });
 
 test("honors bounded GitHub rate-limit and server retries without swallowing failure", async () => {
-  const url = "https://api.github.com/repos/signalridge/pi-extensions/pulls/34";
+  const url = "https://api.github.com/repos/example/repo/pulls/1";
   const delays = [];
   const responses = [
     new Response(null, { status: 429, headers: { "retry-after": "2" } }),
