@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.2
+### Patch Changes
+
+- 8190516: Normalize Codex compaction requests for Pi 0.87 providers without prepending a duplicate system prompt or restoring removed tools when the session already carries system updates; retain the original context path on older Pi hosts. Fall back to native compaction if live prompt or tool changes have not yet reached the persisted transcript, or if the prompt, tool set, or active session branch diverges while the remote request is in flight. Fingerprint only the projected conversation messages Pi actually retains after compaction: system updates are snapshotted onto the compaction entry, while context-edited replacements and raw cut-point identities still replay correctly across repeated compaction and reload.
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- Updated dependencies [8190516]
+- Updated dependencies [8190516]
+  - @signalridge/pi-ui@1.3.2
+
 ## 1.3.1
 ### Patch Changes
 

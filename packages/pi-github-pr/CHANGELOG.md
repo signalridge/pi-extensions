@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.4
+### Patch Changes
+
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Keep a fresh GitHub pull request request or its existing poll when the branch watcher finishes starting, avoiding duplicate CLI calls and discarded status updates. Still refresh after an aborted turn or when no request has started.
+- 8190516: Refresh the current HEAD immediately when it changes during watcher discovery, coalesce agent-turn and branch-debounce requests, and keep startup and bounded refresh retries working through transient statusline or timer failures. Clean up temporary Git fixtures after watcher tests.
+- 8190516: Run the initial GitHub pull request refresh in the background so slow CLI calls do not block session startup. Keep startup discovery and refresh owned by the session so turn cancellation cannot disarm branch watching or periodic updates, while stale work is cancelled on session and branch changes.
+
 ## 1.2.3
 ### Patch Changes
 

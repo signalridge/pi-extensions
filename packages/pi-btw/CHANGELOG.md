@@ -1,5 +1,22 @@
 # @signalridge/pi-btw
 
+## 1.4.0
+### Minor Changes
+
+- 8190516: **Privacy behavior change:** Independent `/btw` requests no longer include the parent transcript or system prompt by default. Pi's parent `context` hooks can redact provider-visible messages, but their result is not exposed to extensions; forwarding the raw session projection bypassed those redactions. Side questions now send only the explicit question and their own successful side-thread turns. To include **unfiltered** parent history for one question, use `--with-parent=provider/model-id` before that question, naming the actual selected physical model. Each follow-up needs a new opt-in to read the parent again; mismatched, virtual, or auth-endpoint-overridden destinations fail closed. Once parent history has been shared, the side thread is bound to that physical model and effective endpoint, so later provider/model/endpoint switches require a fresh side thread rather than relaying an answer that may echo private parent data. Context-dependent questions without an opt-in will need details supplied in the question or the explicit destination-bound prefix.
+
+### Patch Changes
+
+- 8190516: Normalize side-thread requests before calling Pi 0.87 providers while retaining legacy Context requests on older Pi hosts and preserving the auth-resolved endpoint. When a question explicitly opts in to unfiltered parent history, build its snapshot from Pi's session projection (which honors persisted edits but not request-time privacy hooks), refresh it when the first provider request starts so intervening edits are honored, then keep that snapshot for follow-ups. Fence stale session requests and bring-to-main actions, include bounded compaction and branch summaries plus model-visible custom/Bash messages in order, and retain the raw-branch fallback on older Pi hosts.
+- 8190516: Close an open /btw menu at Pi's pre-switch and pre-tree boundaries, before Pi restores its saved editor text; keep canceled boundaries' live drafts and fence stale menu, side-thread, and fullscreen continuations from replacement sessions.
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Preserve the current main-editor text synchronously when a committed session transition closes the /btw fullscreen UI. Pi restores the outgoing editor snapshot inside the custom UI's close callback; this fix retains a destination draft written by an earlier extension's session handler without overwriting a later handler's draft or resurrecting text after a canceled transition.
+- 8190516: Route Pi 0.99.1 virtual models through the public model registry for side questions, resolving the physical target and credentials at request time. Retain direct provider streaming for physical models on older Pi hosts, and report an explicit error when virtual routing is unavailable.
+- Updated dependencies [8190516]
+- Updated dependencies [8190516]
+  - @signalridge/pi-ui@1.3.2
+
 ## 1.3.2
 ### Patch Changes
 

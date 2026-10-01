@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.6
+### Patch Changes
+
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+
 ## 1.2.5
 ### Patch Changes
 

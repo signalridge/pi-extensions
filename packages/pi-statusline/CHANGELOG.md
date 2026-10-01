@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.2
+### Patch Changes
+
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Include standalone Pi session usage entries, such as cache warming, in historical and live footer tokens, cache, and cost without counting an entry twice. Skip history copies when usage is hidden or the session leaf is unchanged, and inspect only appended entries when it advances.
+- Updated dependencies [8190516]
+- Updated dependencies [8190516]
+  - @signalridge/pi-ui@1.3.2
+
 ## 1.4.1
 ### Patch Changes
 

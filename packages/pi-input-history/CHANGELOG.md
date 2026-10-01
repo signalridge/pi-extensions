@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.7
+### Patch Changes
+
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Repaint the editor after accepting a Ctrl+R history match so the selected prompt appears immediately when the overlay closes. Queue repeat Ctrl+R presses during history loading as bounded moves to older matches without opening another popup, and close active searches or pending scans on session switch or shutdown so pending shortcuts settle without updating a new editor. Retire active searches on committed session-tree navigation as well, without discarding the reusable cross-session scan or cancelling searches for a navigation that was only proposed.
+
 ## 1.2.6
 ### Patch Changes
 

@@ -1,5 +1,12 @@
 # @signalridge/pi-lsp
 
+## 1.2.4
+### Patch Changes
+
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Keep a bounded UTF-8-safe tail of language-server stderr in memory and error messages without copying the entire tail for every chunk. Ignore output and exit events from a superseded server when a client restarts, and clear its partial JSON-RPC frame and cached diagnostics before opening the replacement.
+
 ## 1.2.3
 ### Patch Changes
 

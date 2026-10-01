@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.4
+### Patch Changes
+
+- 8190516: Clarify that keyword arming guides the model but is not an execution-time permission gate; direct workflow calls remain governed by the host's normal tool permissions.
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Retain Pi's tree-navigation attempt signal for branch ownership and deduplication. Active child or workflow work now causes a non-destructive preflight veto rather than pre-veto quiescence; accepted tree changes fence late old-branch callbacks. A second attempt rechecks live work instead of reusing state from a canceled attempt. Pi still lacks an atomic post-veto, pre-leaf commit hook: work started during asynchronous summarization may need to be quarantined on commit.
+- 8190516: Skip the full Pi session-branch scan when the workflow journal's anchored leaf is still current. Keep the existing ancestry check when the leaf changes or cannot be reported, so navigated-away branches cannot receive old journal entries.
+- 8190516: Block session switches and tree navigation while subagents, workflows, or provider cleanup remain unsettled, without stopping work on a cancellable attempt. Confirmed shutdown coordinates workflow-owned cleanup before retiring the subagent RPC responder; confirmed tree changes fence stale callbacks and keep old terminal facts off the new branch. Pi's hook ordering still leaves a narrow, non-atomic interval between preflight and commit, so new work during summarization is quarantined on commit rather than guaranteed to finish.
+
 ## 1.7.3
 ### Patch Changes
 

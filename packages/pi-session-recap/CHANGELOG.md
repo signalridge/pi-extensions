@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- 8190516: Disable independent, history-bearing recap requests by default. Require both `--recap-allow-raw-history` and a concrete physical `--recap-model "provider/model-id"` destination; parent `context`-hook redactions do not apply to recap history. Also refuse auth-resolved endpoint overrides that differ from the selected model's registered base URL, rather than sending raw history to an unapproved physical destination. Manual `/recap` explains missing consent or an endpoint mismatch, while automatic triggers stay quiet.
+
+### Patch Changes
+
+- 8190516: Exclude projected parent system messages and tool declarations from independent recap provider requests while retaining conversation and summary framing.
+- 8190516: Extend the tested Pi host compatibility range through 0.87.x while retaining supported older hosts. Validate the published extensions against Pi 0.87.1 and adapt changed provider, session-context, and lifecycle contracts where necessary.
+- 8190516: Add Pi 0.99.1 to the supported host peer ranges while retaining Pi 0.84–0.87 compatibility. Align Pi development dependency pins with 0.99.1 for validation against the new host.
+- 8190516: Build recaps from Pi's model-visible session projection so context edits and compaction cannot restore omitted prompts or discarded attempts. Count projected assistant work despite later custom messages, and preserve activity when only a compaction summary remains. When explicitly enabled, wait for final agent settlement before automatic idle and away recaps, cancel the pending blur timer on settlement so it cannot bypass the three-second continuation debounce, recheck activity before showing a drafted recap, and ignore late lifecycle events from a replaced session. Retain the pre-projection fallback for older supported Pi hosts without choosing a superseded compaction summary. Skip provider dispatch if input or a session transition cancels the recap while model authentication is pending. Recheck the live projected provider context after authentication so omitted or replaced private content is never sent in a stale recap request. Exclude orphan and duplicate tool results and incomplete assistant turns before selecting the recent window, and include the matching assistant call when a long result run crosses that bounded window. Ignore aborted or errored assistant work for automatic recap activity. Precompute branch positions when selecting retained summaries.
+- 8190516: Skip recaps for Pi virtual model selections unless a physical `--recap-model` override is configured. Tell manual `/recap` callers how to configure one, while keeping automatic skips quiet and preserving reasoning-off behavior.
+
 ## 1.2.4
 ### Patch Changes
 
