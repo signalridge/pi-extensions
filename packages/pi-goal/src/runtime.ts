@@ -17,7 +17,7 @@ export { queueGoalSafetyReset, resetGoalSafetyEpoch } from "./safety.js";
 
 import { DEFAULT_GOAL_SETTINGS, type GoalSettings, type GoalSettingsLoadIssue } from "./settings.js";
 import { GoalToolPolicy, type GoalToolVisibilitySnapshot } from "./tool-policy.js";
-import { GoalWaitTimer } from "./wait.js";
+import { type GoalWait, GoalWaitTimer } from "./wait.js";
 
 export { GOAL_BLOCKED_TOOL, GOAL_COMPLETE_TOOL, GOAL_TOOL_NAMES, GOAL_WAIT_TOOL } from "./tool-policy.js";
 
@@ -69,7 +69,7 @@ export type GoalStopRequest =
    * same stale-call block — but lands on `paused`, which is already the state
    * every resume path knows how to bring back.
    */
-  | { kind: "wait"; expectedGoalId: string; reason: string }
+  | { kind: "wait"; expectedGoalId: string; wait: GoalWait }
   | {
       kind: "tools_unavailable";
       expectedGoalId: string;
@@ -210,6 +210,8 @@ export class GoalRuntime {
   /** `null` marks a run that must not be charged to the active goal. */
   agentRunGoalId?: string | null;
   agentRunOrigin?: GoalRunOrigin;
+  /** Input wakes inside an existing run cannot refresh its system prompt. */
+  inputWakeGoalId?: string;
   agentRunToolAttempted = false;
   guardAbortGoalId?: string;
   staleGoalToolCallsBlocked = false;
@@ -383,7 +385,7 @@ export class GoalRuntime {
     let terminalReason: string | undefined;
     switch (request.kind) {
       case "explicit_pause":
-        this.recordGoalUsage(goal, ctx);
+        if (goal.status === "active") this.recordGoalUsage(goal, ctx);
         this.cancelContinuationWork();
         this.clearGoalRecoveryForGoal(goal.id);
         this.clearBudgetWrapUp();
@@ -418,7 +420,7 @@ export class GoalRuntime {
         this.clearBudgetWrapUp();
         this.blockStaleGoalToolCalls();
         status = "paused";
-        terminalReason = request.reason;
+        terminalReason = request.wait.reason;
         break;
       case "retry_exhausted":
         this.clearGoalRecoveryForGoal(goal.id);
@@ -467,6 +469,10 @@ export class GoalRuntime {
     }
 
     this.activeGoal = transitionGoal(goal, status);
+    if (request.kind === "wait") {
+      this.activeGoal.wait = request.wait;
+      this.activeGoal.safetyPauseCause = undefined;
+    }
     if (terminalReason !== undefined) this.setTerminalReason(this.activeGoal.id, terminalReason);
     const stoppedGoal = this.activeGoal;
     this.persistGoal(stoppedGoal);
@@ -736,14 +742,39 @@ export class GoalRuntime {
    */
   onGoalWaitElapsed?: (ctx: StatusContext, goalId: string) => void;
 
-  scheduleGoalWaitWake(ctx: StatusContext, goalId: string, resumeAt: number): void {
+  scheduleGoalWaitWake(ctx: StatusContext): void {
+    this.clearGoalWaitWake();
+    const goal = this.activeGoal;
+    if (this.queueFrozen || this.pendingQueueAction || goal?.status !== "paused" || !goal.wait) return;
+    const resumeAt = goal.wait.resumeAt;
+    if (resumeAt === undefined) return;
+    const generation = this.menuGeneration;
     this.goalWaitTimer.schedule(resumeAt, () => {
-      // Re-checked at fire time, not at schedule time: the goal may have been
-      // completed, cleared, or replaced during the wait, and waking a goal that
-      // is no longer the active one would resume the wrong work.
-      if (this.activeGoal?.id !== goalId || this.activeGoal.status !== "paused") return;
-      this.onGoalWaitElapsed?.(ctx, goalId);
+      if (
+        generation !== this.menuGeneration ||
+        this.activeGoal?.id !== goal.id ||
+        this.activeGoal.wait?.resumeAt !== resumeAt
+      )
+        return;
+      this.dispatchGoalWaitIfDue(ctx);
     });
+  }
+
+  dispatchGoalWaitIfDue(ctx: StatusContext): void {
+    const goal = this.activeGoal;
+    if (
+      this.queueFrozen ||
+      this.pendingQueueAction ||
+      goal?.status !== "paused" ||
+      goal.wait?.resumeAt === undefined ||
+      goal.wait.resumeAt > Date.now() ||
+      !this.toolPolicy.toolsAvailable() ||
+      ctx.isIdle?.() !== true ||
+      hasPendingMessages(ctx)
+    )
+      return;
+    this.clearGoalWaitWake();
+    this.onGoalWaitElapsed?.(ctx, goal.id);
   }
 
   clearGoalWaitWake(): void {
@@ -1069,7 +1100,7 @@ export function transitionGoal(goal: ActiveGoal, requestedStatus: GoalStatus): A
     requestedStatus === "active" && goal.tokenBudget !== undefined && goal.tokensUsed >= goal.tokenBudget
       ? "budget_limited"
       : requestedStatus;
-  const next = { ...goal, status, updatedAt: now };
+  const next = { ...goal, status, updatedAt: now, wait: undefined };
   checkpointGoalActiveTime(next, now, status === "active");
   return next;
 }
@@ -1105,6 +1136,7 @@ export function formatStatus(
     }
     return `paused · automatic limit ${goal.automaticModelTurns}/${automaticTurnLimit}`;
   }
+  if (goal.status === "paused" && goal.wait) return `waiting · ${automatic}`;
   if (goal.status === "paused") return `paused · ${automatic}`;
   if (goal.status === "blocked") return `blocked · ${automatic}`;
   if (goal.status === "usage_limited") return `usage · ${automatic}`;
@@ -1135,6 +1167,10 @@ export function goalSummary(
     `Active elapsed: ${formatDuration(goal.timeUsedSeconds)}`,
     `Tokens: ${goal.tokenBudget === undefined ? formatTokenCount(goal.tokensUsed) : formatBudget(goal)}`,
   ];
+  if (goal.wait) {
+    summary.push(`Waiting: ${goal.wait.reason}`);
+    if (goal.wait.resumeAt !== undefined) summary.push(`Wake deadline: ${new Date(goal.wait.resumeAt).toISOString()}`);
+  }
   if (goal.safetyPauseCause) {
     summary.push(
       goal.safetyPauseCause === "continuation_limit"

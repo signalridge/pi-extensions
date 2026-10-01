@@ -69,6 +69,7 @@ export type StoredGoal = {
   lastToolFreeOutputFingerprint?: string;
   safetyPauseCause?: string;
   safetyResetPending?: boolean;
+  wait?: { reason: string; resumeAt?: number };
 };
 
 export function assertHardenedGoalPrompt(prompt: string) {

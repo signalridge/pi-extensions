@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isNonNegativeFiniteNumber, nonNegativeFiniteNumber, normalizeTokenBudget } from "./accounting.js";
 import type { GoalStatus } from "./prompts.js";
+import { type GoalWait, normalizeGoalWait } from "./wait.js";
 
 const GOAL_STATE_ENTRY_TYPE = "goal-state";
 const LEGACY_GOALS_STATE_ENTRY_TYPE = "goals-state";
@@ -28,6 +29,8 @@ export interface ActiveGoal {
   lastToolFreeOutputFingerprint?: string;
   safetyPauseCause?: SafetyPauseCause;
   safetyResetPending?: boolean;
+  /** Only a paused goal with this record may wake without /goal resume. */
+  wait?: GoalWait;
 }
 
 export type PendingQueueAction =
@@ -224,6 +227,7 @@ export function normalizeLoadedGoal(goal: ActiveGoal): ActiveGoal {
     lastToolFreeOutputFingerprint: normalizeOutputFingerprint(goal.lastToolFreeOutputFingerprint),
     safetyPauseCause: normalizeSafetyPauseCause(goal.safetyPauseCause),
     safetyResetPending: goal.safetyResetPending === true ? true : undefined,
+    wait: goal.status === "paused" && !goal.safetyPauseCause ? normalizeGoalWait(goal.wait) : undefined,
   };
 }
 

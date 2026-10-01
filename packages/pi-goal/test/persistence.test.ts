@@ -213,6 +213,34 @@ test("malformed persisted safety fields reset without discarding the goal", () =
   assert.equal(loaded.goal?.safetyPauseCause, undefined);
 });
 
+test("wait persistence distinguishes waiting from old pauses and rejects malformed wake metadata", () => {
+  const wait = { reason: "  awaiting review  ", resumeAt: 60_000 };
+  const paused = { ...active, status: "paused" as const, wait };
+  const loaded = loadGoalStateFromSession(
+    branch({
+      customType: "goal-state",
+      data: JSON.parse(JSON.stringify(serializeGoalState(paused, [], undefined))),
+    }),
+  );
+  assert.deepEqual(loaded.goal?.wait, { reason: "awaiting review", resumeAt: 60_000 });
+  assert.equal(loaded.goal?.id, active.id);
+  assert.equal(loaded.goal?.tokensUsed, active.tokensUsed);
+
+  for (const goal of [
+    { ...paused, wait: undefined },
+    { ...paused, wait: { reason: "invalid", resumeAt: "soon" } },
+    { ...paused, wait: { reason: "invalid", resumeAt: -1 } },
+    { ...paused, status: "blocked" },
+    { ...paused, status: "active" },
+    { ...paused, safetyPauseCause: "no_progress" },
+  ]) {
+    const restored = loadGoalStateFromSession(branch({ customType: "goal-state", data: { goal } }));
+    assert.equal(restored.goal?.id, active.id);
+    assert.equal(restored.goal?.status, goal.status);
+    assert.equal(restored.goal?.wait, undefined);
+  }
+});
+
 test("malformed canonical or plural queue state fails closed", () => {
   for (const [customType, data] of [
     ["goal-state", { goal: { ...active, id: "" } }],

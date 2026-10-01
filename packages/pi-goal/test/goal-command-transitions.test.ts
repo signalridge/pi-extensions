@@ -425,11 +425,11 @@ test("editing paused, blocked, or usage-limited goals preserves their stopped st
   }
 });
 
-test("pause remains active-only for new stopped statuses", async () => {
+test("pause rejects stopped statuses that are not waiting", async () => {
   for (const status of ["blocked", "usage_limited", "budget_limited"] as const) {
     const restored = restoreGoalForTest(status);
     await restored.mock.commands.get("goal")?.handler("pause", restored.ctx);
-    assert.match(restored.notifications.at(-1)?.message ?? "", /only active goals can be paused/i);
+    assert.match(restored.notifications.at(-1)?.message ?? "", /only active or waiting goals can be paused/i);
     const label = status === "usage_limited" ? "usage" : status === "budget_limited" ? "budget 5/10" : status;
     assert.equal(restored.statuses.get("goal"), `${label} · automatic 0/25`);
   }

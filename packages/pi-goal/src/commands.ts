@@ -24,6 +24,7 @@ import {
   isResumableGoalStatus,
   nextGoalInstance,
   queueGoalSafetyReset,
+  resetGoalSafetyEpoch,
   STATUS_KEY,
   type StatusContext,
   stoppedStatusLabel,
@@ -274,6 +275,7 @@ export class GoalCommandController {
       return this.dispatchPendingQueueActionIfSettled(ctx);
     }
     const goal = this.runtime.activeGoal;
+    this.runtime.scheduleGoalWaitWake(ctx);
     if (goal?.status !== "active") return false;
     this.runtime.requestContinuation(goal);
     return this.runtime.dispatchContinuationIfSettled(ctx);
@@ -388,8 +390,12 @@ export class GoalCommandController {
       notifyTerminal(ctx.ui, "No active goal.", "info");
       return;
     }
-    if (this.runtime.activeGoal.status !== "active") {
-      notifyTerminal(ctx.ui, `Goal is ${this.runtime.activeGoal.status}; only active goals can be paused.`, "warning");
+    if (this.runtime.activeGoal.status !== "active" && !this.runtime.activeGoal.wait) {
+      notifyTerminal(
+        ctx.ui,
+        `Goal is ${this.runtime.activeGoal.status}; only active or waiting goals can be paused.`,
+        "warning",
+      );
       return;
     }
     const stoppedGoal = this.runtime.stopActiveGoal(ctx, {
@@ -399,7 +405,23 @@ export class GoalCommandController {
     if (stoppedGoal) notifyTerminal(ctx.ui, `Goal paused: ${stoppedGoal.text}`, "info");
   }
 
-  async resumeGoal(ctx: StatusContext) {
+  resumeWaitingGoalOnInput(ctx: StatusContext) {
+    if (
+      this.runtime.queueFrozen ||
+      this.runtime.pendingQueueAction ||
+      this.runtime.activeGoal?.status !== "paused" ||
+      !this.runtime.activeGoal.wait
+    )
+      return;
+    // The incoming message already owns a turn; do not send a second prompt.
+    const resumed = this.prepareGoalResume(ctx, false);
+    if (resumed) {
+      this.runtime.inputWakeGoalId = resumed.resumedGoal.id;
+      this.runtime.beginAgentRun(resumed.resumedGoal.id, "manual");
+    }
+  }
+
+  private prepareGoalResume(ctx: StatusContext, resetOnPrompt: boolean) {
     if (!this.runtime.activeGoal) {
       notifyTerminal(ctx.ui, "No active goal.", "info");
       return;
@@ -427,19 +449,25 @@ export class GoalCommandController {
       return;
     }
     const stoppedGoal = this.runtime.activeGoal;
-    const stoppedStatus = stoppedGoal.status;
     this.runtime.cancelContinuationWork();
     this.runtime.clearGoalRecovery();
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
-    this.runtime.activeGoal = queueGoalSafetyReset(transitionGoal(nextGoalInstance(this.runtime.activeGoal), "active"));
-    this.runtime.persistGoal(this.runtime.activeGoal);
-    this.runtime.updateStatus(ctx, this.runtime.activeGoal);
-    if (this.runtime.activeGoal.status !== "active") {
-      notifyTerminal(ctx.ui, `Goal token budget is still reached: ${formatBudget(this.runtime.activeGoal)}`, "warning");
-      return;
-    }
-    const resumedGoal = this.runtime.activeGoal;
+    const active = transitionGoal(nextGoalInstance(stoppedGoal), "active");
+    const resumedGoal = resetOnPrompt ? queueGoalSafetyReset(active) : resetGoalSafetyEpoch(active);
+    this.runtime.activeGoal = resumedGoal;
+    this.runtime.persistGoal(resumedGoal);
+    // Canonical state publication can synchronously pause or replace the goal.
+    if (this.runtime.activeGoal !== resumedGoal || resumedGoal.status !== "active") return;
+    this.runtime.updateStatus(ctx, resumedGoal);
+    return { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation };
+  }
+
+  async resumeGoal(ctx: StatusContext) {
+    const prepared = this.prepareGoalResume(ctx, true);
+    if (!prepared) return;
+    const { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation } = prepared;
+    const stoppedStatus = stoppedGoal.status;
     const sent = await this.runtime.sendOwnedGoalPrompt(
       ctx,
       resumedGoal.id,

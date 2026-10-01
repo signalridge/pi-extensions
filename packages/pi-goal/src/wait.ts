@@ -100,12 +100,16 @@ export class GoalWaitTimer {
   schedule(resumeAt: number, onDue: () => void): void {
     this.clear();
     const generation = this.generation;
-    // A deadline already past fires on the next tick rather than never, and one
-    // beyond the timer range is capped instead of overflowing to immediate.
+    // Long waits use bounded timer segments, never an early wake. Overdue
+    // deadlines run on the next tick so restore can finish before resuming.
     const delay = Math.max(0, Math.min(MAX_GOAL_WAIT_DELAY_MS, resumeAt - Date.now()));
     this.timer = setTimeout(() => {
       if (generation !== this.generation) return;
       this.timer = undefined;
+      if (resumeAt > Date.now()) {
+        this.schedule(resumeAt, onDue);
+        return;
+      }
       onDue();
     }, delay);
   }

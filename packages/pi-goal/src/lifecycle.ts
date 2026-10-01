@@ -41,6 +41,8 @@ export function registerGoalLifecycle(
 ) {
   pi.on("session_start", async (_event, ctx) => {
     runtime.replaceMenuSession();
+    runtime.inputWakeGoalId = undefined;
+    runtime.clearGoalWaitWake();
     runtime.clearCompletionStatusTimer();
     runtime.clearContinuationTracking();
     runtime.clearPendingGoalPrompts();
@@ -113,6 +115,7 @@ export function registerGoalLifecycle(
       }
       runtime.persistGoal(runtime.activeGoal);
       runtime.updateStatus(ctx, runtime.activeGoal);
+      runtime.scheduleGoalWaitWake(ctx);
       if (startRestoredQueuedGoal) {
         const restoredGoal = runtime.activeGoal;
         const sent = await runtime.sendOwnedGoalPrompt(
@@ -139,6 +142,8 @@ export function registerGoalLifecycle(
   pi.on("session_shutdown", (_event, ctx) => {
     runController.unbindSession();
     runtime.closeMenuSession();
+    runtime.inputWakeGoalId = undefined;
+    runtime.clearGoalWaitWake();
     if (runtime.activeGoal) {
       if (!runtime.queueFrozen && runtime.activeGoal.status === "active") {
         runtime.recordGoalUsage(runtime.activeGoal, ctx, false);
@@ -182,6 +187,7 @@ export function registerGoalLifecycle(
     if (runtime.activeGoal?.status !== "active") {
       runtime.clearGoalRecovery();
       if (runtime.pendingQueueAction) await commands.dispatchPendingQueueActionIfSettled(ctx);
+      runtime.scheduleGoalWaitWake(ctx);
       return;
     }
 
@@ -217,6 +223,10 @@ export function registerGoalLifecycle(
     runtime.scheduleContinuationDispatch(ctx, runtime.activeGoal.id);
   });
 
+  pi.on("session_compact_failed", (_event, ctx) => {
+    runtime.scheduleGoalWaitWake(ctx);
+  });
+
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") {
       if (runtime.consumeCancelledContinuationPrompt(event.text) || runtime.consumeStaleOwnedGoalPrompt(event.text)) {
@@ -242,6 +252,7 @@ export function registerGoalLifecycle(
     if (event.streamingBehavior === "steer") {
       runtime.noteQueuedNonGoalInput(event.text, "steer");
     }
+    commands.resumeWaitingGoalOnInput(ctx);
     runtime.clearGoalRecovery();
     runtime.clearBudgetWrapUp();
     runtime.clearStaleGoalToolCallBlock();
@@ -305,6 +316,20 @@ export function registerGoalLifecycle(
       // A current custom follow-up clears the guard at message_start. Otherwise,
       // context transformation aborts before the provider adapter receives the signal.
       abortCurrentTurn(ctx);
+    }
+    const goal = runtime.activeGoal;
+    if (!runtime.queueFrozen && goal?.status === "active" && runtime.inputWakeGoalId === goal.id) {
+      // Native queued input reaches message_start without before_agent_start.
+      // Keep the rotated guard visible for every remaining response in this run,
+      // without enqueueing another user turn or changing persisted user input.
+      messages.push({
+        role: "custom",
+        customType: "goal-input-wake",
+        content: `Goal runtime binding update: real input resumed the waiting goal. This current goal_id supersedes the earlier binding.\n\n${buildGoalSystemPrompt(goal)}`,
+        display: false,
+        timestamp: Date.now(),
+      });
+      return { messages };
     }
     if (messages.length !== event.messages.length) return { messages };
   });
@@ -372,6 +397,7 @@ export function registerGoalLifecycle(
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    runtime.inputWakeGoalId = undefined;
     runtime.clearAgentRun();
     if (runtime.queueFrozen) return;
     // Pi-owned retries emit agent_start directly. Reaching a normal prompt
@@ -582,9 +608,11 @@ export function registerGoalLifecycle(
     }
     if (!dispatchedQueueAction) runtime.dispatchContinuationIfSettled(ctx);
     runtime.clearSettledSafetyTracking();
+    runtime.scheduleGoalWaitWake(ctx);
   });
 
   function beginNonGoalFollowUp(ctx: StatusContext, resetSafetyEpoch: boolean) {
+    if (resetSafetyEpoch) commands.resumeWaitingGoalOnInput(ctx);
     runtime.clearGoalRecovery();
     runtime.clearStaleGoalToolCallBlock();
     if (resetSafetyEpoch) runtime.clearBudgetWrapUp();

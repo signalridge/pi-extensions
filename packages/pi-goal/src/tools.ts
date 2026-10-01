@@ -20,7 +20,13 @@ import {
   transitionGoal,
   truncateNotification,
 } from "./runtime.js";
-import { createGoalWait, MAX_GOAL_WAIT_REASON_LENGTH, MIN_GOAL_WAIT_DELAY_MS, resolveGoalWaitDelay } from "./wait.js";
+import {
+  createGoalWait,
+  MAX_GOAL_WAIT_REASON_LENGTH,
+  MIN_GOAL_WAIT_DELAY_MS,
+  normalizeGoalWait,
+  resolveGoalWaitDelay,
+} from "./wait.js";
 
 interface GoalCompleteDetails {
   goal: string;
@@ -366,17 +372,23 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
       if (goal.status !== "active") return reject(`goal is ${goal.status}, not active`);
       if (!reason) return reject("reason is empty");
 
-      const wait = createGoalWait(reason, requestedResumeAfterMs);
+      if (
+        requestedResumeAfterMs !== undefined &&
+        (!Number.isSafeInteger(requestedResumeAfterMs) || requestedResumeAfterMs < 1)
+      )
+        return reject("resume_after_ms must be a positive safe integer");
+      const wait = normalizeGoalWait(createGoalWait(reason, requestedResumeAfterMs));
+      if (!wait) return reject("invalid wait reason or deadline");
       const stoppedGoal = runtime.stopActiveGoal(ctx, {
         kind: "wait",
         expectedGoalId: goal.id,
-        reason,
+        wait,
       });
       if (!stoppedGoal) return reject("active goal changed before the wait took effect");
 
       // Armed after the stop, so a wake can never race a goal that is still
       // being transitioned out of `active`.
-      if (wait.resumeAt !== undefined) runtime.scheduleGoalWaitWake(ctx, stoppedGoal.id, wait.resumeAt);
+      if (runtime.activeGoal === stoppedGoal) runtime.scheduleGoalWaitWake(ctx);
 
       const { requestedMs, effectiveMs } = resolveGoalWaitDelay(requestedResumeAfterMs);
       const clamped = requestedMs !== undefined && effectiveMs !== undefined && effectiveMs !== requestedMs;
