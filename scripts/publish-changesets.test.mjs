@@ -2,12 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   assertDistTagDoesNotRegress,
+  assertPi099RecoveryDirectories,
+  assertPi099RecoveryDispatch,
+  assertPi099RecoveryPullRequest,
+  assertPi099RecoveryTransition,
+  assertPi099TagRef,
   buildGitHubReleasePayload,
   buildPublishArgs,
   classifyCurrentReleaseTransition,
   createTagBuffer,
   DEFAULT_PUBLISH_COOLDOWN_MS,
   extractChangelogSection,
+  fetchGitHubRead,
   findQualifyingReleasePullRequest,
   hasQualifyingReleasePullRequest,
   isQualifyingReleasePullRequest,
@@ -15,6 +21,7 @@ import {
   isValidReleasePullRequestMetadata,
   isVersionPackagesReleaseSubject,
   orderPublishPackages,
+  PI_099_RECOVERY,
   packageDirectoryFromPath,
   parseRetryAfterMs,
   parseVersionsOutput,
@@ -309,4 +316,228 @@ test("orders changed packages after their changed local dependencies", () => {
     },
   };
   assert.deepEqual(orderPublishPackages([runtime, protocol]), [protocol, runtime]);
+});
+
+test("accepts only the fixed Pi 0.99 recovery dispatch on current main", () => {
+  const valid = {
+    eventName: "workflow_dispatch",
+    ref: "refs/heads/main",
+    repository: PI_099_RECOVERY.repository,
+    githubSha: "current-main-sha",
+    checkoutHead: "current-main-sha",
+    originMain: "current-main-sha",
+    directReleases: true,
+    tag: "latest",
+  };
+  assert.doesNotThrow(() => assertPi099RecoveryDispatch(valid));
+  for (const change of [{ eventName: "push" }, { ref: "refs/heads/feature" }, { repository: "someone/fork" }]) {
+    assert.throws(() => assertPi099RecoveryDispatch({ ...valid, ...change }), /requires a dispatch from/);
+  }
+  for (const change of [{ githubSha: "different" }, { checkoutHead: "different" }, { originMain: "different" }]) {
+    assert.throws(() => assertPi099RecoveryDispatch({ ...valid, ...change }), /current origin\/main checkout/);
+  }
+  for (const change of [{ directReleases: false }, { tag: "next" }]) {
+    assert.throws(
+      () => assertPi099RecoveryDispatch({ ...valid, ...change }),
+      /direct GitHub releases and the latest npm tag/,
+    );
+  }
+});
+
+test("authenticates the reviewed merge, PR head, and exact 28-package selection", () => {
+  const transition = { form: "head", releaseCommit: PI_099_RECOVERY.mergeSha };
+  const parents = [PI_099_RECOVERY.parentSha];
+  const pullRequest = {
+    number: PI_099_RECOVERY.pullRequestNumber,
+    merged_at: "2026-10-01T03:34:44Z",
+    merge_commit_sha: PI_099_RECOVERY.mergeSha,
+    head: {
+      ref: "changeset-release/main",
+      sha: PI_099_RECOVERY.headSha,
+      repo: { full_name: PI_099_RECOVERY.repository },
+    },
+    base: { ref: "main", repo: { full_name: PI_099_RECOVERY.repository } },
+  };
+  assert.doesNotThrow(() => assertPi099RecoveryTransition(transition, parents));
+  assert.equal(assertPi099RecoveryPullRequest(pullRequest), pullRequest);
+  assert.doesNotThrow(() => assertPi099RecoveryDirectories(new Set(PI_099_RECOVERY.directories)));
+  assert.throws(() => assertPi099RecoveryTransition(undefined, parents), /reviewed Version Packages transition/);
+  assert.throws(
+    () => assertPi099RecoveryTransition(transition, ["another-parent"]),
+    /reviewed Version Packages transition/,
+  );
+  assert.throws(
+    () => assertPi099RecoveryTransition({ ...transition, form: "second-parent" }, parents),
+    /reviewed Version Packages transition/,
+  );
+  assert.throws(
+    () => assertPi099RecoveryTransition({ ...transition, releaseCommit: "ordinary-head" }, parents),
+    /reviewed Version Packages transition/,
+  );
+  for (const change of [
+    { number: 35 },
+    { merged_at: null },
+    { merge_commit_sha: "another-merge" },
+    { head: { ...pullRequest.head, sha: "another-head" } },
+    { head: { ...pullRequest.head, ref: "feature" } },
+    { head: { ...pullRequest.head, repo: { full_name: "someone/fork" } } },
+    { base: { ...pullRequest.base, repo: { full_name: "someone/fork" } } },
+  ]) {
+    assert.throws(() => assertPi099RecoveryPullRequest({ ...pullRequest, ...change }), /merged release PR #34/);
+  }
+  assert.throws(
+    () => assertPi099RecoveryDirectories(new Set(PI_099_RECOVERY.directories.slice(1))),
+    /reviewed release transition/,
+  );
+  assert.throws(
+    () => assertPi099RecoveryDirectories(new Set([...PI_099_RECOVERY.directories, "pi-subagents-protocol"])),
+    /reviewed release transition/,
+  );
+});
+
+test("accepts only Git tag refs targeting the authenticated release merge", () => {
+  const tag = "@signalridge/pi-agent-guidance@1.2.4";
+  const reference = { ref: `refs/tags/${tag}`, object: { type: "commit", sha: PI_099_RECOVERY.mergeSha } };
+  assert.doesNotThrow(() => assertPi099TagRef(tag, reference));
+  assert.throws(
+    () => assertPi099TagRef(tag, { ...reference, object: { type: "commit", sha: "another-sha" } }),
+    /does not point to/,
+  );
+  assert.throws(
+    () => assertPi099TagRef(tag, { ...reference, object: { type: "tag", sha: PI_099_RECOVERY.mergeSha } }),
+    /does not point to/,
+  );
+});
+
+test("retries transient GitHub GET failures and preserves real HTTP outcomes", async () => {
+  const url = "https://api.github.com/repos/signalridge/pi-extensions/releases/tags/test";
+  const delays = [];
+  const seen = [];
+  const options = {
+    delay: async (milliseconds) => {
+      delays.push(milliseconds);
+    },
+    warn: () => {},
+    retryDelaysMs: [1_000, 3_000],
+    request: async (requestedUrl, requestOptions) => {
+      seen.push({ requestedUrl, authorization: requestOptions.headers.authorization });
+      if (seen.length === 1) throw new TypeError("fetch failed", { cause: new Error("socket reset") });
+      return new Response(null, { status: 200 });
+    },
+  };
+  const response = await fetchGitHubRead(url, { authorization: "Bearer test" }, options);
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen, [
+    { requestedUrl: url, authorization: "Bearer test" },
+    { requestedUrl: url, authorization: "Bearer test" },
+  ]);
+  assert.deepEqual(delays, [1_000]);
+
+  let calls = 0;
+  for (const status of [404, 401, 403]) {
+    const result = await fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          calls += 1;
+          return new Response(null, { status });
+        },
+        delay: async () => {
+          throw new Error("permanent status must not be retried");
+        },
+        warn: () => {},
+      },
+    );
+    assert.equal(result.status, status);
+  }
+  assert.equal(calls, 3);
+});
+
+test("honors bounded GitHub rate-limit and server retries without swallowing failure", async () => {
+  const url = "https://api.github.com/repos/signalridge/pi-extensions/pulls/34";
+  const delays = [];
+  const responses = [
+    new Response(null, { status: 429, headers: { "retry-after": "2" } }),
+    new Response(null, { status: 503 }),
+    new Response(null, { status: 200 }),
+  ];
+  const response = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () => responses.shift(),
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      retryDelaysMs: [1_000, 3_000],
+      warn: () => {},
+    },
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(delays, [2_000, 3_000]);
+
+  let attempts = 0;
+  await assert.rejects(
+    fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          attempts += 1;
+          throw new TypeError("fetch failed");
+        },
+        delay: async () => {},
+        retryDelaysMs: [1, 2],
+        warn: () => {},
+      },
+    ),
+    /GitHub GET .* failed after 3 attempts: TypeError: fetch failed/,
+  );
+  assert.equal(attempts, 3);
+});
+
+test("retries headerless secondary throttling but preserves an ordinary forbidden response", async () => {
+  const url = "https://api.github.com/repos/signalridge/pi-extensions/releases/tags/test";
+  const delays = [];
+  const responses = [
+    new Response(JSON.stringify({ message: "You have exceeded a secondary rate limit. Please wait a few minutes." }), {
+      status: 403,
+      headers: { "x-ratelimit-remaining": "4999" },
+    }),
+    new Response(null, { status: 200 }),
+  ];
+  const recovered = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () => responses.shift(),
+      delay: async (milliseconds) => {
+        delays.push(milliseconds);
+      },
+      retryDelaysMs: [1_000],
+      warn: () => {},
+    },
+  );
+  assert.equal(recovered.status, 200);
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(responses.length, 0);
+
+  const denied = await fetchGitHubRead(
+    url,
+    {},
+    {
+      request: async () =>
+        new Response(JSON.stringify({ message: "Resource not accessible by integration" }), {
+          status: 403,
+          headers: { "x-ratelimit-remaining": "4999" },
+        }),
+      delay: async () => {
+        throw new Error("ordinary authorization failure must not be retried");
+      },
+      warn: () => {},
+    },
+  );
+  assert.equal(denied.status, 403);
+  assert.match(await denied.text(), /Resource not accessible by integration/);
 });

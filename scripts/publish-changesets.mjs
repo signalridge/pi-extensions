@@ -14,6 +14,46 @@ export const DEFAULT_PUBLISH_COOLDOWN_MS = 10_000;
 export const DEFAULT_RELEASE_BRANCH = "changeset-release/main";
 export const DEFAULT_RELEASE_BASE_BRANCH = "main";
 const githubApiBase = "https://api.github.com";
+const githubReadRetryDelaysMs = [1_000, 3_000, 9_000];
+const githubReadTimeoutMs = 15_000;
+const maxGithubRetryAfterMs = 120_000;
+export const PI_099_RECOVERY = {
+  repository: "signalridge/pi-extensions",
+  pullRequestNumber: 34,
+  mergeSha: "9008b59d7774cf8b9a7d7c798584150e1e2fc70f",
+  parentSha: "8190516f269af945851e7c598028a6dbbee77596",
+  headSha: "f9256019cd0bd9b5fcddd2f2f0ee7fd6d6e972f0",
+  directories: [
+    "pi-agent-guidance",
+    "pi-analytics",
+    "pi-ask-user-question",
+    "pi-btw",
+    "pi-code-actions",
+    "pi-codex-compact",
+    "pi-files-widget",
+    "pi-github-pr",
+    "pi-goal",
+    "pi-gpt-fast",
+    "pi-herdr-state",
+    "pi-input-history",
+    "pi-input-prefix",
+    "pi-lsp",
+    "pi-plan-mode",
+    "pi-ralph-wiggum",
+    "pi-recall",
+    "pi-session-recap",
+    "pi-stamp",
+    "pi-statusline",
+    "pi-subagents",
+    "pi-tab-status",
+    "pi-ui",
+    "pi-usage-extension",
+    "pi-welcome",
+    "pi-workflows",
+    "pi-worktime",
+    "pi-worktree",
+  ],
+};
 
 function diagnostic(result) {
   return [result?.error?.message, result?.stderr, result?.stdout].filter(Boolean).join("\n");
@@ -287,6 +327,64 @@ export function selectReleaseTransition({ head, headSubject, parents, parentSubj
   return undefined;
 }
 
+export function assertPi099RecoveryDispatch({
+  eventName,
+  ref,
+  repository,
+  githubSha,
+  checkoutHead,
+  originMain,
+  directReleases,
+  tag,
+}) {
+  if (eventName !== "workflow_dispatch" || ref !== "refs/heads/main" || repository !== PI_099_RECOVERY.repository) {
+    throw new Error("Pi 0.99 release recovery requires a dispatch from signalridge/pi-extensions main");
+  }
+  if (githubSha !== checkoutHead || checkoutHead !== originMain) {
+    throw new Error("Pi 0.99 release recovery requires the current origin/main checkout");
+  }
+  if (!directReleases || tag !== "latest") {
+    throw new Error("Pi 0.99 release recovery requires direct GitHub releases and the latest npm tag");
+  }
+}
+
+export function assertPi099RecoveryTransition(transition, parents) {
+  if (
+    transition?.form !== "head" ||
+    transition.releaseCommit !== PI_099_RECOVERY.mergeSha ||
+    parents.length !== 1 ||
+    parents[0] !== PI_099_RECOVERY.parentSha
+  ) {
+    throw new Error("Pi 0.99 recovery merge commit does not match the reviewed Version Packages transition");
+  }
+}
+
+export function assertPi099RecoveryPullRequest(pullRequest) {
+  if (
+    !isQualifyingReleasePullRequest(pullRequest, {
+      releaseBranch: DEFAULT_RELEASE_BRANCH,
+      baseBranch: DEFAULT_RELEASE_BASE_BRANCH,
+      currentRepository: PI_099_RECOVERY.repository,
+    }) ||
+    pullRequest.number !== PI_099_RECOVERY.pullRequestNumber ||
+    pullRequest.merge_commit_sha !== PI_099_RECOVERY.mergeSha ||
+    pullRequest.head.sha !== PI_099_RECOVERY.headSha ||
+    pullRequest.base?.repo?.full_name !== PI_099_RECOVERY.repository
+  ) {
+    throw new Error(
+      `Pi 0.99 recovery requires merged release PR #${PI_099_RECOVERY.pullRequestNumber} at the fixed commit and head`,
+    );
+  }
+  return pullRequest;
+}
+
+export function assertPi099RecoveryDirectories(directories) {
+  const expected = new Set(PI_099_RECOVERY.directories);
+  if (directories.size !== expected.size || [...directories].some((directory) => !expected.has(directory))) {
+    throw new Error("Pi 0.99 recovery package manifests differ from the reviewed release transition");
+  }
+}
+
 function runGit(args) {
   return spawnSync("git", args, { cwd: root, encoding: "utf8" });
 }
@@ -298,8 +396,22 @@ function gitText(args, description) {
   return (result.stdout ?? "").trim();
 }
 
-async function readChangedPackageDirectories() {
-  const currentHead = gitText(["rev-parse", "HEAD"], "could not inspect current HEAD");
+async function readChangedPackageDirectories({ recovery = false } = {}) {
+  const checkoutHead = gitText(["rev-parse", "HEAD"], "could not inspect current HEAD");
+  if (recovery) {
+    const originMain = gitText(["rev-parse", "origin/main"], "could not inspect origin/main");
+    assertPi099RecoveryDispatch({
+      eventName: process.env.GITHUB_EVENT_NAME,
+      ref: process.env.GITHUB_REF,
+      repository: process.env.GITHUB_REPOSITORY,
+      githubSha: process.env.GITHUB_SHA,
+      checkoutHead,
+      originMain,
+      directReleases: process.env.PUBLISH_CREATE_GITHUB_RELEASES === "true",
+      tag: process.env.PUBLISH_TAG ?? "latest",
+    });
+  }
+  const currentHead = recovery ? PI_099_RECOVERY.mergeSha : checkoutHead;
   const parentLine = gitText(
     ["rev-list", "--parents", "-n", "1", currentHead],
     "could not inspect current HEAD parents",
@@ -320,10 +432,21 @@ async function readChangedPackageDirectories() {
     parents,
     parentSubjects,
   });
+  if (recovery) assertPi099RecoveryTransition(transition, parents);
   if (!transition) return undefined;
 
-  const pullRequest = await requireReleasePullRequest(currentHead);
+  const pullRequest = await requireReleasePullRequest(currentHead, { recovery });
   const snapshotSha = fetchReleasePullRequestHead(pullRequest);
+  if (recovery) {
+    if (snapshotSha !== PI_099_RECOVERY.headSha) {
+      throw new Error("Pi 0.99 recovery PR head changed from the reviewed package snapshot");
+    }
+    const packageDiff = runGit(["diff", "--quiet", currentHead, snapshotSha, "--", "packages"]);
+    if (packageDiff.error) throw packageDiff.error;
+    if (packageDiff.status !== 0) {
+      throw new Error(`Pi 0.99 recovery package trees differ from the release merge: ${diagnostic(packageDiff)}`);
+    }
+  }
   const releaseCommit = transition.releaseCommit;
   const baseCommit = gitText(["rev-parse", `${releaseCommit}^`], "could not find the release commit parent");
   const result = runGit(["diff", "--name-only", "-z", baseCommit, releaseCommit, "--", "packages/*/package.json"]);
@@ -338,7 +461,8 @@ async function readChangedPackageDirectories() {
     }
     changedDirectories.add(directory);
   }
-  return { ...transition, currentHead, pullRequest, snapshotSha, changedDirectories };
+  if (recovery) assertPi099RecoveryDirectories(changedDirectories);
+  return { ...transition, currentHead, pullRequest, snapshotSha, changedDirectories, recovery };
 }
 
 export async function classifyCurrentReleaseTransition(readTransition = readChangedPackageDirectories) {
@@ -490,11 +614,69 @@ async function responseDetails(response) {
   }
 }
 
+function githubReadRetryAfterMs(response, fallback) {
+  const value = response.headers?.get("retry-after");
+  if (value) {
+    const seconds = Number(value);
+    const delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(value) - Date.now();
+    if (Number.isFinite(delay) && delay >= 0) return Math.min(Math.ceil(delay), maxGithubRetryAfterMs);
+  }
+  return fallback;
+}
+
+async function retryableGitHubResponse(response) {
+  if (response.status === 429 || response.status >= 500) return true;
+  if (response.status !== 403) return false;
+  if (response.headers?.get("x-ratelimit-remaining") === "0" || response.headers?.has("retry-after")) return true;
+  try {
+    const body = await response.clone().text();
+    return /secondary rate limit|API rate limit exceeded|abuse detection mechanism/iu.test(body);
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchGitHubRead(
+  url,
+  headers,
+  {
+    request = fetch,
+    delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    retryDelaysMs = githubReadRetryDelaysMs,
+    warn = console.warn,
+  } = {},
+) {
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    let response;
+    try {
+      response = await request(url, { headers, signal: AbortSignal.timeout(githubReadTimeoutMs) });
+    } catch (error) {
+      const cause = error instanceof Error && error.cause instanceof Error ? `: ${error.cause.message}` : "";
+      if (attempt === retryDelaysMs.length) {
+        throw new Error(`GitHub GET ${url} failed after ${attempt + 1} attempts: ${error}${cause}`, { cause: error });
+      }
+      warn(`GitHub GET retry ${attempt + 1} for ${url}: ${error}${cause}`);
+      await delay(retryDelaysMs[attempt]);
+      continue;
+    }
+    if (!(await retryableGitHubResponse(response))) return response;
+    if (attempt === retryDelaysMs.length) {
+      throw new Error(`GitHub GET ${url} failed after ${attempt + 1} attempts: HTTP ${response.status}`);
+    }
+    const retryAfter = githubReadRetryAfterMs(response, retryDelaysMs[attempt]);
+    await response.body?.cancel();
+    warn(`GitHub GET retry ${attempt + 1} for ${url}: HTTP ${response.status}; waiting ${retryAfter}ms`);
+    await delay(retryAfter);
+  }
+  throw new Error(`GitHub GET ${url} exhausted retries`);
+}
+
 async function githubReleaseExists(tag, context = githubContext()) {
   if (!context) return undefined;
-  const response = await fetch(githubUrl(context, `/releases/tags/${encodeURIComponent(tag)}`), {
-    headers: githubHeaders(context.token),
-  });
+  const response = await fetchGitHubRead(
+    githubUrl(context, `/releases/tags/${encodeURIComponent(tag)}`),
+    githubHeaders(context.token),
+  );
   if (response.status === 404) return false;
   if (!response.ok) {
     throw new Error(`GitHub release lookup failed for ${tag}: HTTP ${response.status}`);
@@ -502,11 +684,40 @@ async function githubReleaseExists(tag, context = githubContext()) {
   return true;
 }
 
-async function requireReleasePullRequest(currentHead) {
+export function assertPi099TagRef(tag, reference) {
+  if (
+    reference?.ref !== `refs/tags/${tag}` ||
+    reference.object?.type !== "commit" ||
+    reference.object.sha !== PI_099_RECOVERY.mergeSha
+  ) {
+    throw new Error(`GitHub tag ${tag} does not point to the Pi 0.99 release merge`);
+  }
+}
+
+async function pi099TagExists(tag, { allowMissing = false } = {}) {
   const context = githubContext({ required: true });
-  const response = await fetch(githubUrl(context, `/commits/${encodeURIComponent(currentHead)}/pulls`), {
-    headers: githubHeaders(context.token),
-  });
+  const response = await fetchGitHubRead(
+    githubUrl(context, `/git/ref/tags/${encodeURIComponent(tag)}`),
+    githubHeaders(context.token),
+  );
+  if (response.status === 404 && allowMissing) return false;
+  if (!response.ok) throw new Error(`GitHub tag lookup failed for ${tag}: HTTP ${response.status}`);
+  let reference;
+  try {
+    reference = await response.json();
+  } catch (error) {
+    throw new Error(`GitHub tag lookup returned invalid JSON for ${tag}: ${error}`);
+  }
+  assertPi099TagRef(tag, reference);
+  return true;
+}
+
+async function requireReleasePullRequest(currentHead, { recovery = false } = {}) {
+  const context = githubContext({ required: true });
+  const path = recovery
+    ? `/pulls/${PI_099_RECOVERY.pullRequestNumber}`
+    : `/commits/${encodeURIComponent(currentHead)}/pulls`;
+  const response = await fetchGitHubRead(githubUrl(context, path), githubHeaders(context.token));
   if (!response.ok) {
     throw new Error(`GitHub release PR lookup failed for ${currentHead}: HTTP ${response.status}`);
   }
@@ -517,6 +728,7 @@ async function requireReleasePullRequest(currentHead) {
   } catch (error) {
     throw new Error(`GitHub release PR lookup returned invalid JSON: ${error}`);
   }
+  if (recovery) return assertPi099RecoveryPullRequest(pullRequests);
   const qualifying = findQualifyingReleasePullRequest(pullRequests, {
     releaseBranch: process.env.PUBLISH_RELEASE_BRANCH ?? DEFAULT_RELEASE_BRANCH,
     baseBranch: DEFAULT_RELEASE_BASE_BRANCH,
@@ -592,13 +804,15 @@ function releaseBody(entry) {
   return section;
 }
 
-async function createGitHubRelease(entry) {
+async function createGitHubRelease(entry, { recovery = false } = {}) {
   const context = githubContext({ required: true, requireSha: true });
   const exists = await githubReleaseExists(entry.tag, context);
   if (exists) {
+    if (recovery) await pi099TagExists(entry.tag);
     console.log(`release: ${entry.tag} already exists`);
     return;
   }
+  if (recovery) await pi099TagExists(entry.tag, { allowMissing: true });
   const body = releaseBody(entry);
   const response = await fetch(githubUrl(context, "/releases"), {
     method: "POST",
@@ -608,17 +822,19 @@ async function createGitHubRelease(entry) {
         tag: entry.tag,
         version: entry.version,
         body,
-        targetCommit: context.sha,
+        targetCommit: recovery ? PI_099_RECOVERY.mergeSha : context.sha,
       }),
     ),
   });
   if (response.ok) {
+    if (recovery) await pi099TagExists(entry.tag);
     console.log(`release: ${entry.tag}`);
     return;
   }
   if (response.status === 409 || response.status === 422) {
     const existsAfterConflict = await githubReleaseExists(entry.tag, context);
     if (existsAfterConflict) {
+      if (recovery) await pi099TagExists(entry.tag);
       console.warn(`release: ${entry.tag} was created concurrently; treating it as successful`);
       return;
     }
@@ -629,13 +845,13 @@ async function createGitHubRelease(entry) {
   );
 }
 
-async function flushTagBuffer(buffer) {
+async function flushTagBuffer(buffer, { recovery = false } = {}) {
   const entries = buffer.entries();
   if (entries.length === 0) return [];
   if (process.env.PUBLISH_CREATE_GITHUB_RELEASES === "true") {
     const flushed = [];
     for (const entry of entries) {
-      await createGitHubRelease(entry);
+      await createGitHubRelease(entry, { recovery });
       flushed.push(...buffer.flushOne(entry.packageName, () => undefined));
     }
     return flushed;
@@ -734,12 +950,19 @@ async function main() {
     console.log((await classifyCurrentReleaseTransition()) ? "true" : "false");
     return;
   }
-  const transition = await readChangedPackageDirectories();
+  const recovery = process.env.PUBLISH_RECOVER_PI099 === "true";
+  const transition = await readChangedPackageDirectories({ recovery });
   if (transition === undefined) {
+    if (recovery) throw new Error("Pi 0.99 recovery did not authenticate the fixed release transition");
     console.log("publish-changesets: current HEAD is not a Version Packages release transition");
     return;
   }
   const tag = validateDistTag(process.env.PUBLISH_TAG ?? "latest");
+  if (recovery) {
+    console.log(
+      `publish-changesets: recovering ${transition.currentHead} from PR #${transition.pullRequest.number} head ${transition.snapshotSha}`,
+    );
+  }
   if (process.env.PUBLISH_CREATE_GITHUB_RELEASES === "true") {
     githubContext({ required: true, requireSha: true });
   }
@@ -782,13 +1005,16 @@ async function main() {
       } finally {
         rmSync(destination, { recursive: true, force: true });
       }
+      if (recovery && readRemoteDistTag(pkg.manifest, tag) !== pkg.manifest.version) {
+        throw new Error(`Pi 0.99 recovery requires ${pkg.manifest.name}@${tag} to point to ${pkg.manifest.version}`);
+      }
       console.log(`publish: ${pkg.manifest.name}@${pkg.manifest.version} already published with matching integrity`);
       tagBuffer.add(pkg);
     }
 
     if (candidates.length === 0) {
       console.log("publish-changesets: no unpublished versioned packages");
-      await flushTagBuffer(tagBuffer);
+      await flushTagBuffer(tagBuffer, { recovery });
       return;
     }
 
@@ -816,13 +1042,13 @@ async function main() {
           });
         }
       }
-      await flushTagBuffer(tagBuffer);
+      await flushTagBuffer(tagBuffer, { recovery });
       let writeCount = 0;
       for (const pkg of packed) {
         if (writeCount > 0 && cooldownMs > 0) wait(cooldownMs);
         publishOne(pkg, tag, cooldownMs);
         tagBuffer.add(pkg);
-        await flushTagBuffer(tagBuffer);
+        await flushTagBuffer(tagBuffer, { recovery });
         writeCount += 1;
       }
     } finally {

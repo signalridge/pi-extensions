@@ -4,29 +4,55 @@ import test from "node:test";
 
 const workflowUrl = new URL("../.github/workflows/publish-packages.yml", import.meta.url);
 
-test("publish workflow versions release transitions before invoking npm publish", async () => {
+test("publish workflow separates normal Changesets transitions from fixed recovery", async () => {
   const workflow = await readFile(workflowUrl, "utf8");
-
-  assert.doesNotMatch(workflow, /^ {2}release-transition:|Publish current release transition/m);
-  assert.doesNotMatch(workflow, /^\s*run:\s*bun run publish-packages\s*$/m);
-  assert.match(workflow, /--classify-release-transition/);
-  assert.match(
-    workflow,
-    /if: steps\.release-selection\.outputs\.current-main == 'true' \|\| steps\.release-selection\.outputs\.release-transition == 'true'/,
-  );
-
   const validation = workflow.indexOf("run: bun run check");
   const revalidation = workflow.indexOf("id: release-revalidation", validation);
   const action = workflow.indexOf("uses: changesets/action@", revalidation);
   const version = workflow.indexOf("version: bun run version-packages", action);
   const publish = workflow.indexOf("publish: bun run publish-packages", action);
-  assert.ok(validation >= 0, "the exact release revision must pass the full repository check");
-  assert.ok(revalidation > validation, "main/release eligibility must be revalidated after the check");
-  assert.ok(action > revalidation, "Changesets writes must stay downstream of final revalidation");
-  assert.match(workflow, /if: steps\.release-revalidation\.outputs\.eligible == 'true'/);
+  const guard = workflow.indexOf("name: Require current main for Pi 0.99 recovery", revalidation);
+  const recovery = workflow.indexOf("name: Resume the fixed Pi 0.99 release", action);
+  const versionJob = workflow.indexOf("  version:\n");
+  const jobSteps = workflow.indexOf("    steps:\n", versionJob);
+  const jobEnvironment = workflow.indexOf("    environment: npm-publish\n", versionJob);
+  const permissions = workflow.slice(workflow.indexOf("permissions:\n"), workflow.indexOf("concurrency:\n"));
+
+  assert.match(
+    workflow,
+    /recover_pi099:\n\s+description: "Resume the fixed Pi 0\.99 release PR #34 without versioning"\n\s+type: boolean\n\s+default: false/,
+  );
+  assert.match(
+    workflow,
+    /name: Restrict Pi 0\.99 recovery dispatch\n\s+if: github\.event_name == 'workflow_dispatch' && inputs\.recover_pi099 == true\n\s+run: \|\n\s+test "\$GITHUB_REPOSITORY" = signalridge\/pi-extensions\n\s+test "\$GITHUB_REF" = refs\/heads\/main/,
+  );
+  assert.match(
+    workflow,
+    /if: steps\.release-selection\.outputs\.current-main == 'true' \|\| steps\.release-selection\.outputs\.release-transition == 'true'/,
+  );
+  assert.ok(validation >= 0 && revalidation > validation);
+  assert.ok(action > revalidation && version > action && publish > version);
+  assert.match(
+    workflow,
+    /if: steps\.release-revalidation\.outputs\.eligible == 'true' && inputs\.recover_pi099 != true\n\s+uses: changesets\/action@/,
+  );
+  assert.ok(guard > revalidation && guard < action, "current-main recovery guard must precede every publish step");
+  assert.ok(recovery > publish);
+  assert.ok(versionJob >= 0 && jobEnvironment > versionJob && jobEnvironment < jobSteps);
+  assert.match(permissions, /^ {2}id-token: write$/m);
+  assert.match(
+    workflow,
+    /name: Require current main for Pi 0\.99 recovery[\s\S]*?test "\$ELIGIBLE" = true\n\s+git fetch --no-tags origin main\n\s+test "\$\(git rev-parse HEAD\)" = "\$\(git rev-parse origin\/main\)"/,
+  );
+  assert.match(
+    workflow,
+    /name: Resume the fixed Pi 0\.99 release\n\s+if: github\.event_name == 'workflow_dispatch' && inputs\.recover_pi099 == true && steps\.release-revalidation\.outputs\.eligible == 'true'/,
+  );
+  assert.match(
+    workflow,
+    /PUBLISH_CREATE_GITHUB_RELEASES: "true"\n\s+PUBLISH_RECOVER_PI099: "true"\n\s+PUBLISH_TAG: latest\n\s+run: bun run publish-packages/,
+  );
   assert.equal(workflow.match(/--classify-release-transition/g)?.length, 2);
-  assert.ok(version > action, "Changesets action must version packages");
-  assert.ok(publish > version, "publish must remain downstream of Changesets versioning");
 });
 
 /**
