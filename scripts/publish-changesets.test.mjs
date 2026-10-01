@@ -520,7 +520,7 @@ test("retries headerless secondary throttling but preserves an ordinary forbidde
     },
   );
   assert.equal(recovered.status, 200);
-  assert.deepEqual(delays, [1_000]);
+  assert.deepEqual(delays, [30_000]);
   assert.equal(responses.length, 0);
 
   const denied = await fetchGitHubRead(
@@ -540,4 +540,29 @@ test("retries headerless secondary throttling but preserves an ordinary forbidde
   );
   assert.equal(denied.status, 403);
   assert.match(await denied.text(), /Resource not accessible by integration/);
+
+  const throttledDelays = [];
+  let attempts = 0;
+  await assert.rejects(
+    fetchGitHubRead(
+      url,
+      {},
+      {
+        request: async () => {
+          attempts += 1;
+          return new Response(JSON.stringify({ message: "You have exceeded a secondary rate limit." }), {
+            status: 403,
+          });
+        },
+        delay: async (milliseconds) => {
+          throttledDelays.push(milliseconds);
+        },
+        retryDelaysMs: [1, 2, 3],
+        warn: () => {},
+      },
+    ),
+    /GitHub GET .* failed after 4 attempts: HTTP 403/,
+  );
+  assert.equal(attempts, 4);
+  assert.deepEqual(throttledDelays, [30_000, 60_000, 120_000]);
 });

@@ -15,6 +15,7 @@ export const DEFAULT_RELEASE_BRANCH = "changeset-release/main";
 export const DEFAULT_RELEASE_BASE_BRANCH = "main";
 const githubApiBase = "https://api.github.com";
 const githubReadRetryDelaysMs = [1_000, 3_000, 9_000];
+const githubRateLimitRetryDelaysMs = [30_000, 60_000, 120_000];
 const githubReadTimeoutMs = 15_000;
 const maxGithubRetryAfterMs = 120_000;
 export const PI_099_RECOVERY = {
@@ -663,7 +664,11 @@ export async function fetchGitHubRead(
     if (attempt === retryDelaysMs.length) {
       throw new Error(`GitHub GET ${url} failed after ${attempt + 1} attempts: HTTP ${response.status}`);
     }
-    const retryAfter = githubReadRetryAfterMs(response, retryDelaysMs[attempt]);
+    const rateLimited = response.status === 403 || response.status === 429;
+    const fallback = rateLimited
+      ? (githubRateLimitRetryDelaysMs[attempt] ?? retryDelaysMs[attempt])
+      : retryDelaysMs[attempt];
+    const retryAfter = githubReadRetryAfterMs(response, fallback);
     await response.body?.cancel();
     warn(`GitHub GET retry ${attempt + 1} for ${url}: HTTP ${response.status}; waiting ${retryAfter}ms`);
     await delay(retryAfter);
