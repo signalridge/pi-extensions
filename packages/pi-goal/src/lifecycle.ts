@@ -1,9 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { currentTokenTotal } from "./accounting.js";
+import { assistantTokensAfterGoalState, currentTokenTotal, rebaseGoalUsage } from "./accounting.js";
 import type { GoalCommandController } from "./commands.js";
 import { notifyTerminal } from "./errors.js";
 import { type ActiveGoal, loadGoalStateFromSession } from "./persistence.js";
-import { buildGoalPrompt, buildGoalSystemPrompt } from "./prompts.js";
+import {
+  buildGoalBindingUpdate,
+  buildGoalPrompt,
+  buildGoalSystemPrompt,
+  GOAL_BINDING_UPDATE_HEADER,
+} from "./prompts.js";
 import { activateQueuedGoal } from "./queue.js";
 import type { GoalRunController } from "./run-protocol.js";
 import {
@@ -13,6 +18,7 @@ import {
   findFinalAssistantMessage,
   formatError,
   type GoalRuntime,
+  hasPendingMessages,
   incrementGoal,
   isGoalContextOverflow,
   isRetryableGoalInterruption,
@@ -39,15 +45,50 @@ export function registerGoalLifecycle(
   runController: GoalRunController,
   options: GoalLifecycleOptions = {},
 ) {
+  function afterTreeNavigationSettles(ctx: StatusContext, ownsWork: () => boolean, work: () => Promise<unknown>) {
+    const generation = runtime.menuGeneration;
+    const signal = runtime.menuController.signal;
+    let timer: ReturnType<typeof setTimeout>;
+    const cancel = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", cancel);
+    };
+    const attempt = () => {
+      if (signal.aborted || generation !== runtime.menuGeneration || !ownsWork()) {
+        cancel();
+        return;
+      }
+      if (ctx.isIdle?.() !== true || hasPendingMessages(ctx)) {
+        timer = setTimeout(attempt, 1_000);
+        return;
+      }
+      cancel();
+      void work().catch((error) => {
+        if (!signal.aborted && generation === runtime.menuGeneration) {
+          notifyTerminal(ctx.ui, `Cannot restore /goal after tree navigation: ${formatError(error)}`, "error");
+        }
+      });
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    timer = setTimeout(attempt, 0);
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     runtime.replaceMenuSession();
     runtime.inputWakeGoalId = undefined;
+    runtime.inputWakeNeedsPrompt = false;
+    runtime.pendingDirectInputs = [];
+    runtime.ambiguousWaitInputGoalId = undefined;
+    runtime.acceptedRunPrompt = undefined;
+    runtime.pendingInputWake = undefined;
     runtime.clearGoalWaitWake();
     runtime.clearCompletionStatusTimer();
     runtime.clearContinuationTracking();
     runtime.clearPendingGoalPrompts();
     runtime.clearAgentRun();
     runtime.guardAbortGoalId = undefined;
+    runtime.pendingStoppedUsageGoalId = undefined;
+    runtime.pendingReplacementUsage = undefined;
     runtime.clearGoalRecovery();
     runtime.clearBudgetWrapUp();
     runtime.clearStaleGoalToolCallBlock();
@@ -102,6 +143,12 @@ export function registerGoalLifecycle(
         runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
       }
       if (runtime.activeGoal.status === "active") {
+        if (runtime.activeGoal.usageBaselinePending) {
+          runtime.activeGoal = rebaseGoalUsage(
+            { ...runtime.activeGoal, usageBaselinePending: undefined },
+            currentTokenTotal(ctx),
+          );
+        }
         runtime.recordGoalUsage(runtime.activeGoal, ctx);
         if (runtime.limitActiveGoalForBudget(ctx, false)) return;
         if (runtime.enforceAutomaticTurnLimit(ctx, false) || runtime.enforceNoProgressLimit(ctx)) return;
@@ -139,10 +186,122 @@ export function registerGoalLifecycle(
     }
   });
 
+  pi.on("session_before_tree", (_event, ctx) => {
+    const goal = runtime.activeGoal;
+    if (runtime.queueFrozen || goal?.status !== "active") return;
+    if (!runtime.recordGoalUsage(goal, ctx)) return;
+    runtime.persistGoal(goal);
+    runtime.updateStatus(ctx, goal);
+  });
+
+  pi.on("session_tree", (_event, ctx) => {
+    runtime.replaceMenuSession();
+    runtime.clearCompletionStatusTimer();
+    runtime.cancelContinuationWork();
+    runtime.clearContinuationTracking();
+    runtime.clearPendingGoalPrompts();
+    runtime.clearAgentRun();
+    runtime.pendingNonGoalInputs = [];
+    runtime.pendingDirectInputs = [];
+    runtime.ambiguousWaitInputGoalId = undefined;
+    runtime.acceptedRunPrompt = undefined;
+    runtime.inputWakeGoalId = undefined;
+    runtime.inputWakeNeedsPrompt = false;
+    runtime.guardAbortGoalId = undefined;
+    runtime.pendingStoppedUsageGoalId = undefined;
+    runtime.pendingReplacementUsage = undefined;
+    runtime.clearGoalRecovery();
+    runtime.clearBudgetWrapUp();
+    runtime.clearStaleGoalToolCallBlock();
+    runtime.clearTerminalDetails();
+
+    const loaded = loadGoalStateFromSession(ctx);
+    runtime.activeGoal = loaded.goal;
+    runtime.queuedGoals = loaded.queue;
+    runtime.pendingQueueAction = loaded.pendingAction;
+    runtime.queueFrozen = loaded.hasExperimentalQueueState && !runtime.settings.experimental.goals;
+    if (runtime.queueFrozen) {
+      runController.handleTreeNavigation(undefined);
+      ctx.ui.setStatus(STATUS_KEY, "queue off");
+      return;
+    }
+    if (!runtime.activeGoal) {
+      runController.handleTreeNavigation(undefined);
+      runtime.toolPolicy.reconcileRestoredState(runtime.settings.toolVisibility, false);
+      ctx.ui.setStatus(STATUS_KEY, undefined);
+      return;
+    }
+    let startQueuedHead = false;
+    if (runtime.activeGoal.status === "queued" && !runtime.pendingQueueAction) {
+      runtime.activeGoal = activateQueuedGoal(runtime.activeGoal, currentTokenTotal(ctx));
+      startQueuedHead = runtime.activeGoal.status === "active";
+    }
+    runController.handleTreeNavigation(runtime.activeGoal.id);
+    runtime.toolPolicy.reconcileRestoredState(runtime.settings.toolVisibility, true);
+    const pending = runtime.pendingQueueAction;
+    if (pending) {
+      afterTreeNavigationSettles(
+        ctx,
+        () => runtime.pendingQueueAction === pending,
+        () => commands.dispatchPendingQueueActionIfSettled(ctx),
+      );
+    }
+    if (runtime.activeGoal.status === "active") {
+      const usageIsFinalized =
+        runtime.pendingQueueAction?.kind === "prioritize" &&
+        runtime.pendingQueueAction.displacedUsageFinalized === true;
+      const unaccountedTokens =
+        usageIsFinalized || startQueuedHead || runtime.activeGoal.usageBaselinePending
+          ? 0
+          : assistantTokensAfterGoalState(ctx, loaded.source === "legacy-goals" ? "goals-state" : "goal-state");
+      const goalWithUsage = {
+        ...runtime.activeGoal,
+        tokensUsed: Math.min(Number.MAX_SAFE_INTEGER, runtime.activeGoal.tokensUsed + unaccountedTokens),
+      };
+      runtime.activeGoal = rebaseGoalUsage(
+        { ...goalWithUsage, usageBaselinePending: undefined },
+        currentTokenTotal(ctx),
+      );
+      if (runtime.activeGoal.safetyResetPending) runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
+      if (runtime.limitActiveGoalForBudget(ctx, false)) return;
+      if (runtime.enforceAutomaticTurnLimit(ctx, false) || runtime.enforceNoProgressLimit(ctx)) return;
+      if (!runtime.toolPolicy.toolsAvailable()) {
+        runtime.pauseGoalForUnavailableTools(ctx, false, false);
+        return;
+      }
+    }
+    runtime.persistGoal(runtime.activeGoal);
+    runtime.updateStatus(ctx, runtime.activeGoal);
+    runtime.scheduleGoalWaitWake(ctx);
+    if (startQueuedHead) {
+      const queuedHead = runtime.activeGoal;
+      afterTreeNavigationSettles(
+        ctx,
+        () => runtime.activeGoal?.id === queuedHead.id && runtime.activeGoal.status === "active",
+        async () => {
+          const sent = await runtime.sendOwnedGoalPrompt(ctx, queuedHead.id, buildGoalPrompt(queuedHead), false);
+          if (!sent && runtime.activeGoal?.id === queuedHead.id) {
+            runtime.stopActiveGoal(ctx, {
+              kind: "activation_rollback",
+              expectedGoalId: queuedHead.id,
+              restoreGoal: queuedHead,
+              abortTurn: false,
+            });
+          }
+        },
+      );
+    }
+  });
+
   pi.on("session_shutdown", (_event, ctx) => {
     runController.unbindSession();
     runtime.closeMenuSession();
     runtime.inputWakeGoalId = undefined;
+    runtime.inputWakeNeedsPrompt = false;
+    runtime.pendingDirectInputs = [];
+    runtime.ambiguousWaitInputGoalId = undefined;
+    runtime.acceptedRunPrompt = undefined;
+    runtime.pendingInputWake = undefined;
     runtime.clearGoalWaitWake();
     if (runtime.activeGoal) {
       if (!runtime.queueFrozen && runtime.activeGoal.status === "active") {
@@ -154,6 +313,8 @@ export function registerGoalLifecycle(
     runtime.clearPendingGoalPrompts();
     runtime.clearAgentRun();
     runtime.guardAbortGoalId = undefined;
+    runtime.pendingStoppedUsageGoalId = undefined;
+    runtime.pendingReplacementUsage = undefined;
     runtime.clearGoalRecovery();
     runtime.clearBudgetWrapUp();
     runtime.clearStaleGoalToolCallBlock();
@@ -227,7 +388,7 @@ export function registerGoalLifecycle(
     runtime.scheduleGoalWaitWake(ctx);
   });
 
-  pi.on("input", (event, ctx) => {
+  pi.on("input", (event, _ctx) => {
     if (event.source === "extension") {
       if (runtime.consumeCancelledContinuationPrompt(event.text) || runtime.consumeStaleOwnedGoalPrompt(event.text)) {
         return { action: "handled" as const };
@@ -239,8 +400,9 @@ export function registerGoalLifecycle(
       if (runtime.hasPendingOwnedGoalPrompt(event.text)) return;
       if (event.streamingBehavior === "steer" || event.streamingBehavior === "followUp") {
         runtime.noteQueuedNonGoalInput(event.text, event.streamingBehavior);
+      } else {
+        runtime.noteDirectInput(event.text, false);
       }
-      runtime.clearGoalRecovery();
       return;
     }
     if (runtime.queueFrozen) return;
@@ -250,13 +412,10 @@ export function registerGoalLifecycle(
       return;
     }
     if (event.streamingBehavior === "steer") {
-      runtime.noteQueuedNonGoalInput(event.text, "steer");
+      runtime.noteQueuedNonGoalInput(event.text, "steer", true);
+    } else {
+      runtime.noteDirectInput(event.text, true);
     }
-    commands.resumeWaitingGoalOnInput(ctx);
-    runtime.clearGoalRecovery();
-    runtime.clearBudgetWrapUp();
-    runtime.clearStaleGoalToolCallBlock();
-    runtime.resetActiveSafetyEpoch(ctx);
   });
 
   pi.on("message_start", (event, ctx) => {
@@ -270,7 +429,11 @@ export function registerGoalLifecycle(
       return;
     }
     if (message.role === "custom") {
-      if (runtime.isActiveBudgetWrapUpMessage(message)) return;
+      if (runtime.isActiveBudgetWrapUpMessage(message)) {
+        runtime.beginAgentRun(runtime.activeGoal?.id, "manual");
+        return;
+      }
+      runtime.finalizeStoppedRunUsage(ctx);
       if (runtime.guardAbortGoalId === runtime.activeGoal?.id) {
         runtime.guardAbortGoalId = undefined;
       }
@@ -289,18 +452,77 @@ export function registerGoalLifecycle(
         : "";
     const ownedPrompt = runtime.consumeOwnedGoalPrompt(prompt);
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(prompt);
-    const queuedNonGoalInput = runtime.consumeQueuedNonGoalInput(prompt, !ownedPromptBoundary);
-    if (!ownedPrompt) {
-      if (queuedNonGoalInput?.behavior === "followUp") {
-        beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
+    const acceptedRunPrompt = runtime.acceptedRunPrompt;
+    const initialRunMessage =
+      acceptedRunPrompt !== undefined &&
+      (prompt === acceptedRunPrompt || prompt.startsWith(`${acceptedRunPrompt}\n\n`));
+    runtime.acceptedRunPrompt = undefined;
+    if (initialRunMessage && runtime.pendingInputWake) {
+      const ticket = runtime.pendingInputWake;
+      runtime.pendingInputWake = undefined;
+      if (!commands.commitWaitingGoalOnInput(ctx, ticket)) {
+        runtime.beginAgentRun(null, undefined);
+        abortCurrentTurn(ctx);
       }
+      return;
+    }
+    const classifyInput = !ownedPromptBoundary && !initialRunMessage;
+    const collidingCandidates =
+      classifyInput && runtime.hasDirectInputCandidate(prompt) && runtime.hasQueuedInputCandidate(prompt);
+    const exactDirectInput = classifyInput ? runtime.consumeDirectInput(prompt, false) : undefined;
+    const exactQueuedInput = classifyInput ? runtime.consumeQueuedNonGoalInput(prompt, false) : undefined;
+    const agreeingRealInputs = Boolean(exactDirectInput?.realInput && exactQueuedInput?.realInput);
+    if (agreeingRealInputs && exactQueuedInput) runtime.pendingNonGoalInputs.unshift(exactQueuedInput);
+    const ambiguousInput =
+      !agreeingRealInputs && (collidingCandidates || Boolean(exactDirectInput && exactQueuedInput));
+    const deliveredDirectInput = ambiguousInput
+      ? exactDirectInput
+        ? { ...exactDirectInput, realInput: false }
+        : undefined
+      : (exactDirectInput ??
+        (exactQueuedInput ? undefined : classifyInput ? runtime.consumeDirectInput(prompt) : undefined));
+    const queuedNonGoalInput = ambiguousInput
+      ? exactQueuedInput
+        ? { ...exactQueuedInput, realInput: false }
+        : undefined
+      : !classifyInput || deliveredDirectInput
+        ? undefined
+        : (exactQueuedInput ?? runtime.consumeQueuedNonGoalInput(prompt));
+    if (!ownedPrompt && ownedPromptBoundary) return;
+    if (!ownedPrompt) {
+      if (initialRunMessage || deliveredDirectInput || queuedNonGoalInput) {
+        runtime.clearGoalRecovery();
+        if (deliveredDirectInput?.realInput || queuedNonGoalInput?.realInput) runtime.clearBudgetWrapUp();
+        runtime.clearStaleGoalToolCallBlock();
+        if (runtime.guardAbortGoalId === runtime.activeGoal?.id) runtime.guardAbortGoalId = undefined;
+      }
+      if (deliveredDirectInput?.realInput && deliveredDirectInput.waiting) {
+        if (commands.resumeWaitingGoalOnInput(ctx, true)) runtime.guardAbortGoalId = undefined;
+      } else if (deliveredDirectInput?.realInput) {
+        runtime.resetActiveSafetyEpoch(ctx);
+      } else if (queuedNonGoalInput?.behavior === "followUp") {
+        beginNonGoalFollowUp(ctx, queuedNonGoalInput.realInput, true);
+      } else if (queuedNonGoalInput?.realInput) {
+        if (commands.resumeWaitingGoalOnInput(ctx, true)) {
+          runtime.guardAbortGoalId = undefined;
+        } else if (queuedNonGoalInput.realInput) {
+          runtime.resetActiveSafetyEpoch(ctx);
+        }
+      }
+      if (runtime.activeGoal?.status !== "active") runtime.beginAgentRun(null, undefined);
       return;
     }
     if (runtime.activeGoal?.id !== ownedPrompt.goalId || runtime.activeGoal.status !== "active") {
       return;
     }
-    if (runtime.agentRunGoalId !== undefined && runtime.agentRunGoalId !== ownedPrompt.goalId) {
-      runtime.activeGoal.baselineTokens = Math.max(0, currentTokenTotal(ctx) - runtime.activeGoal.tokensUsed);
+    if (
+      runtime.activeGoal.usageBaselinePending ||
+      (runtime.agentRunGoalId !== undefined && runtime.agentRunGoalId !== ownedPrompt.goalId)
+    ) {
+      runtime.activeGoal = rebaseGoalUsage(
+        { ...runtime.activeGoal, usageBaselinePending: undefined },
+        currentTokenTotal(ctx),
+      );
     }
     runtime.beginAgentRun(ownedPrompt.goalId, "manual");
     if (ownedPrompt.resetSafetyEpoch) {
@@ -325,7 +547,9 @@ export function registerGoalLifecycle(
       messages.push({
         role: "custom",
         customType: "goal-input-wake",
-        content: `Goal runtime binding update: real input resumed the waiting goal. This current goal_id supersedes the earlier binding.\n\n${buildGoalSystemPrompt(goal)}`,
+        content: runtime.inputWakeNeedsPrompt
+          ? `${GOAL_BINDING_UPDATE_HEADER}\n\n${buildGoalSystemPrompt(goal)}`
+          : buildGoalBindingUpdate(goal),
         display: false,
         timestamp: Date.now(),
       });
@@ -397,7 +621,10 @@ export function registerGoalLifecycle(
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    runtime.pendingInputWake = undefined;
+    runtime.acceptedRunPrompt = typeof event.prompt === "string" ? event.prompt : undefined;
     runtime.inputWakeGoalId = undefined;
+    runtime.inputWakeNeedsPrompt = false;
     runtime.clearAgentRun();
     if (runtime.queueFrozen) return;
     // Pi-owned retries emit agent_start directly. Reaching a normal prompt
@@ -410,15 +637,36 @@ export function registerGoalLifecycle(
     const ownedPromptGoalId = goalPromptGoalId ?? continuationGoalId;
     const ownedPromptBoundary = runtime.hasOwnedPromptBoundary(event.prompt);
     const activeBudgetWrapUp = runtime.hasActiveBudgetWrapUp();
+    const recoveryBeforeInput = runtime.hasActiveGoalRecovery();
+    const acceptedDirectInput =
+      ownedPromptBoundary || ownedPromptGoalId !== undefined ? undefined : runtime.consumeDirectInput(event.prompt);
+    const queuedNonGoalInput =
+      activeBudgetWrapUp || acceptedDirectInput
+        ? undefined
+        : runtime.consumeQueuedNonGoalInput(
+            event.prompt,
+            !recoveryBeforeInput && ownedPromptGoalId === undefined && !ownedPromptBoundary,
+          );
+    if (acceptedDirectInput || queuedNonGoalInput) runtime.clearGoalRecovery();
     const activeGoalRecovery = runtime.hasActiveGoalRecovery();
-    const queuedNonGoalInput = activeBudgetWrapUp
-      ? undefined
-      : runtime.consumeQueuedNonGoalInput(
-          event.prompt,
-          !activeGoalRecovery && ownedPromptGoalId === undefined && !ownedPromptBoundary,
-        );
+    if (acceptedDirectInput?.realInput || queuedNonGoalInput?.realInput) {
+      const ticket = commands.prepareWaitingGoalOnInput(ctx);
+      if (ticket) {
+        runtime.pendingInputWake = ticket;
+        runtime.beginAgentRun(null, undefined);
+        return { systemPrompt: `${event.systemPrompt}\n\n${buildGoalSystemPrompt(ticket.resumedGoal)}` };
+      }
+    }
+    if (!ownedPromptBoundary && ownedPromptGoalId === undefined && acceptedDirectInput?.realInput) {
+      if (acceptedDirectInput.waiting) commands.resumeWaitingGoalOnInput(ctx);
+      else runtime.resetActiveSafetyEpoch(ctx);
+    }
     if (queuedNonGoalInput?.behavior === "followUp") {
-      beginNonGoalFollowUp(ctx, queuedNonGoalInput.resetSafetyEpoch);
+      beginNonGoalFollowUp(ctx, queuedNonGoalInput.realInput, false);
+    } else if (queuedNonGoalInput?.realInput) {
+      if (!commands.resumeWaitingGoalOnInput(ctx) && queuedNonGoalInput.realInput) {
+        runtime.resetActiveSafetyEpoch(ctx);
+      }
     }
     const runOrigin = continuationGoalId
       ? "automatic"
@@ -469,6 +717,12 @@ export function registerGoalLifecycle(
       runtime.pauseGoalForUnavailableTools(ctx, ownedPromptGoalId !== undefined);
       return;
     }
+    if (goalPromptGoalId === runtime.activeGoal.id && runtime.activeGoal.usageBaselinePending) {
+      runtime.activeGoal = rebaseGoalUsage(
+        { ...runtime.activeGoal, usageBaselinePending: undefined },
+        currentTokenTotal(ctx),
+      );
+    }
     if (goalPrompt?.resetSafetyEpoch && goalPromptGoalId === runtime.activeGoal.id) {
       runtime.activeGoal = resetGoalSafetyEpoch(runtime.activeGoal);
       runtime.persistGoal(runtime.activeGoal);
@@ -503,6 +757,21 @@ export function registerGoalLifecycle(
 
   pi.on("agent_end", (event, ctx) => {
     const run = runtime.finishAgentRun();
+    const replacement = runtime.pendingReplacementUsage;
+    if (replacement && replacement.runGoalId === run.goalId) {
+      runtime.pendingReplacementUsage = undefined;
+      const successor = runtime.activeGoal;
+      if (successor?.id === replacement.replacementGoalId) {
+        const rebasedSuccessor = rebaseGoalUsage(
+          { ...successor, usageBaselinePending: undefined },
+          currentTokenTotal(ctx),
+        );
+        runtime.activeGoal = rebasedSuccessor;
+        runtime.persistGoal(rebasedSuccessor);
+        if (runtime.activeGoal === rebasedSuccessor) runtime.updateStatus(ctx, rebasedSuccessor);
+      }
+    }
+    if (runtime.finalizeStoppedRunUsage(ctx, run.goalId)) return;
     if (runtime.queueFrozen || run.goalId === null) return;
     if (!runtime.canRecordGoalUsage() && !runtime.hasActiveBudgetWrapUp()) return;
     if (run.goalId && run.goalId !== runtime.activeGoal?.id) return;
@@ -608,17 +877,22 @@ export function registerGoalLifecycle(
     }
     if (!dispatchedQueueAction) runtime.dispatchContinuationIfSettled(ctx);
     runtime.clearSettledSafetyTracking();
+    runtime.acceptedRunPrompt = undefined;
+    runtime.pendingInputWake = undefined;
+    runtime.inputWakeGoalId = undefined;
+    runtime.inputWakeNeedsPrompt = false;
     runtime.scheduleGoalWaitWake(ctx);
   });
 
-  function beginNonGoalFollowUp(ctx: StatusContext, resetSafetyEpoch: boolean) {
-    if (resetSafetyEpoch) commands.resumeWaitingGoalOnInput(ctx);
+  function beginNonGoalFollowUp(ctx: StatusContext, realInput = false, inRun = false) {
+    const resumed = realInput && commands.resumeWaitingGoalOnInput(ctx, inRun);
+    if (resumed) runtime.guardAbortGoalId = undefined;
     runtime.clearGoalRecovery();
     runtime.clearStaleGoalToolCallBlock();
-    if (resetSafetyEpoch) runtime.clearBudgetWrapUp();
+    if (realInput) runtime.clearBudgetWrapUp();
     const activeGoalId = runtime.activeGoal?.status === "active" ? runtime.activeGoal.id : undefined;
     runtime.beginAgentRun(activeGoalId ?? null, activeGoalId ? "manual" : undefined);
-    if (resetSafetyEpoch && activeGoalId) runtime.resetActiveSafetyEpoch(ctx);
+    if (realInput && activeGoalId && !resumed) runtime.resetActiveSafetyEpoch(ctx);
   }
 
   function stopGoalAfterAgentEnd(

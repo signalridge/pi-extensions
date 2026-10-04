@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { test } from "vitest";
+import { updateGoalUsage } from "../src/accounting.js";
 import { buildGoalMenuState, GOAL_MENU_ACTIONS, safeGoalMenuText, showGoalManager } from "../src/menu.js";
 import type { ActiveGoal, PendingQueueAction } from "../src/persistence.js";
 import { createGoal, transitionGoal } from "../src/runtime.js";
@@ -675,6 +676,35 @@ test("menu preserves exact token values in status and budget input", async () =>
   assert.match(inputTitle, /Current budget: 10\.5k \(10,500 tokens\)/i);
   assert.match(inputTitle, /Current usage: 10\.5k \(10,499 tokens\)/i);
   assert.equal(tracked.calls.length, 0);
+});
+
+test("opening the menu preserves a waiting goal's usage while unrelated work runs", async () => {
+  const goal = transitionGoal(createGoal("await review", 50, 100), "paused");
+  goal.tokensUsed = 23;
+  goal.wait = { reason: "external review" };
+  const state = {
+    ...runtime(goal),
+    recordGoalUsage: (current: ActiveGoal) =>
+      updateGoalUsage(current, {
+        sessionManager: {
+          getBranch: () => [{ type: "message", message: { role: "assistant", usage: { totalTokens: 623 } } }],
+        },
+      }),
+    persistGoal: () => undefined,
+    updateStatus: () => undefined,
+  };
+  let displayed = "";
+  const context = createMockContext({
+    mode: "tui",
+    hasUI: true,
+    select: async (title: string) => {
+      displayed = title;
+      return GOAL_MENU_ACTIONS.close;
+    },
+  });
+  await showGoalManager(state, commands().controller as never, context.ctx, async () => undefined);
+  assert.match(displayed, /Usage: 23\/50/);
+  assert.equal(goal.tokensUsed, 23);
 });
 
 test("Queue Back returns to the refreshed main menu", async () => {

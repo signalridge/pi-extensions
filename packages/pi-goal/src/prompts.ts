@@ -37,6 +37,13 @@ export function buildGoalSystemPrompt(goal: GoalPromptContext) {
   return `Active /goal:\n${goalContextBlock(goal)}\n\nA later Goal runtime binding update can replace this goal_id after real input resumes a wait. Use its current goal_id, not the earlier binding.\n\n${goalModeRules("the active goal")}${budgetLine}`;
 }
 
+export const GOAL_BINDING_UPDATE_HEADER =
+  "Goal runtime binding update: real input resumed the waiting goal. This current goal_id supersedes the earlier binding.";
+
+export function buildGoalBindingUpdate(goal: GoalPromptContext) {
+  return `${GOAL_BINDING_UPDATE_HEADER}\n\n${goalCompletionGuardBlock(goal)}`;
+}
+
 export function buildContinuePrompt(goal: GoalPromptContext, marker: string) {
   return `Continue the active /goal until it is complete:\n\n${goalContextBlock(goal)}\n\nThis is automatic continuation #${goal.iteration}. The full objective persists across turns; continue from the authoritative current state.\n\n${goalModeRules("this goal")}\n\n${continuationMarkerComment(marker)}`;
 }

@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, test } from "vitest";
+import { describe, test, vi } from "vitest";
 import goal from "../src/goal.js";
 import type { ActiveGoal, GoalStateEntryData } from "../src/persistence.js";
 import { createMockContext, createMockPi } from "./support.js";
@@ -842,6 +842,64 @@ test("stopped displaced goals remain stopped after the priority goal completes",
     [{ text: "paused original", status: "paused" }],
   );
   assert.equal(harness.mock.sentUserMessages.length, promptsBeforeCompletion);
+});
+
+test("returning to a displaced waiting goal restores its deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const harness = await createHarness();
+    await harness.command("waiting original");
+    const original = stateGoals(harness.mock)[0];
+    assert.ok(original);
+    await findGoalTool(harness.mock, "goal_wait").execute(
+      "wait",
+      { goal_id: original.id, reason: "review", resume_after_ms: 10_000 },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    await harness.command("prioritize urgent fix");
+    await harness.command("skip");
+    assert.equal(stateGoals(harness.mock)[0]?.status, "paused");
+    assert.deepEqual(stateGoals(harness.mock)[0]?.wait, { reason: "review", resumeAt: Date.now() + 10_000 });
+    const promptsBeforeDeadline = harness.mock.sentUserMessages.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(harness.mock.sentUserMessages.length, promptsBeforeDeadline + 1);
+    assert.equal(stateGoals(harness.mock)[0]?.status, "active");
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("failed priority delivery restores the displaced wait deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    const harness = await createHarness();
+    await harness.command("waiting original");
+    const original = stateGoals(harness.mock)[0];
+    assert.ok(original);
+    await findGoalTool(harness.mock, "goal_wait").execute(
+      "wait",
+      { goal_id: original.id, reason: "review", resume_after_ms: 10_000 },
+      undefined,
+      undefined,
+      harness.ctx,
+    );
+    const send = harness.mock.rawPi.sendUserMessage;
+    harness.mock.rawPi.sendUserMessage = () => {
+      throw new Error("delivery failed");
+    };
+    await harness.command("prioritize urgent fix");
+    assert.equal(stateGoals(harness.mock)[0]?.id, original.id);
+    assert.equal(stateGoals(harness.mock)[0]?.status, "paused");
+    harness.mock.rawPi.sendUserMessage = send;
+    const promptsBeforeDeadline = harness.mock.sentUserMessages.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    assert.equal(harness.mock.sentUserMessages.length, promptsBeforeDeadline + 1);
+    assert.equal(stateGoals(harness.mock)[0]?.status, "active");
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("resumed displaced goals exclude tokens spent on the priority goal", async () => {

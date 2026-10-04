@@ -15,7 +15,15 @@ import {
 
 const extensionPath = resolve(import.meta.dirname, "../src/goal.ts");
 
-async function createHarness(responses, fauxOptions = {}, prepareSession, goalSettings, piSettings = {}, managedRun) {
+async function createHarness(
+  responses,
+  fauxOptions = {},
+  prepareSession,
+  goalSettings,
+  piSettings = {},
+  managedRun,
+  configureObserver,
+) {
   const root = await mkdtemp(join(tmpdir(), "pi-goal-runtime-"));
   const agentDir = join(root, "agent");
   const cwd = join(root, "workspace");
@@ -125,6 +133,7 @@ async function createHarness(responses, fauxOptions = {}, prepareSession, goalSe
               ),
             );
             pi.on("agent_settled", () => lifecycleEvents.push("agent_settled"));
+            configureObserver?.(pi);
           },
         },
       ],
@@ -724,6 +733,150 @@ async function managedRunDisabledScenario() {
   }
 }
 
+function waitResponse(context) {
+  const response = completionResponse(context);
+  const goalId = response.content[0].arguments.goal_id;
+  return fauxAssistantMessage(fauxToolCall("goal_wait", { goal_id: goalId, reason: "external review" }));
+}
+
+async function acceptedWaitInputScenario() {
+  const inputSources = [];
+  const harness = await createHarness(
+    [waitResponse, completionResponse],
+    {},
+    undefined,
+    { toolVisibility: "always" },
+    {},
+    undefined,
+    (pi) => {
+      pi.on("input", (event) => {
+        inputSources.push(event.source);
+        if (event.text === "handled review") return { action: "handled" };
+        if (event.text === "expand review") return { action: "transform", text: "Accepted expanded review" };
+      });
+    },
+  );
+  try {
+    await harness.session.prompt("/goal verify accepted wait input");
+    await waitFor(() => persistedGoalState(harness.session)?.goal?.wait !== undefined, "goal_wait state");
+    await waitFor(() => harness.session.isIdle, "waiting goal settled");
+    const waitingGoal = persistedGoalState(harness.session).goal;
+    await harness.session.prompt("handled review");
+    assert.equal(persistedGoalState(harness.session).goal.id, waitingGoal.id);
+    assert.equal(harness.faux.state.callCount, 1);
+    await assert.rejects(
+      harness.session.prompt("review with invalid image", {
+        images: [{ type: "image", data: null, mimeType: "image/png" }],
+      }),
+      /data|Buffer|argument/i,
+    );
+    assert.equal(persistedGoalState(harness.session).goal.id, waitingGoal.id);
+    assert.deepEqual(persistedGoalState(harness.session).goal.wait, waitingGoal.wait);
+    assert.equal(harness.faux.state.callCount, 1, "invalid image must fail before a provider request");
+    await harness.session.prompt("expand review");
+    await waitFor(() => harness.session.isIdle, "accepted wait input completed");
+    assert.equal(persistedGoalStatus(harness.session), null);
+    assert.equal(harness.faux.state.callCount, 2);
+    const users = harness.session.messages.map(userMessageText).filter(Boolean);
+    assert.equal(users.length, 2, "kickoff and accepted input only; no second resume prompt");
+    assert.equal(users[1], "Accepted expanded review");
+    assert.ok(inputSources.includes("interactive"));
+  } finally {
+    await harness.cleanup();
+  }
+}
+
+async function restoredDeadlineScenario() {
+  const now = Date.now();
+  const harness = await createHarness(
+    [completionResponse],
+    {},
+    (sessionManager) => {
+      sessionManager.appendCustomEntry("goal-state", {
+        goal: {
+          id: crypto.randomUUID(),
+          text: "finish after restored deadline",
+          status: "paused",
+          startedAt: now,
+          updatedAt: now,
+          iteration: 0,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+          baselineTokens: 0,
+          wait: { reason: "external review", resumeAt: now + 100 },
+        },
+      });
+    },
+    { toolVisibility: "always" },
+  );
+  try {
+    await waitFor(() => harness.faux.state.callCount === 1, "restored deadline provider request");
+    await waitFor(() => harness.session.isIdle, "restored deadline settled");
+    assert.equal(persistedGoalStatus(harness.session), null);
+    assert.equal(harness.session.messages.map(userMessageText).filter(Boolean).length, 1);
+  } finally {
+    await harness.cleanup();
+  }
+}
+
+async function treePriorityScenario() {
+  let targetId;
+  let sawBusyTreeHook = false;
+  const now = Date.now();
+  const harness = await createHarness(
+    [waitResponse],
+    {},
+    (sessionManager) => {
+      sessionManager.appendMessage(fauxAssistantMessage("historical goal response"));
+      sessionManager.appendCustomEntry("goal-state", {
+        goal: {
+          id: crypto.randomUUID(),
+          text: "budgeted historical head",
+          status: "active",
+          startedAt: now,
+          updatedAt: now,
+          iteration: 1,
+          tokenBudget: 20,
+          tokensUsed: 10,
+          timeUsedSeconds: 0,
+          baselineTokens: 0,
+        },
+        pendingAction: { kind: "prioritize", objective: "urgent after tree navigation" },
+      });
+      const message = fauxAssistantMessage("unaccounted historical tail");
+      message.usage = { ...message.usage, input: 15, totalTokens: 15 };
+      targetId = sessionManager.appendMessage(message);
+      sessionManager.appendCustomEntry("goal-state", { goal: null });
+    },
+    { toolVisibility: "always", experimental: { goals: true } },
+    {},
+    undefined,
+    (pi) => {
+      pi.on("session_tree", async (_event, ctx) => {
+        sawBusyTreeHook = !ctx.isIdle();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
+    },
+  );
+  try {
+    assert.equal(persistedGoalStatus(harness.session), null);
+    await harness.session.navigateTree(targetId);
+    await waitFor(
+      () => persistedGoalState(harness.session)?.goal?.text === "urgent after tree navigation",
+      "tree priority dispatch after asynchronous observer",
+    );
+    await waitFor(() => harness.session.isIdle && harness.faux.state.callCount === 1, "tree-priority goal_wait");
+    const state = persistedGoalState(harness.session);
+    assert.ok(sawBusyTreeHook, "Pi keeps navigation busy until every tree handler returns");
+    assert.equal(state.goal.status, "paused");
+    assert.equal(state.goal.wait.reason, "external review");
+    assert.equal(state.queue[0].status, "budget_limited");
+    assert.equal(state.queue[0].tokensUsed, 25);
+  } finally {
+    await harness.cleanup();
+  }
+}
+
 async function manualCompactionScenario() {
   const now = Date.now();
   const harness = await createHarness(
@@ -799,6 +952,9 @@ await budgetAgentEndFallbackScenario();
 await managedRunRpcScenario();
 await managedRunDisabledScenario();
 await manualCompactionScenario();
+await acceptedWaitInputScenario();
+await restoredDeadlineScenario();
+await treePriorityScenario();
 console.log(
-  "pi-goal runtime smoke: normal, runaway guards, retry and busy-edit ownership, ordered queue, queued input, pause, frozen-queue and stale blocked-tool aborts, managed-run RPC, bounded budget behavior, and manual compaction passed",
+  "pi-goal runtime smoke: normal, runaway guards, retry and busy-edit ownership, ordered queue, queued input, pause, frozen-queue and stale blocked-tool aborts, managed-run RPC, bounded budget behavior, manual compaction, accepted wait input, restored deadline, and asynchronous tree priority passed",
 );

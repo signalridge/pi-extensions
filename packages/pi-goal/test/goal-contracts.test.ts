@@ -148,7 +148,7 @@ test("assistant token accounting prefers totalTokens and uses a cache-inclusive 
   );
 });
 
-test("goal token usage subtracts its baseline and clamps branch rewinds", async () => {
+test("goal token usage subtracts its baseline and preserves usage across branch rewinds", async () => {
   const branch: Array<Record<string, unknown>> = [assistantUsageEntry({ totalTokens: 100 })];
   const tracked = await startGoalForTest({
     sessionManager: { getBranch: () => branch, getEntries: () => branch },
@@ -160,11 +160,11 @@ test("goal token usage subtracts its baseline and clamps branch rewinds", async 
 
   branch.splice(0, branch.length, assistantUsageEntry({ totalTokens: 50 }));
   await tracked.mock.commands.get("goal")?.handler("", tracked.ctx);
-  assert.equal(requireLastGoal(tracked.mock).tokensUsed, 0);
+  assert.equal(requireLastGoal(tracked.mock).tokensUsed, 40);
 
   branch.push(assistantUsageEntry({ input: 20, output: 10, cacheRead: 30, cacheWrite: 20 }));
   await tracked.mock.commands.get("goal")?.handler("", tracked.ctx);
-  assert.equal(requireLastGoal(tracked.mock).tokensUsed, 30);
+  assert.equal(requireLastGoal(tracked.mock).tokensUsed, 120);
 });
 
 test("active elapsed time excludes stopped waits and survives active edits", async () => {

@@ -75,10 +75,12 @@ test("goal registers command, status tools, and lifecycle hooks", () => {
     "input",
     "message_start",
     "session_before_compact",
+    "session_before_tree",
     "session_compact",
     "session_compact_failed",
     "session_shutdown",
     "session_start",
+    "session_tree",
     "tool_call",
     "tool_execution_end",
     "turn_end",
@@ -577,6 +579,20 @@ test("after-first-goal does not widen a restrictive active turn", async () => {
   assert.equal(mock.sentUserMessages.length, 0);
   assert.deepEqual(mock.rawPi.getActiveTools(), []);
   assert.match(context.notifications.at(-1)?.message ?? "", /wait until Pi is idle/i);
+});
+
+test("an owned prompt blocked before its run keeps the stale-tool guard", async () => {
+  const fixture = await startGoalForTest();
+  const prompt = fixture.mock.sentUserMessages[0]?.text ?? "";
+  fixture.mock.rawPi.setActiveTools(["read"]);
+  await fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt, systemPrompt: "base" }, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).status, "paused");
+  await fixture.mock.events.get("message_start")?.[0]?.({ message: { role: "user", content: prompt } }, fixture.ctx);
+  const blocked = fixture.mock.events.get("tool_call")?.[0]?.(
+    { toolName: "read", toolCallId: "stale-owned", input: {} },
+    fixture.ctx,
+  ) as { block?: boolean } | undefined;
+  assert.equal(blocked?.block, true);
 });
 
 test("failed replacement activation pauses an existing active goal without terminal tools", async () => {

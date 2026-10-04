@@ -166,6 +166,30 @@ test("stopped input and failed resume preserve the exact safety epoch", async ()
   assert.deepEqual(pickSafetyState(requireLastGoal(restored.mock)), safety);
 });
 
+test("handled or rejected input does not reset an active goal's safety epoch", async () => {
+  const active = restoreGoalForTest("active", { automaticModelTurns: 2, toolFreeRepeatCount: 1 });
+  active.mock.events.get("input")?.[0]?.({ source: "interactive", text: "handled" }, active.ctx);
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 2);
+  active.mock.events.get("input")?.[0]?.({ source: "interactive", text: "missing auth" }, active.ctx);
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 2);
+  active.mock.events.get("input")?.[0]?.({ source: "rpc", text: "accepted" }, active.ctx);
+  active.mock.events.get("before_agent_start")?.[0]?.({ prompt: "accepted", systemPrompt: "base" }, active.ctx);
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 0);
+  assert.equal(requireLastGoal(active.mock).toolFreeRepeatCount, 0);
+});
+
+test("queued real steer resets active safety only when delivered", async () => {
+  const active = restoreGoalForTest("active", { automaticModelTurns: 2, toolFreeRepeatCount: 1 });
+  active.mock.events.get("input")?.[0]?.(
+    { source: "interactive", text: "new evidence", streamingBehavior: "steer" },
+    active.ctx,
+  );
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 2);
+  active.mock.events.get("message_start")?.[0]?.({ message: { role: "user", content: "new evidence" } }, active.ctx);
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 0);
+  assert.equal(requireLastGoal(active.mock).toolFreeRepeatCount, 0);
+});
+
 test("direct active input resets safety and reclassifies an in-flight automatic run", async () => {
   const active = await startGoalForTest({}, "finish", LOW_LIMITS_SETTINGS_PATH);
   await active.mock.events.get("agent_end")?.[0]?.(
@@ -180,10 +204,22 @@ test("direct active input resets safety and reclassifies an in-flight automatic 
     active.ctx,
   );
   assert.equal(requireLastGoal(active.mock).automaticModelTurns, 1);
-  active.mock.events.get("input")?.[0]?.({ source: "extension", text: "unrelated extension input" }, active.ctx);
+  active.mock.events.get("input")?.[0]?.(
+    { source: "extension", text: "unrelated extension input", streamingBehavior: "steer" },
+    active.ctx,
+  );
+  active.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "user", content: "unrelated extension input" } },
+    active.ctx,
+  );
   assert.equal(requireLastGoal(active.mock).automaticModelTurns, 1);
 
-  active.mock.events.get("input")?.[0]?.({ source: "interactive", text: "new evidence" }, active.ctx);
+  active.mock.events.get("input")?.[0]?.(
+    { source: "interactive", text: "new evidence", streamingBehavior: "followUp" },
+    active.ctx,
+  );
+  assert.equal(requireLastGoal(active.mock).automaticModelTurns, 1);
+  active.mock.events.get("message_start")?.[0]?.({ message: { role: "user", content: "new evidence" } }, active.ctx);
   active.mock.events.get("turn_end")?.[0]?.(
     { message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] },
     active.ctx,

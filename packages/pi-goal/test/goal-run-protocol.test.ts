@@ -141,6 +141,28 @@ test("managed run RPC is disabled when settings are missing, invalid, or explici
   }
 });
 
+test("tree navigation closes a managed run before starting on an empty branch", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const mock = createMockPi({ activeTools: ["read", "bash"] });
+  registerGoal(mock);
+  const context = createMockContext({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  bindSession(mock, context);
+  const oldEvents = observeRun(mock, "tree-old");
+  startRun(mock, "tree-old");
+  await flush();
+  assert.equal(states(oldEvents).at(-1)?.status, "active");
+
+  await mock.events.get("session_tree")?.[0]?.({ oldLeafId: "old", newLeafId: "root" }, context.ctx);
+  await flush();
+  assert.equal(states(oldEvents).at(-1)?.status, "cleared");
+
+  const newEvents = observeRun(mock, "tree-new");
+  startRun(mock, "tree-new");
+  await flush();
+  assert.equal(errors(newEvents).length, 0);
+  assert.equal(states(newEvents).at(-1)?.status, "active");
+});
+
 test("start reports no active session before bind and after shutdown", async () => {
   const mock = createMockPi({ activeTools: ["read", "bash"] });
   registerGoal(mock);

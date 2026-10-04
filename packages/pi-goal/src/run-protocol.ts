@@ -169,6 +169,21 @@ export class GoalRunController {
     this.usedRunIds.clear();
   }
 
+  handleTreeNavigation(goalId: string | undefined) {
+    const run = this.run;
+    if (!run || run.closed || run.goalId === goalId) return;
+    if (run.goalId) {
+      this.publishStateEvent(run, {
+        goalId: run.goalId,
+        status: "cleared",
+        reason: "managed Goal left by session tree navigation",
+      });
+      return;
+    }
+    this.closeCurrentRun();
+    this.emitError(run.runId, "start", "SUPERSEDED", "Goal run superseded by session tree navigation.");
+  }
+
   private async handleStart(data: unknown) {
     const runId = parseRunId(data);
     if (!runId) return;

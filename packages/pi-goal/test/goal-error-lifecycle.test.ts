@@ -536,6 +536,119 @@ test("explicit pause cancels a deferred manual-compaction continuation", async (
   assert.equal(lastGoalStatus(compacted.mock), "paused");
 });
 
+test("explicit pause records late usage from its aborted goal-owned run", async () => {
+  const branch: Array<Record<string, unknown>> = [assistantUsageEntry({ totalTokens: 100 })];
+  const fixture = await startGoalForTest({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  const prompt = fixture.mock.sentUserMessages[0]?.text ?? "";
+  fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt, systemPrompt: "base" }, fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 20 }));
+  await fixture.mock.commands.get("goal")?.handler("pause", fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 20);
+  branch.push(assistantUsageEntry({ totalTokens: 80 }));
+  await fixture.mock.events.get("agent_end")?.[0]?.(
+    { messages: [{ role: "assistant", stopReason: "aborted", usage: { totalTokens: 80 } }] },
+    fixture.ctx,
+  );
+  assert.equal(requireLastGoal(fixture.mock).status, "paused");
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 100);
+  await fixture.mock.events.get("agent_end")?.[0]?.({ messages: [] }, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 100);
+  assert.equal(fixture.mock.sentUserMessages.length, 1);
+});
+
+test("replacement before the aborted run ends excludes the old response's late usage", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const fixture = await startGoalForTest({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  const oldPrompt = fixture.mock.sentUserMessages[0]?.text ?? "";
+  fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt: oldPrompt, systemPrompt: "base" }, fixture.ctx);
+  await fixture.mock.commands.get("goal")?.handler("pause", fixture.ctx);
+  await fixture.mock.commands.get("goal")?.handler("--tokens 5 replacement objective", fixture.ctx);
+  const replacementId = requireLastGoal(fixture.mock).id;
+  branch.push(assistantUsageEntry({ totalTokens: 12 }));
+  await fixture.mock.events.get("agent_end")?.[0]?.(
+    { messages: [{ role: "assistant", stopReason: "aborted", usage: { totalTokens: 12 } }] },
+    fixture.ctx,
+  );
+  const replacementPrompt = fixture.mock.sentUserMessages.at(-1)?.text ?? "";
+  fixture.mock.events.get("before_agent_start")?.[0]?.(
+    { prompt: replacementPrompt, systemPrompt: "base" },
+    fixture.ctx,
+  );
+  branch.push(assistantUsageEntry({ totalTokens: 1 }));
+  await fixture.mock.events.get("tool_execution_end")?.[0]?.({}, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).id, replacementId);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 1);
+  assert.equal(requireLastGoal(fixture.mock).status, "active");
+});
+
+test("context-only custom messages preserve the stopped goal's final usage", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const fixture = await startGoalForTest({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  const prompt = fixture.mock.sentUserMessages[0]?.text ?? "";
+  fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt, systemPrompt: "base" }, fixture.ctx);
+  await fixture.mock.commands.get("goal")?.handler("pause", fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 12 }));
+  await fixture.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "custom", customType: "context-note", content: "No new provider turn" } },
+    fixture.ctx,
+  );
+  await fixture.mock.events.get("agent_end")?.[0]?.({ messages: [] }, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 12);
+  assert.equal(requireLastGoal(fixture.mock).status, "paused");
+});
+
+test("replacement during an unrelated run excludes its late usage", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const fixture = await startGoalForTest({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  await fixture.mock.commands.get("goal")?.handler("pause", fixture.ctx);
+  await fixture.mock.events.get("input")?.[0]?.({ source: "extension", text: "housekeeping" }, fixture.ctx);
+  await fixture.mock.events.get("before_agent_start")?.[0]?.(
+    { prompt: "housekeeping", systemPrompt: "base" },
+    fixture.ctx,
+  );
+  await fixture.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "user", content: "housekeeping" } },
+    fixture.ctx,
+  );
+  await fixture.mock.commands.get("goal")?.handler("--tokens 5 new objective", fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 12 }));
+  await fixture.mock.events.get("agent_end")?.[0]?.({ messages: [] }, fixture.ctx);
+  const prompt = fixture.mock.sentUserMessages.at(-1)?.text ?? "";
+  await fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt, systemPrompt: "base" }, fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 1 }));
+  await fixture.mock.events.get("tool_execution_end")?.[0]?.({}, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 1);
+  assert.equal(requireLastGoal(fixture.mock).status, "active");
+});
+
+test("late accounting ticket does not charge a delivered extension steer", async () => {
+  const branch: Array<Record<string, unknown>> = [assistantUsageEntry({ totalTokens: 100 })];
+  const fixture = await startGoalForTest({ sessionManager: { getBranch: () => branch, getEntries: () => branch } });
+  const prompt = fixture.mock.sentUserMessages[0]?.text ?? "";
+  fixture.mock.events.get("before_agent_start")?.[0]?.({ prompt, systemPrompt: "base" }, fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 20 }));
+  await fixture.mock.commands.get("goal")?.handler("pause", fixture.ctx);
+  await fixture.mock.events.get("input")?.[0]?.(
+    { source: "extension", text: "housekeeping", streamingBehavior: "steer" },
+    fixture.ctx,
+  );
+  await fixture.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "user", content: "housekeeping" } },
+    fixture.ctx,
+  );
+  branch.push(assistantUsageEntry({ totalTokens: 80 }));
+  await fixture.mock.events.get("agent_end")?.[0]?.(
+    { messages: [{ role: "assistant", stopReason: "stop", usage: { totalTokens: 80 } }] },
+    fixture.ctx,
+  );
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 20);
+  await fixture.mock.events.get("agent_settled")?.[0]?.({}, fixture.ctx);
+  await fixture.mock.commands.get("goal")?.handler("resume", fixture.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 5 }));
+  await fixture.mock.events.get("tool_execution_end")?.[0]?.({}, fixture.ctx);
+  assert.equal(requireLastGoal(fixture.mock).tokensUsed, 25);
+});
+
 test("stale goal tool calls are blocked after pause until a fresh non-goal prompt arrives", async () => {
   const paused = await startGoalForTest();
   await paused.mock.commands.get("goal")?.handler("pause", paused.ctx);
@@ -562,7 +675,13 @@ test("stale goal tool calls are blocked after pause until a fresh non-goal promp
   });
 
   paused.mock.events.get("input")?.[0]?.({ source: "interactive", text: "what happened?" }, paused.ctx);
-  assert.equal(pauseToolCall?.({ toolName: "bash", toolCallId: "t4", input: {} }, paused.ctx), undefined);
+  assert.deepEqual(pauseToolCall?.({ toolName: "bash", toolCallId: "t4", input: {} }, paused.ctx), {
+    block: true,
+    reason: STALE_GOAL_TOOL_REASON,
+  });
+  paused.mock.events.get("before_agent_start")?.[0]?.({ prompt: "what happened?", systemPrompt: "base" }, paused.ctx);
+  paused.mock.events.get("message_start")?.[0]?.({ message: { role: "user", content: "what happened?" } }, paused.ctx);
+  assert.equal(pauseToolCall?.({ toolName: "bash", toolCallId: "t5", input: {} }, paused.ctx), undefined);
 });
 
 function assertNoTerminalControls(value: string) {

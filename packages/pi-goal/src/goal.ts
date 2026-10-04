@@ -21,7 +21,7 @@ function registerGoalRuntime(pi: ExtensionAPI, options: GoalOptions = {}) {
   // the real one. Wired here because the controller owns it and the runtime,
   // which arms the timer, deliberately does not depend on the controller.
   runtime.onGoalWaitElapsed = (ctx) => {
-    void commands.resumeGoal(ctx);
+    void commands.resumeGoal(ctx, "deadline");
   };
 
   // Keep registration order explicit: managed-run bus listeners exist before tools,

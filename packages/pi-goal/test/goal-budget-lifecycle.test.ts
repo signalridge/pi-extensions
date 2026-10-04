@@ -281,6 +281,64 @@ test("budget wrap-up does not consume a pending transformed follow-up", async ()
   assert.equal(completion.terminate, true);
 });
 
+test("an extension steer does not discard an active budget wrap-up", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const budgeted = await startGoalForTest(
+    { sessionManager: { getBranch: () => branch, getEntries: () => branch } },
+    "--tokens 10 finish",
+  );
+  budgeted.mock.events.get("input")?.[0]?.(
+    { source: "extension", text: "housekeeping", streamingBehavior: "steer" },
+    budgeted.ctx,
+  );
+  branch.push(assistantUsageEntry({ totalTokens: 12 }));
+  await budgeted.mock.events.get("tool_execution_end")?.[0]?.(
+    { toolCallId: "tool-1", toolName: "bash", result: {}, isError: false },
+    budgeted.ctx,
+  );
+  budgeted.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "user", content: "housekeeping" } },
+    budgeted.ctx,
+  );
+  assert.deepEqual(
+    budgeted.mock.events.get("tool_call")?.[0]?.(
+      { toolName: "read", toolCallId: "extension-read", input: {} },
+      budgeted.ctx,
+    ),
+    { block: true, reason: "Goal token budget is exhausted; only goal_complete is allowed during wrap-up." },
+  );
+});
+
+test("wrap-up delivery reclaims usage ownership after an extension steer", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const budgeted = await startGoalForTest(
+    { sessionManager: { getBranch: () => branch, getEntries: () => branch } },
+    "--tokens 10 finish",
+  );
+  budgeted.mock.events.get("input")?.[0]?.(
+    { source: "extension", text: "housekeeping", streamingBehavior: "steer" },
+    budgeted.ctx,
+  );
+  branch.push(assistantUsageEntry({ totalTokens: 12 }));
+  await budgeted.mock.events.get("tool_execution_end")?.[0]?.({}, budgeted.ctx);
+  budgeted.mock.events.get("message_start")?.[0]?.(
+    { message: { role: "user", content: "housekeeping" } },
+    budgeted.ctx,
+  );
+  const wrapUp = { role: "custom", ...(budgeted.mock.sentMessages[0]?.message as Record<string, unknown>) };
+  budgeted.mock.events.get("message_start")?.[0]?.({ message: wrapUp }, budgeted.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 3 }));
+  await budgeted.mock.events.get("agent_end")?.[0]?.(
+    { messages: [wrapUp, { role: "assistant", stopReason: "stop" }] },
+    budgeted.ctx,
+  );
+  assert.equal(requireLastGoal(budgeted.mock).tokensUsed, 15);
+  const context = budgeted.mock.events.get("context")?.[0]?.({ messages: [wrapUp] }, budgeted.ctx) as {
+    messages?: unknown[];
+  };
+  assert.deepEqual(context?.messages, []);
+});
+
 test("budget wrap-up custom message retains goal ownership through agent_end", async () => {
   const branch: Array<Record<string, unknown>> = [];
   const budgeted = await startGoalForTest(
@@ -373,6 +431,26 @@ test("budget edits require an actual increase before reactivating and rotate sta
   assert.notEqual(increased.id, unchanged.id);
   assert.equal(budgeted.mock.sentUserMessages.length, 2);
   assertPromptHasGoalId(budgeted.mock.sentUserMessages.at(-1)?.text ?? "", increased.id);
+});
+
+test("budget-increase edit excludes usage from unrelated work while limited", async () => {
+  const branch: Array<Record<string, unknown>> = [];
+  const budgeted = await startGoalForTest(
+    { sessionManager: { getBranch: () => branch, getEntries: () => branch } },
+    "--tokens 10 finish",
+  );
+  branch.push(assistantUsageEntry({ totalTokens: 10 }));
+  await budgeted.mock.events.get("agent_end")?.[0]?.(
+    { messages: [{ role: "assistant", stopReason: "stop" }] },
+    budgeted.ctx,
+  );
+  assert.equal(requireLastGoal(budgeted.mock).status, "budget_limited");
+  branch.push(assistantUsageEntry({ totalTokens: 50 }));
+  await budgeted.mock.commands.get("goal")?.handler("edit --tokens 20 revised objective", budgeted.ctx);
+  branch.push(assistantUsageEntry({ totalTokens: 1 }));
+  await budgeted.mock.events.get("tool_execution_end")?.[0]?.({}, budgeted.ctx);
+  assert.equal(requireLastGoal(budgeted.mock).tokensUsed, 11);
+  assert.equal(requireLastGoal(budgeted.mock).status, "active");
 });
 
 test("failed budget-increase edit delivery restores the limited goal and stale id", async () => {

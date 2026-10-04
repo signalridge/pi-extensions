@@ -3,6 +3,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 export interface GoalAccountingState {
   status: string;
   baselineTokens: number;
+  /** Usage retained from before the current session-token baseline. */
+  usageOffset?: number;
   tokensUsed: number;
   timeUsedSeconds: number;
   activeStartedAt?: number;
@@ -29,15 +31,36 @@ export function checkpointGoalActiveTime(goal: GoalAccountingState, now: number,
   goal.activeStartedAt = continueClock ? now : undefined;
 }
 
+export function rebaseGoalUsage<T extends GoalAccountingState>(goal: T, totalTokens: number): T {
+  const total = nonNegativeFiniteNumber(totalTokens);
+  const used = nonNegativeFiniteNumber(goal.tokensUsed);
+  return {
+    ...goal,
+    baselineTokens: Math.max(0, total - used),
+    usageOffset: total < used ? used - total : undefined,
+  };
+}
+
 export function updateGoalUsage(
   goal: GoalAccountingState,
   ctx: UsageContext,
   continueClock = goal.status === "active",
 ) {
   const now = Date.now();
-  const baselineTokens = nonNegativeFiniteNumber(goal.baselineTokens);
-  goal.baselineTokens = baselineTokens;
-  goal.tokensUsed = Math.max(0, currentTokenTotal(ctx) - baselineTokens);
+  const total = currentTokenTotal(ctx);
+  goal.baselineTokens = nonNegativeFiniteNumber(goal.baselineTokens);
+  goal.tokensUsed = nonNegativeFiniteNumber(goal.tokensUsed);
+  goal.usageOffset = Math.min(goal.tokensUsed, nonNegativeFiniteNumber(goal.usageOffset)) || undefined;
+  const previousTotal = goal.baselineTokens + goal.tokensUsed - (goal.usageOffset ?? 0);
+  if (total < previousTotal) {
+    const rebased = rebaseGoalUsage(goal, total);
+    goal.baselineTokens = rebased.baselineTokens;
+    goal.usageOffset = rebased.usageOffset;
+  }
+  goal.tokensUsed = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    (goal.usageOffset ?? 0) + Math.max(0, total - goal.baselineTokens),
+  );
   checkpointGoalActiveTime(goal, now, continueClock);
   goal.updatedAt = now;
 }
@@ -99,4 +122,15 @@ export function cumulativeAssistantTokens(entries: unknown[]) {
 export function currentTokenTotal(ctx: UsageContext): number {
   const sessionManager = ctx.sessionManager as { getBranch?: () => unknown[] } | undefined;
   return cumulativeAssistantTokens(sessionManager?.getBranch?.() ?? []);
+}
+
+export function assistantTokensAfterGoalState(ctx: UsageContext, customType = "goal-state") {
+  const sessionManager = ctx.sessionManager as { getBranch?: () => unknown[] } | undefined;
+  const branch = sessionManager?.getBranch?.() ?? [];
+  let lastStateIndex = -1;
+  for (let index = 0; index < branch.length; index++) {
+    const entry = branch[index] as { type?: unknown; customType?: unknown };
+    if (entry?.type === "custom" && entry.customType === customType) lastStateIndex = index;
+  }
+  return lastStateIndex < 0 ? 0 : cumulativeAssistantTokens(branch.slice(lastStateIndex + 1));
 }

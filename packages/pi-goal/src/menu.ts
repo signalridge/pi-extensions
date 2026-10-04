@@ -597,7 +597,7 @@ function goalMainMenuItem(label: string): ActionMenuItem<GoalMenuScreen, GoalMen
 
 function refreshGoalMenuState(runtime: GoalMenuRuntimeView, ctx: ExtensionCommandContext) {
   const goal = runtime.activeGoal;
-  if (!goal || runtime.queueFrozen) return;
+  if (!goal || runtime.queueFrozen || goal.status !== "active") return;
   runtime.recordGoalUsage?.(goal, ctx);
   runtime.persistGoal?.(goal);
   runtime.updateStatus?.(ctx, goal);

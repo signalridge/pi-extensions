@@ -1,4 +1,4 @@
-import { checkpointGoalActiveTime, currentTokenTotal, formatTokenCount } from "./accounting.js";
+import { checkpointGoalActiveTime, currentTokenTotal, formatTokenCount, rebaseGoalUsage } from "./accounting.js";
 import { validateObjective } from "./command.js";
 import { notifyTerminal, safeGoalMenuText } from "./errors.js";
 import type { ActiveGoal } from "./persistence.js";
@@ -29,6 +29,7 @@ import {
   type StatusContext,
   stoppedStatusLabel,
   transitionGoal,
+  type WaitingInputWake,
 } from "./runtime.js";
 
 // User-command mutations are kept separate from Pi event wiring. Every controller
@@ -57,6 +58,7 @@ export class GoalCommandController {
 
     const existingGoal = this.runtime.activeGoal?.status !== "complete" ? this.runtime.activeGoal : undefined;
     const existingQueuedGoals = [...this.runtime.queuedGoals];
+    const existingReplacementUsage = this.runtime.pendingReplacementUsage;
     const existingQueueIdentity = goalQueueIdentity(
       this.runtime.activeGoal,
       this.runtime.queuedGoals,
@@ -107,6 +109,14 @@ export class GoalCommandController {
     this.runtime.pendingQueueAction = undefined;
     this.runtime.activeGoal = createGoal(objective, tokenBudget, currentTokenTotal(ctx));
     const startedGoal = this.runtime.activeGoal;
+    this.runtime.pendingReplacementUsage =
+      this.runtime.agentRunGoalId !== undefined
+        ? { runGoalId: this.runtime.agentRunGoalId, replacementGoalId: startedGoal.id }
+        : undefined;
+    if (this.runtime.pendingReplacementUsage) startedGoal.usageBaselinePending = true;
+    this.runtime.ambiguousWaitInputGoalId = undefined;
+    this.runtime.pendingDirectInputs = [];
+    this.runtime.pendingNonGoalInputs = [];
     onActivated?.(startedGoal);
     this.runtime.persistGoal(startedGoal);
     if (this.runtime.activeGoal?.id !== startedGoal.id || this.runtime.activeGoal.status !== "active") {
@@ -127,7 +137,7 @@ export class GoalCommandController {
         rolledBackStartedGoal = true;
         if (existingGoal) {
           this.runtime.queuedGoals = existingQueuedGoals;
-          this.runtime.recordGoalUsage(existingGoal, ctx);
+          if (existingGoal.status === "active") this.runtime.recordGoalUsage(existingGoal, ctx);
           if (existingGoal.status === "active") {
             this.runtime.stopActiveGoal(ctx, {
               kind: "activation_rollback",
@@ -150,7 +160,9 @@ export class GoalCommandController {
         }
       }
       if (rolledBackStartedGoal) {
+        this.runtime.pendingReplacementUsage = existingReplacementUsage;
         this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
+        this.runtime.scheduleGoalWaitWake(ctx);
       }
       return;
     }
@@ -332,6 +344,7 @@ export class GoalCommandController {
       if (blocksStaleGoalToolCalls(this.runtime.activeGoal.status)) {
         this.runtime.blockStaleGoalToolCalls();
       }
+      this.runtime.scheduleGoalWaitWake(ctx);
       notifyTerminal(
         ctx.ui,
         `${reason === "complete" ? "Goal complete" : "Goal skipped"}: ${previousText}. Next goal remains ${this.runtime.activeGoal.status}: ${this.runtime.activeGoal.text}`,
@@ -405,20 +418,71 @@ export class GoalCommandController {
     if (stoppedGoal) notifyTerminal(ctx.ui, `Goal paused: ${stoppedGoal.text}`, "info");
   }
 
-  resumeWaitingGoalOnInput(ctx: StatusContext) {
+  private canWakeWaitingGoal() {
+    const goal = this.runtime.activeGoal;
+    return Boolean(
+      !this.runtime.queueFrozen &&
+        !this.runtime.pendingQueueAction &&
+        goal?.status === "paused" &&
+        goal.wait &&
+        this.runtime.ambiguousWaitInputGoalId !== goal.id &&
+        this.runtime.toolPolicy.toolsAvailable() &&
+        (goal.tokenBudget === undefined || goal.tokensUsed < goal.tokenBudget),
+    );
+  }
+
+  prepareWaitingGoalOnInput(ctx: StatusContext): WaitingInputWake | undefined {
+    const goal = this.runtime.activeGoal;
+    if (!goal || !this.canWakeWaitingGoal()) return undefined;
+    // Reserve the prompt binding without changing the persisted wait. Pi can
+    // still reject images after before_agent_start, before any message starts.
+    const resumedGoal = resetGoalSafetyEpoch(
+      transitionGoal(nextGoalInstance(rebaseGoalUsage(goal, currentTokenTotal(ctx))), "active"),
+    );
+    return { waitingGoal: goal, resumedGoal, generation: this.runtime.menuGeneration };
+  }
+
+  commitWaitingGoalOnInput(ctx: StatusContext, ticket: WaitingInputWake, inRun = false) {
     if (
-      this.runtime.queueFrozen ||
-      this.runtime.pendingQueueAction ||
-      this.runtime.activeGoal?.status !== "paused" ||
-      !this.runtime.activeGoal.wait
+      ticket.generation !== this.runtime.menuGeneration ||
+      this.runtime.activeGoal !== ticket.waitingGoal ||
+      !this.canWakeWaitingGoal()
     )
-      return;
-    // The incoming message already owns a turn; do not send a second prompt.
-    const resumed = this.prepareGoalResume(ctx, false);
-    if (resumed) {
-      this.runtime.inputWakeGoalId = resumed.resumedGoal.id;
-      this.runtime.beginAgentRun(resumed.resumedGoal.id, "manual");
+      return false;
+    const previousRunGoalId = this.runtime.agentRunGoalId;
+    const resumedGoal = resetGoalSafetyEpoch(
+      transitionGoal(
+        {
+          ...rebaseGoalUsage(ticket.waitingGoal, currentTokenTotal(ctx)),
+          id: ticket.resumedGoal.id,
+        },
+        "active",
+      ),
+    );
+    this.runtime.pendingInputWake = undefined;
+    this.runtime.cancelContinuationWork();
+    this.runtime.clearGoalRecovery();
+    this.runtime.clearBudgetWrapUp();
+    this.runtime.clearStaleGoalToolCallBlock();
+    this.runtime.pendingDirectInputs = this.runtime.pendingDirectInputs
+      .filter((pending) => pending.realInput && pending.goalId === ticket.waitingGoal.id)
+      .map((pending) => ({ ...pending, goalId: resumedGoal.id }));
+    this.runtime.pendingNonGoalInputs = this.runtime.pendingNonGoalInputs.filter((pending) => pending.realInput);
+    this.runtime.activeGoal = resumedGoal;
+    if (inRun) {
+      this.runtime.inputWakeGoalId = resumedGoal.id;
+      this.runtime.inputWakeNeedsPrompt = previousRunGoalId !== ticket.waitingGoal.id;
     }
+    this.runtime.beginAgentRun(resumedGoal.id, "manual");
+    this.runtime.persistGoal(resumedGoal);
+    if (ticket.generation !== this.runtime.menuGeneration || this.runtime.activeGoal !== resumedGoal) return false;
+    this.runtime.updateStatus(ctx, resumedGoal);
+    return true;
+  }
+
+  resumeWaitingGoalOnInput(ctx: StatusContext, inRun = false) {
+    const ticket = this.prepareWaitingGoalOnInput(ctx);
+    return ticket ? this.commitWaitingGoalOnInput(ctx, ticket, inRun) : false;
   }
 
   private prepareGoalResume(ctx: StatusContext, resetOnPrompt: boolean) {
@@ -449,11 +513,15 @@ export class GoalCommandController {
       return;
     }
     const stoppedGoal = this.runtime.activeGoal;
+    this.runtime.ambiguousWaitInputGoalId = undefined;
+    this.runtime.pendingDirectInputs = [];
+    this.runtime.pendingNonGoalInputs = [];
     this.runtime.cancelContinuationWork();
     this.runtime.clearGoalRecovery();
     this.runtime.clearBudgetWrapUp();
     this.runtime.clearStaleGoalToolCallBlock();
-    const active = transitionGoal(nextGoalInstance(stoppedGoal), "active");
+    const rebased = rebaseGoalUsage({ ...stoppedGoal, usageBaselinePending: undefined }, currentTokenTotal(ctx));
+    const active = transitionGoal(nextGoalInstance(rebased), "active");
     const resumedGoal = resetOnPrompt ? queueGoalSafetyReset(active) : resetGoalSafetyEpoch(active);
     this.runtime.activeGoal = resumedGoal;
     this.runtime.persistGoal(resumedGoal);
@@ -463,7 +531,7 @@ export class GoalCommandController {
     return { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation };
   }
 
-  async resumeGoal(ctx: StatusContext) {
+  async resumeGoal(ctx: StatusContext, source: "explicit" | "deadline" = "explicit") {
     const prepared = this.prepareGoalResume(ctx, true);
     if (!prepared) return;
     const { stoppedGoal, resumedGoal, goalToolVisibilityBeforeActivation } = prepared;
@@ -482,6 +550,9 @@ export class GoalCommandController {
           this.runtime.blockStaleGoalToolCalls();
         }
         this.runtime.toolPolicy.restore(goalToolVisibilityBeforeActivation);
+        if (source === "explicit" && stoppedGoal.wait?.resumeAt !== undefined) {
+          this.runtime.scheduleGoalWaitWake(ctx);
+        }
       }
       return;
     }
@@ -525,7 +596,7 @@ export class GoalCommandController {
       return;
     }
 
-    this.runtime.recordGoalUsage(this.runtime.activeGoal, ctx);
+    if (this.runtime.activeGoal.status === "active") this.runtime.recordGoalUsage(this.runtime.activeGoal, ctx);
     const previousGoal = { ...this.runtime.activeGoal };
     this.runtime.cancelContinuationWork();
     this.runtime.clearGoalRecovery();
@@ -540,7 +611,12 @@ export class GoalCommandController {
       },
       editedGoalStatus(previousStatus),
     );
-    const nextGoal = transitionedGoal.status === "active" ? queueGoalSafetyReset(transitionedGoal) : transitionedGoal;
+    const nextGoal =
+      transitionedGoal.status === "active"
+        ? queueGoalSafetyReset(
+            previousStatus === "active" ? transitionedGoal : rebaseGoalUsage(transitionedGoal, currentTokenTotal(ctx)),
+          )
+        : transitionedGoal;
     const goalToolVisibilityBeforeActivation =
       nextGoal.status === "active" ? this.runtime.toolPolicy.snapshot() : undefined;
     if (nextGoal.status === "active") {
@@ -602,7 +678,7 @@ export class GoalCommandController {
       this.reportGoalStatus(ctx, message);
       return;
     }
-    if (!this.runtime.queueFrozen) {
+    if (!this.runtime.queueFrozen && this.runtime.activeGoal.status === "active") {
       this.runtime.recordGoalUsage(this.runtime.activeGoal, ctx);
       this.runtime.persistGoal(this.runtime.activeGoal);
       this.runtime.updateStatus(ctx, this.runtime.activeGoal);
@@ -668,6 +744,7 @@ export class GoalCommandController {
           this.runtime.pauseGoalForUnavailableTools(ctx, true, !displacedUsageFinalized);
         } else {
           this.runtime.persistGoal(currentGoal);
+          this.runtime.scheduleGoalWaitWake(ctx);
         }
       }
       return false;
@@ -713,6 +790,7 @@ export class GoalCommandController {
         this.runtime.updateStatus(ctx, this.runtime.activeGoal);
       }
       this.runtime.toolPolicy.restore(visibilityBeforeActivation);
+      this.runtime.scheduleGoalWaitWake(ctx);
       return false;
     }
     notifyTerminal(ctx.ui, `Goal prioritized: ${objective}`, "info");

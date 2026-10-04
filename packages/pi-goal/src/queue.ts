@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { checkpointGoalActiveTime } from "./accounting.js";
+import { checkpointGoalActiveTime, rebaseGoalUsage } from "./accounting.js";
 import type { ActiveGoal, PendingQueueAction } from "./persistence.js";
 import { resetGoalSafetyEpoch } from "./safety.js";
 
@@ -83,8 +83,7 @@ export function shelveGoal(goal: ActiveGoal, now = Date.now()): ActiveGoal {
 
 export function activateQueuedGoal(goal: ActiveGoal, currentTokenTotal: number, now = Date.now()): ActiveGoal {
   const rebased = {
-    ...goal,
-    baselineTokens: Math.max(0, currentTokenTotal - goal.tokensUsed),
+    ...rebaseGoalUsage(goal, currentTokenTotal),
     activeStartedAt: undefined,
     updatedAt: now,
   };

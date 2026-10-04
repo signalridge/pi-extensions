@@ -241,6 +241,19 @@ test("wait persistence distinguishes waiting from old pauses and rejects malform
   }
 });
 
+test("compacted usage offsets survive session persistence", () => {
+  const goal = { ...active, status: "paused" as const, usageOffset: 9_900, tokensUsed: 10_000, baselineTokens: 0 };
+  const loaded = loadGoalStateFromSession(
+    branch({ customType: "goal-state", data: JSON.parse(JSON.stringify(serializeGoalState(goal, [], undefined))) }),
+  );
+  assert.equal(loaded.goal?.usageOffset, 9_900);
+  assert.equal(loaded.goal?.tokensUsed, 10_000);
+  const malformed = loadGoalStateFromSession(
+    branch({ customType: "goal-state", data: { goal: { ...goal, usageOffset: 20_000 } } }),
+  );
+  assert.equal(malformed.goal?.usageOffset, undefined);
+});
+
 test("malformed canonical or plural queue state fails closed", () => {
   for (const [customType, data] of [
     ["goal-state", { goal: { ...active, id: "" } }],

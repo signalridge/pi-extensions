@@ -23,6 +23,9 @@ export interface ActiveGoal {
   tokensUsed: number;
   timeUsedSeconds: number;
   baselineTokens: number;
+  usageOffset?: number;
+  /** A preceding run still owns usage after this activation checkpoint. */
+  usageBaselinePending?: boolean;
   activeStartedAt?: number;
   automaticModelTurns: number;
   toolFreeRepeatCount: number;
@@ -221,6 +224,11 @@ export function normalizeLoadedGoal(goal: ActiveGoal): ActiveGoal {
     tokensUsed: nonNegativeFiniteNumber(goal.tokensUsed),
     timeUsedSeconds: nonNegativeFiniteNumber(goal.timeUsedSeconds),
     baselineTokens: nonNegativeFiniteNumber(goal.baselineTokens),
+    usageOffset:
+      isNonNegativeFiniteNumber(goal.usageOffset) && goal.usageOffset <= nonNegativeFiniteNumber(goal.tokensUsed)
+        ? goal.usageOffset
+        : undefined,
+    usageBaselinePending: goal.usageBaselinePending === true ? true : undefined,
     activeStartedAt: goal.status === "active" ? now : undefined,
     automaticModelTurns: normalizeSafetyCounter(goal.automaticModelTurns),
     toolFreeRepeatCount: normalizeSafetyCounter(goal.toolFreeRepeatCount),
