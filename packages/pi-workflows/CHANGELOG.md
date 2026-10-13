@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.9.0
+### Minor Changes
+
+- 2c7f8f1: Add live, keyboard-controllable workflow inspection with stable run selection, phase and call drill-down, bounded result views, and state-aware pause/resume/stop controls. Retain authoritative observed progress separately from durable journal facts, and preserve named nested-workflow resolution when resuming from controls or provider recovery.
+
+### Patch Changes
+
+- Updated dependencies [2c7f8f1]
+  - @signalridge/pi-subagents-protocol@1.6.0
+
 ## 1.8.0
 ### Minor Changes
 

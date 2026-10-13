@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.0
+### Minor Changes
+
+- 2c7f8f1: Add optional workflow UI snapshot, query, and explicit user open-action contracts with strict detached payload parsers and exact owned-conversation attempt identity. Keep managed protocol v4 channels, capabilities, and handshake envelopes unchanged.
+
 ## 1.5.1
 ### Patch Changes
 
