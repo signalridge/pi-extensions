@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JobEvent, JobManager, JobSnapshot, StartOptions } from "../src/contracts.js";
 import extension from "../src/extension.js";
@@ -98,6 +99,7 @@ function harness(mode = "tui") {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const commands = new Map<string, { handler(args: string, ctx: ExtensionContext): Promise<void> }>();
+  const shortcuts = new Map<string, { description: string; handler(ctx: ExtensionContext): Promise<void> }>();
   let idle = true;
   let pending = false;
   let sessionId = "session-a";
@@ -143,6 +145,8 @@ function harness(mode = "tui") {
     registerTool: (tool: Tool) => tools.set(tool.name, tool),
     registerCommand: (name: string, command: { handler(args: string, ctx: ExtensionContext): Promise<void> }) =>
       commands.set(name, command),
+    registerShortcut: (key: string, shortcut: { description: string; handler(ctx: ExtensionContext): Promise<void> }) =>
+      shortcuts.set(key, shortcut),
     on: (event: string, handler: Handler) => handlers.set(event, handler),
     sendUserMessage: (text: string) => {
       userMessages.push(text);
@@ -164,6 +168,7 @@ function harness(mode = "tui") {
     ctx,
     tools,
     commands,
+    shortcuts,
     messages,
     userMessages,
     setBranch: (ids: string[]) => {
@@ -555,18 +560,18 @@ describe("extension lifecycle", () => {
     try {
       await h.emit("session_start");
       await h.tools.get("bash_background")?.execute("call", { command: "sleep 1" }, undefined, undefined, h.ctx);
-      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "1 running · 0 finished");
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R1 F0");
       const opening = h.commands.get("background")?.handler("", h.ctx);
       await vi.waitFor(() => expect(native.component()).toBeDefined());
       native.key("x");
       native.key("y");
       await vi.waitFor(() => expect(fake.managers[0].manager.get("job-0").endedAt).toBeDefined());
       await vi.waitFor(() =>
-        expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished"),
+        expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R0 F1"),
       );
       native.key("\x1b");
       await opening;
-      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "0 running · 1 finished");
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R0 F1");
     } finally {
       await h.emit("session_shutdown");
       native.dispose();
@@ -607,6 +612,97 @@ describe("extension lifecycle", () => {
       await h.emit("session_shutdown");
       native.dispose();
     }
+  });
+
+  it("opens an empty selector from the shortcut and ignores repeated entry during construction or viewing", async () => {
+    const native = nativeUIFixture();
+    const h = harness();
+    Object.defineProperty(h.ctx, "ui", { value: native.ui });
+    const shortcut = h.shortcuts.get("ctrl+alt+b");
+    expect(shortcut?.description).toBe("Open background task selector");
+    try {
+      await shortcut?.handler(h.ctx); // No session owner yet.
+      expect(native.custom).not.toHaveBeenCalled();
+      await h.emit("session_start");
+      expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", undefined);
+      h.setWaitForIdle(() => {
+        throw new Error("Navigation must not wait for idle");
+      });
+      h.setIdle(false); // Opening is still safe during independent agent work.
+      const opening = shortcut?.handler(h.ctx);
+      await shortcut?.handler(h.ctx); // Deferred import not mounted yet.
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      const view = native.component();
+      expect(native.render().join("\n")).toContain("No background jobs");
+      await shortcut?.handler(h.ctx);
+      expect(native.component()).toBe(view);
+      expect(native.custom).toHaveBeenCalledOnce();
+      expect(fake.managers[0].manager.start).not.toHaveBeenCalled();
+      expect(h.messages).toEqual([]);
+      expect(h.userMessages).toEqual([]);
+      native.key("\x1b");
+      await opening;
+      expect(fake.managers[0].listeners.size).toBe(0);
+      // Both entrypoints keep the same owned stop/cancel/status/retirement path.
+      await h.tools.get("bash_background")?.execute("start", { command: "sleep 1" }, undefined, undefined, h.ctx);
+      fake.managers[0].emit(event());
+      const second = shortcut?.handler(h.ctx);
+      await vi.waitFor(() => expect(native.component()).toBeDefined());
+      native.key("x");
+      native.key("y");
+      await vi.waitFor(() => expect(fake.managers[0].manager.get("job-0").endedAt).toBeDefined());
+      await vi.waitFor(() =>
+        expect(native.ui.setStatus).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R0 F1"),
+      );
+      expect(
+        (await h.tools.get("background_list")?.execute("list", {}, undefined, undefined, h.ctx))?.details
+          .pendingNotifications,
+      ).toBe(0);
+      await h.emit("session_tree");
+      await second;
+      expect(native.component()).toBeUndefined();
+      expect(fake.managers[0].listeners.size).toBe(0);
+      h.setBranch(["diverged"]);
+      await shortcut?.handler(h.ctx);
+      expect(native.custom).toHaveBeenCalledTimes(2);
+    } finally {
+      await h.emit("session_shutdown");
+      native.dispose();
+    }
+  });
+
+  it("shows a bounded plain keyboard hint for pending-only status, but keeps the empty owner quiet", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.emit("session_start");
+    expect(h.status).toHaveBeenLastCalledWith("pi-background", undefined);
+    h.setIdle(false);
+    fake.managers[0].emit({ ...event(), description: "\x1b]52;c;untrusted\x07\n" });
+    expect(h.status).toHaveBeenLastCalledWith("pi-background", "Ctrl+Alt+B tasks · R0 F0 P1");
+    expect(String(h.status.mock.lastCall?.[1])).not.toContain("\x1b");
+    expect(String(h.status.mock.lastCall?.[1])).not.toContain("\n");
+    expect(truncateToWidth(String(h.status.mock.lastCall?.[1]), 40)).toContain("P1");
+    h.setAcceptWake(false);
+    h.setIdle(true);
+    await h.emit("agent_settled");
+    vi.advanceTimersByTime(2000); // Deliver the debounced wake before its ACK deadline.
+    vi.advanceTimersByTime(30_000);
+    const visible = truncateToWidth(String(h.status.mock.lastCall?.[1]), 40);
+    expect(visible).toContain("P1");
+    expect(visible).toContain("PAUSED");
+    await h.emit("session_shutdown");
+    expect(h.status).toHaveBeenLastCalledWith("pi-background", undefined);
+  });
+
+  it.each(["rpc", "json", "print", "tui"])("shortcut is inert without terminal UI (%s)", async (mode) => {
+    const h = harness(mode);
+    if (mode === "tui") Object.defineProperty(h.ctx, "hasUI", { value: false });
+    await h.emit("session_start");
+    await h.shortcuts.get("ctrl+alt+b")?.handler(h.ctx);
+    expect(h.custom).not.toHaveBeenCalled();
+    expect(h.messages).toEqual([]);
+    expect(fake.managers.at(-1)?.manager.start).not.toHaveBeenCalled();
+    await h.emit("session_shutdown");
   });
 
   it("does not call custom UI in TUI mode without hasUI", async () => {

@@ -31,6 +31,7 @@
     "@sinclair/typebox": "*"
   },
   "dependencies": {
+    "@signalridge/pi-approval-core": "^1.2.0",
     "croner": "^10.0.1",
     "@signalridge/pi-subagents-protocol": "^1.6.0",
     "@signalridge/pi-ui": "^1.4.0",

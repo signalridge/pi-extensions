@@ -177,8 +177,14 @@ Publishable, but install them deliberately rather than as part of a default set.
 
 Marked `piExtension.lifecycle: experimental`, which keeps them out of a release
 unless a changeset names them: `pi-recall`, `pi-codex-compact`, `pi-analytics`,
-and [`pi-background`](packages/pi-background/README.md) (session-owned background
-shell jobs and event-driven log monitors; local macOS/Linux only).
+[`pi-background`](packages/pi-background/README.md) (session-owned background
+shell jobs and event-driven log monitors; local macOS/Linux only), and
+[`pi-todo`](packages/pi-todo/README.md) (revisioned, branch-local checklists with
+explicit manual controls; not a project backlog or execution scheduler),
+[`pi-approvals`](packages/pi-approvals/README.md) (per-operation reviewed local
+writes/edits and commands; opt-in adapters, not an OS sandbox), and
+[`pi-sessions`](packages/pi-sessions/README.md) (human-owned history navigation
+and editable linked-session handoff; destination draft only, never auto-send).
 
 ### Libraries
 
@@ -189,6 +195,7 @@ as ordinary npm dependencies — never listed in Pi's extension package map.
 | --- | --- |
 | `pi-subagents-protocol` | Side-effect-free wire contracts for the managed subagent protocol |
 | `pi-ui` | Side-effect-free bordered UI, inert display encoding and opt-in public custom-editor preservation adapters |
+| `pi-approval-core` | Side-effect-free local approval contracts, cooperative-adapter validation and reviewed native-tool factories; no Pi resources |
 
 ## Boundaries
 
@@ -243,4 +250,5 @@ See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 ## Reference reviews
 
 - [Community extension survey](docs/community-extension-survey.md): Todo/checklist alternatives, project task ledgers, and additive plugin patterns with primary-source links and compatibility caveats.
+- [Task and human-control acceptance ledger](docs/task-human-controls.md): implementation scope, verified evidence and remaining release gates; not a publication claim.
 - [Workflow and subagent UI synchronization](docs/workflow-ui-upstream-sync.md): selective upstream adoption, interactive ownership and verification boundaries.

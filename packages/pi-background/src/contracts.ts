@@ -52,7 +52,8 @@ export interface JobEvent {
 export interface JobManager {
   /** Local UI invalidation only; never a model wake. Unsubscribe is idempotent. */
   subscribe(listener: () => void): () => void;
-  start(options: StartOptions, signal?: AbortSignal): Promise<JobSnapshot>;
+  /** Invocation-local synchronous guard, checked after stat and just before run dispatch. */
+  start(options: StartOptions, signal?: AbortSignal, launchGuard?: () => void): Promise<JobSnapshot>;
   watch(id: string, options: WatchOptions): JobSnapshot;
   list(): JobSnapshot[];
   get(id: string): JobSnapshot;

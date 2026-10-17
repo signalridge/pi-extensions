@@ -50,6 +50,44 @@
         "@earendil-works/pi-coding-agent": "*",
       },
     },
+    "packages/pi-approval-core": {
+      "name": "@signalridge/pi-approval-core",
+      "version": "1.2.0",
+      "devDependencies": {
+        "@biomejs/biome": "^2.5.7",
+        "@earendil-works/pi-coding-agent": "1.0.4",
+        "@types/node": "^24.10.0",
+        "typebox": "1.3.27",
+        "typescript": "^6.0.0",
+        "vitest": "^4.1.11",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "typebox": "*",
+      },
+    },
+    "packages/pi-approvals": {
+      "name": "@signalridge/pi-approvals",
+      "version": "1.2.0",
+      "dependencies": {
+        "@signalridge/pi-approval-core": "^1.2.0",
+      },
+      "devDependencies": {
+        "@biomejs/biome": "^2.5.7",
+        "@earendil-works/pi-ai": "1.0.4",
+        "@earendil-works/pi-coding-agent": "1.0.4",
+        "@earendil-works/pi-tui": "1.0.4",
+        "@types/node": "^24.10.0",
+        "typebox": "1.3.27",
+        "typescript": "^6.0.0",
+        "vitest": "^4.1.11",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "typebox": "*",
+      },
+    },
     "packages/pi-ask-user-question": {
       "name": "@signalridge/pi-ask-user-question",
       "version": "1.3.5",
@@ -70,6 +108,9 @@
     "packages/pi-background": {
       "name": "@signalridge/pi-background",
       "version": "1.4.0",
+      "dependencies": {
+        "@signalridge/pi-approval-core": "^1.2.0",
+      },
       "devDependencies": {
         "@earendil-works/pi-ai": "1.0.4",
         "@earendil-works/pi-coding-agent": "1.0.4",
@@ -299,6 +340,20 @@
         "@earendil-works/pi-tui": "*",
       },
     },
+    "packages/pi-sessions": {
+      "name": "@signalridge/pi-sessions",
+      "version": "1.2.0",
+      "devDependencies": {
+        "@earendil-works/pi-ai": "1.0.4",
+        "@earendil-works/pi-coding-agent": "1.0.4",
+        "@earendil-works/pi-tui": "1.0.4",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-ai": "*",
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+      },
+    },
     "packages/pi-stamp": {
       "name": "@signalridge/pi-stamp",
       "version": "1.3.3",
@@ -343,8 +398,9 @@
       "name": "@signalridge/pi-subagents",
       "version": "1.13.0",
       "dependencies": {
-        "@signalridge/pi-subagents-protocol": "^1.5.1",
-        "@signalridge/pi-ui": "^1.3.3",
+        "@signalridge/pi-approval-core": "^1.2.0",
+        "@signalridge/pi-subagents-protocol": "^1.6.0",
+        "@signalridge/pi-ui": "^1.4.0",
         "croner": "^10.0.1",
         "minimatch": "^10.2.6",
         "nanoid": "^5.1.16",
@@ -384,6 +440,19 @@
         "@earendil-works/pi-agent-core": "*",
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
+      },
+    },
+    "packages/pi-todo": {
+      "name": "@signalridge/pi-todo",
+      "version": "1.2.0",
+      "devDependencies": {
+        "@earendil-works/pi-ai": "1.0.4",
+        "@earendil-works/pi-coding-agent": "1.0.4",
+      },
+      "peerDependencies": {
+        "@earendil-works/pi-coding-agent": "*",
+        "@earendil-works/pi-tui": "*",
+        "typebox": "*",
       },
     },
     "packages/pi-ui": {
@@ -709,6 +778,10 @@
 
     "@signalridge/pi-analytics": ["@signalridge/pi-analytics@workspace:packages/pi-analytics"],
 
+    "@signalridge/pi-approval-core": ["@signalridge/pi-approval-core@workspace:packages/pi-approval-core"],
+
+    "@signalridge/pi-approvals": ["@signalridge/pi-approvals@workspace:packages/pi-approvals"],
+
     "@signalridge/pi-ask-user-question": ["@signalridge/pi-ask-user-question@workspace:packages/pi-ask-user-question"],
 
     "@signalridge/pi-background": ["@signalridge/pi-background@workspace:packages/pi-background"],
@@ -743,6 +816,8 @@
 
     "@signalridge/pi-session-recap": ["@signalridge/pi-session-recap@workspace:packages/pi-session-recap"],
 
+    "@signalridge/pi-sessions": ["@signalridge/pi-sessions@workspace:packages/pi-sessions"],
+
     "@signalridge/pi-stamp": ["@signalridge/pi-stamp@workspace:packages/pi-stamp"],
 
     "@signalridge/pi-statusline": ["@signalridge/pi-statusline@workspace:packages/pi-statusline"],
@@ -752,6 +827,8 @@
     "@signalridge/pi-subagents-protocol": ["@signalridge/pi-subagents-protocol@workspace:packages/pi-subagents-protocol"],
 
     "@signalridge/pi-tab-status": ["@signalridge/pi-tab-status@workspace:packages/pi-tab-status"],
+
+    "@signalridge/pi-todo": ["@signalridge/pi-todo@workspace:packages/pi-todo"],
 
     "@signalridge/pi-ui": ["@signalridge/pi-ui@workspace:packages/pi-ui"],
 

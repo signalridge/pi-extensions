@@ -9,20 +9,10 @@
  *  - pre-v4 journals are quarantined on restore
  */
 
-import { setTimeout as realDelay } from "node:timers/promises";
+import * as childProcess from "node:child_process";
+import { clearTimeout as realClearTimeout, setTimeout as realSetTimeout } from "node:timers";
 import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
-import { describe, expect, it, vi as vitest } from "vitest";
-
-// Advance engine clocks only after real helper I/O has had a turn, then flush
-// its replies. Helper execution is intentionally not governed by fake timers.
-const vi = {
-  ...vitest,
-  async advanceTimersByTimeAsync(ms: number) {
-    await realDelay(150);
-    await vitest.advanceTimersByTimeAsync(ms);
-    await realDelay(150);
-  },
-};
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { WorkflowEngine } from "../src/engine.js";
 import { deriveRecoveryId, JOURNAL_ENTRY_TYPE, JOURNAL_SCHEMA_VERSION, type JournalEvent } from "../src/journal.js";
@@ -34,10 +24,63 @@ import {
   type WorkflowEventBus,
 } from "../src/rpc-client.js";
 
-// These tests previously used a same-thread setImmediate as a VM flush. A Node
-// execution frame needs real I/O turns (also while engine timers are faked).
-function setImmediate(callback: () => void): void {
-  void realDelay(150).then(callback);
+// Observe real child handles without replacing their process behavior.
+const { closedHelpers, openHelpers } = vi.hoisted(() => ({
+  closedHelpers: new WeakSet<object>(),
+  openHelpers: new Set<childProcess.ChildProcess>(),
+}));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof childProcess>();
+  return {
+    ...actual,
+    spawn: vi.fn((...args: Parameters<typeof actual.spawn>) => {
+      const helper = actual.spawn(...args);
+      openHelpers.add(helper);
+      helper.once("close", () => {
+        closedHelpers.add(helper);
+        openHelpers.delete(helper);
+      });
+      return helper;
+    }),
+  };
+});
+
+// Helper IPC is real I/O, even when the engine's deadlines use fake timers.
+// Retry the actual boundary assertion without advancing any engine clocks. Both
+// timers belong to this wait and are cleared on success or assertion timeout.
+function waitForObserved(assertion: () => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let retry: ReturnType<typeof realSetTimeout> | undefined;
+    let lastError: unknown;
+    const deadline = realSetTimeout(() => {
+      realClearTimeout(retry);
+      reject(lastError);
+    }, 3_000);
+    const check = () => {
+      try {
+        assertion();
+        realClearTimeout(deadline);
+        realClearTimeout(retry);
+        resolve();
+      } catch (error) {
+        lastError = error;
+        retry = realSetTimeout(check, 10);
+      }
+    };
+    check();
+  });
+}
+
+const engines = new Set<WorkflowEngine>();
+afterEach(async () => {
+  for (const engine of engines) engine.dispose();
+  engines.clear();
+  await waitForObserved(() => expect(openHelpers.size).toBe(0));
+});
+
+function trackEngine(engine: WorkflowEngine): WorkflowEngine {
+  engines.add(engine);
+  return engine;
 }
 
 function makeBus(): WorkflowEventBus {
@@ -217,17 +260,19 @@ function makeEngine(
   const bus = makeBus();
   const client = makeClient(bus, opts);
   const entries: unknown[] = [];
-  const engine = new WorkflowEngine(
-    bus,
-    client,
-    {
-      append(event: JournalEvent) {
-        entries.push(event);
+  const engine = trackEngine(
+    new WorkflowEngine(
+      bus,
+      client,
+      {
+        append(event: JournalEvent) {
+          entries.push(event);
+        },
       },
-    },
-    undefined,
-    undefined,
-    cwd,
+      undefined,
+      undefined,
+      cwd,
+    ),
   );
   return { engine, client, entries, bus };
 }
@@ -242,10 +287,13 @@ const a = await agent("first");
 const b = await agent("second");
 return [a, b];`;
 
-/** Complete every in-flight agent and let the engine settle. */
-async function completeAllInflight(client: FakeClient): Promise<void> {
-  await new Promise((resolve) => setImmediate(resolve));
-  void client;
+/** A dispatch is ready only once its spawn reply has registered a lifecycle waiter. */
+async function waitForSpawn(engine: WorkflowEngine, client: FakeClient, count: number): Promise<void> {
+  await waitForObserved(() => {
+    expect(client.spawned).toHaveLength(count);
+    const latest = client.spawned[count - 1];
+    expect(engine.getState(latest.runId)?.agentWaiters.has(latest.id)).toBe(true);
+  });
 }
 
 describe("workflow engine", () => {
@@ -294,7 +342,7 @@ describe("workflow engine", () => {
       const pending = engine.start(`${header} void workflow("saved"); return 1;`, {
         loadSavedWorkflow: () => `${header} void parallel([()=>agent("child")]); return 2;`,
       });
-      await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+      await waitForSpawn(engine, client, 1);
       expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
       expect((entries as JournalEvent[]).some((event) => event.kind === "workflow_result")).toBe(false);
       client.complete(client.spawned[0].id, "child");
@@ -485,21 +533,22 @@ return await agent(JSON.stringify({ local: [cwd, process.cwd()], child }));`;
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     try {
       const started = await engine.start(script, { background: true });
-      await new Promise((resolve) => setImmediate(resolve));
+      await waitForObserved(() => expect(engine.getRun(started.runId)?.status).toBe("paused"));
       expect(engine.getRun(started.runId)?.status).toBe("paused");
       expect(client.spawned[0]?.task.prompt).toBe(expected);
       // The timer's resume has no caller supplying execution options.
       opts.spawnError = undefined;
       await vi.advanceTimersByTimeAsync(1_000);
+      await waitForSpawn(engine, client, 2);
       expect(client.spawned.at(-1)?.task.prompt).toBe(expected);
       await engine.control("pause", started.runId);
       // Nor does the control-command resume. Both replay the cached child.
       await engine.control("resume", started.runId, (entries as JournalEvent[]).map(asSessionEntry));
-      await new Promise((resolve) => setImmediate(resolve));
+      await waitForSpawn(engine, client, 3);
       expect(client.spawned).toHaveLength(3);
       expect(client.spawned.at(-1)?.task.prompt).toBe(expected);
       client.complete(client.spawned.at(-1)?.id ?? "", "done");
-      await new Promise((resolve) => setImmediate(resolve));
+      await waitForObserved(() => expect(engine.getRun(started.runId)?.status).toBe("completed"));
       expect(engine.getRun(started.runId)?.status).toBe("completed");
     } finally {
       engine.dispose();
@@ -522,14 +571,14 @@ return await agent(JSON.stringify({ local: [cwd, process.cwd()], child }));`;
 
     protocolAvailable = true;
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     await engine.control("pause", started.runId);
     const spawnCount = client.spawned.length;
 
     protocolAvailable = false;
     await expect(engine.resume(started.runId, [], { background: true })).rejects.toThrow("protocol unavailable");
     expect(client.spawned).toHaveLength(spawnCount);
-    expect(engine.getRun(started.runId)?.status).toBe("interrupted");
+    expect(engine.getRun(started.runId)?.status, engine.getRun(started.runId)?.error).toBe("interrupted");
     engine.dispose();
   });
 
@@ -550,15 +599,15 @@ await agent("first", { strength: "low" });
 await agent("second", { strength: "low" });
 return 0;`;
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     client.complete(client.spawned[0]?.id ?? "", "first result");
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 2);
     await engine.control("pause", started.runId);
     const beforeResume = client.spawned.length;
     thinking = "high";
     const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     await engine.resume(started.runId, sessionEntries, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, beforeResume + 1);
     expect(client.spawned.length).toBe(beforeResume + 1);
     expect(client.spawned.at(-1)?.nodeId).toBe("call-0");
     await engine.control("stop", started.runId);
@@ -578,17 +627,17 @@ await agent("first", { strength: "low" });
 await agent("second", { strength: "low" });
 return 0;`;
     const started = await engine.start(script, { background: true, strengths: { low: "high" } });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned[0]?.task.tier).toBe("high");
 
     client.complete(client.spawned[0]?.id ?? "", "first result");
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 2);
     await engine.control("pause", started.runId);
     const beforeResume = client.spawned.length;
 
     // No options: this is the path a user takes through /workflows resume.
     await engine.control("resume", started.runId, (entries as JournalEvent[]).map(asSessionEntry));
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, beforeResume + 1);
 
     // One new dispatch, not two: the first call replayed from the journal
     // because its identity still resolves to the same tier.
@@ -612,13 +661,15 @@ return 0;`;
         `export const meta = { name: "provider-strength", description: "p" };\nreturn await agent("work", { strength: "low" });`,
         { background: true, strengths: { low: "low" } },
       );
-      await new Promise((resolve) => setImmediate(resolve));
+      await waitForObserved(() => expect(engine.getRun(started.runId)?.status).toBe("paused"));
       expect(engine.getRun(started.runId)?.status).toBe("paused");
       expect(client.spawned[0]?.task.tier).toBe("low");
 
       // The edit a user makes while the run sits rate-limit-paused.
       engine.strengths = () => ({ low: "custom-small" });
       await vi.advanceTimersByTimeAsync(1_000);
+      await waitForObserved(() => expect(client.spawned.length).toBeGreaterThan(1));
+      await waitForObserved(() => expect(engine.getRun(started.runId)?.status).toBe("paused"));
 
       expect(client.spawned.length).toBeGreaterThan(1);
       expect(client.spawned.at(-1)?.task.tier).toBe("custom-small");
@@ -657,7 +708,7 @@ return 0;`;
         `export const meta = { name: "provider-limit", description: "p" };\nreturn await agent("work");`,
         { background: true },
       );
-      await new Promise((resolve) => setImmediate(resolve));
+      await waitForObserved(() => expect(engine.getRun(started.runId)?.status).toBe("paused"));
       expect(engine.getRun(started.runId)?.status).toBe("paused");
 
       protocolAvailable = false;
@@ -773,7 +824,8 @@ return await workflow("child", { payload: { tag: "original" } });`;
 return await agent("tag=" + args.payload.tag);`
           : undefined,
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(uiTag).toBe("original"));
+    await waitForSpawn(engine, client, 1);
     expect(uiTag).toBe("original");
     expect(client.spawned[0]?.task.prompt).toBe("tag=original");
     client.complete(client.spawned[0]?.id ?? "", "done");
@@ -791,7 +843,7 @@ return await workflow("child");`;
           ? `export const meta = { name: "child", description: "c" };\nreturn await agent("child work");`
           : undefined,
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned[0]?.nodeId).toMatch(new RegExp(`^call-${started.runId}-nested-call-0-g1-[0-9a-f-]+:0$`));
     client.complete(client.spawned[0]?.id ?? "", "child result");
     const run = await engine.waitFor(started.runId);
@@ -839,7 +891,7 @@ return await workflow("child");`;
     const { engine, client } = makeEngine({ manual: true });
     const script = `export const meta = { name: "pending", description: "p" };\nreturn await agent("work");`;
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
 
     expect(client.spawned).toHaveLength(1);
     expect(engine.getState(started.runId)?.agentWaiters.size).toBe(1);
@@ -857,12 +909,12 @@ return await workflow("child");`;
     expect(started.status).toBe("running");
     // Agents run sequentially: complete the first in-flight agent, then the
     // second one dispatches. Drain both.
-    await new Promise((resolve) => setImmediate(resolve));
     for (let step = 0; step < 2; step++) {
+      await waitForSpawn(engine, client, step + 1);
       const state = engine.getState(started.runId);
       const ids = [...(state?.agentWaiters.keys() ?? [])];
-      if (ids.length > 0) client.complete(ids[0], `r${step}`);
-      await new Promise((resolve) => setImmediate(resolve));
+      expect(ids).toEqual([client.spawned[step].id]);
+      client.complete(ids[0], `r${step}`);
     }
     const run = await engine.waitFor(started.runId);
     expect(run.status).toBe("completed");
@@ -871,7 +923,7 @@ return await workflow("child");`;
   it("pause aborts execution, stops the owned agent, and leaves the run interrupted", async () => {
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     await engine.control("pause", started.runId);
     const state = engine.getState(started.runId);
     expect(state?.run.status).toBe("interrupted");
@@ -885,10 +937,10 @@ return await workflow("child");`;
       identityBeforeReply: { tier: "high" },
     });
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     await engine.control("pause", started.runId);
     await engine.resume(started.runId, [], { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 2);
     expect(client.spawned).toHaveLength(2);
 
     await engine.control("stop", started.runId);
@@ -903,7 +955,7 @@ return await workflow("child");`;
       identityBeforeReply: { tier: "custom-small" },
     });
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     client.fail(client.spawned[0].id, "stopped");
     const run = await engine.waitFor(started.runId);
     expect(run.callResults["0"]?.status).toBe("stopped");
@@ -918,7 +970,7 @@ return await workflow("child");`;
     const script = `export const meta = { name: "failed", description: "f" };\nawait agent("work");\nreturn 0;`;
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     client.fail(client.spawned[0].id, "error");
     const run = await engine.waitFor(started.runId);
     expect(run.callResults["0"]?.status).toBe("failed");
@@ -928,7 +980,7 @@ return await workflow("child");`;
   it("suspends and aborts old branch runs before quiescence awaits", async () => {
     const { engine, client, entries } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     const quiescing = engine.quiesceForBranchChange();
     const oldState = engine.getState(started.runId);
     expect(oldState?.lifecycleSuspended).toBe(true);
@@ -949,7 +1001,7 @@ return await workflow("child");`;
       'export const meta = { name: "detached", description: "test" }; return await agent("work");',
       { background: true, signal: invocation.signal },
     );
-    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    await waitForObserved(() => expect(client.spawned).toHaveLength(1));
     const waiter = new AbortController();
     const waiting = engine.waitFor(started.runId, waiter.signal);
     const rejected = expect(waiting).rejects.toThrow();
@@ -1000,18 +1052,18 @@ return await workflow("child");`;
           data: { settled: true, pending: [] },
         });
     });
-    const engine = new WorkflowEngine(bus, client, { append() {} });
+    const engine = trackEngine(new WorkflowEngine(bus, client, { append() {} }));
     const invocation = new AbortController();
     let returned = false;
     const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((value) => {
       returned = true;
       return value;
     });
-    await vi.waitFor(() => expect(dispatched).toBe(1));
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(dispatched).toBe(1));
+    await waitForObserved(() => expect(engine.getState(engine.list()[0].runId)?.agentWaiters.size).toBe(1));
     session.abort();
     invocation.abort();
-    await vi.waitFor(() => expect(releaseCleanup).toBeTypeOf("function"));
+    await waitForObserved(() => expect(releaseCleanup).toBeTypeOf("function"));
     expect(stopped).toBe(true);
     expect(returned).toBe(false);
     const runId = engine.list()[0].runId;
@@ -1082,16 +1134,16 @@ return await workflow("child");`;
         });
     });
     const entries: JournalEvent[] = [];
-    const engine = new WorkflowEngine(bus, client, { append: (entry) => entries.push(entry) });
+    const engine = trackEngine(new WorkflowEngine(bus, client, { append: (entry) => entries.push(entry) }));
     const invocation = new AbortController();
     let returned = false;
     const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal }).then((value) => {
       returned = true;
       return value;
     });
-    await vi.waitFor(() => expect(allocation).toBeDefined());
+    await waitForObserved(() => expect(allocation).toBeDefined());
     invocation.abort();
-    await vi.waitFor(() => expect(releaseCleanup).toBeTypeOf("function"));
+    await waitForObserved(() => expect(releaseCleanup).toBeTypeOf("function"));
     expect(reconciliations).toBeGreaterThan(0);
     expect(returned).toBe(false);
     const runId = engine.list()[0].runId;
@@ -1124,7 +1176,7 @@ return await workflow("child");`;
     client.quiesceOwned = quiesce;
     const invocation = new AbortController();
     const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
-    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    await waitForObserved(() => expect(client.spawned).toHaveLength(1));
     invocation.abort();
     const result = await pending;
     expect(result.status).toBe("interrupted");
@@ -1153,9 +1205,9 @@ return await workflow("child");`;
       returned = true;
       return result;
     });
-    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    await waitForObserved(() => expect(client.spawned).toHaveLength(1));
     invocation.abort();
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(client.stopped).toEqual([client.spawned[0].id]));
     expect(returned).toBe(false);
     expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
     expect(client.stopped).toEqual([client.spawned[0].id]); // immediate RPC acknowledgement
@@ -1211,10 +1263,10 @@ return await workflow("child");`;
         returned = true;
         return value;
       });
-      await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+      await waitForObserved(() => expect(client.spawned).toHaveLength(1));
       invocation.abort();
       acknowledge();
-      await vi.waitFor(() => expect(quiescing).toBe(true));
+      await waitForObserved(() => expect(quiescing).toBe(true));
       expect(returned).toBe(false);
       expect(await engine.resume(client.spawned[0].runId, [])).toBeUndefined();
       finishCleanup();
@@ -1227,10 +1279,10 @@ return await workflow("child");`;
   it.each(["foreground", "pause"])("bounds %s drain of an arbitrary unresolved script promise", async (mode) => {
     const { engine, entries } = makeEngine();
     const signal = new AbortController();
-    const script = `export const meta = { name: "never", description: "d" }; await new Promise(() => {});`;
+    const script = `export const meta = { name: "never", description: "d" }; phase("waiting"); await new Promise(() => {});`;
     let returned = false;
     const pending = engine.start(script, { background: mode === "pause", signal: signal.signal });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(engine.getInspection(engine.list()[0].runId)?.currentPhase).toBe("waiting"));
     vi.useFakeTimers();
     try {
       const runId = engine.list()[0].runId;
@@ -1239,10 +1291,12 @@ return await workflow("child");`;
         returned = true;
       });
       signal.abort();
+      // Let real process-close I/O win before testing the outer engine deadline.
+      await waitForObserved(() => expect(returned).toBe(true));
       await vi.advanceTimersByTimeAsync(12_000);
       expect(returned).toBe(true);
       expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
-      expect(engine.getRun(runId)?.status).toBe("interrupted");
+      expect(engine.getRun(runId)?.status, engine.getRun(runId)?.error).toBe("interrupted");
       const resumed = await engine.resume(
         runId,
         (entries as JournalEvent[]).map(asSessionEntry),
@@ -1260,7 +1314,7 @@ return await workflow("child");`;
   it("foreground resume bounds unresolved helper execution and restores a resumable interruption", async () => {
     const { engine, client, entries } = makeEngine({ manual: true });
     const started = await engine.start(SIMPLE_SCRIPT, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     await engine.control("pause", started.runId);
     const controller = new AbortController();
     let returned = false;
@@ -1268,15 +1322,17 @@ return await workflow("child");`;
       started.runId,
       (entries as JournalEvent[]).map(asSessionEntry),
       { signal: controller.signal },
-      `export const meta = { name: "never-resume", description: "d" }; await new Promise(() => {}); await agent("late");`,
+      `export const meta = { name: "never-resume", description: "d" }; phase("resume-waiting"); await new Promise(() => {}); await agent("late");`,
     );
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(engine.getInspection(started.runId)?.currentPhase).toBe("resume-waiting"));
     vi.useFakeTimers();
     try {
       void pending.then(() => {
         returned = true;
       });
       controller.abort();
+      // Let real process-close I/O win before testing the outer engine deadline.
+      await waitForObserved(() => expect(returned).toBe(true));
       await vi.advanceTimersByTimeAsync(12_000);
       expect(returned).toBe(true);
       const count = client.spawned.length;
@@ -1285,7 +1341,7 @@ return await workflow("child");`;
       const persisted = (entries as JournalEvent[]).map(asSessionEntry);
       engine.restore(persisted);
       expect(engine.getRun(started.runId)?.nonResumable).not.toBe(true);
-      expect(engine.getRun(started.runId)?.status).toBe("interrupted");
+      expect(engine.getRun(started.runId)?.status, engine.getRun(started.runId)?.error).toBe("interrupted");
     } finally {
       engine.dispose();
       vi.useRealTimers();
@@ -1312,22 +1368,23 @@ return await workflow("child");`;
         return await agent("first", { timeoutMs: 100 });`,
         { background: mode === "pause", signal: invocation.signal },
       );
+      await waitForSpawn(engine, client, 1);
       await vi.advanceTimersByTimeAsync(101);
+      await waitForObserved(() => expect(cleaning).toBe(true));
       expect(cleaning).toBe(true);
       const runId = client.spawned[0].runId;
       const cancelled = mode === "pause" ? engine.control("pause", runId) : pending;
       if (mode === "foreground") invocation.abort();
       release();
-      await vi.advanceTimersByTimeAsync(1);
       await cancelled;
-      expect(engine.getRun(runId)?.status).toBe("interrupted");
+      expect(engine.getRun(runId)?.status, engine.getRun(runId)?.error).toBe("interrupted");
       expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
-      const resumed = engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry));
-      await vi.advanceTimersByTimeAsync(1);
-      expect(await resumed).toBeDefined();
+      const resumed = await engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry));
+      expect(resumed).toBeDefined();
+      await waitForSpawn(engine, client, 2);
       expect(client.spawned).toHaveLength(2);
       client.complete("agent-2", "resumed answer");
-      await vi.advanceTimersByTimeAsync(1);
+      await waitForObserved(() => expect(engine.getRun(runId)?.status).toBe("completed"));
       expect(engine.getRun(runId)?.status).toBe("completed");
     } finally {
       release();
@@ -1341,31 +1398,49 @@ return await workflow("child");`;
     async (nested) => {
       const { engine, client, entries } = makeEngine({ manual: true });
       let release = () => {};
+      let cleaning = false;
+      let releaseFailure!: () => void;
+      const failureGate = new Promise<boolean>((resolve) => {
+        releaseFailure = () => resolve(true);
+      });
+      const confirm = vi.fn(() => failureGate);
       const cleanup = new Promise<void>((resolve) => {
         release = resolve;
       });
       client.quiesceOwned = async () => {
+        cleaning = true;
         await cleanup;
         return { settled: true, pending: [] };
       };
       const body = `void agent("slow", { timeoutMs: 10 });
-      await new Promise(resolve => setTimeout(resolve, 20)); throw new Error("fatal script failure");`;
+      await checkpoint("release fatal failure"); throw new Error("fatal script failure");`;
       const child = `export const meta = { name: "fatal-child", description: "d" }; ${body}`;
       const script = `export const meta = { name: "fatal-root", description: "d" };
       ${nested ? `await workflow(${JSON.stringify(child)});` : body}`;
+      const firstHelper = vi.mocked(childProcess.spawn).mock.results.length;
       vi.useFakeTimers();
       try {
-        await engine.start(script, { background: true });
-        await vi.advanceTimersByTimeAsync(21);
+        await engine.start(script, { background: true, confirm });
+        await waitForSpawn(engine, client, 1);
+        await waitForObserved(() => expect(confirm).toHaveBeenCalledOnce());
+        await vi.advanceTimersByTimeAsync(11);
+        await waitForObserved(() => expect(cleaning).toBe(true));
         const runId = client.spawned[0].runId;
+        // Seal the VM's failure only after the real dispatch and pending cleanup
+        // are observed. Helper execution is not governed by the parent's clock.
+        releaseFailure();
+        await waitForObserved(() => {
+          const throwingHelper = vi.mocked(childProcess.spawn).mock.results[firstHelper + (nested ? 1 : 0)]?.value;
+          expect(throwingHelper).toBeDefined();
+          expect(closedHelpers.has(throwingHelper)).toBe(true);
+        });
         const paused = engine.control("pause", runId);
         release();
-        await vi.advanceTimersByTimeAsync(1);
         await paused;
         if (nested) {
           // A nested frame does not seal the root: its rejection has not crossed
           // the root's VM boundary yet. Pause terminates that pending root await.
-          expect(engine.getRun(runId)?.status).toBe("interrupted");
+          expect(engine.getRun(runId)?.status, engine.getRun(runId)?.error).toBe("interrupted");
           expect(engine.getRun(runId)?.nonResumable).not.toBe(true);
         } else {
           expect(engine.getRun(runId)?.status).toBe("failed");
@@ -1374,6 +1449,7 @@ return await workflow("child");`;
           ).rejects.toThrow(/cannot resume/);
         }
       } finally {
+        releaseFailure();
         release();
         engine.dispose();
         vi.useRealTimers();
@@ -1384,10 +1460,12 @@ return await workflow("child");`;
   it("pause during unconfirmed timeout cleanup remains non-resumable", async () => {
     const { engine, client, entries } = makeEngine({ manual: true });
     let release = () => {};
+    let cleaning = false;
     const cleanup = new Promise<void>((resolve) => {
       release = resolve;
     });
     client.quiesceOwned = async (_runId, ids) => {
+      cleaning = true;
       await cleanup;
       return { settled: false, pending: ids };
     };
@@ -1398,11 +1476,12 @@ return await workflow("child");`;
         await agent("slow", { timeoutMs: 10 });`,
         { background: true },
       );
+      await waitForSpawn(engine, client, 1);
       await vi.advanceTimersByTimeAsync(11);
+      await waitForObserved(() => expect(cleaning).toBe(true));
       const runId = client.spawned[0].runId;
       const paused = engine.control("pause", runId);
       release();
-      await vi.advanceTimersByTimeAsync(1);
       await paused;
       expect(engine.getRun(runId)?.nonResumable).toBe(true);
       await expect(engine.control("resume", runId, (entries as JournalEvent[]).map(asSessionEntry))).rejects.toThrow(
@@ -1418,9 +1497,11 @@ return await workflow("child");`;
   it("a final timed-out call cannot publish completion before cleanup", async () => {
     const { engine, client } = makeEngine({ manual: true });
     let release = () => {};
+    let cleaning = false;
     client.quiesceOwned = async () => {
       await new Promise<void>((resolve) => {
         release = resolve;
+        cleaning = true;
       });
       return { settled: true, pending: [] };
     };
@@ -1433,11 +1514,13 @@ return await workflow("child");`;
         .then(() => {
           returned = true;
         });
+      await waitForSpawn(engine, client, 1);
       await vi.advanceTimersByTimeAsync(20);
+      await waitForObserved(() => expect(cleaning).toBe(true));
       expect(returned).toBe(false);
       expect(engine.getRun(client.spawned[0].runId)?.status).toBe("running");
       release();
-      await vi.advanceTimersByTimeAsync(1);
+      await waitForObserved(() => expect(returned).toBe(true));
       expect(returned).toBe(true);
     } finally {
       release();
@@ -1449,10 +1532,12 @@ return await workflow("child");`;
   it("timeout cleanup fences a parallel sibling and releases foreground waiters", async () => {
     const { engine, client } = makeEngine({ manual: true });
     let release = () => {};
+    let cleaning = false;
     client.quiesceOwned = async (_runId, ids) => {
       if (ids[0] === "agent-1")
         await new Promise<void>((resolve) => {
           release = resolve;
+          cleaning = true;
         });
       return { settled: ids[0] !== "agent-1", pending: ids[0] === "agent-1" ? ids : [] };
     };
@@ -1464,10 +1549,13 @@ return await workflow("child");`;
       void engine.start(script, { agentTimeoutMs: null }).then((value) => {
         result = value;
       });
+      await waitForSpawn(engine, client, 2);
       await vi.advanceTimersByTimeAsync(20);
+      await waitForObserved(() => expect(cleaning).toBe(true));
       expect(client.spawned).toHaveLength(2);
       release();
       await vi.advanceTimersByTimeAsync(12_000);
+      await waitForObserved(() => expect(result?.status).toBe("stopped"));
       expect(result?.status).toBe("stopped");
       expect(client.stopped).toContain("agent-2");
       client.complete("agent-2", "late");
@@ -1482,9 +1570,11 @@ return await workflow("child");`;
   it("timeout continuation and completion wait for exact-owner cleanup", async () => {
     const { engine, client } = makeEngine({ manual: true });
     let release = () => {};
+    let cleaning = false;
     client.quiesceOwned = async () => {
       await new Promise<void>((resolve) => {
         release = resolve;
+        cleaning = true;
       });
       return { settled: true, pending: [] };
     };
@@ -1495,13 +1585,15 @@ return await workflow("child");`;
         await agent("first", { timeoutMs: 10 }); return await agent("next", { timeoutMs: null });`,
         { background: true },
       );
+      await waitForSpawn(engine, client, 1);
       await vi.advanceTimersByTimeAsync(20);
+      await waitForObserved(() => expect(cleaning).toBe(true));
       expect(client.spawned).toHaveLength(1);
       release();
-      await vi.advanceTimersByTimeAsync(1);
+      await waitForSpawn(engine, client, 2);
       expect(client.spawned).toHaveLength(2);
       client.complete("agent-2", "ok");
-      await vi.advanceTimersByTimeAsync(1);
+      await waitForObserved(() => expect(engine.getRun(client.spawned[0].runId)?.status).toBe("completed"));
       expect(engine.getRun(client.spawned[0].runId)?.status).toBe("completed");
     } finally {
       release();
@@ -1515,7 +1607,7 @@ return await workflow("child");`;
     client.quiesceOwned = async () => new Promise(() => {});
     const invocation = new AbortController();
     const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
-    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    await waitForObserved(() => expect(client.spawned).toHaveLength(1));
     vi.useFakeTimers();
     try {
       invocation.abort();
@@ -1541,7 +1633,7 @@ return await workflow("child");`;
           };
     const invocation = new AbortController();
     const pending = engine.start(SIMPLE_SCRIPT, { signal: invocation.signal });
-    await vi.waitFor(() => expect(client.spawned).toHaveLength(1));
+    await waitForObserved(() => expect(client.spawned).toHaveLength(1));
     invocation.abort();
     const result = await pending;
     expect(result.status).toBe("stopped");
@@ -1659,7 +1751,7 @@ return await agent("target=" + target);`;
       background: true,
       args: { nested: { target: "original" } },
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned[0]?.task.prompt).toBe("target=original");
     expect(engine.getRun(started.runId)?.args).toEqual({ nested: { target: "original" } });
     expect(entries.find((entry) => (entry as JournalEvent).kind === "run_created") as JournalEvent).toMatchObject({
@@ -1672,7 +1764,7 @@ return await agent("target=" + target);`;
       background: true,
       args: { nested: { target: "replacement" } },
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 2);
     expect(client.spawned.at(-1)?.task.prompt).toBe("target=original");
     expect(engine.getRun(started.runId)?.args).toEqual({ nested: { target: "original" } });
     await engine.control("stop", started.runId);
@@ -1683,7 +1775,7 @@ return await agent("target=" + target);`;
     const script = `export const meta = { name: "omitted-args", description: "a" };
 return await agent("target=" + (args === undefined ? "undefined" : args.target));`;
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned[0]?.task.prompt).toBe("target=undefined");
     expect(engine.getRun(started.runId)).toMatchObject({ frozenArgsPresent: false });
     expect(engine.getRun(started.runId)?.args).toBeUndefined();
@@ -1701,7 +1793,7 @@ return await agent("target=" + (args === undefined ? "undefined" : args.target))
       background: true,
       args: { target: "replacement" },
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 2);
     expect(client.spawned.at(-1)?.task.prompt).toBe("target=undefined");
     expect(engine.getRun(started.runId)?.args).toBeUndefined();
     await engine.control("stop", started.runId);
@@ -1746,7 +1838,7 @@ return await agent("work");`;
       tokenBudget: 500.6,
       agentTimeoutMs: 1_500.4,
     });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(engine.getState(started.runId)?.execution).toBeDefined());
     expect(engine.getRun(started.runId)).toMatchObject({
       frozenMaxAgents: 9,
       frozenConcurrency: 4,
@@ -1779,7 +1871,7 @@ return await agent("work");`;
       agentTimeoutMs: 1_500,
     });
     await engine.resume(started.runId, sessionEntries, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForObserved(() => expect(engine.getState(started.runId)?.execution).toBeDefined());
     expect(engine.getState(started.runId)?.frozenOptions).toMatchObject({
       maxAgents: 9,
       concurrency: 4,
@@ -1794,11 +1886,10 @@ return await agent("work");`;
     const script = `export const meta = { name: "tiered", description: "t" };\nawait agent("work", { strength: "high" });\nreturn 0;`;
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(script, { background: true, strengths: { high: "high" } });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned[0]?.task.tier).toBe("high");
     // Complete it to avoid a dangling run.
     await engine.control("stop", started.runId);
-    void completeAllInflight;
   });
 });
 
@@ -1808,7 +1899,7 @@ describe("A4 spawnKey generation rotation", () => {
   it("a live dispatch uses runId/call-N/attempt-G spawn-key identity", async () => {
     const { engine, client } = makeEngine({ manual: true });
     const started = await engine.start(script, { background: true });
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     expect(client.spawned.length).toBe(1);
     const spawn = client.spawned[0];
     expect(spawn.nodeId).toBe("call-0");
@@ -1825,7 +1916,7 @@ describe("A4 spawnKey generation rotation", () => {
     await engine.control("pause", started.runId);
     const sessionEntries = (entries as JournalEvent[]).map(asSessionEntry);
     await engine.resume(started.runId, sessionEntries, { background: true }, revised);
-    await new Promise((resolve) => setImmediate(resolve));
+    await waitForSpawn(engine, client, 1);
     const latest = client.spawned.at(-1);
     expect(latest?.task.prompt).toBe("new prompt");
     if (latest) client.complete(`agent-${client.spawned.length}`, "done");

@@ -93,10 +93,12 @@ Apple 桥风险较大：授权是 Reminders 全读写，不是仅“pi”列表�
 
 以上仍为源码／发布物调查，不是安装验收；许可证均须按实际复制的源码保留。
 
-## 最小 pi-todo：仅为提案，尚未实施
+## 独立实现进度：已进入验收，尚未发布
 
-若最终需要自己维护，建议只做**会话级清单**：稳定 ID、增量操作、强制 revision 校验、验证后替换、深复制全量持久快照；空快照也必须有效。明确完成保留/清理政策，人工重开与编辑可后补；模型结果默认紧凑，压缩后按需补回精确状态。
+上述研究固定于原调查基线，不应把当时的缺口描述当作当前发布状态。后续独立实现了 [`pi-todo`](../packages/pi-todo/README.md)、[`pi-approvals`](../packages/pi-approvals/README.md) 与 [`pi-sessions`](../packages/pi-sessions/README.md)，并为现有后台工具和 managed child 接入逐次审批。它们仍须通过最终组合验收和正常发布流程；当前证据及未完成项见[验收记录](task-human-controls.md)，不表示已安装、启用或发布。
+
+`pi-todo` 保持**会话／分支级清单**：稳定 UUID、增量操作、强制 revision 校验、完整依赖图验证、深复制全量快照，空快照同样有效；已实现人工编辑、重开和独立确认的删除／清空。模型变更结果默认紧凑，完整状态通过结构化结果及精确上下文补回。文件会话须先有真实持久化对话，变更后验证实际落盘记录；无会话模式明确为易失状态，不宣称原子磁盘事务。
 
 借 99 的验证与上下文恢复、rpiv 的显式持久化，不复制调度器。独立包，只用公共 Pi API/pi.events，不跨包导入源码；Todo 勾选不冒充 workflow 成功，不自动放开只读 Plan。[包边界](https://github.com/signalridge/pi-extensions/blob/c75ad95e26372fa4f2ab6bb2f937a0a372549b6d/docs/package-boundaries.md)
 
-验收至少覆盖 tree/fork/reload、压缩与模型知晓、空快照、嵌套调用、过期写、TUI/print/RPC；同名 todo 只保留一个所有者。先完成这一个小闭环，再决定下一项插件投入。
+验收覆盖 tree/fork/reload、压缩与模型知晓、空快照、嵌套调用、过期写和 TUI/print/RPC；同名 todo 只保留一个有效所有者。会话清单不扩展为项目共享 backlog，审批不冒充沙箱，通用摘要交接也不替换 Plan 已有的批准计划实施交接。仍按独立包边界和实际宿主证据逐项收敛，不批量叠装集合包。

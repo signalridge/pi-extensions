@@ -168,10 +168,11 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
     });
   };
 
-  async function launch(options: StartOptions, signal?: AbortSignal): Promise<JobSnapshot> {
+  async function launch(options: StartOptions, signal?: AbortSignal, launchGuard?: () => void): Promise<JobSnapshot> {
     let reserved = true;
     try {
       const directory = await stat(options.cwd);
+      launchGuard?.();
       if (!directory.isDirectory()) throw new Error("cwd must be a directory");
       if (signal?.aborted) throw abortError();
       if (shuttingDown) throw new Error("Background manager is shutting down");
@@ -224,9 +225,9 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
       return await new Promise<JobSnapshot>((resolve, reject) => {
         let acknowledged = false;
         let startupError: Error | undefined;
-        const cancel = (): void => {
+        const failStartup = (error: Error): void => {
           if (acknowledged || startupError) return;
-          startupError = signal?.aborted ? abortError() : new Error("Background manager is shutting down");
+          startupError = error;
           job.suppressExit = true;
           job.stopReason = "stopped";
           job.state.status = "stopped";
@@ -235,6 +236,8 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
           clearTimeout(job.killTimer);
           signalGroup(job, "SIGKILL");
         };
+        const cancel = (): void =>
+          failStartup(signal?.aborted ? abortError() : new Error("Background manager is shutting down"));
         const detachAbort = (): void => signal?.removeEventListener("abort", cancel);
         // Command timeouts begin only after its spawn acknowledgement. Bound
         // the separate helper handshake too (e.g. inherited inspect-brk flags).
@@ -278,6 +281,15 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
               cancel();
               signalGroup(job, "SIGKILL");
             } else {
+              // The helper has no command yet. Revalidate the captured launch
+              // owner/service after its asynchronous ready handshake, with no
+              // await between this check and the irreversible run dispatch.
+              try {
+                launchGuard?.();
+              } catch (error) {
+                failStartup(error instanceof Error ? error : new Error(String(error)));
+                return;
+              }
               child.send({ kind: "run", command: options.command, cwd: options.cwd }, (error) => {
                 if (!error) return;
                 job.state.error = safeEventText(error.message);
@@ -366,7 +378,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         listeners.delete(listener);
       };
     },
-    start(options, signal) {
+    start(options, signal, launchGuard) {
       if (shuttingDown) return Promise.reject(new Error("Background manager is shutting down"));
       let validated: StartOptions;
       try {
@@ -379,7 +391,7 @@ export function createJobManager(onEvent: (event: JobEvent) => void): JobManager
         return Promise.reject(error);
       }
       pending++;
-      const promise = launch(validated, signal);
+      const promise = launch(validated, signal, launchGuard);
       starting.add(promise);
       void promise.then(
         () => starting.delete(promise),

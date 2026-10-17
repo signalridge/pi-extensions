@@ -1,7 +1,15 @@
 import { resolve } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
+import {
+  assertLaunchCurrent,
+  commandApproval,
+  finalParameters,
+  registerApprovalAdapter,
+  startSnapshot,
+} from "./approval.js";
 import { type JobManager, type JobSnapshot, LIMITS, type WatchOptions } from "./contracts.js";
+import { validateWatch } from "./matcher.js";
 import { safeText, truncateUtf8 } from "./notifications.js";
 
 const attention = Type.Union([Type.Literal("turn"), Type.Literal("context"), Type.Literal("off")]);
@@ -91,7 +99,30 @@ export const TOOL_NAMES = [
 ] as const;
 
 export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => void {
-  const schemas = new Map<string, unknown>();
+  // Each extension instance owns a distinct schema identity, including reloads.
+  const backgroundParameters = Type.Object({
+    command: Type.String({ minLength: 1, maxLength: 32768 }),
+    cwd: Type.Optional(Type.String({ minLength: 1 })),
+    description: Type.Optional(Type.String({ maxLength: 200 })),
+    timeout_ms: Type.Optional(timeout),
+    notify: Type.Optional(attention),
+  });
+  const monitorParameters = Type.Object({
+    command: Type.Optional(Type.String({ minLength: 1, maxLength: 32768 })),
+    id: Type.Optional(id),
+    cwd: Type.Optional(Type.String({ minLength: 1 })),
+    description: Type.Optional(Type.String({ maxLength: 200 })),
+    patterns: Type.Array(Type.String({ minLength: 1, maxLength: LIMITS.patternChars }), {
+      minItems: 1,
+      maxItems: LIMITS.patterns,
+    }),
+    stream: Type.Optional(stream),
+    repeat: Type.Optional(Type.Boolean()),
+    cooldown_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 3_600_000 })),
+    notify: Type.Optional(Type.Union([Type.Literal("turn"), Type.Literal("context")])),
+    timeout_ms: Type.Optional(timeout),
+  });
+  const schemas = new Map<string, TSchema>();
   const register: ExtensionAPI["registerTool"] = (tool) => {
     schemas.set(tool.name, tool.parameters);
     pi.registerTool(tool);
@@ -119,25 +150,23 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
         "Background jobs execute with full local process permissions. Do not use this tool to bypass a blocked bash call or remote workspace policy.",
         "No sleep-and-poll: completion arrives automatically. Inspect progress deliberately with background_logs or background_list, not repeatedly while waiting. Humans open /background or /background view <id> themselves; never steal focus.",
       ],
-      parameters: Type.Object({
-        command: Type.String({ minLength: 1, maxLength: 32768 }),
-        cwd: Type.Optional(Type.String({ minLength: 1 })),
-        description: Type.Optional(Type.String({ maxLength: 200 })),
-        timeout_ms: Type.Optional(timeout),
-        notify: Type.Optional(attention),
-      }),
+      parameters: backgroundParameters,
       outputSchema,
-      async execute(_call, params, signal, _update, ctx) {
-        const job = await runtime.manager(ctx).start(
-          {
-            command: params.command,
-            cwd: resolve(ctx.cwd, params.cwd ?? "."),
-            description: params.description,
-            timeoutMs: params.timeout_ms ?? 30 * 60 * 1000,
-            attention: params.notify ?? "turn",
-          },
-          signal,
-        );
+      async execute(call, params, signal, _update, ctx) {
+        const manager = runtime.manager(ctx);
+        assertLaunchCurrent(manager, signal);
+        const input = finalParameters(backgroundParameters, params);
+        const options = startSnapshot({
+          command: input.command,
+          cwd: resolve(ctx.cwd, input.cwd ?? "."),
+          description: input.description,
+          timeoutMs: input.timeout_ms ?? 30 * 60 * 1000,
+          attention: input.notify ?? "turn",
+        });
+        const approval = commandApproval(pi, "bash_background", call, manager, options, signal);
+        if (approval) await approval.pending;
+        assertLaunchCurrent(manager, signal);
+        const job = await manager.start(options, signal, approval?.guard);
         return result(
           { jobs: [job], ...runtime.pending() },
           "Background job started; do useful independent work while it runs.",
@@ -153,55 +182,46 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       annotations: mutate,
       description:
         "Start a long-lived local command OR attach a literal line matcher to an existing job. Supply exactly one of command/id and patterns. Each pattern notifies once by default; repeat uses a cooldown. Not regex; no model calls during monitoring. Attaching replaces prior rules; only future output matches.",
-      parameters: Type.Object({
-        command: Type.Optional(Type.String({ minLength: 1, maxLength: 32768 })),
-        id: Type.Optional(id),
-        cwd: Type.Optional(Type.String({ minLength: 1 })),
-        description: Type.Optional(Type.String({ maxLength: 200 })),
-        patterns: Type.Array(Type.String({ minLength: 1, maxLength: LIMITS.patternChars }), {
-          minItems: 1,
-          maxItems: LIMITS.patterns,
-        }),
-        stream: Type.Optional(stream),
-        repeat: Type.Optional(Type.Boolean()),
-        cooldown_ms: Type.Optional(Type.Integer({ minimum: 1000, maximum: 3_600_000 })),
-        notify: Type.Optional(Type.Union([Type.Literal("turn"), Type.Literal("context")])),
-        timeout_ms: Type.Optional(timeout),
-      }),
+      parameters: monitorParameters,
       outputSchema,
-      async execute(_call, params, signal, _update, ctx) {
-        if ((params.command !== undefined) === (params.id !== undefined))
+      async execute(call, params, signal, _update, ctx) {
+        const manager = runtime.manager(ctx);
+        assertLaunchCurrent(manager, signal);
+        const input = finalParameters(monitorParameters, params);
+        if ((input.command !== undefined) === (input.id !== undefined))
           throw new Error("monitor requires exactly one of command or id.");
         if (
-          params.id &&
-          (params.cwd !== undefined || params.description !== undefined || params.timeout_ms !== undefined)
+          input.id &&
+          (input.cwd !== undefined || input.description !== undefined || input.timeout_ms !== undefined)
         ) {
           throw new Error("cwd, description and timeout_ms apply only when monitor starts a command.");
         }
-        const watch: WatchOptions = {
-          patterns: params.patterns,
-          stream: params.stream ?? "both",
-          repeat: params.repeat ?? false,
-          cooldownMs: params.cooldown_ms ?? LIMITS.cooldownMs,
-          attention: params.notify ?? "turn",
-        };
-        const manager = runtime.manager(ctx);
+        const watch: WatchOptions = validateWatch({
+          patterns: input.patterns,
+          stream: input.stream ?? "both",
+          repeat: input.repeat ?? false,
+          cooldownMs: input.cooldown_ms ?? LIMITS.cooldownMs,
+          attention: input.notify ?? "turn",
+        });
         let job: JobSnapshot;
-        if (params.id !== undefined) {
-          job = manager.watch(params.id, watch);
+        if (input.id !== undefined) {
+          assertLaunchCurrent(manager, signal);
+          job = manager.watch(input.id, watch);
+          assertLaunchCurrent(manager, signal);
           runtime.cancel(job.id);
         } else {
-          job = await manager.start(
-            {
-              command: params.command ?? "",
-              cwd: resolve(ctx.cwd, params.cwd ?? "."),
-              description: params.description,
-              timeoutMs: params.timeout_ms,
-              attention: params.notify ?? "turn",
-              watch,
-            },
-            signal,
-          );
+          const options = startSnapshot({
+            command: input.command ?? "",
+            cwd: resolve(ctx.cwd, input.cwd ?? "."),
+            description: input.description,
+            timeoutMs: input.timeout_ms,
+            attention: input.notify ?? "turn",
+            watch,
+          });
+          const approval = commandApproval(pi, "monitor", call, manager, options, signal);
+          if (approval) await approval.pending;
+          assertLaunchCurrent(manager, signal);
+          job = await manager.start(options, signal, approval?.guard);
         }
         return result(
           { jobs: [job], ...runtime.pending() },
@@ -295,6 +315,7 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       },
     }),
   );
+  registerApprovalAdapter(pi, schemas, (ctx) => runtime.manager(ctx));
   // Discovery is an action API: only call after runtime binding, not in the factory.
   return () => {
     const collisions = pi

@@ -614,7 +614,8 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
     const fixture = createPi(false);
     fixture.ctx.mode = "tui";
     fixture.ctx.hasUI = true;
-    let resolveConfirm: (value: boolean) => void = () => {};
+    const controller = new AbortController();
+    let resolveConfirm: ((value: boolean) => void) | undefined;
     fixture.ctx.ui.confirm.mockImplementation(
       () =>
         new Promise<boolean>((resolve) => {
@@ -629,18 +630,28 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
         script: 'export const meta = { name: "live", description: "test" }; return await checkpoint("wait");',
         background: false,
       },
-      undefined,
+      controller.signal,
       undefined,
       fixture.ctx,
     );
-    await vi.waitFor(() => expect(fixture.widgetUpdates.some((lines) => lines && lines.length > 0)).toBe(true));
-    resolveConfirm(true);
-    await pending;
-    await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
-    expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
-    const updates = fixture.widgetUpdates.length;
-    await Promise.resolve();
-    expect(fixture.widgetUpdates).toHaveLength(updates);
+    try {
+      await vi.waitFor(() => expect(fixture.widgetUpdates.some((lines) => lines && lines.length > 0)).toBe(true));
+      // The live widget is published before the VM reaches its checkpoint.
+      // Wait for the actual dialog; resolving a placeholder here loses the answer.
+      await vi.waitFor(() => expect(fixture.ctx.ui.confirm).toHaveBeenCalledOnce());
+      if (!resolveConfirm) throw new Error("Checkpoint confirmation is not ready");
+      resolveConfirm(true);
+      expect((await pending).details.status).toBe("completed");
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
+      const updates = fixture.widgetUpdates.length;
+      await Promise.resolve();
+      expect(fixture.widgetUpdates).toHaveLength(updates);
+    } finally {
+      controller.abort();
+      await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
+      await pending;
+    }
   });
   it("does not register tools, commands, ping, or journal state in a child session", async () => {
     const fixture = createPi(true);

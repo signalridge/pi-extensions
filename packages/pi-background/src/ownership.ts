@@ -52,9 +52,12 @@ export class Ownership {
           listener();
         });
       },
-      start: async (options, signal) => {
+      start: async (options, signal, launchGuard) => {
         check();
-        const result = await manager.start(options, signal);
+        const result = await manager.start(options, signal, () => {
+          check();
+          launchGuard?.();
+        });
         check();
         return result;
       },

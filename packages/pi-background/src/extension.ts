@@ -17,6 +17,7 @@ interface Owner {
   compacting: boolean;
   navigating: boolean;
   closeView?: () => void;
+  openingView?: symbol;
 }
 
 /** One extension instance owns one live branch; nothing starts in the factory. */
@@ -51,11 +52,11 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
     const jobs = owner.manager.list();
     const running = jobs.filter((job) => job.status === "running").length;
     const pending = owner.notifications.count;
-    const paused = owner.notifications.deliveryPaused ? " · delivery paused" : "";
+    const paused = owner.notifications.deliveryPaused ? " PAUSED" : "";
     owner.context.ui.setStatus(
       "pi-background",
       jobs.length || pending
-        ? `${running} running · ${jobs.length - running} finished${pending ? ` · ${pending} pending` : ""}${paused}`
+        ? `Ctrl+Alt+B tasks · R${running} F${jobs.length - running}${pending ? ` P${pending}` : ""}${paused}`
         : undefined,
     );
   }
@@ -180,6 +181,64 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
     },
   });
 
+  /** Shared command/shortcut interaction; the manager and retirement policy stay identical. */
+  async function openTaskView(ctx: ExtensionContext, owner: Owner, viewId?: string): Promise<void> {
+    requireOwner(ctx, owner);
+    const opening = Symbol();
+    owner.openingView = opening;
+    const manager = owner.ownership.guard(owner.manager, () => {
+      requireOwner(ctx, owner);
+    });
+    try {
+      await showBackgroundUI(
+        ctx,
+        {
+          manager: {
+            ...manager,
+            stop: async (id) => {
+              try {
+                return await manager.stop(id);
+              } finally {
+                if (live(owner, ctx)) updateStatus(owner);
+              }
+            },
+          },
+          live: () => ctx.mode === "tui" && ctx.hasUI && live(owner, ctx),
+          cancel: (id) => {
+            requireOwner(ctx, owner);
+            owner.notifications.cancel(id);
+            updateStatus(owner);
+          },
+          mount: (closeView) => {
+            requireOwner(ctx, owner);
+            owner.closeView?.();
+            owner.closeView = closeView;
+            return () => {
+              if (owner.closeView === closeView) owner.closeView = undefined;
+            };
+          },
+        },
+        viewId,
+      );
+    } finally {
+      if (owner.openingView === opening) owner.openingView = undefined;
+    }
+  }
+
+  // Pi routes registered shortcuts through its native editor, not raw terminal
+  // listeners: focused dialogs/overlays keep input ownership. Do not intercept
+  // onTerminalInput here, which runs before that focus routing.
+  pi.registerShortcut("ctrl+alt+b", {
+    description: "Open background task selector",
+    handler: async (ctx) => {
+      const owner = active;
+      if (ctx.mode !== "tui" || !ctx.hasUI || !live(owner, ctx)) return;
+      // Reserve the asynchronous TUI import too; repeated keys must not reset a view.
+      if (owner.closeView || owner.openingView) return;
+      await openTaskView(ctx, owner);
+    },
+  });
+
   pi.registerCommand("background", {
     description: "Open background tasks; view <id> opens logs, status summarizes, retry recovers notifications.",
     handler: async (args, ctx) => {
@@ -201,39 +260,7 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
       if (input && input !== "status" && !viewId) throw new Error("Usage: /background [view <id>|status|retry]");
       if (viewId) owner.manager.get(viewId);
       if (input !== "status" && ctx.mode === "tui" && ctx.hasUI) {
-        const manager = owner.ownership.guard(owner.manager, () => {
-          requireOwner(ctx, owner);
-        });
-        await showBackgroundUI(
-          ctx,
-          {
-            manager: {
-              ...manager,
-              stop: async (id) => {
-                try {
-                  return await manager.stop(id);
-                } finally {
-                  if (live(owner, ctx)) updateStatus(owner);
-                }
-              },
-            },
-            live: () => ctx.mode === "tui" && ctx.hasUI && live(owner, ctx),
-            cancel: (id) => {
-              requireOwner(ctx, owner);
-              owner.notifications.cancel(id);
-              updateStatus(owner);
-            },
-            mount: (closeView) => {
-              requireOwner(ctx, owner);
-              owner.closeView?.();
-              owner.closeView = closeView;
-              return () => {
-                if (owner.closeView === closeView) owner.closeView = undefined;
-              };
-            },
-          },
-          viewId,
-        );
+        await openTaskView(ctx, owner, viewId);
         return;
       }
       const rows = jobs.map((job) => `${job.id} [${job.status}] ${safeText(job.description)}`);

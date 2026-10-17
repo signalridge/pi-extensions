@@ -21,6 +21,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { type ApprovalEvents, captureApprovalService, queryApprovalAdapter, requiresApprovalAdapter, schemaRequiresApprovalAdapter } from "@signalridge/pi-approval-core";
 import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
@@ -42,9 +43,11 @@ import { type ModelRegistry, resolveModel, shortModelLabel } from "./model-resol
 import { parentModelSessionOptions } from "./model-runtime-bridge.js";
 import { checkModelScope } from "./model-scope.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
+import { createChildApprovalTools } from "./operation-approvals.js";
 import { ANSWER_SUBAGENT_QUESTION, type ParentQuestionHandler } from "./parent-questions.js";
 import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
+import { captureQuestionOrigin } from "./question-origin.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createSupervisorTool } from "./supervisor.js";
@@ -396,9 +399,11 @@ const TOOL_CALL_ABORT_GRACE_MS = 25;
 interface ApprovalTimer {
   isInteractiveAsk: (name: string) => boolean;
   armApproved: (toolCallId: string, toolName: string) => void;
+  pauseHuman: (toolCallId: string) => () => void;
 }
 // The policy survives runAgent for resumed turns; the current prompt owns its
-// abort timers, so resume replaces armApproved instead of arming a stale timer.
+// abort timers, so resume replaces both approval callbacks instead of using
+// a stale execution budget.
 const approvalTimers = new WeakMap<AgentSession, ApprovalTimer>();
 let defaultToolTimeoutMs = DEFAULT_TOOL_TIMEOUT_MS;
 export function getDefaultToolTimeoutMs(): number { return defaultToolTimeoutMs; }
@@ -427,7 +432,8 @@ export function withTimeout<T>(promise: Promise<T>, ms: number, label: string): 
 function createToolTimeouts(session: AgentSession, grace: number, isInteractiveAsk: (name: string) => boolean) {
   const pending = new Map<string, ReturnType<typeof setTimeout>>();
   const due = new Map<string, number>();
-  const paused = new Map<string, { remaining: number; children: Set<string> }>();
+  const paused = new Map<string, { remaining: number; children: Set<string>; human: number }>();
+  let disposed = false;
   const clear = (id: string): void => {
     const handle = pending.get(id);
     if (handle) clearTimeout(handle);
@@ -436,7 +442,7 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
     paused.delete(id);
   };
   const arm = (id: string, name: string, delay = defaultToolTimeoutMs + grace): void => {
-    if (defaultToolTimeoutMs <= 0 || name === "contact_supervisor") return;
+    if (disposed || defaultToolTimeoutMs <= 0 || name === "contact_supervisor") return;
     due.set(id, performance.now() + delay);
     const handle = setTimeout(() => {
       pending.delete(id);
@@ -450,25 +456,42 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
     handle.unref?.();
     pending.set(id, handle);
   };
+  const pause = (id: string) => {
+    const existing = paused.get(id);
+    if (existing) return existing;
+    const handle = pending.get(id);
+    const deadline = due.get(id);
+    if (!handle || deadline === undefined) return undefined;
+    clearTimeout(handle);
+    pending.delete(id);
+    due.delete(id);
+    const state = { remaining: Math.max(0, deadline - performance.now()), children: new Set<string>(), human: 0 };
+    paused.set(id, state);
+    return state;
+  };
+  const resume = (id: string): void => {
+    const state = paused.get(id);
+    if (!state || state.children.size || state.human) return;
+    paused.delete(id);
+    arm(id, "", state.remaining);
+  };
   return {
     armApproved: (id: string, name: string): void => arm(id, name),
+    pauseHuman: (id: string): (() => void) => {
+      const state = pause(id);
+      if (!state) return () => {};
+      state.human++;
+      let finished = false;
+      return () => {
+        if (finished) return;
+        finished = true;
+        state.human--;
+        resume(id);
+      };
+    },
     start: (event: { toolCallId: string; toolName: string; parentToolCallId?: string }): void => {
       if (event.parentToolCallId) {
-        const parent = paused.get(event.parentToolCallId);
-        if (parent) parent.children.add(event.toolCallId);
-        else {
-          const handle = pending.get(event.parentToolCallId);
-          const deadline = due.get(event.parentToolCallId);
-          if (handle && deadline !== undefined) {
-            clearTimeout(handle);
-            pending.delete(event.parentToolCallId);
-            due.delete(event.parentToolCallId);
-            paused.set(event.parentToolCallId, {
-              remaining: Math.max(0, deadline - performance.now()),
-              children: new Set([event.toolCallId]),
-            });
-          }
-        }
+        pause(event.parentToolCallId)?.children.add(event.toolCallId);
       }
       if (!isInteractiveAsk(event.toolName)) arm(event.toolCallId, event.toolName);
     },
@@ -478,11 +501,10 @@ function createToolTimeouts(session: AgentSession, grace: number, isInteractiveA
       const parent = paused.get(event.parentToolCallId);
       if (!parent) return;
       parent.children.delete(event.toolCallId);
-      if (parent.children.size > 0) return;
-      paused.delete(event.parentToolCallId);
-      arm(event.parentToolCallId, "", parent.remaining);
+      resume(event.parentToolCallId);
     },
     dispose: (): void => {
+      disposed = true;
       for (const handle of pending.values()) clearTimeout(handle);
       pending.clear();
       due.clear();
@@ -844,9 +866,11 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
  * reads instead, leaving registration/unsubscription and all metadata intact.
  * Each read wraps the CURRENT callbacks before Pi takes its event snapshot.
  */
+type ToolCallAdmission = () => ToolCallEventResult | undefined;
 function guardExtensionToolCalls(
   extension: Extension,
   deadlines: WeakMap<object, number>,
+  admissions: WeakMap<object, ToolCallAdmission>,
 ): Extension {
   type Handler = NonNullable<ReturnType<Extension["handlers"]["get"]>>[number];
   const guarded = new WeakMap<Handler, Handler>();
@@ -864,18 +888,23 @@ function guardExtensionToolCalls(
                 return { block: true, reason: "Invalid subagent tool_call event." };
               }
               const deadline = deadlines.get(call);
-              if (deadline === undefined) {
+              const admission = admissions.get(call);
+              if (deadline === undefined || !admission) {
                 return { block: true, reason: "Subagent tool policy was bypassed." };
               }
-              if (deadline === Infinity) return handler(...args);
               const toolName = Reflect.get(call, "toolName");
               const label = `tool_call for "${typeof toolName === "string" ? toolName : "unknown"}"`;
               const remaining = Math.ceil(deadline - performance.now());
               if (remaining <= 0) return { block: true, reason: `${label} timed out before the extension handler.` };
               try {
-                // This race blocks the call; it cannot cancel side effects of
-                // a handler that keeps running after its Promise loses.
-                return await withTimeout(Promise.resolve().then(() => handler(...args)), remaining, label);
+                // This race cannot cancel side effects in a timed-out handler.
+                const result = deadline === Infinity ? await handler(...args)
+                  : await withTimeout(Promise.resolve().then(() => handler(...args)), remaining, label);
+                if (deadline <= performance.now()) return { block: true, reason: `${label} timed out` };
+                // Later handlers mutate the native args object. Check after EACH
+                // handler using the original execution name/schema, not its mutable
+                // event.toolName. This admission never invokes askGate again.
+                return admission() ?? result;
               } catch (error) {
                 // Pi does not catch tool_call handler failures. A timeout must
                 // block the tool, not leave a rejected event or an awaited hook.
@@ -908,6 +937,11 @@ export async function runAgent(
   // an already-cancelled caller. This matters for tool-call signals: the
   // caller may be cancelled before this async function gets its first turn.
   throwIfAborted(options.signal);
+  // Capture the ROOT peer synchronously, before discovery or resource allocation.
+  // Only absence is optional; malformed/duplicate peers must fail closed here.
+  const approvalCapture = options.pi.events ? captureApprovalService(options.pi.events) : undefined;
+  const approvalService = approvalCapture?.service;
+  const approvalRootOrigin = approvalService ? captureQuestionOrigin(ctx) : undefined;
   if (options.supervisorQuestions === "parent" && !options.parentQuestion) {
     throw new Error('Parent clarification requires a manager-issued background channel. Use Agent with run_in_background: true and supervisor_questions: "parent".');
   }
@@ -1144,11 +1178,15 @@ export async function runAgent(
   const approvalTimer: ApprovalTimer = {
     isInteractiveAsk: (name) => interactiveAskNames.has(name.toLowerCase()),
     armApproved: () => {},
+    pauseHuman: () => () => {},
   };
   // The policy starts a single monotonic deadline for each public tool_call
   // event. All subsequently selected extension handlers share its remainder,
   // including calls initiated by another tool through ctx.executeTool().
   const toolCallDeadlines = new WeakMap<object, number>();
+  const toolCallAdmissions = new WeakMap<object, ToolCallAdmission>();
+  let captureAdmission: (name: string, input: unknown) => ToolCallAdmission =
+    () => () => ({ block: true, reason: "Subagent tool policy is not ready." });
   const extensionsOverride = (base: LoadExtensionsResult): LoadExtensionsResult => {
     const policy = base.extensions.find((e) => e.path === `<inline:${TOOL_POLICY_EXTENSION}>`);
     if (!policy) throw new Error("Subagent tool policy extension failed to load.");
@@ -1171,7 +1209,7 @@ export async function runAgent(
     return {
       ...base,
       extensions: [policy, ...selected.filter((e) => e !== policy)
-        .map((extension) => guardExtensionToolCalls(extension, toolCallDeadlines))],
+        .map((extension) => guardExtensionToolCalls(extension, toolCallDeadlines, toolCallAdmissions))],
     };
   };
 
@@ -1179,12 +1217,14 @@ export async function runAgent(
   // ctx.executeTool calls. A policy factory also loads with noExtensions: true,
   // without loading any discovered extension. Deny until the child policy is
   // installed, including calls an extension might make during session_start.
-  let checkToolCall: (name: string, input: unknown, deadline: number) => Promise<ToolCallEventResult | undefined> =
+  let checkToolCall: (name: string, input: unknown, deadline: number, admission: ToolCallAdmission) => Promise<ToolCallEventResult | undefined> =
     async () => ({ block: true, reason: "Subagent tool policy is not ready." });
+  let childApprovalEvents: ApprovalEvents | undefined;
   const extensionFactories: InlineExtension[] = [{
     name: TOOL_POLICY_EXTENSION,
     hidden: true,
     factory: (pi) => {
+      childApprovalEvents = pi.events;
       pi.on("tool_call", async (event, hookCtx) => {
         if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
         const waitingForHuman = approvalTimer.isInteractiveAsk(event.toolName);
@@ -1195,7 +1235,9 @@ export async function runAgent(
           ? performance.now() + defaultToolTimeoutMs
           : Infinity;
         toolCallDeadlines.set(event, deadline);
-        const decision = await checkToolCall(event.toolName, event.input, deadline);
+        const admission = captureAdmission(event.toolName, event.input);
+        toolCallAdmissions.set(event, admission);
+        const decision = await checkToolCall(event.toolName, event.input, deadline, admission);
         // Abort cannot interrupt an already-open human dialog on these hosts.
         // Do not execute a tool if that dialog eventually approves a stopped run.
         if (hookCtx?.signal?.aborted) return { block: true, reason: "Subagent tool call was aborted." };
@@ -1279,6 +1321,10 @@ export async function runAgent(
       .flatMap(resource => resolvedNames.get(resource.path) ?? []));
     let warnedBackground = false;
     const admitChildExtension = (resource: ResolvedResource, intentional: boolean): boolean => {
+      if (approvalService && resolvedNames.get(resource.path)?.includes("pi-approvals")) {
+        if (intentional) throw new Error(`pi-approvals cannot load in agent "${type}"; integrate approvals in the root session instead (requested extension "${resource.path}").`);
+        return false;
+      }
       if (!resolvedNames.get(resource.path)?.includes("pi-background")) return true;
       const reason = `pi-background cannot load in agent "${type}": managed child sessions do not support asynchronous model wakes after completion/worktree cleanup`;
       if (intentional) throw new Error(`${reason} (requested extension "${resource.path}").`);
@@ -1517,9 +1563,34 @@ export async function runAgent(
           },
         })
       : [];
-  // One list from here on: both sets are custom tools this package injects, and
-  // the scoping pass below keeps exactly the names it is given.
-  const injectedTools = [...nestedTools, ...supervisorTools];
+  // Reviewed replacements are SDK tools, not inherited extension permissions.
+  // Admit only canonical names already allowed by the child policy.
+  let approvalSession: AgentSession | undefined;
+  // SDK winner metadata alone misses a losing late extension registration.
+  // Inspect live public maps at bind, admission and every execute guard.
+  const hasCanonicalConflict = (name: string): boolean =>
+    loader.getExtensions().extensions.some(extension => extension.tools.has(name));
+  const reviewedTools = approvalCapture && approvalService && approvalRootOrigin && toolNames.some(name => ["edit", "write", "bash"].includes(name) && !disallowedSet?.has(name))
+    ? createChildApprovalTools({
+        service: approvalService, root: ctx, rootOrigin: approvalRootOrigin, agentId: options.agentId, settings: settingsManager,
+        assertServiceCurrent: approvalCapture.assertCurrent,
+        isToolCurrent: (name) => approvalSession?.getActiveToolNames().includes(name) === true,
+        waiting: (id) => approvalSession ? approvalTimers.get(approvalSession)?.pauseHuman(id) ?? (() => {}) : () => {},
+        isBound: (): boolean => {
+          const tools = approvalSession?.getAllTools();
+          return [...reviewedNames].every(name => !hasCanonicalConflict(name) && tools?.find(tool => tool.name === name)?.sourceInfo.path === `<sdk:${name}>`);
+        },
+      }).filter(tool => toolNames.includes(tool.name) && !disallowedSet?.has(tool.name))
+    : [];
+  const reviewedNames = new Set(reviewedTools.map(tool => tool.name));
+  for (const extension of loader.getExtensions().extensions) {
+    for (const name of reviewedNames) {
+      if (extension.tools.has(name)) {
+        throw new Error(`Approval-required tool "${name}" was shadowed by "${extension.path}"; remove the conflicting child extension.`);
+      }
+    }
+  }
+  const injectedTools = [...nestedTools, ...supervisorTools, ...reviewedTools];
   const nestedToolNames = new Set(injectedTools.map(tool => tool.name));
   const askGate = createAskGate({
     askTools: agentConfig?.askTools ?? [],
@@ -1637,6 +1708,7 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  approvalSession = session;
   approvalTimers.set(session, approvalTimer);
   // Install the forwarding listener immediately after session creation, before
   // bindExtensions/session_start can do asynchronous work. The old placement
@@ -1650,12 +1722,42 @@ export async function runAgent(
   const inScope = noExtensions ? undefined : extensionToolNamesInScope(session, {
     loader, toolNames, disallowedSet, extNames, narrowing, nestedToolNames, resolvedNames,
   });
-  checkToolCall = async (name, input, deadline) => {
+  captureAdmission = (name, input) => {
+    // Pi executes these captured args, even if a handler reassigns event.input.
+    const captured = session.getAllTools().find(tool => tool.name === name);
+    const requiresSchema = !!approvalService && !!captured && schemaRequiresApprovalAdapter(captured.parameters);
+    return () => {
+      if (!approvalService) return undefined;
+      if (reviewedNames.has(name)) {
+        if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)
+          return { block: true, reason: `Approval-required tool "${name}" was shadowed; remove the conflicting child extension.` };
+        return undefined;
+      }
+      const effective = session.getAllTools().find(tool => tool.name === name);
+      if (requiresApprovalAdapter(input) || requiresSchema) {
+        try {
+          if (!captured || !effective || !childApprovalEvents || effective.parameters !== captured.parameters ||
+              effective.description !== captured.description || effective.sourceInfo.path !== captured.sourceInfo.path)
+            throw new Error("Child approval binding changed");
+          queryApprovalAdapter(childApprovalEvents, name, captured.parameters);
+        } catch {
+          return { block: true, reason: `Tool "${name}" requires exactly one live cooperative approval adapter; unreviewed fallback is blocked.` };
+        }
+      }
+      return undefined;
+    };
+  };
+  checkToolCall = async (name, input, deadline, admission) => {
     const run = async (): Promise<ToolCallEventResult | undefined> => {
       // Scope first, then approval: never prompt for a tool this child cannot use.
       if (inScope && !inScope().has(name)) {
         return { block: true, reason: `Tool "${name}" is not available to this subagent.` };
       }
+      if (reviewedNames.has(name) && (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`)) {
+        return { block: true, reason: `Approval-required tool "${name}" was shadowed; only its reviewed SDK binding may execute.` };
+      }
+      const denied = admission();
+      if (denied) return denied;
       return askGate?.(name, input);
     };
     if (deadline === Infinity) return run();
@@ -1686,6 +1788,11 @@ export async function runAgent(
     },
   });
   throwIfAborted(options.signal);
+  for (const name of reviewedNames) {
+    if (hasCanonicalConflict(name) || session.getAllTools().find(tool => tool.name === name)?.sourceInfo.path !== `<sdk:${name}>`) {
+      throw new Error(`Approval-required tool "${name}" was shadowed; remove the conflicting child extension.`);
+    }
+  }
 
   // With `allowedToolNames` unset, the ACTIVE set still needs managing: Pi
   // activates default built-ins and eligible extension tools at registration.
@@ -1761,6 +1868,7 @@ export async function runAgent(
   // `contact_supervisor` is excluded: it intentionally waits for a human.
   const toolTimeouts = createToolTimeouts(session, noExtensions ? 0 : TOOL_CALL_ABORT_GRACE_MS, approvalTimer.isInteractiveAsk);
   approvalTimer.armApproved = toolTimeouts.armApproved;
+  approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
   // Own finalized output before observer dispatch: a synchronous callback
   // failure must remain visible without erasing the answer it interrupted.
   const collector = collectResponseText(session);
@@ -1819,6 +1927,7 @@ export async function runAgent(
     await session.prompt(prompt);
   } finally {
     approvalTimer.armApproved = () => {};
+    approvalTimer.pauseHuman = () => () => {};
     unsubTurns();
     collector.unsubscribe();
     toolTimeouts.dispose();
@@ -1890,7 +1999,10 @@ export async function resumeAgent(
   const approvalTimer = approvalTimers.get(session);
   const toolTimeouts = createToolTimeouts(session, TOOL_CALL_ABORT_GRACE_MS,
     approvalTimer?.isInteractiveAsk ?? (() => false));
-  if (approvalTimer) approvalTimer.armApproved = toolTimeouts.armApproved;
+  if (approvalTimer) {
+    approvalTimer.armApproved = toolTimeouts.armApproved;
+    approvalTimer.pauseHuman = toolTimeouts.pauseHuman;
+  }
   const unsubResumeTimeout = session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "tool_execution_start") toolTimeouts.start(event);
     else if (event.type === "tool_execution_end") toolTimeouts.end(event);
@@ -1900,7 +2012,10 @@ export async function resumeAgent(
     throwIfAborted(options.signal);
     await session.prompt(prompt);
   } finally {
-    if (approvalTimer) approvalTimer.armApproved = () => {};
+    if (approvalTimer) {
+      approvalTimer.armApproved = () => {};
+      approvalTimer.pauseHuman = () => () => {};
+    }
     collector.unsubscribe();
     unsubEvents();
     unsubResumeTimeout();

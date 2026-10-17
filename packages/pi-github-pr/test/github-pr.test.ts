@@ -16,8 +16,8 @@ import githubPr, {
 } from "../src/github-pr.js";
 import { createMockContext, createMockPi } from "./support.js";
 
-// Keep the OS watcher as the default. Only the timer/ownership behavior test
-// substitutes its owned event source; the real HEAD smoke tests still use fs.watch.
+// Keep the OS watcher as the default. Deterministic timer/ownership tests
+// substitute their owned event source; real HEAD smoke tests still use fs.watch.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, watch: vi.fn(actual.watch) };
@@ -468,7 +468,26 @@ test("a one-shot startup status-clear failure still discovers Git, refreshes, an
 });
 
 test("a turn abort during Git discovery still installs the branch watcher and refreshes", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const { root, headPath } = createGitHeadFixture();
+  const close = vi.fn();
+  const watcher: FSWatcher = Object.assign(new EventEmitter(), {
+    close,
+    ref() {
+      return this;
+    },
+    unref() {
+      return this;
+    },
+  });
+  const installed = deferred<fs.WatchListener<string> | undefined>();
+  const watch = vi
+    .mocked(fs.watch)
+    .mockClear()
+    .mockImplementationOnce((_path, _options, listener) => {
+      installed.resolve(listener);
+      return watcher;
+    });
 
   const mock = createMockPi();
   const gitResult = deferred<ExecResult>();
@@ -506,12 +525,25 @@ test("a turn abort during Git discovery still installs the branch watcher and re
     await waitForMicrotasks(() => prViews === 1, "initial PR refresh after cancelled discovery");
     await waitForMicrotasks(() => (context.statuses.get("github-pr") ?? "").includes("#123"), "initial status");
 
+    // Test session/turn ownership at the installed callback boundary. An initial
+    // status is not a barrier for platform-specific OS notification delivery.
+    const onHeadChange = await installed.promise;
+    assert.ok(onHeadChange);
+    assert.equal(watch.mock.calls.length, 1);
+    assert.equal(watch.mock.calls[0]?.[0], join(root, ".git"));
+    assert.deepEqual(watch.mock.calls[0]?.[1], { persistent: false });
+    assert.equal(watch.mock.results[0]?.value, watcher);
     writeFileSync(headPath, "ref: refs/heads/main\n");
-    await waitFor(() => prViews >= 2, "branch watcher refreshes after turn abort");
-    await waitFor(() => (context.statuses.get("github-pr") ?? "").includes("#456"), "new branch status");
+    onHeadChange("change", "HEAD");
+    assert.equal(context.statuses.get("github-pr"), undefined, "the branch event clears stale status");
+    vi.advanceTimersByTime(100);
+    await waitForMicrotasks(() => prViews === 2, "branch watcher refreshes after turn abort");
+    await waitForMicrotasks(() => (context.statuses.get("github-pr") ?? "").includes("#456"), "new branch status");
   } finally {
     gitResult.resolve(textResult(".git/HEAD\n"));
     await sessionShutdown({}, context.ctx);
+    watch.mockClear();
+    assert.equal(close.mock.calls.length, 1);
   }
 });
 

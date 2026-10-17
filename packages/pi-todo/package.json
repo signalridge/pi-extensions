@@ -1,0 +1,36 @@
+{
+  "name": "@signalridge/pi-todo",
+  "version": "1.2.0",
+  "description": "An opt-in, branch-local session checklist for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": ["pi-package", "pi-extension", "todo", "checklist"],
+  "files": ["README.md", "LICENSE", "CHANGELOG.md", "src"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "piExtension": { "lifecycle": "experimental" },
+  "scripts": {
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write .",
+    "lint": "biome check .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run test --config vitest.config.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-todo"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-todo",
+  "bugs": { "url": "https://github.com/signalridge/pi-extensions/issues" },
+  "publishConfig": { "access": "public" }
+}
