@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.5
+### Patch Changes
+
+- 2b68eb3: Admit bounded Hypa inspection wrappers at the final bash policy gate, including exact executable paths resolved from the runtime PATH, while retaining native read-only validators and rejecting nested or unsupported wrapper modes.
+
 ## 1.4.4
 ### Patch Changes
 

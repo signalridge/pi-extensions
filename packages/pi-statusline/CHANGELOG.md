@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.5
+### Patch Changes
+
+- 2b68eb3: Keep all visible extension statuses when wrapping the footer, and preserve producer parentheticals such as armed states and approval action hints.
+
 ## 1.4.4
 ### Patch Changes
 

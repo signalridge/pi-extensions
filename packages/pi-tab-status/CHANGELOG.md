@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.7
+### Patch Changes
+
+- 2b68eb3: Recognize Git commit commands executed through `hypa_shell` when settling the tab status, requiring a verified zero CLI exit rather than treating a successful tool invocation as command success.
+
 ## 1.2.6
 ### Patch Changes
 
