@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0
+### Minor Changes
+
+- a4dc1de: Omit routine verified-storage success text from file-backed tool results, model context and the Todo progress status. Keep all persistence verification and explicit volatile, not-yet-persisted and unavailable-storage notices unchanged.
+
 ## 1.3.0
 ### Minor Changes
 

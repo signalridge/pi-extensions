@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.0
+### Minor Changes
+
+- a4dc1de: Expose optional session/branch-owned status navigation to the existing workflow navigator and add compact run-authoritative footer counts without changing execution or widget behavior.
+
 ## 1.9.0
 ### Minor Changes
 

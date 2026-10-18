@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.8
+### Patch Changes
+
+- a4dc1de: Reject resume while an accepted iteration still owns a live operation, preserving its cancellation authority. Validate loop controls as nonnegative safe integers before tool or command starts can change task files, state, or ownership.
+
 ## 1.2.7
 ### Patch Changes
 
