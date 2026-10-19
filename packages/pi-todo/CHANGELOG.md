@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.1
+### Patch Changes
+
+- 4d37546: Omit current-checklist context when the host excludes the model's todo tool, without reactivating tools or changing stored state. Clarify that the human /todo command is not model-callable and unavailable checklist operations do not block unrelated authorized work.
+
 ## 1.4.0
 ### Minor Changes
 

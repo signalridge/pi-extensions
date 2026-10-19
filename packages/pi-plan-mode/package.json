@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-plan-mode",
-  "version": "1.4.5",
+  "version": "1.4.6",
   "description": "Pi extension that adds a Codex-like read-only /plan collaboration mode.",
   "type": "module",
   "license": "MIT",

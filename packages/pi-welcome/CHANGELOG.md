@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.9
+### Patch Changes
+
+- 4d37546: Point package documentation to the maintained compatibility guide instead of removed historical review snapshots.
+
 ## 1.3.8
 ### Patch Changes
 
