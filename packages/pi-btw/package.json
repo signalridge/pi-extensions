@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-btw",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Pi extension that adds a /btw side-question command.",
   "type": "module",
   "license": "MIT",

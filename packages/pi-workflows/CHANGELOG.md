@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.10.1
+### Patch Changes
+
+- c00f9f9: Wait for the exact terminal journal append receipt before publishing workflow completion, and recheck soft run/phase budgets after queue admission and before retry attempts.
+
 ## 1.10.0
 ### Minor Changes
 

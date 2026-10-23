@@ -123,7 +123,7 @@
     },
     "packages/pi-btw": {
       "name": "@signalridge/pi-btw",
-      "version": "1.4.2",
+      "version": "1.4.3",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.54.0",
         "@signalridge/pi-ui": "^1.3.2",
@@ -191,7 +191,7 @@
     },
     "packages/pi-github-pr": {
       "name": "@signalridge/pi-github-pr",
-      "version": "1.2.6",
+      "version": "1.2.7",
       "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "@earendil-works/pi-coding-agent": "1.0.4",
@@ -248,7 +248,7 @@
     },
     "packages/pi-input-history": {
       "name": "@signalridge/pi-input-history",
-      "version": "1.2.9",
+      "version": "1.2.10",
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
@@ -265,7 +265,7 @@
     },
     "packages/pi-lsp": {
       "name": "@signalridge/pi-lsp",
-      "version": "1.2.7",
+      "version": "1.2.8",
       "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "@earendil-works/pi-coding-agent": "1.0.4",
@@ -358,7 +358,7 @@
     },
     "packages/pi-stamp": {
       "name": "@signalridge/pi-stamp",
-      "version": "1.3.3",
+      "version": "1.3.4",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.54.0",
         "@signalridge/pi-ui": "^1.3.2",
@@ -377,7 +377,7 @@
     },
     "packages/pi-statusline": {
       "name": "@signalridge/pi-statusline",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.54.0",
         "@signalridge/pi-ui": "^1.3.2",
@@ -398,7 +398,7 @@
     },
     "packages/pi-subagents": {
       "name": "@signalridge/pi-subagents",
-      "version": "1.15.1",
+      "version": "1.15.2",
       "dependencies": {
         "@signalridge/pi-approval-core": "^1.2.0",
         "@signalridge/pi-subagents-protocol": "^1.6.0",
@@ -494,7 +494,7 @@
     },
     "packages/pi-workflows": {
       "name": "@signalridge/pi-workflows",
-      "version": "1.10.0",
+      "version": "1.10.1",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.5.1",
         "@signalridge/pi-ui": "^1.3.3",

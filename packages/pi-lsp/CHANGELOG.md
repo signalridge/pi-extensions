@@ -1,5 +1,10 @@
 # @signalridge/pi-lsp
 
+## 1.2.8
+### Patch Changes
+
+- c00f9f9: Match diagnostics and waiters across equivalent file URL encodings, including Windows drive casing, without changing non-file URI identity. Cancel and drain complete session-owned diagnostics and fix invocations during shutdown/replacement, prevent cancelled continuations and queued writes, and guard stale status contexts while preserving client leases and mutation freshness checks.
+
 ## 1.2.7
 ### Patch Changes
 
