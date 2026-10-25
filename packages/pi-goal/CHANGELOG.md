@@ -1,5 +1,10 @@
 # @signalridge/pi-goal
 
+## 1.4.8
+### Patch Changes
+
+- 0b24158: Report safety-pause causes and current count/limit before ambiguous ownership errors in Goal tools, and include an authoritative request-local pause notice when background notifications trigger ordinary conversation. Keep ownership, stale-ID, and abort guards intact: notifications never reset counters or bypass a safety pause, and only explicit resume restarts the Goal.
+
 ## 1.4.7
 ### Patch Changes
 
