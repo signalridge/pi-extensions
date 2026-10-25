@@ -1,4 +1,22 @@
 import { formatTokenCount } from "./accounting.js";
+import type { ActiveGoal } from "./persistence.js";
+import { formatGoalSafetyPause } from "./safety.js";
+import type { GoalSettings } from "./settings.js";
+
+export const GOAL_SAFETY_PAUSE_CONTEXT_TYPE = "goal-safety-pause-state";
+
+export function buildGoalSafetyPauseNotice(goal: ActiveGoal, limits: GoalSettings["continuationLimits"]) {
+  const pause = formatGoalSafetyPause(goal, limits);
+  if (!pause) return undefined;
+  return [
+    "Goal runtime state (authoritative for this request):",
+    `goal_id: ${escapeXmlText(goal.id)}`,
+    pause,
+    "This state supersedes earlier active Goal instructions. This response is ordinary conversation or notification handling, not Goal automatic execution.",
+    "Do not claim the Goal is running or continuing automatically. Do not call goal_complete, goal_blocked, or goal_wait while it is paused.",
+    "Background completion notifications and ordinary messages do not resume this safety pause or reset its counters. Only explicit user resume can restart Goal execution.",
+  ].join("\n");
+}
 
 export type GoalStatus = "active" | "queued" | "paused" | "blocked" | "usage_limited" | "budget_limited" | "complete";
 
@@ -67,6 +85,7 @@ function goalCompletionGuardBlock(goal: GoalPromptContext) {
 function goalModeRules(goalLabel: string) {
   return [
     "Goal-mode rules:",
+    "- Automatic continuation requires active Goal runtime state. A later authoritative Goal runtime state notice supersedes earlier active instructions; never treat notification handling as proof that Goal execution resumed.",
     "- Preserve the full objective across turns; do not redefine success around a narrower, safer, smaller, merely compatible, or easier-to-test result.",
     "- Derive concrete requirements from the objective and any referenced files, plans, specifications, issues, or user instructions.",
     "- Treat the current worktree, command output, tests, runtime behavior, PR state, rendered artifacts, and external state as authoritative. Previous conversation, plans, and summaries are context, not proof; inspect the current state before relying on them.",

@@ -20,6 +20,7 @@ import {
   transitionGoal,
   truncateNotification,
 } from "./runtime.js";
+import { formatGoalSafetyPause } from "./safety.js";
 import {
   createGoalWait,
   MAX_GOAL_WAIT_REASON_LENGTH,
@@ -101,6 +102,15 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
         };
       }
       const completingDuringBudgetWrapUp = runtime.hasActiveBudgetWrapUp();
+      const safetyPause = formatGoalSafetyPause(completedGoal, runtime.settings.continuationLimits);
+      if (safetyPause) {
+        const rejection = `Goal completion rejected: ${safetyPause}`;
+        notifyTerminal(ctx.ui, rejection, "warning");
+        return {
+          content: toolContent(rejection),
+          details: completionDetails(goal, requestedGoalId, summary),
+        };
+      }
       if (!runtime.canRecordGoalUsage() && !completingDuringBudgetWrapUp) {
         const rejection = "Goal completion rejected: current run does not own the active goal.";
         notifyTerminal(ctx.ui, rejection, "warning");
@@ -257,7 +267,7 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
       const evidence = typeof params.evidence === "string" ? params.evidence.trim() : "";
       const repeatedTurns = typeof params.repeated_turns === "number" ? params.repeated_turns : Number.NaN;
       const reject = (rejectionReason: string, terminate = false) => {
-        const rejection = `goal_blocked rejected: ${rejectionReason}.`;
+        const rejection = `goal_blocked rejected: ${rejectionReason}${rejectionReason.endsWith(".") ? "" : "."}`;
         notifyTerminal(ctx.ui, rejection, "warning");
         return {
           content: toolContent(rejection),
@@ -267,6 +277,8 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
       };
 
       if (!blockedGoal) return reject("no active goal");
+      const safetyPause = formatGoalSafetyPause(blockedGoal, runtime.settings.continuationLimits);
+      if (safetyPause) return reject(safetyPause);
       if (!runtime.canRecordGoalUsage()) {
         return reject("current run does not own the active goal");
       }
@@ -363,6 +375,8 @@ export function registerGoalTools(pi: ExtensionAPI, runtime: GoalRuntime) {
       };
 
       if (!goal) return reject("no active goal");
+      const safetyPause = formatGoalSafetyPause(goal, runtime.settings.continuationLimits);
+      if (safetyPause) return reject(safetyPause);
       if (!runtime.canRecordGoalUsage()) return reject("current run does not own the active goal");
       if (hasPendingSkipForGoal(runtime, goal.id)) {
         runtime.recordGoalUsage(goal, ctx);

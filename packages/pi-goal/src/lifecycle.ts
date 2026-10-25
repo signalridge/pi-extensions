@@ -6,8 +6,10 @@ import { type ActiveGoal, loadGoalStateFromSession } from "./persistence.js";
 import {
   buildGoalBindingUpdate,
   buildGoalPrompt,
+  buildGoalSafetyPauseNotice,
   buildGoalSystemPrompt,
   GOAL_BINDING_UPDATE_HEADER,
+  GOAL_SAFETY_PAUSE_CONTEXT_TYPE,
 } from "./prompts.js";
 import { activateQueuedGoal } from "./queue.js";
 import type { GoalRunController } from "./run-protocol.js";
@@ -28,7 +30,7 @@ import {
   type StatusContext,
   truncateNotification,
 } from "./runtime.js";
-import { hasAssistantToolCall } from "./safety.js";
+import { formatGoalSafetyPause, hasAssistantToolCall } from "./safety.js";
 import { DEFAULT_GOAL_SETTINGS, readGoalSettings } from "./settings.js";
 
 const EXPERIMENTAL_GOALS_WARNING =
@@ -533,13 +535,31 @@ export function registerGoalLifecycle(
   });
 
   pi.on("context", (event, ctx) => {
-    const messages = event.messages.filter((message) => runtime.keepBudgetWrapUpMessage(message));
+    const messages = event.messages.filter(
+      (message) =>
+        runtime.keepBudgetWrapUpMessage(message) &&
+        !(message.role === "custom" && message.customType === GOAL_SAFETY_PAUSE_CONTEXT_TYPE),
+    );
     if (runtime.activeGoal?.status === "paused" && runtime.guardAbortGoalId === runtime.activeGoal.id) {
       // A current custom follow-up clears the guard at message_start. Otherwise,
       // context transformation aborts before the provider adapter receives the signal.
       abortCurrentTurn(ctx);
     }
     const goal = runtime.activeGoal;
+    const safetyPause =
+      !runtime.queueFrozen && goal ? buildGoalSafetyPauseNotice(goal, runtime.settings.continuationLimits) : undefined;
+    if (safetyPause) {
+      // Request-local, so queued custom notifications (which can skip
+      // before_agent_start) also see current state without persisting stale notices.
+      messages.push({
+        role: "custom",
+        customType: GOAL_SAFETY_PAUSE_CONTEXT_TYPE,
+        content: safetyPause,
+        display: false,
+        timestamp: Date.now(),
+      });
+      return { messages };
+    }
     if (!runtime.queueFrozen && goal?.status === "active" && runtime.inputWakeGoalId === goal.id) {
       // Native queued input reaches message_start without before_agent_start.
       // Keep the rotated guard visible for every remaining response in this run,
@@ -595,7 +615,9 @@ export function registerGoalLifecycle(
     abortCurrentTurn(ctx);
     return {
       block: true,
-      reason: "Blocked stale /goal tool call after the goal stopped or was interrupted.",
+      reason:
+        formatGoalSafetyPause(runtime.activeGoal, runtime.settings.continuationLimits) ??
+        "Blocked stale /goal tool call after the goal stopped or was interrupted.",
     };
   });
 

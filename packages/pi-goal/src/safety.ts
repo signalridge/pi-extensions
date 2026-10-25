@@ -1,5 +1,14 @@
 import { createHash } from "node:crypto";
 import type { ActiveGoal } from "./persistence.js";
+import type { GoalSettings } from "./settings.js";
+
+export function formatGoalSafetyPause(goal: ActiveGoal, limits: GoalSettings["continuationLimits"]) {
+  if (goal.status !== "paused" || !goal.safetyPauseCause) return undefined;
+  const automatic = goal.safetyPauseCause === "continuation_limit";
+  const used = automatic ? goal.automaticModelTurns : goal.toolFreeRepeatCount;
+  const limit = automatic ? limits.automaticTurns : limits.noProgressTurns;
+  return `Goal paused: ${goal.safetyPauseCause} (${used}/${limit ?? "Unlimited"}). Explicit resume required: run /goal resume.`;
+}
 
 export interface ToolFreeRepeatState {
   toolFreeRepeatCount: number;
