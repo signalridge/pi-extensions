@@ -231,8 +231,9 @@ export function extensionColor(key: string, value: string): ThemeColor {
   return "muted";
 }
 
+// The key, or its icon, comes back as the label, so drop it in every form: "key: x", "key x", "key".
 export function stripExtensionStatusPrefix(key: string, value: string): string {
-  return value.trim().replace(new RegExp(`^${escapeRegExp(key)}\\s*:\\s*`, "iu"), "");
+  return value.trim().replace(new RegExp(`^${escapeRegExp(key)}(?:\\s*:\\s*|\\s+|$)`, "iu"), "");
 }
 
 export function simplifyExtensionStatusText(value: string): string {

@@ -1142,6 +1142,25 @@ test("extension status icons use config, leading emoji, defaults, and fallback",
   assert.equal(formatExtensionStatus("unknown", "running", theme, config({})), "unknown running");
 });
 
+test("a status that already starts with its key is not labelled twice", () => {
+  const theme = { fg: (_color: string, text: string) => text } as never;
+  const config = { extensionStatusIcons: {} };
+  assert.equal(formatExtensionStatus("loop", "loop 1 · next 3m", theme, config), "loop 1 · next 3m");
+  assert.equal(formatExtensionStatus("goal", "goal reached", theme, config), "goal reached");
+  assert.equal(formatExtensionStatus("monitor", "Monitor 2", theme, config), "monitor 2");
+  assert.equal(formatExtensionStatus("monitor", "Monitor", theme, config), "monitor");
+  // A configured icon stands in for the key, as it already does for "key: text".
+  assert.equal(
+    formatExtensionStatus("loop", "loop 1 · next 3m", theme, { extensionStatusIcons: { loop: "L" } }),
+    "L 1 · next 3m",
+  );
+  // The colon form is tried first, so a space before the colon still drops the colon.
+  assert.equal(formatExtensionStatus("mcp", "MCP : 6 servers", theme, config), "mcp 6 servers");
+  // Only the whole key, and only at the start.
+  assert.equal(formatExtensionStatus("loop", "loops paused", theme, config), "loop loops paused");
+  assert.equal(formatExtensionStatus("loop", "paused loop 1", theme, config), "loop paused loop 1");
+});
+
 test("extension status text renders as plain text when the extension styles or decorates it", () => {
   const theme = { fg: (_color: string, text: string) => text } as never;
   const config = (extensionStatusIcons: Record<string, string> = {}) => ({
