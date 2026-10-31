@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { inspect } from "node:util";
 import {
   type Context,
@@ -10,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { test, vi } from "vitest";
+import { createDiagnosticTrace, type DiagnosticPhase, diagnosticsPath, flushDiagnostics } from "../src/diagnostics.js";
 import { type CompactionFailureCode, failureFrom, formatCompactionFailure } from "../src/failure.js";
 import { MAX_SSE_BYTES } from "../src/protocol.js";
 import { contextForProvider, requestRemoteCompaction } from "../src/remote.js";
@@ -107,6 +109,188 @@ function fakeProvider(
     },
   };
 }
+
+test("provider done does not await a never-ending iterator or its hanging return", async () => {
+  const provider = fakeProvider(() => {});
+  const original = provider.stream;
+  let returned = false;
+  provider.stream = (...args) => {
+    const stream = original(...args);
+    const iterator = stream[Symbol.asyncIterator]();
+    stream[Symbol.asyncIterator] = () => ({
+      next: async () => {
+        const next = await iterator.next();
+        return next.done ? new Promise(() => {}) : next;
+      },
+      return: () => {
+        returned = true;
+        return new Promise(() => {});
+      },
+    });
+    return stream;
+  };
+  const result = await requestRemoteCompaction({
+    provider,
+    model,
+    context: { messages: [] },
+    signal: new AbortController().signal,
+    fetch: async () => responseSse(),
+    requestTimeoutMs: 100,
+  });
+  assert.deepEqual(result.usage, usage);
+  assert.equal(returned, true);
+});
+
+test("wire completion without provider done cannot fabricate zero usage", async () => {
+  const provider = fakeProvider(() => {});
+  const original = provider.stream;
+  provider.stream = (...args) => {
+    const stream = original(...args);
+    const iterator = stream[Symbol.asyncIterator]();
+    stream[Symbol.asyncIterator] = () => ({
+      next: async () => {
+        const next = await iterator.next();
+        return !next.done && next.value.type === "done" ? { done: true, value: undefined } : next;
+      },
+    });
+    return stream;
+  };
+  await assert.rejects(
+    requestRemoteCompaction({
+      provider,
+      model,
+      context: { messages: [] },
+      signal: new AbortController().signal,
+      fetch: async () => responseSse(),
+    }),
+    (error: unknown) => failureFrom(error, "local_compaction_failed").code === "remote_response_invalid",
+  );
+});
+
+for (const phase of [
+  "fetch",
+  "headers",
+  "first_body",
+  "wire_terminal",
+  "provider_done",
+  "completion_wait",
+] as DiagnosticPhase[]) {
+  test(`diagnostic observer cannot authorize late output after retiring ownership at ${phase}`, async () => {
+    let current = true;
+    let sends = 0;
+    const diagnostics = createDiagnosticTrace("observer-session", "manual", {
+      observe: (row) => {
+        if (row.phase === phase) current = false;
+      },
+    });
+    await assert.rejects(
+      requestRemoteCompaction({
+        provider: fakeProvider(() => {}),
+        model,
+        context: { messages: [] },
+        signal: new AbortController().signal,
+        isCurrent: () => current,
+        diagnostics,
+        fetch: async () => {
+          sends++;
+          return responseSse();
+        },
+      }),
+      (error: unknown) => error instanceof DOMException && error.name === "AbortError",
+    );
+    assert.equal(sends, phase === "fetch" ? 0 : 1);
+  });
+}
+
+test("trace methods are frozen and all throwing observers remain best effort", async () => {
+  const diagnostics = createDiagnosticTrace("observer-session", "manual", {
+    observe: () => {
+      throw new Error("SECRET_OBSERVER");
+    },
+  });
+  for (const method of ["phase", "attempt", "bytes"] as const) {
+    assert.throws(
+      () =>
+        Object.defineProperty(diagnostics, method, {
+          value: () => {
+            throw new Error("SECRET_METHOD");
+          },
+        }),
+      TypeError,
+    );
+  }
+  const result = await requestRemoteCompaction({
+    provider: fakeProvider(() => {}),
+    model,
+    context: { messages: [] },
+    signal: new AbortController().signal,
+    diagnostics,
+    fetch: async () => responseSse(),
+  });
+  assert.deepEqual(result.usage, usage);
+  const forged = {
+    ...diagnostics,
+    attempt: () => {
+      throw new Error("SECRET_METHOD");
+    },
+  };
+  const other = await requestRemoteCompaction({
+    provider: fakeProvider(() => {}),
+    model,
+    context: { messages: [] },
+    signal: new AbortController().signal,
+    diagnostics: forged,
+    fetch: async () => responseSse(),
+  });
+  assert.deepEqual(other.usage, usage);
+});
+
+test("persisted transport trace never contains source, opaque, credential or provider-error canaries", async () => {
+  const diagnostics = createDiagnosticTrace("SECRET_SESSION", "manual");
+  const provider = fakeProvider(() => {}, "SECRET_PROMPT");
+  await requestRemoteCompaction({
+    provider,
+    model: { ...model, baseUrl: "https://SECRET_DESTINATION.test" },
+    context: {
+      systemPrompt: "SECRET_SYSTEM",
+      messages: [{ role: "user", content: "SECRET_BODY", timestamp: 1 }],
+      tools: [
+        {
+          name: "SECRET_TOOL",
+          description: "SECRET_SCHEMA",
+          parameters: Type.Object({ SECRET_ARGUMENT: Type.String() }),
+        },
+      ],
+    },
+    ...credentials,
+    signal: new AbortController().signal,
+    diagnostics,
+    fetch: async () => responseSse("SECRET_ENCRYPTED_CONTENT"),
+  });
+  diagnostics.finish("prepared");
+  const failed = createDiagnosticTrace("SECRET_SESSION", "overflow");
+  await assert.rejects(
+    requestRemoteCompaction({
+      provider,
+      model,
+      context: { messages: [] },
+      ...credentials,
+      signal: new AbortController().signal,
+      diagnostics: failed,
+      fetch: async () => {
+        throw new Error("SECRET_PROVIDER_ERROR SECRET_MISMATCH SECRET_CWD SECRET_SESSION_PATH");
+      },
+    }),
+  );
+  failed.finish("failure", "remote_transport_error");
+  await flushDiagnostics();
+  const text = await readFile(diagnosticsPath(), "utf8");
+  assert.doesNotMatch(
+    text,
+    /SECRET_|secret-api-key|secret-header-token|secret-provider-token|secret-env-token|example\.test/,
+  );
+  assert.match(text, /"phase":"provider_done"/);
+});
 
 function responseSse(content = "opaque") {
   const item = { type: "compaction", encrypted_content: content };
@@ -500,6 +684,45 @@ for (const type of ["error", "response.failed"] as const) {
   }, 2000);
 }
 
+for (const mode of ["timeout", "caller abort"] as const) {
+  test(`pending pre-done iterator attempts cleanup on ${mode}`, async () => {
+    let returned = 0;
+    const caller = new AbortController();
+    const inner = fakeProvider(() => {}, "current", false);
+    const provider: Provider = {
+      ...inner,
+      stream(model, context, options) {
+        const stream = inner.stream(model, context, options);
+        stream[Symbol.asyncIterator] = () => ({
+          next: () => new Promise<never>(() => {}),
+          return: () => {
+            returned++;
+            return new Promise<never>(() => {});
+          },
+        });
+        return stream;
+      },
+    };
+    const timer = mode === "caller abort" ? setTimeout(() => caller.abort(), 5) : undefined;
+    try {
+      await assert.rejects(
+        requestRemoteCompaction({
+          provider,
+          model,
+          context: { messages: [] },
+          signal: caller.signal,
+          requestTimeoutMs: mode === "timeout" ? 20 : 100,
+          fetch: async () => responseSse(),
+        }),
+        (error) => assertSafeError(error, mode === "caller abort", "remote_timeout"),
+      );
+      assert.equal(returned, 1, "cleanup is attempted even when next() never settles");
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+}
+
 for (const outcome of ["provider error", "stalled iterator close", "caller abort", "retired owner"] as const) {
   test(`terminal provider error with an unfinished HTTP 200 inspection: ${outcome}`, async () => {
     const caller = new AbortController();
@@ -693,6 +916,76 @@ test("real Codex and inspector finish at response.completed without EOF and canc
   assert.equal(cancellations, 1);
   assert.equal(controller.signal.aborted, false);
 }, 2000);
+
+for (const terminal of ["response.completed", "response.done"]) {
+  test(`native ${terminal} usage/cost survives open SSE and a done iterator with hanging cleanup`, async () => {
+    const provider = openaiCodexProvider();
+    const nativeStream = provider.stream;
+    let nativeUsage: unknown;
+    let cleanup = false;
+    provider.stream = (...args) => {
+      const stream = nativeStream(...args);
+      const iterator = stream[Symbol.asyncIterator]();
+      let sawDone = false;
+      stream[Symbol.asyncIterator] = () => ({
+        next: async () => {
+          if (sawDone) return new Promise(() => {});
+          const next = await iterator.next();
+          if (!next.done && next.value.type === "done") {
+            sawDone = true;
+            nativeUsage = structuredClone(next.value.message.usage);
+          }
+          return next;
+        },
+        return: () => {
+          cleanup = true;
+          return new Promise(() => {});
+        },
+      });
+      return stream;
+    };
+    const item = { type: "compaction", encrypted_content: "opaque-λ" };
+    const bytes = new TextEncoder().encode(
+      `data: ${JSON.stringify({
+        type: terminal,
+        response: {
+          status: "completed",
+          output: [item],
+          usage: {
+            input_tokens: 100,
+            output_tokens: 10,
+            total_tokens: 110,
+            input_tokens_details: { cached_tokens: 20 },
+            output_tokens_details: { reasoning_tokens: 3 },
+          },
+        },
+      })}\r\n\r\n`,
+    );
+    const result = await requestRemoteCompaction({
+      provider,
+      model: { ...model, cost: { input: 2, output: 8, cacheRead: 1, cacheWrite: 2 } },
+      apiKey: codexApiKey,
+      context: { messages: [{ role: "user", content: "offline", timestamp: 1 }] },
+      signal: new AbortController().signal,
+      maxRetries: 0,
+      requestTimeoutMs: 1000,
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+    });
+    assert.deepEqual(result.usage, nativeUsage);
+    assert.ok(result.usage.totalTokens > 0);
+    assert.ok(result.usage.cost.total > 0);
+    assert.equal(result.usage.cacheRead, 20);
+    assert.equal(cleanup, true);
+  });
+}
 
 for (const type of ["response.completed", "response.done"]) {
   for (const chunkSize of [1, 7, 4096]) {

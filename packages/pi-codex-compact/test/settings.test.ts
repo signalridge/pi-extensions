@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "vitest";
 import {
+  type CodexCompactSettings,
   createCodexCompactSettingsRuntime,
   DEFAULT_CODEX_COMPACT_SETTINGS,
+  effectiveStageTimeoutMs,
   loadCodexCompactSettings,
   normalizeCodexCompactSettings,
 } from "../src/settings.js";
@@ -32,6 +34,32 @@ test("normalizes defaults and bounded user settings", () => {
   assert.equal(normalizeCodexCompactSettings({ maxRetries: 3 }), undefined);
   assert.equal(normalizeCodexCompactSettings({ requestTimeoutMs: 10 }), undefined);
   assert.equal(normalizeCodexCompactSettings({ replacementTokenBudget: 1_000_000 }), undefined);
+});
+
+test("legacy injected settings remain source-compatible without the new optional stage key", () => {
+  const legacy: CodexCompactSettings = {
+    enabled: true,
+    allowCanonicalHistory: false,
+    requestTimeoutMs: 300_000,
+    maxRetries: 2,
+    replacementTokenBudget: 64_000,
+    notifyOnFallback: true,
+  };
+  assert.equal(effectiveStageTimeoutMs(legacy), 300_000);
+});
+
+test("stage and whole-operation defaults are independent and explicit legacy totals stay honored", () => {
+  assert.equal(normalizeCodexCompactSettings({})?.requestTimeoutMs, 900_000);
+  assert.equal(normalizeCodexCompactSettings({})?.stageTimeoutMs, 300_000);
+  assert.equal(normalizeCodexCompactSettings({ requestTimeoutMs: 300_000 })?.requestTimeoutMs, 300_000);
+  for (const [key, max] of [
+    ["requestTimeoutMs", 1_800_000],
+    ["stageTimeoutMs", 600_000],
+  ] as const) {
+    for (const value of [30_000, max]) assert.equal(normalizeCodexCompactSettings({ [key]: value })?.[key], value);
+    for (const value of [29_999, max + 1, NaN, Infinity, "300000", 30_000.5])
+      assert.equal(normalizeCodexCompactSettings({ [key]: value }), undefined);
+  }
 });
 
 test("loads missing and valid files without consulting real user settings", async () => {

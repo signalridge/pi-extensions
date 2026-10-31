@@ -596,7 +596,11 @@ async function exercise(control: Control, drift?: Drift) {
       assert.deepEqual(checkpoint(), before);
       assert.deepEqual(outcomes, [{ hasResult: false, aborted: true }]);
       if (!drift?.endsWith("canonical") && !drift?.startsWith("fold")) {
-        assert.ok(notifications.some((message) => message.endsWith("[loadout_mismatch]")));
+        assert.ok(
+          notifications.some((message) =>
+            /\[loadout_mismatch\](?: Last stage: .+ See \/codex-compact diagnostics\.)?$/.test(message),
+          ),
+        );
       }
     } else {
       assert.equal(remote.length, boundedFold ? 2 : 1);

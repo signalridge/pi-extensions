@@ -1,6 +1,7 @@
 import * as zlib from "node:zlib";
 import type { Context, Model, Provider, ProviderHeaders, Usage } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
+import { type DiagnosticTrace, trustedDiagnosticTrace } from "./diagnostics.js";
 import {
   type CompactionFailure,
   compactionAbortError,
@@ -34,6 +35,8 @@ export interface RemoteCompactionRequest {
   validatePayload?: (payload: unknown) => boolean;
   isCurrent?: () => boolean;
   requestTimeoutMs?: number;
+  stageTimeoutMs?: number;
+  diagnostics?: DiagnosticTrace;
   maxRetries?: number;
   fetch?: typeof globalThis.fetch;
   /** Internal bounded-fold seam. Presence enables strict serialized-body verification. */
@@ -47,15 +50,6 @@ export interface RemoteCompactionResponse {
   promptInput: JsonObject[];
   usage: Usage;
 }
-
-const EMPTY_USAGE: Usage = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
 
 // Pi 0.87 requires a normalized transcript at the provider boundary; 0.84/0.85
 // have no normalizeContext export and still accept the original Context there.
@@ -172,6 +166,7 @@ async function performRemoteCompaction(
   onFatalFailure: (failure: CompactionFailure) => void,
 ): Promise<RemoteCompactionResponse> {
   if (operationSignal.aborted) throw compactionAbortError();
+  const diagnostics = trustedDiagnosticTrace(request.diagnostics);
   let sentInput: JsonObject[] | undefined;
   let localRejection: CompactionFailure | undefined;
   let acceptedBody: string | undefined;
@@ -247,6 +242,15 @@ async function performRemoteCompaction(
           : operationSignal;
       init = { ...init, signal };
       // Callbacks receive a disposable view, not dispatch-owned storage.
+      diagnostics?.bytes(
+        "request",
+        typeof init.body === "string"
+          ? Buffer.byteLength(init.body)
+          : init.body instanceof Uint8Array
+            ? init.body.byteLength
+            : 0,
+      );
+      diagnostics?.phase("fetch");
       request.beforeFetch?.(
         input,
         request.selectInput
@@ -267,7 +271,9 @@ async function performRemoteCompaction(
     }
     let response: Response;
     try {
+      diagnostics?.attempt();
       response = await baseFetch(input, init);
+      diagnostics?.phase("headers");
     } catch (error) {
       transportFailure = compactionFailure("remote_transport_error");
       // Preserve the provider's existing retry decisions (notably AbortError).
@@ -288,14 +294,27 @@ async function performRemoteCompaction(
     }
     // Abort the body independently of fetch: injected fetch implementations
     // need not honor signals, and a native fetch may only time out headers.
-    const bridge = new TransformStream<Uint8Array, Uint8Array>();
+    let firstBody = true;
+    const bridge = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        diagnostics?.bytes("response", chunk.byteLength);
+        if (firstBody) {
+          firstBody = false;
+          diagnostics?.phase("first_body");
+        }
+        controller.enqueue(chunk);
+      },
+    });
     void response.body.pipeTo(bridge.writable, { signal }).catch(() => undefined);
     let providerBody = bridge.readable;
     if (response.ok) {
       const [providerBranch, inspectionBody] = providerBody.tee();
       providerBody = providerSseBody(providerBranch, signal);
       const inspection = collectCompactionSse(inspectionBody, { signal: operationSignal }).then(
-        (value) => ({ ok: true as const, value }),
+        (value) => {
+          diagnostics?.phase("wire_terminal");
+          return { ok: true as const, value };
+        },
         (error: unknown) => {
           const failure = failureFrom(
             error,
@@ -351,6 +370,7 @@ async function performRemoteCompaction(
       maxRetries: request.maxRetries ?? 2,
       fetch: inspectedFetch,
       onPayload: (payload) => {
+        diagnostics?.phase("payload");
         if (operationSignal.aborted || !isCurrent()) throw compactionAbortError();
         if (localRejection) throw compactionError(localRejection.code);
         // Providers may swallow onPayload exceptions and emit arbitrary text in
@@ -393,20 +413,61 @@ async function performRemoteCompaction(
       },
     });
 
-    let usage = EMPTY_USAGE;
-    for await (const event of stream) {
-      if (operationSignal.aborted) throw compactionAbortError();
-      if (event.type === "error") throw providerFailure(event.error);
-      if (event.type === "done") usage = event.message.usage;
+    let usage: Usage | undefined;
+    const iterator = stream[Symbol.asyncIterator]();
+    let cleaned = false;
+    const cleanupIterator = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try {
+        void Promise.resolve(iterator.return?.()).catch(() => undefined);
+      } catch {
+        /* Cleanup cannot delay or replace the operation result. */
+      }
+    };
+    let rejectIterationAbort: (reason: unknown) => void = () => {};
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      rejectIterationAbort = reject;
+    });
+    // The signal may already be aborted before the first race is attached.
+    void interrupted.catch(() => undefined);
+    const onIterationAbort = () => {
+      cleanupIterator();
+      rejectIterationAbort(compactionAbortError());
+    };
+    operationSignal.addEventListener("abort", onIterationAbort, { once: true });
+    try {
+      if (operationSignal.aborted) onIterationAbort();
+      while (true) {
+        if (operationSignal.aborted) throw compactionAbortError();
+        const next = await Promise.race([iterator.next(), interrupted]);
+        if (operationSignal.aborted) throw compactionAbortError();
+        if (next.done) break;
+        const event = next.value;
+        if (event.type === "error") throw providerFailure(event.error);
+        if (event.type === "done") {
+          usage = event.message.usage;
+          diagnostics?.phase("provider_done");
+          break;
+        }
+      }
+    } finally {
+      operationSignal.removeEventListener("abort", onIterationAbort);
+      // Cleanup is attempted even if next() stalls, but return() is never awaited.
+      cleanupIterator();
     }
     if (operationSignal.aborted) throw compactionAbortError();
     if (localRejection) throw compactionError(localRejection.code);
     if (transportFailure) throw compactionError(transportFailure.code, transportFailure.httpStatus);
     if (!sentInput) throw compactionError("payload_rejected");
+    if (!usage) throw compactionError("remote_response_invalid");
+    diagnostics?.phase("completion_wait");
     const inspection = await inspections.at(-1);
     if (operationSignal.aborted) throw compactionAbortError();
     if (!inspection) throw compactionError("remote_response_invalid");
     if (!inspection.ok) throw compactionError(inspection.failure.code);
+    if (!isCurrent()) throw compactionAbortError();
+    if (performance.now() >= deadline) throw compactionError("remote_timeout");
     return { item: inspection.value.item, promptInput: sentInput, usage };
   } catch (error) {
     if (operationSignal.aborted || !isCurrent()) throw compactionAbortError();

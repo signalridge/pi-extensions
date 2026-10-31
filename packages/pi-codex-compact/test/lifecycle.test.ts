@@ -36,6 +36,7 @@ import {
   type CodexCompactSettingsState,
   DEFAULT_CODEX_COMPACT_SETTINGS,
 } from "../src/settings.js";
+import { withoutDiagnosticSummaries } from "./diagnostic-assertions.js";
 import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const model = {
@@ -420,7 +421,7 @@ test("real Codex HTTP errors cannot echo credentials into fallback warnings or c
   assert.equal(sentHeaders?.get("Authorization"), `Bearer ${apiKey}`);
   assert.equal(sentHeaders?.get("X-Provider-Token"), providerToken);
   assert.equal(result, undefined, "failure must fall back to native compaction");
-  assert.deepEqual(notifications, [
+  assert.deepEqual(withoutDiagnosticSummaries(notifications), [
     { message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]", level: "warning" },
   ]);
   for (const secret of [apiKey, `Bearer ${apiKey}`, providerToken, envSecret]) {
@@ -481,7 +482,7 @@ test("a real Codex stalled body reaches the extension deadline and uses native f
   assert.equal(attempts, 1);
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   assert.equal(cancellations, 1);
-  assert.deepEqual(notifications, [
+  assert.deepEqual(withoutDiagnosticSummaries(notifications), [
     { message: "Codex remote compaction failed; using Pi compaction. [remote_timeout]", level: "warning" },
   ]);
   assert.equal(statuses.get("codex-compact"), undefined);
@@ -491,7 +492,109 @@ test("a real Codex stalled body reaches the extension deadline and uses native f
   );
 }, 2000);
 
-for (const scenario of ["delayed success", "auth deadline", "cancel during auth", "combined deadline"] as const) {
+test("synchronous final result preparation cannot publish after the whole deadline", async () => {
+  let now = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => now);
+  const runtime = settingsRuntime();
+  const state = runtime.get();
+  const configured = {
+    ...state.settings,
+    get replacementTokenBudget() {
+      now = 900_001;
+      return 64_000;
+    },
+  };
+  runtime.get = () => ({ ...state, settings: configured });
+  const session = SessionManager.inMemory();
+  const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+  const mock = createMockPi();
+  const fetch = vi.fn<typeof globalThis.fetch>(async () => sseResponse());
+  createCodexCompactExtension({ settingsRuntime: runtime, fetch })(mock.pi);
+  const { ctx, notifications } = createMockContext({
+    model,
+    hasUI: true,
+    getSystemPrompt: () => "",
+    sessionManager: session,
+    modelRegistry: {
+      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "synthetic-key" }),
+      getProvider: stableProvider(() => fakeProvider()),
+    },
+  });
+  const result = await mock.events.get("session_before_compact")?.[0](
+    {
+      ...event(),
+      branchEntries: session.getBranch(),
+      preparation: { ...event().preparation, firstKeptEntryId: keptId },
+    },
+    ctx,
+  );
+  assert.equal(fetch.mock.calls.length, 1);
+  assert.equal(result, undefined);
+  assert.ok(notifications.some((entry) => entry.message.includes("[remote_timeout]")));
+  assert.equal(
+    session.getEntries().some((entry) => entry.type === "compaction"),
+    false,
+  );
+});
+
+for (const scenario of ["late auth without timer turn", "legacy runtime without stage limit"] as const) {
+  test(`authentication hard-boundary regression: ${scenario}`, async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const session = SessionManager.inMemory();
+    const keptId = session.appendMessage({ role: "user", content: "Task", timestamp: 1 });
+    const mock = createMockPi();
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => sseResponse());
+    createCodexCompactExtension({
+      settingsRuntime:
+        scenario === "legacy runtime without stage limit"
+          ? settingsRuntime({ stageTimeoutMs: undefined })
+          : settingsRuntime(),
+      fetch,
+    })(mock.pi);
+    const { ctx, notifications } = createMockContext({
+      model,
+      hasUI: true,
+      getSystemPrompt: () => "",
+      sessionManager: session,
+      modelRegistry: {
+        getApiKeyAndHeaders: async () => {
+          if (scenario === "late auth without timer turn") {
+            now = 300_001;
+            return { ok: true, apiKey: "synthetic-key" };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return { ok: false, error: "synthetic missing credentials" };
+        },
+        getProvider: stableProvider(() => fakeProvider()),
+      },
+    });
+    const result = await mock.events.get("session_before_compact")?.[0](
+      {
+        ...event(),
+        branchEntries: session.getBranch(),
+        preparation: { ...event().preparation, firstKeptEntryId: keptId },
+      },
+      ctx,
+    );
+    assert.equal(result, undefined);
+    assert.equal(fetch.mock.calls.length, 0);
+    const expected = scenario === "late auth without timer turn" ? "authentication_timeout" : "credentials_unavailable";
+    assert.ok(notifications.some((entry) => entry.message.includes(`[${expected}]`)));
+    assert.equal(
+      session.getEntries().some((entry) => entry.type === "compaction"),
+      false,
+    );
+  });
+}
+
+for (const scenario of [
+  "delayed success",
+  "auth deadline",
+  "stage auth deadline",
+  "cancel during auth",
+  "combined deadline",
+] as const) {
   test(`compaction operation bounds authentication: ${scenario}`, async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
     try {
@@ -507,7 +610,10 @@ for (const scenario of ["delayed success", "auth deadline", "cancel during auth"
       let requestSignal: AbortSignal | undefined;
       let persisted = false;
       createCodexCompactExtension({
-        settingsRuntime: settingsRuntime({ requestTimeoutMs: 100, notifyOnFallback: true }),
+        settingsRuntime: settingsRuntime({
+          requestTimeoutMs: scenario === "stage auth deadline" ? 900_000 : 100,
+          notifyOnFallback: true,
+        }),
         fetch: async () => {
           requests += 1;
           return scenario === "combined deadline" ? response.promise : sseResponse();
@@ -558,8 +664,8 @@ for (const scenario of ["delayed success", "auth deadline", "cancel during auth"
         await vi.advanceTimersByTimeAsync(0);
         assert.equal(persisted, true);
         assert.equal(requests, 0, "late authentication cannot dispatch after cancellation");
-      } else if (scenario === "auth deadline") {
-        await vi.advanceTimersByTimeAsync(99);
+      } else if (scenario === "auth deadline" || scenario === "stage auth deadline") {
+        await vi.advanceTimersByTimeAsync(scenario === "stage auth deadline" ? 299_999 : 99);
         assert.equal(settled, false);
         await vi.advanceTimersByTimeAsync(1);
         assert.equal(settled, true, "the deadline includes unresolved authentication");
@@ -589,10 +695,10 @@ for (const scenario of ["delayed success", "auth deadline", "cancel during auth"
           await vi.advanceTimersByTimeAsync(0);
         }
       }
-      if (scenario === "auth deadline" || scenario === "combined deadline") {
-        assert.deepEqual(notifications, [
+      if (scenario === "auth deadline" || scenario === "stage auth deadline" || scenario === "combined deadline") {
+        assert.deepEqual(withoutDiagnosticSummaries(notifications), [
           {
-            message: `Codex remote compaction failed; using Pi compaction. [${scenario === "auth deadline" ? "authentication_timeout" : "remote_timeout"}]`,
+            message: `Codex remote compaction failed; using Pi compaction. [${scenario !== "combined deadline" ? "authentication_timeout" : "remote_timeout"}]`,
             level: "warning",
           },
         ]);
@@ -1729,7 +1835,7 @@ test("disabled, unsupported, auth-failed, and aborted compaction paths remain sa
   );
   const failed = await run({ auth: { ok: false, error: "Authorization: Bearer secret-auth-token" } });
   assert.equal(failed.result, undefined);
-  assert.deepEqual(failed.notifications, [
+  assert.deepEqual(withoutDiagnosticSummaries(failed.notifications), [
     { message: "Codex remote compaction failed; using Pi compaction. [credentials_unavailable]", level: "warning" },
   ]);
   assert.equal(JSON.stringify(failed.notifications).includes("secret-auth-token"), false);

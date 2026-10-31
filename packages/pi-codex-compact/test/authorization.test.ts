@@ -9,6 +9,7 @@ import { test, vi } from "vitest";
 import { CANONICAL_HISTORY_NOTICE } from "../src/authorization.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
+import { withoutDiagnosticSummaries } from "./diagnostic-assertions.js";
 import { createMockContext, createMockPi, stableProvider } from "./support.js";
 
 const model: Model<"openai-codex-responses"> = {
@@ -285,7 +286,7 @@ test("transport failure permits native fallback only after canonical consent", a
   try {
     assert.equal(await f.compact(), undefined);
     assert.equal(f.requests.length, 1);
-    assert.deepEqual(f.notifications, [
+    assert.deepEqual(withoutDiagnosticSummaries(f.notifications), [
       {
         message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
         level: "warning",

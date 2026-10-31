@@ -321,7 +321,8 @@ project-level override.
 {
   "enabled": true,
   "allowCanonicalHistory": false,
-  "requestTimeoutMs": 300000,
+  "requestTimeoutMs": 900000,
+  "stageTimeoutMs": 300000,
   "maxRetries": 2,
   "replacementTokenBudget": 64000,
   "notifyOnFallback": true
@@ -332,7 +333,8 @@ project-level override.
 | --- | ---: | --- | --- | --- |
 | `enabled` | `true` | Boolean | Use remote compaction for compatible models and protect active opaque boundaries on all models. Turning it off explicitly permits Pi-native compaction outside both safety and consent gates. | Keep enabled to enforce the gate. |
 | `allowCanonicalHistory` | `false` | Boolean | Explicit persistent authorization to send canonical history and permit native summary fallback when no opaque boundary is active. | Leave off unless you understand the privacy boundary below; toggle in this extension's Settings menu to opt in. |
-| `requestTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Bound authentication, retries, and response-body inspection after authorization. | Keep five minutes; increase only for a consistently slow connection. |
+| `requestTimeoutMs` | `900000` | Integer from 30,000 to 1,800,000 ms | Hard whole-operation deadline across authentication, all folds, retries, and response-body inspection after authorization. | Default fifteen minutes; explicit existing values remain unchanged. |
+| `stageTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Hard deadline for authentication or one logical fold including transport retries, body inspection and provider completion; capped by remaining total time. | Keep five minutes. |
 | `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
 | `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. Does not suppress cancellation warnings protecting an active opaque checkpoint. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
@@ -346,6 +348,45 @@ Malformed, invalid, oversized, or symlinked settings files are never overwritten
 active, and the menu provides read-only repair guidance until the file is fixed and Pi is reloaded.
 Separate Pi processes do not share a mutation lock; a detected concurrent edit is rejected so the
 user can reopen Settings and retry.
+
+Neither deadline resets on incoming bytes or progress. For example, five healthy 70-second folds
+can finish within the new fifteen-minute total, but an explicitly configured `requestTimeoutMs: 300000`
+still limits the entire operation to five minutes. Recovery export remains one prefix request bounded
+by the **smaller** of stage and total budgets, including authentication. The global limit remains eight
+actual HTTP attempts across all normal folds and retries; no extra requests or cache-retention changes
+are introduced.
+
+### Source-free diagnostics
+
+Run **`/codex-compact diagnostics`** in the TUI to view this session's most recent operation. The
+read-only command neither sends a model message nor appends a session entry. It reports the last stage,
+closed outcome/error and timeout scope, fold/HTTP counts, elapsed time, and the captured stage/total
+limits. `prepared` means a complete result was returned to Pi, **not** that the host persisted it.
+The normal deadline is checked before returning that result; host commit latency is outside the
+extension's ownership. Recovery also checks the clock at its last pre-publication boundary. A
+publication already begun within budget is not undone or hidden by later durability/cleanup latency.
+Manual, threshold, overflow and recovery triggers are distinguished; older hosts without a reason use
+`unknown`. A stage report identifies observed progress, not the underlying cause of a live timeout.
+
+Best-effort private diagnostics are also appended in headless mode to
+`<getAgentDir()>/pi-codex-compact-diagnostics.jsonl`. Rows contain only an operation UUID, a one-way
+session correlation, fixed stages/codes, timestamps, bounded counts, separate request/response byte
+counts, and finite nonnegative native token/cache/cost scalars. No prompt, tool, input/output body,
+opaque checkpoint, URL, credential, header, environment, provider error text, session path or raw
+session ID is recorded. The provider remains authoritative for usage/cost; no wire usage is invented.
+
+Persistence has at most 128 rows per operation, a bounded queue and a 1 MiB file cap. New files use
+`0600`; readers/writers require a regular, private, single-link file with the extension's schema marker.
+Symlinks, foreign/malformed files and full logs are not rewritten or deleted. A non-waiting owned
+`.lock` serializes writers across processes/reloads; an existing or stale lock skips logging rather
+than recovering/deleting it. Logging failures never delay the network or checkpoint commit. The
+command uses recent in-memory rows when available and bounds persisted reads to 500 ms. Logging is
+not an audit guarantee: busy/full/unavailable storage may drop rows, and no automatic rotation occurs.
+
+Native Codex already recognizes completed/done SSE terminals without HTTP EOF. The extension stops
+its event iterator at the provider's ordinary `done`, preserves exact native usage/cost, and does not
+await potentially hanging iterator cleanup. Its independent strict wire inspector must still validate
+one unique bounded opaque item and a successful terminal before any result can be returned.
 
 ### Relationship to Codex configuration
 

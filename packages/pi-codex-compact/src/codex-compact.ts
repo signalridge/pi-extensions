@@ -26,6 +26,7 @@ import {
   parseCheckpointDetails,
   projectCheckpointContext,
 } from "./checkpoint.js";
+import { createDiagnosticTrace, diagnosticSummary, readLastDiagnostic } from "./diagnostics.js";
 import {
   type CompactionCancellationCode,
   type CompactionFailure,
@@ -45,6 +46,7 @@ import {
   type CodexCompactSettingsRuntime,
   type CodexCompactSettingsState,
   createCodexCompactSettingsRuntime,
+  effectiveStageTimeoutMs,
 } from "./settings.js";
 import { showCodexCompactMenu } from "./settings-menu.js";
 import { comparableTools, sameTools, ToolStateTracker } from "./tool-state.js";
@@ -229,11 +231,16 @@ function projectedCurrentMessages(
   return { messages, transcript: session.messages, prior };
 }
 
-function notifyFailure(ctx: ExtensionContext, settings: CodexCompactSettings, failure: CompactionFailure): void {
+function notifyFailure(
+  ctx: ExtensionContext,
+  settings: CodexCompactSettings,
+  failure: CompactionFailure,
+  diagnostic = "",
+): void {
   if (!ctx.hasUI || !settings.notifyOnFallback) return;
   try {
     ctx.ui.notify(
-      `Codex remote compaction failed; using Pi compaction. ${formatCompactionFailure(failure)}`,
+      `Codex remote compaction failed; using Pi compaction. ${formatCompactionFailure(failure)}${diagnostic ? ` ${diagnostic}` : ""}`,
       "warning",
     );
   } catch {
@@ -249,7 +256,7 @@ function setCompactionStatus(ctx: ExtensionContext, value: string | undefined): 
   }
 }
 
-function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailure): { cancel: true } {
+function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailure, diagnostic = ""): { cancel: true } {
   try {
     if (ctx.hasUI) {
       ctx.ui.notify(
@@ -259,7 +266,7 @@ function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailur
             : failure.code === "checkpoint_malformed" || failure.code === "checkpoint_projection_failed"
               ? " Recover a pre-compaction branch if the checkpoint cannot be replayed safely."
               : ""
-        }`,
+        }${diagnostic ? ` ${diagnostic}` : ""}`,
         "warning",
       );
     }
@@ -318,10 +325,17 @@ async function awaitCompactionAuth(
     });
     // Race only our wait. Pi owns token refresh and persistence, which must be
     // allowed to finish after cancellation. Promise.race observes late rejection.
-    return await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(model), interrupted]);
+    const auth = await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(model), interrupted]);
+    if (signal.aborted) throw compactionAbortError();
+    if (performance.now() >= deadline) {
+      timedOut = true;
+      throw compactionError("authentication_timeout");
+    }
+    return auth;
   } catch {
     // Authentication errors and abort reasons can contain credentials.
     if (signal.aborted) throw compactionAbortError();
+    timedOut ||= performance.now() >= deadline;
     throw compactionError(timedOut ? "authentication_timeout" : "authentication_failed");
   } finally {
     clearTimeout(timeout);
@@ -456,11 +470,18 @@ async function compactRemotely(
   }
   if (!isCurrent()) return cancelInvalidatedPreparation();
   const deadline = performance.now() + settings.requestTimeoutMs;
+  const stageTimeoutMs = effectiveStageTimeoutMs(settings);
+  const diagnostics = createDiagnosticTrace(sessionId, event.reason, {
+    signal,
+    operationTimeoutMs: settings.requestTimeoutMs,
+    stageTimeoutMs,
+  });
+  diagnostics.phase("auth");
   if (ctx.mode === "tui" && ctx.hasUI) setCompactionStatus(ctx, "Codex remote compaction…");
   let phase: CompactionFailureCode = "authentication_failed";
   try {
     const effectiveBeforeAuth = piCodingAgentCompat.buildSessionProjection ? ctx.getSystemPrompt() : undefined;
-    const auth = await awaitCompactionAuth(ctx, model, signal, deadline);
+    const auth = await awaitCompactionAuth(ctx, model, signal, Math.min(deadline, performance.now() + stageTimeoutMs));
     if (!isCurrent()) return cancelInvalidatedPreparation();
     if (effectiveBeforeAuth !== undefined && ctx.getSystemPrompt() !== effectiveBeforeAuth) {
       throw compactionError("loadout_mismatch");
@@ -553,6 +574,8 @@ async function compactRemotely(
           }
         : undefined,
       requestTimeoutMs: remainingMs,
+      stageTimeoutMs,
+      diagnostics,
       maxRetries: settings.maxRetries,
       fetch,
     });
@@ -579,6 +602,11 @@ async function compactRemotely(
       // projected messages are full lineage, never a tail to remove afterward.
       willRetry: !piCodingAgentCompat.buildSessionProjection && event.willRetry,
     });
+    if (!isCurrent()) return cancelInvalidatedPreparation();
+    if (performance.now() >= deadline) throw compactionError("remote_timeout");
+    // Synchronous fingerprinting/retention may outlast timer delivery too.
+    if (performance.now() >= deadline) throw compactionError("remote_timeout");
+    diagnostics.finish("prepared");
     return {
       compaction: {
         summary: fallbackSummary(details.checkpointId),
@@ -596,12 +624,24 @@ async function compactRemotely(
     // the opaque history. Falling through would replace it with a lossy native
     // summary. Historical checkpoints superseded by a native boundary do not
     // block fallback; current malformed/incompatible opaque boundaries do.
+    const failure = failureFrom(error, phase);
+    diagnostics.finish(
+      "failure",
+      failure.code,
+      failure.code === "remote_timeout" || failure.code === "authentication_timeout"
+        ? performance.now() >= deadline
+          ? "operation"
+          : "stage"
+        : "none",
+    );
+    const summary = diagnosticSummary(diagnostics.snapshot());
     if (isOpaqueCompaction(activeCompaction(event.branchEntries))) {
-      return cancelOpaqueCompaction(ctx, failureFrom(error, phase));
+      return cancelOpaqueCompaction(ctx, failure, summary);
     }
-    notifyFailure(ctx, settings, failureFrom(error, phase));
+    notifyFailure(ctx, settings, failure, summary);
     return undefined;
   } finally {
+    diagnostics.finish("cancelled");
     if (!ownerSignal.aborted && ctx.mode === "tui" && ctx.hasUI && ctx.sessionManager.getSessionId() === sessionId) {
       setCompactionStatus(ctx, undefined);
     }
@@ -646,6 +686,35 @@ export function createCodexCompactExtension(
     pi.registerCommand("codex-compact", {
       description: "Compact now or configure experimental Codex Remote Compaction V2",
       handler: async (args, ctx) => {
+        if (args.trim() === "diagnostics") {
+          if (ctx.mode !== "tui" || !ctx.hasUI) return;
+          const ownerGeneration = generation;
+          const sessionId = ctx.sessionManager.getSessionId();
+          const ui = ctx.ui;
+          const rows = await readLastDiagnostic(sessionId);
+          if (
+            !active ||
+            ctx.mode !== "tui" ||
+            !ctx.hasUI ||
+            ctx.ui !== ui ||
+            ownerGeneration !== generation ||
+            sessionController.signal.aborted ||
+            ctx.sessionManager.getSessionId() !== sessionId
+          )
+            return;
+          const last = rows.at(-1);
+          try {
+            ctx.ui.notify(
+              last
+                ? `${last.outcome} [${last.error}; timeout=${last.timeoutScope}]. ${diagnosticSummary(last)}`
+                : "No diagnostics available for this session.",
+              "info",
+            );
+          } catch {
+            /* Read-only, best effort UI. */
+          }
+          return;
+        }
         if (await recovery.handle(args, ctx)) return;
         const ownerGeneration = generation;
         await showCodexCompactMenu(settingsRuntime, ctx, {

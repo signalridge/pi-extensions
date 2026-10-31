@@ -20,6 +20,7 @@ import { createCheckpointDetails, fallbackSummary, parseCheckpointDetails } from
 import { createCodexCompactExtension } from "../src/codex-compact.js";
 import type { JsonObject } from "../src/protocol.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
+import { withoutDiagnosticSummaries } from "./diagnostic-assertions.js";
 import { createMockContext } from "./support.js";
 
 const model: Model<"openai-codex-responses"> = {
@@ -619,7 +620,7 @@ for (const delivery of ["current", "after-navigation"] as const) {
         JSON.stringify(f.notifications),
         /USER_CANARY|PASS_CANARY|TOKEN_CANARY|HEADER_CANARY|failure\.test|Authorization|Bearer/,
       );
-      assert.deepEqual(f.notifications, [
+      assert.deepEqual(withoutDiagnosticSummaries(f.notifications), [
         {
           message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
           level: "warning",
@@ -671,7 +672,7 @@ test("SDK Compact now during streaming reports a genuine native failure after ab
       JSON.stringify(f.notifications),
       /USER_CANARY|PASS_CANARY|TOKEN_CANARY|HEADER_CANARY|failure\.test|Authorization|Bearer/,
     );
-    assert.deepEqual(f.notifications, [
+    assert.deepEqual(withoutDiagnosticSummaries(f.notifications), [
       {
         message: "Codex remote compaction failed; using Pi compaction. [remote_http_error; HTTP 400]",
         level: "warning",

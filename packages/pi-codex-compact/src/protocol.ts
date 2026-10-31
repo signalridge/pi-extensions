@@ -113,7 +113,7 @@ export async function collectCompactionSse(
     void reader.cancel(new DOMException("Compaction aborted", "AbortError")).catch(() => undefined);
   };
   options.signal?.addEventListener("abort", onAbort, { once: true });
-  const decoder = new TextDecoder();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
   let bytes = 0;
   let pending = "";
   let dataLines: string[] = [];
@@ -145,7 +145,10 @@ export async function collectCompactionSse(
       throw new CodexCompactionProviderError();
     }
     if (isCompletedEvent(parsed)) {
-      const response = isObject(parsed.response) ? parsed.response : {};
+      if (!isObject(parsed.response)) {
+        throw new CodexCompactionProtocolError("Remote compaction returned an unsupported terminal response");
+      }
+      const response = parsed.response;
       const status = response.status;
       if (status === "failed" || status === "cancelled" || status === "incomplete") {
         throw new CodexCompactionProviderError();

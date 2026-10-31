@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import fs, { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +25,7 @@ import type { JsonObject } from "../src/protocol.js";
 import { createRecoveryCommand } from "../src/recovery-command.js";
 import { splitRecoveryContext } from "../src/recovery-snapshot.js";
 import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
+import { withoutDiagnosticSummaries } from "./diagnostic-assertions.js";
 import { createMockContext, createMockPi } from "./support.js";
 
 // Small command-boundary harness: all state and auth are synthetic; transport is
@@ -354,6 +355,35 @@ async function witnessedPromptFixture(phase: "stable" | "offer" | "auth" | "body
   };
 }
 
+for (const phase of ["before publication", "after publication"] as const) {
+  test(`recovery hard deadline across synchronous fsync: ${phase}`, async () => {
+    let now = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const f = await witnessedPromptFixture("stable");
+    const sync = fs.fsyncSync;
+    let calls = 0;
+    vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      sync(fd);
+      if (++calls === (phase === "before publication" ? 1 : 2)) now = 300_001;
+    });
+    try {
+      await f.confirm();
+      assert.equal(f.payloads.length, 1);
+      if (phase === "before publication") {
+        assert.equal(f.exports().length, 0, "expired synchronous staging must not publish");
+        assert.ok(f.notifications.some((entry) => entry.message.includes("[remote_timeout]")));
+        f.assertUnchanged();
+      } else {
+        assert.equal(f.exports().length, 1, "already-published success stays visible");
+        assert.match(f.notifications.at(-1)?.message ?? "", /Recovery exported to NEW session/);
+        f.assertSourceUnchanged();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
 test("idle recovery stable witnessed C/E exports once with canonical wire instructions", async () => {
   const f = await witnessedPromptFixture("stable");
   try {
@@ -495,7 +525,7 @@ for (const userFirst of [false, true]) {
       f.assertNoExport();
       if (userFirst) assert.deepEqual(f.notifications, []);
       else
-        assert.deepEqual(f.notifications, [
+        assert.deepEqual(withoutDiagnosticSummaries(f.notifications), [
           { message: "Recovery export failed; original unchanged. [remote_timeout]", level: "warning" },
         ]);
       const count = f.notifications.length;

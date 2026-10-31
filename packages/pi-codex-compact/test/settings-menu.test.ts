@@ -68,7 +68,8 @@ test("settings screen exposes bounded controls and invalid files remain repairab
     [
       ["enabled", "On"],
       ["allowCanonicalHistory", "Off"],
-      ["requestTimeoutMs", "5 min"],
+      ["requestTimeoutMs", "15 min"],
+      ["stageTimeoutMs", "5 min"],
       ["maxRetries", "2"],
       ["replacementTokenBudget", "64K tokens"],
       ["notifyOnFallback", "On"],
