@@ -19,11 +19,12 @@ import {
   checkpointMarker,
   createCheckpointDetails,
 } from "./checkpoint.js";
+import { createDiagnosticTrace, diagnosticSummary } from "./diagnostics.js";
 import { compactionAbortError, compactionError, failureFrom, formatCompactionFailure } from "./failure.js";
 import { exportRecoverySession } from "./recovery-export.js";
 import { splitRecoveryContext } from "./recovery-snapshot.js";
 import { requestRemoteCompaction } from "./remote.js";
-import type { CodexCompactSettingsRuntime } from "./settings.js";
+import { type CodexCompactSettingsRuntime, effectiveStageTimeoutMs } from "./settings.js";
 import { sameTools } from "./tool-state.js";
 
 interface RecoveryDependencies {
@@ -173,6 +174,7 @@ export function createRecoveryCommand(
         };
         isCurrent = ownerIsCurrent;
         const settings = structuredClone(runtime.get().settings);
+        const stageTimeoutMs = effectiveStageTimeoutMs(settings);
         const model = ctx.model;
         if (!settings.enabled || model?.provider !== "openai-codex" || model.api !== "openai-codex-responses") {
           throw compactionError("checkpoint_incompatible");
@@ -374,24 +376,42 @@ export function createRecoveryCommand(
                   };
                 });
                 if (!mounted || !isCurrent()) throw compactionAbortError();
+                const diagnostics = createDiagnosticTrace(sessionId, "recovery", {
+                  signal,
+                  operationTimeoutMs: settings.requestTimeoutMs,
+                  stageTimeoutMs,
+                });
                 const work = async () => {
                   if (!isCurrent()) return;
-                  const deadline = performance.now() + settings.requestTimeoutMs;
+                  const budget = Math.min(settings.requestTimeoutMs, stageTimeoutMs);
+                  const deadline = performance.now() + budget;
+                  diagnostics.phase("auth");
                   timeout = setTimeout(() => {
                     if (signal.aborted) return; // Earlier user/session cancellation wins.
                     timedOut = true;
                     // Signal cancellation retires progress and resolves the command even
                     // if an auth implementation ignores cancellation indefinitely.
-                    if (isCurrent()) notify(ctx, "Recovery export failed; original unchanged. [remote_timeout]");
+                    diagnostics.finish(
+                      "failure",
+                      "remote_timeout",
+                      settings.requestTimeoutMs <= stageTimeoutMs ? "operation" : "stage",
+                    );
+                    if (isCurrent())
+                      notify(
+                        ctx,
+                        `Recovery export failed; original unchanged. [remote_timeout] ${diagnosticSummary(diagnostics.snapshot())}`,
+                      );
                     controller.abort();
-                  }, settings.requestTimeoutMs);
+                  }, budget);
                   try {
                     const auth = await dependencies.authenticate(ctx, model, signal, deadline);
                     if (!isCurrent()) throw compactionAbortError();
                     if (!auth.ok || !auth.apiKey) throw compactionError("credentials_unavailable");
                     const remainingMs = deadline - performance.now();
                     if (remainingMs <= 0) throw compactionError("remote_timeout");
+                    diagnostics.fold();
                     const response = await requestRemoteCompaction({
+                      diagnostics,
                       provider,
                       model: { ...model, baseUrl: auth.baseUrl ?? model.baseUrl },
                       context: {
@@ -414,6 +434,8 @@ export function createRecoveryCommand(
                       fetch: dependencies.fetch,
                     });
                     if (!isCurrent()) throw compactionAbortError();
+                    diagnostics.usage(response.usage);
+                    diagnostics.phase("fold_done");
                     const details = createCheckpointDetails({
                       modelId: model.id,
                       replacementHistory: buildReplacementHistory(response.promptInput, response.item, {
@@ -432,10 +454,12 @@ export function createRecoveryCommand(
                       usage: response.usage,
                       signal,
                       isCurrent,
+                      deadline,
                       onPublished: (result) => {
                         // Publication is committed: cleanup must not extend the deadline
                         // or hold the command/UI hostage to a slow descriptor close.
                         clearTimeout(timeout);
+                        diagnostics.finish("exported");
                         try {
                           if (isCurrent())
                             notify(
@@ -456,14 +480,26 @@ export function createRecoveryCommand(
                 // while publication remains guarded through auth, body, and staging.
                 const running = work()
                   .catch((error: unknown) => {
+                    const failure = failureFrom(error, "local_compaction_failed");
+                    if (isCurrent())
+                      diagnostics.finish(
+                        "failure",
+                        failure.code,
+                        failure.code === "remote_timeout" || failure.code === "authentication_timeout"
+                          ? settings.requestTimeoutMs <= stageTimeoutMs
+                            ? "operation"
+                            : "stage"
+                          : "none",
+                      );
                     if (!timedOut && isCurrent())
                       notify(
                         ctx,
-                        `Recovery export failed; original unchanged. ${formatCompactionFailure(failureFrom(error, "local_compaction_failed"))}`,
+                        `Recovery export failed; original unchanged. ${formatCompactionFailure(failureFrom(error, "local_compaction_failed"))} ${diagnosticSummary(diagnostics.snapshot())}`,
                       );
                   })
                   .finally(retire);
                 await Promise.race([running, cancelled]);
+                diagnostics.finish("cancelled");
               } finally {
                 retire();
               }

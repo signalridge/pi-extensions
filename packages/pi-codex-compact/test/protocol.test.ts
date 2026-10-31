@@ -34,6 +34,40 @@ function validSse(item = { type: "compaction", encrypted_content: "opaque" }): s
   ].join("");
 }
 
+for (const fragmented of [false, true]) {
+  test(`invalid UTF-8 cannot be repaired inside opaque content (${fragmented ? "fragmented" : "whole"})`, async () => {
+    const prefix = encoder.encode(
+      'data: {"type":"response.completed","response":{"output":[{"type":"compaction","encrypted_content":"left',
+    );
+    const suffix = encoder.encode('right"}]}}\n\n');
+    const bytes = new Uint8Array(prefix.length + 1 + suffix.length);
+    bytes.set(prefix);
+    bytes[prefix.length] = 0xff;
+    bytes.set(suffix, prefix.length + 1);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (fragmented) for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+        else controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    await assert.rejects(collectCompactionSse(body), CodexCompactionProtocolError);
+  });
+}
+
+for (const malformed of [undefined, null, [], 0, "completed", true]) {
+  test(`terminal response must be an object: ${JSON.stringify(malformed)}`, async () => {
+    const item = { type: "compaction", encrypted_content: "opaque" };
+    const text = [
+      { type: "response.output_item.done", item },
+      { type: "response.completed", response: malformed },
+    ]
+      .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+      .join("");
+    await assert.rejects(collectCompactionSse(fragmentedStream(text)), CodexCompactionProtocolError);
+  });
+}
+
 test("collects one compaction from fragmented CRLF SSE and deduplicates completed output", async () => {
   const result = await collectCompactionSse(fragmentedStream(validSse()));
   assert.deepEqual(result.item, { type: "compaction", encrypted_content: "opaque" });

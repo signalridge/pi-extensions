@@ -11,22 +11,30 @@ export interface CodexCompactSettings {
   enabled: boolean;
   allowCanonicalHistory: boolean;
   requestTimeoutMs: number;
+  /** Optional for injected runtimes created before stage budgets existed. */
+  stageTimeoutMs?: number;
   maxRetries: number;
   replacementTokenBudget: number;
   notifyOnFallback: boolean;
 }
 
+export function effectiveStageTimeoutMs(settings: Pick<CodexCompactSettings, "stageTimeoutMs">): number {
+  return settings.stageTimeoutMs ?? 300_000;
+}
+
 export const DEFAULT_CODEX_COMPACT_SETTINGS: Readonly<CodexCompactSettings> = Object.freeze({
   enabled: true,
   allowCanonicalHistory: false,
-  requestTimeoutMs: 300_000,
+  requestTimeoutMs: 900_000,
+  stageTimeoutMs: 300_000,
   maxRetries: 2,
   replacementTokenBudget: 64_000,
   notifyOnFallback: true,
 });
 
 const LIMITS = Object.freeze({
-  requestTimeoutMs: { minimum: 30_000, maximum: 600_000 },
+  requestTimeoutMs: { minimum: 30_000, maximum: 1_800_000 },
+  stageTimeoutMs: { minimum: 30_000, maximum: 600_000 },
   maxRetries: { minimum: 0, maximum: 2 },
   replacementTokenBudget: { minimum: 8_000, maximum: 128_000 },
 });
@@ -77,6 +85,8 @@ export function normalizeCodexCompactSettings(value: unknown): CodexCompactSetti
       typeof value.requestTimeoutMs === "number"
         ? value.requestTimeoutMs
         : DEFAULT_CODEX_COMPACT_SETTINGS.requestTimeoutMs,
+    stageTimeoutMs:
+      typeof value.stageTimeoutMs === "number" ? value.stageTimeoutMs : DEFAULT_CODEX_COMPACT_SETTINGS.stageTimeoutMs,
     maxRetries: typeof value.maxRetries === "number" ? value.maxRetries : DEFAULT_CODEX_COMPACT_SETTINGS.maxRetries,
     replacementTokenBudget:
       typeof value.replacementTokenBudget === "number"

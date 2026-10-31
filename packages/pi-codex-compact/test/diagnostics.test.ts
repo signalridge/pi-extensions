@@ -5,8 +5,10 @@ import { type ExtensionContext, type SessionBeforeCompactEvent, SessionManager }
 import { test, vi } from "vitest";
 import { createCheckpointDetails, fallbackSummary } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
+import { createDiagnosticTrace } from "../src/diagnostics.js";
 import { compactionError, failureFrom } from "../src/failure.js";
 import { type CodexCompactSettingsRuntime, DEFAULT_CODEX_COMPACT_SETTINGS } from "../src/settings.js";
+import { withoutDiagnosticSummary } from "./diagnostic-assertions.js";
 import { createMockContext, createMockPi } from "./support.js";
 
 const model: Model<"openai-codex-responses"> = {
@@ -43,6 +45,41 @@ function settingsRuntime(allowCanonicalHistory = true): CodexCompactSettingsRunt
     flush: async () => {},
   };
 }
+
+for (const mode of ["tui", "json", "rpc"] as const) {
+  test(`diagnostics command is session-bound, read-only and guarded in ${mode}`, async () => {
+    const mock = createMockPi();
+    createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(mock.pi);
+    const session = SessionManager.inMemory();
+    const { ctx, notifications } = createMockContext({ mode, hasUI: true, sessionManager: session });
+    const trace = createDiagnosticTrace(session.getSessionId(), "manual");
+    trace.phase("auth");
+    trace.finish("failure", "authentication_timeout", "stage");
+    const command = mock.commands.get("codex-compact");
+    assert.ok(command);
+    await command.handler("diagnostics", ctx);
+    assert.equal(notifications.length, mode === "tui" ? 1 : 0);
+    if (mode === "tui") assert.match(notifications[0].message, /authentication_timeout; timeout=stage/);
+    assert.deepEqual(mock.sentMessages, []);
+    assert.deepEqual(mock.sentUserMessages, []);
+    assert.deepEqual(mock.entries, []);
+    const other = createMockContext({ mode, hasUI: true, sessionManager: SessionManager.inMemory() });
+    await command.handler("diagnostics", other.ctx);
+    if (mode === "tui") assert.equal(other.notifications[0].message, "No diagnostics available for this session.");
+  });
+}
+
+test("diagnostics command suppresses a retired UI even when recent rows are in memory", async () => {
+  const mock = createMockPi();
+  createCodexCompactExtension({ settingsRuntime: settingsRuntime() })(mock.pi);
+  const session = SessionManager.inMemory();
+  const { ctx, notifications } = createMockContext({ mode: "tui", hasUI: true, sessionManager: session });
+  createDiagnosticTrace(session.getSessionId(), "manual").phase("auth");
+  const reading = mock.commands.get("codex-compact")?.handler("diagnostics", ctx);
+  await mock.events.get("session_shutdown")?.[0]({ reason: "reload" }, ctx);
+  await reading;
+  assert.deepEqual(notifications, []);
+});
 
 const cases = [
   ["auth throw", "authentication_failed"],
@@ -305,7 +342,7 @@ test("throwing diagnostic UI cannot turn an authentication failure on opaque his
   assert.deepEqual(result, { cancel: true });
   assert.equal(notify.mock.calls.length, 1);
   assert.equal(
-    notify.mock.calls[0][0],
+    withoutDiagnosticSummary(notify.mock.calls[0][0]),
     "Compaction cancelled to preserve the existing opaque checkpoint. [authentication_failed]",
   );
 });

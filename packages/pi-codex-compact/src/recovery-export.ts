@@ -10,6 +10,7 @@ import {
   parseCheckpointDetails,
   projectCheckpointContext,
 } from "./checkpoint.js";
+import { compactionError } from "./failure.js";
 import { assertClosedToolPairs, type RecoveryMessage, resetHistoricalUsage } from "./recovery-snapshot.js";
 
 const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
@@ -29,6 +30,8 @@ export interface RecoveryExportInput {
   usage: Usage;
   signal: AbortSignal;
   isCurrent(): boolean;
+  /** Absolute monotonic deadline checked before no-replace publication. */
+  deadline?: number;
   /** Synchronous committed-success boundary, before any asynchronous cleanup. */
   onPublished?(result: RecoveryExportResult): void;
 }
@@ -37,6 +40,12 @@ export interface RecoveryExportResult {
   path: string;
   /** The complete file is usable even if its directory durability could not be confirmed. */
   durabilityConfirmed: boolean;
+}
+
+function assertDeadline(deadline: number | undefined): void {
+  if (deadline !== undefined && (!Number.isFinite(deadline) || performance.now() >= deadline)) {
+    throw compactionError("remote_timeout");
+  }
 }
 
 function assertCurrent(input: RecoveryExportInput): void {
@@ -153,6 +162,9 @@ function pinnedPath(path: string, identity: fs.BigIntStats, directory = false): 
  * a malicious same-UID process racing inside the final synchronous syscalls.
  */
 export async function exportRecoverySession(input: RecoveryExportInput): Promise<RecoveryExportResult> {
+  // Capture before callbacks/path pinning; no input getter runs at publication.
+  const deadline = input.deadline;
+  assertDeadline(deadline);
   assertCurrent(input);
   if (!isAbsolute(input.cwd) || !isAbsolute(input.sessionDir)) throw new Error("Recovery needs absolute paths");
   const manager = buildRecoverySession(input);
@@ -234,6 +246,9 @@ export async function exportRecoverySession(input: RecoveryExportInput): Promise
     pinnedPath(directory, directoryIdentity, true);
     pinnedPath(staged, fileIdentity);
     unchanged();
+    // Pure clock check after path validation. Publication begun in budget stays
+    // successful even if its syscall/durability/cleanup finishes after deadline.
+    assertDeadline(deadline);
     fs.linkSync(staged, destination); // EEXIST (including symlinks) never overwrites.
     let durabilityConfirmed = true;
     try {

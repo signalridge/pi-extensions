@@ -110,6 +110,59 @@ function setup(input: JsonObject[], extra: Partial<Parameters<typeof requestBoun
   return { packets, request };
 }
 
+for (const total of [undefined, 300_000]) {
+  test(`five healthy 70s folds respect total ${total ?? "default"}`, async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+    try {
+      let calls = 0;
+      const input = Array.from({ length: 5 }, (_, i) => user(`${i}${"x".repeat(2000)}`));
+      const { request } = setup(input, {
+        requestTimeoutMs: total,
+        fetch: async () => {
+          calls++;
+          await new Promise((resolve) => setTimeout(resolve, 70_000));
+          return response(opaque(`fold-${calls}`));
+        },
+      });
+      const pending = requestBoundedCompaction(request);
+      const checked =
+        total === undefined
+          ? pending.then((result) => assert.deepEqual(result.promptInput, input))
+          : assert.rejects(pending, fails("remote_timeout"));
+      void checked.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(350_000);
+      await checked;
+      assert.equal(calls, 5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+}
+
+test("one stalled stage expires at five minutes despite a fifteen minute total", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+  try {
+    let signal: AbortSignal | undefined;
+    const { request } = setup(users(), {
+      fetch: async (_input, init) => {
+        signal = init?.signal ?? undefined;
+        return new Promise(() => {});
+      },
+    });
+    let settled = false;
+    const checked = assert.rejects(requestBoundedCompaction(request), fails("remote_timeout")).then(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(299_999);
+    assert.equal(settled, false);
+    await vi.advanceTimersByTimeAsync(1);
+    await checked;
+    assert.equal(signal?.aborted, true);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 test("folds contiguous occurrence indices, repeats exact prefix groups, preserves complete backups", async () => {
   const declarations = [
     { type: "additional_tools", role: "developer", tools: [{ name: "a" }] },

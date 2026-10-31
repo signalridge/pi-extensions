@@ -1,7 +1,12 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
 import { withBorderedCustomUi } from "@signalridge/pi-ui";
-import type { CodexCompactSettings, CodexCompactSettingsRuntime, CodexCompactSettingsState } from "./settings.js";
+import {
+  type CodexCompactSettings,
+  type CodexCompactSettingsRuntime,
+  type CodexCompactSettingsState,
+  effectiveStageTimeoutMs,
+} from "./settings.js";
 
 type Screen = "main" | "settings" | "invalid";
 type Action =
@@ -10,6 +15,7 @@ type Action =
   | "set-enabled"
   | "set-canonical"
   | "set-timeout"
+  | "set-stage-timeout"
   | "set-retries"
   | "set-retention"
   | "set-notify";
@@ -125,11 +131,19 @@ export function createCodexCompactMenu(
           },
           {
             id: "requestTimeoutMs",
-            label: "Request timeout",
-            description: "Maximum time for the extension-owned remote compaction request.",
+            label: "Total operation timeout",
+            description: "Hard deadline across authentication, all folds and retries.",
             currentValue: timeoutLabel(state.settings.requestTimeoutMs),
-            values: ["2 min", "5 min", "10 min"],
+            values: ["2 min", "5 min", "10 min", "15 min", "30 min"],
             action: "set-timeout",
+          },
+          {
+            id: "stageTimeoutMs",
+            label: "Stage timeout",
+            description: "Hard deadline for authentication or one fold including retries and body completion.",
+            currentValue: timeoutLabel(effectiveStageTimeoutMs(state.settings)),
+            values: ["2 min", "5 min", "10 min"],
+            action: "set-stage-timeout",
           },
           {
             id: "maxRetries",
@@ -181,7 +195,9 @@ export function createCodexCompactMenu(
       "set-canonical": ({ ctx, value, signal }) =>
         update(runtime, ctx, { allowCanonicalHistory: value === "On" }, signal),
       "set-timeout": ({ ctx, value, signal }) =>
-        update(runtime, ctx, { requestTimeoutMs: Number.parseInt(value ?? "5", 10) * 60_000 }, signal),
+        update(runtime, ctx, { requestTimeoutMs: Number.parseInt(value ?? "15", 10) * 60_000 }, signal),
+      "set-stage-timeout": ({ ctx, value, signal }) =>
+        update(runtime, ctx, { stageTimeoutMs: Number.parseInt(value ?? "5", 10) * 60_000 }, signal),
       "set-retries": ({ ctx, value, signal }) =>
         update(runtime, ctx, { maxRetries: Number.parseInt(value ?? "2", 10) }, signal),
       "set-retention": ({ ctx, value, signal }) =>

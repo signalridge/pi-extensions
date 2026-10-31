@@ -1,4 +1,5 @@
 import type { Usage } from "@earendil-works/pi-ai";
+import { trustedDiagnosticTrace } from "./diagnostics.js";
 import { compactionAbortError, compactionError, failureFrom, isCompactionAbortError } from "./failure.js";
 import type { JsonObject } from "./protocol.js";
 import { type RemoteCompactionRequest, type RemoteCompactionResponse, requestRemoteCompaction } from "./remote.js";
@@ -32,7 +33,8 @@ export async function requestBoundedCompaction(
 async function performBoundedCompaction(
   request: Omit<RemoteCompactionRequest, "selectInput" | "beforeFetch">,
 ): Promise<RemoteCompactionResponse> {
-  const deadline = performance.now() + (request.requestTimeoutMs ?? 300_000);
+  const diagnostics = trustedDiagnosticTrace(request.diagnostics);
+  const deadline = performance.now() + (request.requestTimeoutMs ?? 900_000);
   // Bytes are only a conservative scheduling heuristic, NOT a token counter.
   const target = Math.max(1, Math.min(4 * 1024 * 1024, 3 * (request.model.contextWindow - request.model.maxTokens)));
   const identity = () => JSON.stringify([request.model, request.headers, request.env, request.apiKey]);
@@ -73,10 +75,11 @@ async function performBoundedCompaction(
     let sentBytes = 0;
     let fixedBytes = 0;
     try {
+      diagnostics?.fold();
       const response = await requestRemoteCompaction({
         ...request,
         ...structuredClone(auth),
-        requestTimeoutMs: deadline - performance.now(),
+        requestTimeoutMs: Math.min(request.stageTimeoutMs ?? 300_000, deadline - performance.now()),
         isCurrent: () => {
           // Deadline retains its own closed diagnostic at the no-send gate.
           try {
@@ -149,6 +152,9 @@ async function performBoundedCompaction(
       });
       check();
       if (!original || end === undefined || end <= cursor) throw compactionError("segmentation_unsupported");
+      diagnostics?.usage(response.usage);
+      diagnostics?.phase("fold_done");
+      check();
       usage = addUsage(usage, response.usage);
       cursor = end;
       previous = response.item;
