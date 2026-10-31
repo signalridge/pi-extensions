@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.3
+### Patch Changes
+
+- 1b96283: Stop labelling an extension status twice when its text starts with its key followed by a space, or is just the key in another case: `loop 1 · next 3m` rendered as `loop loop 1 · next 3m`. With an icon configured, the icon replaces the key, as it already does for `key: text`.
+
 ## 1.5.2
 ### Patch Changes
 
