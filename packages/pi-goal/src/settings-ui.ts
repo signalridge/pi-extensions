@@ -43,6 +43,7 @@ export async function showGoalSettings(
     | "choose-no-progress"
     | "set-visibility"
     | "set-queue"
+    | "set-notices"
     | "set-rpc";
   const menu = defineMenu<undefined, Screen, Action, ExtensionCommandContext>({
     start: invalid ? "invalid" : (options.initialScreen ?? "settings"),
@@ -83,6 +84,14 @@ export async function showGoalSettings(
             action: "set-queue",
           },
           {
+            id: "experimentalNotices",
+            label: "Experimental notice",
+            description: "Say once per session that experimental behavior and persisted state may change.",
+            currentValue: runtime.settings.experimental.notices ? "On" : "Off",
+            values: ["On", "Off"],
+            action: "set-notices",
+          },
+          {
             id: "rpcEnabled",
             label: "Managed run RPC",
             description:
@@ -104,6 +113,7 @@ export async function showGoalSettings(
           `No-progress guard: ${formatNoProgressProtection(runtime.settings.continuationLimits.noProgressTurns)}`,
           `Goal tools: ${visibilityLabel(runtime.settings.toolVisibility)}`,
           `Ordered goal queue: ${runtime.settings.experimental.goals ? "Experimental" : "Off"}`,
+          `Experimental notice: ${runtime.settings.experimental.notices ? "On" : "Off"}`,
           `Managed run RPC: ${runtime.settings.rpc.enabled ? "On" : "Off"}`,
         ],
         hint: "back",
@@ -180,6 +190,24 @@ export async function showGoalSettings(
             }
           }
           notifyTerminal(ctx.ui, `Ordered goal queue: ${enabled ? "Experimental" : "Off"}.`, "info");
+          return { kind: "stay" };
+        } catch (error) {
+          notifySettingsFailure(ctx, settingsPath, error);
+          return { kind: "rejected" };
+        }
+      },
+      "set-notices": async ({ value }) => {
+        const enabled = value === "On";
+        if (enabled === runtime.settings.experimental.notices) return { kind: "stay" };
+        try {
+          const next = {
+            ...structuredClone(runtime.settings),
+            experimental: { ...runtime.settings.experimental, notices: enabled },
+          } satisfies GoalSettings;
+          applyGoalSettings(runtime, next, ctx, {
+            save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
+          });
+          notifyTerminal(ctx.ui, `Experimental notice: ${enabled ? "On" : "Off"}.`, "info");
           return { kind: "stay" };
         } catch (error) {
           notifySettingsFailure(ctx, settingsPath, error);
@@ -459,7 +487,7 @@ async function nextQueueSettings(runtime: GoalRuntime, ctx: ExtensionCommandCont
   }
   return {
     ...structuredClone(runtime.settings),
-    experimental: { goals: enabled },
+    experimental: { ...runtime.settings.experimental, goals: enabled },
   } satisfies GoalSettings;
 }
 

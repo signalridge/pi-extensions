@@ -16,6 +16,10 @@ test("normalizeGoalSettings applies defaults and accepts bounded continuation li
   // must not carry their definitions or prompt guidelines. Changing this
   // default changes the context cost of every session that installs pi-goal.
   assert.equal(DEFAULT_GOAL_SETTINGS.toolVisibility, "after-first-goal");
+  // The experimental notice defaults to On: enabling an experiment should say
+  // once that its persisted state may change. It is a setting rather than a
+  // repeated prompt so a reader who has accepted it can stop being told.
+  assert.deepEqual(DEFAULT_GOAL_SETTINGS.experimental, { goals: false, notices: true });
   assert.deepEqual(normalizeGoalSettings({}), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ futureOption: true }), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ toolVisibility: "always" }), {
@@ -28,7 +32,15 @@ test("normalizeGoalSettings applies defaults and accepts bounded continuation li
   });
   assert.deepEqual(normalizeGoalSettings({ experimental: { goals: true, futureOption: "kept-compatible" } }), {
     ...DEFAULT_GOAL_SETTINGS,
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
+  });
+  assert.deepEqual(normalizeGoalSettings({ experimental: { goals: true, notices: false } }), {
+    ...DEFAULT_GOAL_SETTINGS,
+    experimental: { goals: true, notices: false },
+  });
+  assert.deepEqual(normalizeGoalSettings({ experimental: { notices: false } }), {
+    ...DEFAULT_GOAL_SETTINGS,
+    experimental: { goals: false, notices: false },
   });
   assert.deepEqual(normalizeGoalSettings({ rpc: {} }), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ rpc: { enabled: true } }), {
@@ -65,6 +77,7 @@ test("normalizeGoalSettings applies defaults and accepts bounded continuation li
     { toolVisibility: "sometimes" },
     { experimental: true },
     { experimental: { goals: "yes" } },
+    { experimental: { notices: "yes" } },
     { rpc: true },
     { rpc: [] },
     { rpc: { enabled: "yes" } },
@@ -113,7 +126,7 @@ test("saveGoalSettings atomically preserves unknown top-level and nested fields"
   saveGoalSettings(
     {
       toolVisibility: "always",
-      experimental: { goals: true },
+      experimental: { goals: true, notices: false },
       rpc: { enabled: false },
       continuationLimits: { automaticTurns: 40, noProgressTurns: null },
     },
@@ -123,7 +136,7 @@ test("saveGoalSettings atomically preserves unknown top-level and nested fields"
   assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {
     future: { enabled: true },
     toolVisibility: "always",
-    experimental: { goals: true, futureQueue: "keep" },
+    experimental: { goals: true, notices: false, futureQueue: "keep" },
     rpc: { enabled: false, futureRpc: "keep" },
     continuationLimits: { automaticTurns: 40, noProgressTurns: null, futureLimit: 9 },
   });
@@ -164,7 +177,7 @@ test("readGoalSettings distinguishes missing, loaded, malformed, and unreadable 
     kind: "loaded",
     settings: {
       toolVisibility: "after-first-goal",
-      experimental: { goals: true },
+      experimental: { goals: true, notices: true },
       rpc: { enabled: false },
       continuationLimits: { automaticTurns: 25, noProgressTurns: 3 },
     },

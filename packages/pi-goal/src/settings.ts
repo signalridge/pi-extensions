@@ -13,6 +13,7 @@ export interface GoalSettings {
   toolVisibility: GoalToolVisibility;
   experimental: {
     goals: boolean;
+    notices: boolean;
   };
   rpc: {
     enabled: boolean;
@@ -32,7 +33,12 @@ export const DEFAULT_GOAL_SETTINGS: GoalSettings = {
   // unfinished goal reveals them at startup. Set `"always"` to keep them
   // resident.
   toolVisibility: "after-first-goal",
-  experimental: { goals: false },
+  // `notices` is on by default: a user who enabled an experiment should be told
+  // once per session that its persisted state may change. It exists so that
+  // acknowledgement is a setting rather than a repeated prompt — a warning the
+  // reader cannot accept stops carrying information, and the same notification
+  // level carries failures worth reading.
+  experimental: { goals: false, notices: true },
   rpc: { enabled: false },
   continuationLimits: { automaticTurns: 25, noProgressTurns: 3 },
 };
@@ -70,6 +76,11 @@ export function normalizeGoalSettings(value: unknown): GoalSettings | undefined 
       ? Reflect.get(experimentalValue, "goals")
       : DEFAULT_GOAL_SETTINGS.experimental.goals;
   if (typeof goals !== "boolean") return undefined;
+  const notices =
+    experimentalValue && Object.hasOwn(experimentalValue, "notices")
+      ? Reflect.get(experimentalValue, "notices")
+      : DEFAULT_GOAL_SETTINGS.experimental.notices;
+  if (typeof notices !== "boolean") return undefined;
 
   const rpcValue = Object.hasOwn(value, "rpc") ? Reflect.get(value, "rpc") : undefined;
   if (rpcValue !== undefined && (typeof rpcValue !== "object" || rpcValue === null || Array.isArray(rpcValue))) {
@@ -108,7 +119,7 @@ export function normalizeGoalSettings(value: unknown): GoalSettings | undefined 
 
   return {
     toolVisibility: toolVisibility as GoalToolVisibility,
-    experimental: { goals },
+    experimental: { goals, notices },
     rpc: { enabled: rpcEnabled },
     continuationLimits: { automaticTurns, noProgressTurns },
   };
@@ -149,7 +160,11 @@ export function saveGoalSettings(
     {
       ...raw,
       toolVisibility: normalized.toolVisibility,
-      experimental: { ...experimental, goals: normalized.experimental.goals },
+      experimental: {
+        ...experimental,
+        goals: normalized.experimental.goals,
+        notices: normalized.experimental.notices,
+      },
       rpc: { ...rpc, enabled: normalized.rpc.enabled },
       continuationLimits: {
         ...continuationLimits,

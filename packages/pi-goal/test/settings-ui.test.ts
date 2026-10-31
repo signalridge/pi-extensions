@@ -90,12 +90,12 @@ test("applyGoalSettings rolls back file and effective state after runtime applic
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.queuedGoals = [createGoal("queued objective", undefined, 0)];
   const previous = structuredClone(state.settings);
-  const next = { ...structuredClone(previous), experimental: { goals: false } };
+  const next = { ...structuredClone(previous), experimental: { goals: false, notices: true } };
   const saved: GoalSettings[] = [];
   let persistCalls = 0;
   state.persistGoal = () => {
@@ -124,7 +124,7 @@ test("disabling a retained queue pauses and aborts in-flight Goal work", () => {
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.queuedGoals = [createGoal("queued objective", undefined, 0)];
@@ -136,7 +136,7 @@ test("disabling a retained queue pauses and aborts in-flight Goal work", () => {
     hasUI: true,
     abort: () => aborts++,
   });
-  const next = { ...structuredClone(state.settings), experimental: { goals: false } };
+  const next = { ...structuredClone(state.settings), experimental: { goals: false, notices: true } };
 
   applyGoalSettings(state, next, context.ctx, { save() {} });
 
@@ -153,7 +153,7 @@ test("freezing a queue preserves an unrelated in-flight run", () => {
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.queuedGoals = [createGoal("queued objective", undefined, 0)];
@@ -164,7 +164,7 @@ test("freezing a queue preserves an unrelated in-flight run", () => {
     hasUI: true,
     abort: () => aborts++,
   });
-  const next = { ...structuredClone(state.settings), experimental: { goals: false } };
+  const next = { ...structuredClone(state.settings), experimental: { goals: false, notices: true } };
 
   applyGoalSettings(state, next, context.ctx, { save() {} });
 
@@ -344,7 +344,7 @@ test("unfreezing waits for an aborted frozen run to settle before dispatching", 
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: false },
+    experimental: { goals: false, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.queuedGoals = [createGoal("queued objective", undefined, 0)];
@@ -353,7 +353,7 @@ test("unfreezing waits for an aborted frozen run to settle before dispatching", 
   state.guardAbortGoalId = state.activeGoal.id;
   state.queueFreezeAwaitingSettle = true;
   const context = createMockContext({ mode: "tui", hasUI: true, isIdle: () => true });
-  const enabled = { ...structuredClone(state.settings), experimental: { goals: true } };
+  const enabled = { ...structuredClone(state.settings), experimental: { goals: true, notices: true } };
   const controller = new GoalCommandController(state);
 
   applyGoalSettings(state, enabled, context.ctx, { save() {} });
@@ -379,7 +379,7 @@ test("unfreezing an active retained queue dispatches Goal work immediately", asy
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.queuedGoals = [createGoal("queued objective", undefined, 0)];
@@ -399,7 +399,7 @@ test("unfreezing a pending priority dispatches it at the idle boundary", async (
   const state = new GoalRuntime(mock.pi);
   state.settings = {
     ...structuredClone(DEFAULT_GOAL_SETTINGS),
-    experimental: { goals: true },
+    experimental: { goals: true, notices: true },
   };
   state.activeGoal = createGoal("current objective", undefined, 0);
   state.pendingQueueAction = { kind: "prioritize", objective: "urgent objective" };
@@ -414,7 +414,7 @@ test("unfreezing a pending priority dispatches it at the idle boundary", async (
   assert.equal(mock.sentUserMessages.length, 1);
 });
 
-test("standard settings keep all five controls on one level", async () => {
+test("standard settings keep all six controls on one level", async () => {
   const state = runtime();
   let title = "";
   let options: string[] = [];
@@ -434,6 +434,7 @@ test("standard settings keep all five controls on one level", async () => {
     "No-progress guard",
     "Goal tools",
     "Ordered goal queue",
+    "Experimental notice",
     "Managed run RPC",
   ]);
 });
@@ -703,6 +704,59 @@ test("automatic-work editing rejects a replacement active goal without saving", 
   assert.equal(saves, 0);
   assert.equal(state.settings.continuationLimits.automaticTurns, 25);
   assert.match(context.notifications.at(-1)?.message ?? "", /active goal changed/i);
+});
+
+test("Experimental notice setting saves and silences the session-start warning", async () => {
+  const state = runtime();
+  state.settings = {
+    ...structuredClone(state.settings),
+    experimental: { goals: true, notices: true },
+  };
+  let saved: GoalSettings | undefined;
+  // `undefined` cycles to the next value, which from the default `On` is `Off`.
+  const selections = ["Experimental notice", undefined];
+  const context = createMockContext({
+    hasUI: true,
+    mode: "tui",
+    select: async () => selections.shift(),
+  });
+
+  await showGoalSettings(state, context.ctx, {
+    settingsPath: "/tmp/pi-goal.json",
+    save(settings) {
+      saved = structuredClone(settings);
+    },
+  });
+
+  // The notice is a setting, not a mode: the queue stays experimental.
+  assert.deepEqual(saved?.experimental, { goals: true, notices: false });
+  assert.deepEqual(state.settings.experimental, { goals: true, notices: false });
+  assert.equal(state.queueFrozen, false);
+  assert.match(context.notifications.at(-1)?.message ?? "", /Experimental notice: Off/i);
+});
+
+test("Experimental notice setting rolls back when save fails", async () => {
+  const state = runtime();
+  state.settings = {
+    ...structuredClone(state.settings),
+    experimental: { goals: true, notices: true },
+  };
+  const selections = ["Experimental notice", undefined];
+  const context = createMockContext({
+    hasUI: true,
+    mode: "tui",
+    select: async () => selections.shift(),
+  });
+
+  await showGoalSettings(state, context.ctx, {
+    settingsPath: "/tmp/pi-goal.json",
+    save() {
+      throw new Error("disk full");
+    },
+  });
+
+  assert.deepEqual(state.settings.experimental, { goals: true, notices: true });
+  assert.match(context.notifications.at(-1)?.message ?? "", /previous value remains/i);
 });
 
 test("Managed run RPC setting defaults off and saves immediately", async () => {

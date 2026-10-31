@@ -106,7 +106,7 @@ export function registerGoalLifecycle(
     if (settingsResult.kind === "invalid") {
       notifyTerminal(ctx.ui, `pi-goal settings ignored: ${settingsResult.reason}. Using default settings.`, "warning");
     }
-    if (runtime.settings.experimental.goals) {
+    if (runtime.settings.experimental.goals && runtime.settings.experimental.notices) {
       notifyTerminal(ctx.ui, EXPERIMENTAL_GOALS_WARNING, "warning");
     }
     try {

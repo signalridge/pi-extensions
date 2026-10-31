@@ -61,7 +61,8 @@ built-in defaults without creating the file:
 {
   "toolVisibility": "after-first-goal",
   "experimental": {
-    "goals": false
+    "goals": false,
+    "notices": true
   },
   "rpc": {
     "enabled": false
@@ -74,13 +75,14 @@ built-in defaults without creating the file:
 ```
 
 Use `/goal` → **Settings…** in the TUI to create or update the file interactively, or create
-and edit it directly. The standard Settings screen keeps all five controls on one level in task
+and edit it directly. The standard Settings screen keeps all six controls on one level in task
 order; the two safety limits open standard choice screens:
 
 - **Automatic-work limit** shows the exact response limit or **Unlimited**. Choose **Set response limit…** to edit the current finite value (or the built-in default of 25 when switching from Unlimited), or choose **Unlimited…**. Unlimited requires confirmation that tool loops may continue consuming tokens and provider cost without a response-count cap.
 - **No-progress guard** shows **_N_ runs** or **Off**. Choose the default threshold, **Off**, or **Set threshold…** and enter a safe whole number greater than zero.
 - **Goal tools** controls whether terminal Goal tools are always visible or appear after the first goal.
 - **Ordered goal queue** controls the experimental ordered-goal workflows.
+- **Experimental notice** controls whether a session reports once that experimental behavior and persisted state may change. It defaults to **On** and suppresses only that announcement; the queue itself is unaffected.
 - **Managed run RPC** controls whether trusted installed extensions may start and cancel managed Goal runs. It defaults to **Off** and is a cooperation setting, not an extension security sandbox.
 
 Custom number inputs reject zero, negative numbers, decimals, text, and unsafe integers without saving; use the explicit **Unlimited** or **Off** choice instead. Interactive changes are serialized, written atomically, preserve unknown fields, and apply to the current runtime. A successful change updates the visible state immediately. A failed save restores the prior value and reports the settings path so it can be retried. Tool-visibility changes that would alter the active tool schema are rejected while Pi is busy; retry after Pi settles. Escape returns to the previous screen without reverting changes that were already saved.
@@ -91,6 +93,8 @@ Custom number inputs reject zero, negative numbers, decimals, text, and unsafe i
 - `"after-first-goal"` (default) — hides both tools at fresh runtime startup, reveals them for the first accepted Goal activation, and treats an unfinished-goal restore as unlocked for the remainder of that extension runtime. On restore, pi-goal uses the active tools already established by earlier lifecycle handlers; it does not re-add missing terminal tools over a restrictive policy. Failed kickoff, replacement, resume, or reactivating-edit delivery restores the exact pre-activation tool set, including terminal tools exposed by another extension. If revealing the tools would widen an already-running turn, wait for Pi to become idle and retry `/goal`.
 
 `experimental.goals` accepts a boolean and defaults to `false`. Set it to `true` to enable the ordered-goal subcommands and automatic queue advancement described below. Enabled sessions show one warning because command behavior and persisted queue state remain experimental.
+
+`experimental.notices` accepts a boolean and defaults to `true`. It controls that single experimental-goals announcement: with `notices: false` a session starts without it, while the queue, its subcommands, and queue freezing behave exactly as they do with `notices: true`. Nothing else routes through this setting — validation failures, settings-load warnings, and recovery notices always report, because those describe a problem rather than restate a choice the user has already made. Use it when the experiment is a standing configuration rather than a trial, so the warning level keeps meaning something.
 
 `rpc.enabled` accepts a boolean and defaults to `false`. When disabled, a valid managed-run start receives `RPC_DISABLED`; manual and restored Goals remain unchanged. A Settings-menu change applies immediately after its atomic save. Disabling rejects new starts but lets an already accepted run continue publishing its exact state and accept its exact cancellation until terminal, avoiding stranded work. Reload, replacement, and shutdown clear that in-memory ownership.
 

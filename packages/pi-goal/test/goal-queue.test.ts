@@ -12,11 +12,13 @@ import { createMockContext, createMockPi } from "./support.js";
 const settingsDirectory = mkdtempSync(join(tmpdir(), "pi-goal-queue-settings-"));
 const enabledSettingsPath = join(settingsDirectory, "enabled.json");
 const disabledSettingsPath = join(settingsDirectory, "disabled.json");
+const quietSettingsPath = join(settingsDirectory, "quiet.json");
 // `toolVisibility` is pinned rather than left to the default: these tests
 // exercise queue mechanics, which need the goal tools present, and the default
 // is `after-first-goal` (tools hidden until the first goal is set). Leaving it
 // implicit made the whole file depend on a setting it is not testing.
 writeFileSync(enabledSettingsPath, '{"toolVisibility":"always","experimental":{"goals":true}}\n');
+writeFileSync(quietSettingsPath, '{"toolVisibility":"always","experimental":{"goals":true,"notices":false}}\n');
 writeFileSync(disabledSettingsPath, "{}\n");
 
 type GoalTool = {
@@ -42,6 +44,24 @@ test("experimental mode keeps singular registration and exposes canonical queue 
   );
   assert.ok(
     harness.notifications.some(({ message, level }) => level === "warning" && /experimental.*goals/i.test(message)),
+  );
+});
+
+test("silencing the experimental notice keeps the queue experimental", async () => {
+  const harness = await createHarness({}, quietSettingsPath);
+  assert.equal(
+    harness.notifications.some(({ message, level }) => level === "warning" && /experimental.*goals/i.test(message)),
+    false,
+  );
+  // Only the notice is suppressed: the queue still parses and mutates.
+  await harness.command("first goal");
+  await harness.command("add last goal");
+  assert.deepEqual(
+    stateGoals(harness.mock).map(({ text, status }) => ({ text, status })),
+    [
+      { text: "first goal", status: "active" },
+      { text: "last goal", status: "queued" },
+    ],
   );
 });
 
@@ -1401,9 +1421,9 @@ test("disabled settings freeze retained queues without losing state", async () =
   assert.deepEqual(lastState(harness.mock), { goal: null });
 });
 
-async function createHarness(overrides: Record<string, unknown> = {}, enabled = true) {
+async function createHarness(overrides: Record<string, unknown> = {}, settingsFile?: string) {
   const mock = createMockPi({ activeTools: ["goal_complete", "goal_blocked", "goal_wait"] });
-  goal(mock.pi, { settingsPath: enabled ? enabledSettingsPath : disabledSettingsPath });
+  goal(mock.pi, { settingsPath: settingsFile ?? enabledSettingsPath });
   const context = createMockContext(overrides);
   await mock.events.get("session_start")?.[0]?.({}, context.ctx);
   return {
