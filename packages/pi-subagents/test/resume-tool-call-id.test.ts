@@ -29,14 +29,20 @@ import { mockParentRegistry } from "./helpers/model-runtime.js";
 
 function makePi() {
   const tools = new Map<string, any>();
-  const lifecycle = new Map<string, any>();
+  const lifecycle = new Map<string, (...args: unknown[]) => Promise<unknown>>();
   const sent: any[] = [];
   const pi = {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
     getCommands: vi.fn(() => []),
-    on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => unknown) => {
+      const previous = lifecycle.get(event);
+      lifecycle.set(event, async (...args: unknown[]) => {
+        await previous?.(...args);
+        return handler(...args);
+      });
+    }),
     events: { emit: vi.fn(), on: vi.fn(() => vi.fn()) },
     appendEntry: vi.fn(),
     sendMessage: vi.fn((message: any) => {
@@ -104,6 +110,35 @@ describe("background resume re-anchors the tool call id", () => {
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(agentDir, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it("reading a terminal result after the old hold window still suppresses delivery while the parent is busy", async () => {
+    const { pi, tools, lifecycle, sent } = makePi();
+    const root = ctx(); let idle = false;
+    root.isIdle = () => idle; root.hasPendingMessages = () => false;
+    subagentsExtension(pi); await lifecycle.get("session_start")?.({}, root);
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "READ-RESULT", aborted: false, steered: false });
+    const spawned = await tools.get("Agent").execute("spawn", { prompt: "work", description: "read", subagent_type: "general-purpose", run_in_background: true }, undefined, undefined, root);
+    const id = textOf(spawned).match(/Agent ID: (\S+)/)?.[1]; expect(id).toBeTruthy();
+    await settle(); expect(sent).toHaveLength(0);
+    const read = await tools.get("get_subagent_result").execute("read", { agent_id: id }, undefined, undefined, root);
+    expect(textOf(read)).toContain("READ-RESULT"); idle = true;
+    await lifecycle.get("agent_settled")?.({}, root); await settle(); expect(sent).toHaveLength(0);
+    await lifecycle.get("session_shutdown")?.({}, root);
+  });
+
+  it("an unread failure stays available and wakes once at the settled boundary", async () => {
+    const { pi, tools, lifecycle, sent } = makePi();
+    const root = ctx(); let idle = false;
+    root.isIdle = () => idle; root.hasPendingMessages = () => false;
+    subagentsExtension(pi); await lifecycle.get("session_start")?.({}, root);
+    vi.mocked(runAgent).mockRejectedValue(new Error("synthetic unread failure"));
+    await tools.get("Agent").execute("spawn", { prompt: "work", description: "failed", subagent_type: "general-purpose", run_in_background: true }, undefined, undefined, root);
+    await settle(); expect(sent).toHaveLength(0); idle = true;
+    await lifecycle.get("agent_settled")?.({}, root); await settle();
+    expect(sent).toHaveLength(1); expect(notificationText(sent)).toContain("synthetic unread failure");
+    expect(pi.sendMessage.mock.calls[0]?.[1]).toMatchObject({ deliverAs: "steer", triggerTurn: true });
+    await lifecycle.get("session_shutdown")?.({}, root);
   });
 
   it("notifies under the resume's tool call id, not the spawn's", async () => {

@@ -202,6 +202,27 @@ describe("selective upstream parity through production dispatch", () => {
     } finally { await manager.dispose(); }
   });
 
+  it.each([
+    { early: true, peerBeforeHandoff: false },
+    { early: false, peerBeforeHandoff: false },
+    { early: true, peerBeforeHandoff: true },
+  ])("labels a partial group from finalized membership, not snapshot timing: %j", async ({ early, peerBeforeHandoff }) => {
+    const runtime = await start("smart", 2); await spawnTool("first"); const peer = await spawnTool("peer");
+    if (!early) await vi.advanceTimersByTimeAsync(100);
+    pending[0].finish({ responseText: "FIRST", session: pending[0].session, aborted: false, steered: false });
+    for (let i = 0; i < 15; i++) await Promise.resolve();
+    if (early) await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(30_000);
+    if (peerBeforeHandoff) await finish(1, "PEER");
+    await vi.advanceTimersByTimeAsync(200);
+    const status = runtime.registry().getRecord(peer)?.status;
+    const content = runtime.sendMessage.mock.calls.map(([message]) => message.content as string).join("\n");
+    if (!peerBeforeHandoff) await finish(1, "PEER");
+    expect(status).toBe(peerBeforeHandoff ? "completed" : "running");
+    expect(content).toContain("<result>FIRST</result>");
+    expect(content.includes("partial — others still running")).toBe(!peerBeforeHandoff);
+  });
+
   it("snapshots text, activity and tool-use identity when completion is immediately resumed", async () => {
     const runtime = await start();
     const id = await spawnTool("original");
@@ -218,7 +239,7 @@ describe("selective upstream parity through production dispatch", () => {
     expect(message.content).toContain("<result>ORIGINAL</result>");
     expect(message.content).toContain("<status>Done</status>");
     expect(message.details).toMatchObject({ status: "completed", turnCount: 7, toolUses: 1, totalTokens: 12 });
-    expect(delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    expect(delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
     release({ text: "RESUMED", aborted: false, steered: false });
     await runtime.registry().waitForAll();
     await vi.advanceTimersByTimeAsync(200);
@@ -271,8 +292,9 @@ describe("selective upstream parity through production dispatch", () => {
     expect(grouped.content).toContain("<result>SECOND</result>");
     expect(grouped.content).not.toContain("FIRST");
     expect(grouped.details).toMatchObject({ turnCount: 8, status: "completed" });
-    expect(grouped.details.others).toBeUndefined();
-    expect(runtime.sendMessage).toHaveBeenCalledTimes(2);
+    expect(grouped.details.others).toHaveLength(1);
+    expect(grouped.content).toContain("<result>RESUMED</result>");
+    expect(runtime.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("keeps grouped snapshots stable while a completed member resumes before its peer finishes", async () => {
@@ -331,17 +353,17 @@ describe("selective upstream parity through production dispatch", () => {
     await finish(1, "PEER");
     await vi.advanceTimersByTimeAsync(finalized ? 200 : 300);
     const messages = runtime.sendMessage.mock.calls.map(([message]) => message);
-    const grouped = messages.find(message => message.content.includes("group completed"));
-    expect(grouped.content).toContain("<result>PEER</result>");
-    expect(grouped.content.includes("<result>FIRST</result>")).toBe(consume !== "first" && consume !== "both");
-    expect(grouped.content).not.toContain("<result>SECOND</result>");
-    const individual = messages.find(message => !message.content.includes("group completed"));
-    if (consume === "second" || consume === "both") expect(individual).toBeUndefined();
-    else {
-      expect(individual.content).toContain("<result>SECOND</result>");
-      expect(individual.content).toContain("<tool-use-id>tc-second</tool-use-id>");
-    }
-    for (const [, delivery] of runtime.sendMessage.mock.calls) expect(delivery).toEqual({ deliverAs: "followUp", triggerTurn: true });
+    // Explicit group membership remains intact inside the single boundary
+    // message, alongside any unconsumed newer attempt's individual XML.
+    expect(messages).toHaveLength(1);
+    const content = messages[0].content as string;
+    const grouped = content.match(/Background agent group completed:[\s\S]*?Use get_subagent_result for full output\./)?.[0];
+    expect(grouped).toContain("<result>PEER</result>");
+    expect(grouped?.includes("<result>FIRST</result>")).toBe(consume !== "first" && consume !== "both");
+    expect(grouped).not.toContain("<result>SECOND</result>");
+    expect(content.includes("<result>SECOND</result>")).toBe(consume !== "second" && consume !== "both");
+    if (consume !== "second" && consume !== "both") expect(content).toContain("<tool-use-id>tc-second</tool-use-id>");
+    for (const [, delivery] of runtime.sendMessage.mock.calls) expect(delivery).toEqual({ deliverAs: "steer", triggerTurn: true });
   });
 
   it.each(["session_tree", "session_shutdown"])("retires every pre-finalization completed attempt on %s", async event => {

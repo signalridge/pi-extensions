@@ -94,6 +94,12 @@ const ControlSchema = Type.Object(
       { description: "Control action" },
     ),
     run_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    consume: Type.Optional(
+      Type.Boolean({
+        description:
+          "With get/status only: explicitly acknowledge a reviewed terminal result and suppress its pending completion reminder. Running results and ordinary inspections are not consumed.",
+      }),
+    ),
     // Accept camelCase and legacy workflow_run_id for interop with pi-dynamic-workflows docs
     runId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
     workflow_run_id: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
@@ -344,6 +350,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let lifecycleGeneration = 0;
   let deliveryGeneration = 0;
   const deliveryObservers = new Map<string, string>();
+  const observedExecutions = new Map<string, string>();
   let handledTreeEvent: unknown;
   let journalBranchAnchor: string | null | undefined;
   let protocolAbortController: AbortController | undefined;
@@ -370,7 +377,10 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     { generation: number; context: ExtensionContext; engine: WorkflowEngine; anchor: string | null | undefined }
   >();
   /** Pending deliveries for completed runs, including durable recovery (A10). */
-  const pendingDeliveryMarkers = new Map<string, { text: string; timestamp: number }>();
+  const pendingDeliveryMarkers = new Map<
+    string,
+    { text: string; timestamp: number; executionGeneration?: number; completionId?: string }
+  >();
   const PENDING_DELIVERY_TYPE = "pi-workflows:pending-delivery";
   const PENDING_DELIVERY_ACK_TYPE = "pi-workflows:pending-delivery-ack";
   const MAX_PENDING_DELIVERIES = 256;
@@ -426,6 +436,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     workflowUiSurfaceId = randomUUID();
     deliveryGeneration++;
     deliveryObservers.clear();
+    observedExecutions.clear();
     turnArming.retire();
     wakeAdmissions.clear();
     if (deliveryTimer) clearTimeout(deliveryTimer);
@@ -880,7 +891,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
           });
           return new Text(theme.fg("dim", expanded ? text.slice(0, 8_000) : text.slice(0, 1_000)), 0, 0);
         },
-        async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+        async execute(_toolCallId, params, signal, _onUpdate, ctx) {
           try {
             const rawAction = params.action as string;
             const action = (rawAction === "status" ? "get" : rawAction) as
@@ -895,7 +906,22 @@ export default function piWorkflows(pi: ExtensionAPI): void {
             }
             const runId = normalizeControlRunId(params as unknown as Record<string, unknown>);
             const workflowEngine = currentEngine();
+            if (params.consume && action !== "get") throw new Error("consume is supported only with get/status.");
+            const execution = runId ? workflowEngine.getState(runId)?.executionGeneration : undefined;
+            const ownerGeneration = deliveryGeneration;
+            const completionId =
+              params.consume && action === "get" && runId ? completionReceipt(workflowEngine, runId) : undefined;
             const result = await workflowEngine.control(action, runId);
+            signal?.throwIfAborted();
+            if (params.consume) {
+              const notificationConsumed =
+                !!runId &&
+                execution !== undefined &&
+                completionId !== undefined &&
+                consumeReviewedResult(workflowEngine, runId, execution, completionId, ownerGeneration, ctx);
+              const receipt = { ...result, notificationConsumed };
+              return textResult(JSON.stringify(receipt), receipt);
+            }
             return textResult(JSON.stringify(result), result);
           } catch (error: unknown) {
             return textResult(error instanceof Error ? error.message : String(error));
@@ -1548,9 +1574,92 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     });
   };
 
-  const rememberPendingDelivery = (runId: string, text: string, timestamp = Date.now()): void => {
-    if (!runId || timestamp + PENDING_DELIVERY_TTL_MS < Date.now()) return;
-    pendingDeliveryMarkers.set(runId, { text: text.slice(0, 8_000), timestamp });
+  /** Native journal identity survives restore; runtime generation counters do not. */
+  function completionReceipt(workflowEngine: WorkflowEngine, runId: string): string | undefined {
+    const run = workflowEngine.getState(runId)?.run;
+    if (!run || !["completed", "failed", "stopped"].includes(run.status)) return;
+    try {
+      const branch = deliveryContext?.sessionManager.getBranch() ?? [];
+      for (let index = branch.length - 1; index >= 0; index--) {
+        const entry = branch[index];
+        if (entry.type !== "custom" || entry.customType !== JOURNAL_ENTRY_TYPE) continue;
+        const data = entry.data as Record<string, unknown> | undefined;
+        if (
+          data?.runId === runId &&
+          data.status === run.status &&
+          data.timestamp === run.updatedAt &&
+          (data.kind === "workflow_transition" || data.kind === "terminal_recovery")
+        )
+          return entry.id;
+      }
+    } catch {
+      // Unavailable branch evidence cannot acknowledge a result.
+    }
+  }
+
+  function consumeReviewedResult(
+    workflowEngine: WorkflowEngine,
+    runId: string,
+    execution: number,
+    completionId: string,
+    generation: number,
+    ctx: ExtensionContext,
+  ): boolean {
+    const current = () =>
+      generation === deliveryGeneration &&
+      workflowEngine === engine &&
+      ctx.sessionManager === deliveryContext?.sessionManager &&
+      ownsDeliveryBranch() &&
+      workflowEngine.getState(runId)?.executionGeneration === execution &&
+      completionReceipt(workflowEngine, runId) === completionId;
+    if (!current()) return false;
+    // An older marker without a durable receipt cannot be attributed to the
+    // reviewed execution. Preserve it rather than silently migrating history.
+    if (pendingDeliveryMarkers.has(runId) && pendingDeliveryMarkers.get(runId)?.completionId === undefined)
+      return false;
+    if (observedExecutions.get(runId) === completionId) return true;
+    try {
+      const previous = new Set(ctx.sessionManager.getBranch().map((entry) => entry.id));
+      pi.appendEntry(PENDING_DELIVERY_ACK_TYPE, {
+        runId,
+        executionGeneration: execution,
+        completionId,
+        observed: true,
+        timestamp: Date.now(),
+      });
+      if (!current()) return false;
+      const accepted = ctx.sessionManager.getBranch().some((entry) => {
+        if (previous.has(entry.id) || entry.type !== "custom" || entry.customType !== PENDING_DELIVERY_ACK_TYPE)
+          return false;
+        const data = entry.data as Record<string, unknown> | undefined;
+        return data?.runId === runId && data.completionId === completionId && data.observed === true;
+      });
+      if (!accepted) return false;
+      advanceDeliveryAnchor();
+      observedExecutions.set(runId, completionId);
+      while (observedExecutions.size > MAX_PENDING_DELIVERIES)
+        observedExecutions.delete(observedExecutions.keys().next().value as string);
+      if (pendingDeliveryMarkers.get(runId)?.completionId === completionId) pendingDeliveryMarkers.delete(runId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const rememberPendingDelivery = (
+    runId: string,
+    text: string,
+    timestamp = Date.now(),
+    executionGeneration?: number,
+    completionId?: string,
+  ): void => {
+    if (
+      !runId ||
+      timestamp + PENDING_DELIVERY_TTL_MS < Date.now() ||
+      (completionId !== undefined && observedExecutions.get(runId) === completionId)
+    )
+      return;
+    pendingDeliveryMarkers.set(runId, { text: text.slice(0, 8_000), timestamp, executionGeneration, completionId });
     for (const [id, marker] of pendingDeliveryMarkers) {
       if (marker.timestamp + PENDING_DELIVERY_TTL_MS < Date.now()) pendingDeliveryMarkers.delete(id);
     }
@@ -1582,6 +1691,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       !["completed", "failed", "stopped"].includes(run.status)
     )
       return;
+    const completionId = completionReceipt(workflowEngine, runId);
+    if (completionId !== undefined && observedExecutions.get(runId) === completionId) return;
     const header = `Workflow ${run.runId} ${run.status}`;
     const state = workflowEngine.getState(runId);
     const finalResult = state?.result ?? run.finalResult;
@@ -1592,10 +1703,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
         : `result:\n${typeof finalResult === "string" ? finalResult : (JSON.stringify(finalResult, null, 2) ?? String(finalResult))}`);
     const text = `${header}: ${body}`;
     if (!ownsDeliveryBranch()) return;
-    rememberPendingDelivery(runId, text);
+    rememberPendingDelivery(runId, text, Date.now(), executionGeneration, completionId);
     try {
       pi.appendEntry(PENDING_DELIVERY_TYPE, {
         runId,
+        executionGeneration,
+        completionId,
         text: text.slice(0, 8_000),
         status: run.status,
         timestamp: Date.now(),
@@ -1633,22 +1746,37 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   };
   const hydratePendingDeliveries = (entries: SessionEntryLike[]): void => {
     pendingDeliveryMarkers.clear();
+    observedExecutions.clear();
     for (const entry of entries) {
       const shaped = entry as { type?: unknown; customType?: unknown; data?: unknown };
       if (shaped.type !== "custom") continue;
       const data = shaped.data as Record<string, unknown> | undefined;
       if (typeof data?.runId !== "string") continue;
-      if (shaped.customType === PENDING_DELIVERY_ACK_TYPE) pendingDeliveryMarkers.delete(data.runId);
-      else if (shaped.customType === PENDING_DELIVERY_TYPE && typeof data.text === "string") {
+      if (shaped.customType === PENDING_DELIVERY_ACK_TYPE) {
+        // Explicit reads acknowledge exactly one durable terminal receipt.
+        // Ordinary delivery ACKs still acknowledge the actual handed-off marker.
+        if (
+          data.observed !== true ||
+          (typeof data.completionId === "string" &&
+            pendingDeliveryMarkers.get(data.runId)?.completionId === data.completionId)
+        )
+          pendingDeliveryMarkers.delete(data.runId);
+      } else if (shaped.customType === PENDING_DELIVERY_TYPE && typeof data.text === "string") {
         rememberPendingDelivery(
           data.runId,
           data.text,
           typeof data.timestamp === "number" ? data.timestamp : Date.now(),
+          typeof data.executionGeneration === "number" ? data.executionGeneration : undefined,
+          typeof data.completionId === "string" ? data.completionId : undefined,
         );
       }
     }
   };
   const flushPendingDeliveries = (): void => {
+    for (const [runId, marker] of pendingDeliveryMarkers) {
+      if (marker.completionId !== undefined && observedExecutions.get(runId) === marker.completionId)
+        pendingDeliveryMarkers.delete(runId);
+    }
     if (!canDeliver() || !deliveryContext || pendingDeliveryMarkers.size === 0) return;
     if (typeof pi.sendMessage !== "function" || typeof pi.sendUserMessage !== "function") return;
     const ctx = deliveryContext;

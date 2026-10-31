@@ -88,6 +88,32 @@ export class Notifications {
     }
   }
 
+  /** Reading a terminal result consumes only its exit, not unread monitor matches. */
+  consumeExit(jobId: string): void {
+    for (const entries of [this.pending, this.inFlight?.entries]) {
+      const entry = entries?.get(jobId);
+      if (!entry) continue;
+      const exits = entry.events.filter((event) => event.kind === "exit").length;
+      entry.events = entry.events.filter((event) => event.kind !== "exit");
+      entry.count = Math.max(entry.events.length, entry.count - exits);
+      if (entry.events.length === 0) entries?.delete(jobId);
+    }
+    if (this.inFlight?.entries.size === 0) {
+      clearTimeout(this.ackTimer);
+      this.ackTimer = undefined;
+      this.inFlight = undefined;
+      this.attempts = 0;
+      this.paused = false;
+    }
+    if (!this.inFlight && this.pending.size === 0) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+      this.paused = false;
+      this.attempts = 0;
+    }
+    this.schedule();
+  }
+
   private schedule(delay: number = LIMITS.debounceMs): void {
     if (this.disposed || this.paused || this.timer || this.pending.size === 0) return;
     this.timer = setTimeout(() => {

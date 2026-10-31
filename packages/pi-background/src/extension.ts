@@ -210,6 +210,20 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
         deliveryPaused: owner.notifications.deliveryPaused,
       };
     },
+    consumeExit: (ctx, id) => {
+      const owner = requireOwner(ctx);
+      owner.notifications.consumeExit(id);
+      const pending = {
+        pendingNotifications: owner.notifications.count,
+        deliveryPaused: owner.notifications.deliveryPaused,
+      };
+      try {
+        updateStatus(owner);
+      } catch {
+        // Presentation cannot turn an already committed read into a failure.
+      }
+      return pending;
+    },
     cancel: (id) => {
       const owner = active;
       if (!live(owner)) throw new Error("No active background manager for this session.");

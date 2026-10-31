@@ -171,12 +171,12 @@ function fixture(
     drain: async () => {
       await Promise.all(wakes);
     },
-    run: async () => {
+    run: async (script = 'export const meta = { name: "delivery", description: "test" }; return "finished";') => {
       const count = pending().length;
       const result = await tools.get("workflow")?.execute(
         "delivery",
         {
-          script: 'export const meta = { name: "delivery", description: "test" }; return "finished";',
+          script,
           background: true,
         },
         undefined,
@@ -203,6 +203,193 @@ function fixture(
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
 describe("settled workflow result delivery", () => {
+  it("explicit terminal-result consumption prevents a later duplicate wake and survives rebind", async () => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    const runId = await f.run();
+    const read = await f.tools
+      .get("workflow_control")
+      ?.execute("read", { action: "get", runId, consume: true }, undefined, undefined, f.ctx);
+    expect(read?.details).toMatchObject({ notificationConsumed: true });
+    expect(f.acks()).toHaveLength(1);
+    await f.tools
+      .get("workflow_control")
+      ?.execute("read-again", { action: "get", runId, consume: true }, undefined, undefined, f.ctx);
+    expect(f.acks()).toHaveLength(1);
+    f.setIdle(true);
+    await f.emit("agent_settled");
+    await tick();
+    expect(f.pi.sendMessage).not.toHaveBeenCalled();
+    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    await f.emit("session_tree");
+    await tick();
+    expect(f.pi.sendMessage).not.toHaveBeenCalled();
+    await f.shutdown();
+  });
+  it.each([false, true])("consumes a stopped result across a slow terminal append (restore=%s)", async (restore) => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    let started = false;
+    f.bus.on("subagents:rpc:spawn-managed", (raw) => {
+      const { requestId } = raw as { requestId: string };
+      started = true;
+      f.bus.emit(`subagents:rpc:spawn-managed:reply:${requestId}`, {
+        success: true,
+        data: { id: "stopped-child", state: "running" },
+      });
+    });
+    let now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const append = f.pi.appendEntry;
+    const appendSpy = vi.spyOn(f.pi, "appendEntry").mockImplementation((type, data) => {
+      append(type, data);
+      if (
+        type === "pi-workflows:journal" &&
+        typeof data === "object" &&
+        data !== null &&
+        (data as { kind?: string }).kind === "terminal_recovery"
+      )
+        now += 1;
+    });
+    try {
+      const run = await f.tools.get("workflow")?.execute(
+        "start",
+        {
+          script: 'export const meta={name:"stop",description:"test"};return await agent("wait");',
+          background: true,
+        },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      const runId = run?.details.runId;
+      await vi.waitFor(() => expect(started).toBe(true));
+      await f.tools.get("workflow_control")?.execute("stop", { action: "stop", runId }, undefined, undefined, f.ctx);
+      await vi.waitFor(() => expect(f.pending()).toHaveLength(1));
+      expect((f.pending()[0].data as { completionId?: string }).completionId).toEqual(expect.any(String));
+      if (restore) await f.emit("session_tree");
+      const read = await f.tools
+        .get("workflow_control")
+        ?.execute("read", { action: "get", runId, consume: true }, undefined, undefined, f.ctx);
+      expect(read?.details).toMatchObject({ notificationConsumed: true, run: { status: "stopped" } });
+      expect(f.acks()).toHaveLength(1);
+      await f.emit("session_tree");
+      f.setIdle(true);
+      await f.emit("agent_settled");
+      await tick();
+      expect(f.pi.sendMessage).not.toHaveBeenCalled();
+      expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    } finally {
+      await f.shutdown();
+      appendSpy.mockRestore();
+      clock.mockRestore();
+    }
+  });
+  it("a persisted read receipt cannot suppress a new execution after engine restore", async () => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    const runId = await f.run('export const meta={name:"first",description:"test"};throw new Error("first failed");');
+    await f.tools
+      .get("workflow_control")
+      ?.execute("read", { action: "get", runId, consume: true }, undefined, undefined, f.ctx);
+    expect(f.acks()).toHaveLength(1);
+    const oldReceipt = f.acks()[0].data as Record<string, unknown>;
+    await f.emit("session_tree");
+    const before = f.pending().length;
+    const resumed = await f.tools.get("workflow")?.execute(
+      "resume",
+      {
+        script: 'export const meta={name:"second",description:"test"};return "new result";',
+        resumeFromRunId: runId,
+        background: true,
+      },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    expect(resumed?.details.runId, JSON.stringify(resumed)).toBe(runId);
+    await vi.waitFor(() => expect(f.pending()).toHaveLength(before + 1));
+    const current = f.pending().at(-1)?.data as Record<string, unknown>;
+    expect(current.executionGeneration).toBe(oldReceipt.executionGeneration);
+    expect(current.completionId).not.toBe(oldReceipt.completionId);
+    // Even a delayed old receipt with the same runtime generation cannot
+    // acknowledge this execution when the branch is replayed.
+    f.pi.appendEntry("pi-workflows:pending-delivery-ack", oldReceipt);
+    await f.emit("session_tree");
+    f.setIdle(true);
+    await f.emit("agent_settled");
+    await vi.waitFor(() => expect(f.pi.sendUserMessage).toHaveBeenCalledOnce());
+    expect(f.pi.sendMessage.mock.calls[0]?.[0]?.content).toContain("new result");
+    await f.drain();
+    await f.shutdown();
+  });
+  it("does not claim consumption without a branch-visible acknowledgement receipt", async () => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    const runId = await f.run();
+    vi.spyOn(f.pi, "appendEntry").mockImplementationOnce(() => {});
+    const read = await f.tools
+      .get("workflow_control")
+      ?.execute("read", { action: "get", runId, consume: true }, undefined, undefined, f.ctx);
+    expect(read?.details).toMatchObject({ notificationConsumed: false });
+    expect(f.acks()).toHaveLength(0);
+    f.setIdle(true);
+    await f.emit("agent_settled");
+    await vi.waitFor(() => expect(f.pi.sendUserMessage).toHaveBeenCalledOnce());
+    await f.drain();
+    await f.shutdown();
+  });
+  it("ordinary terminal inspections do not silently consume unread completion", async () => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    const runId = await f.run();
+    await f.tools.get("workflow_control")?.execute("inspect", { action: "get", runId }, undefined, undefined, f.ctx);
+    expect(f.acks()).toHaveLength(0);
+    f.setIdle(true);
+    await f.emit("agent_settled");
+    await vi.waitFor(() => expect(f.pi.sendUserMessage).toHaveBeenCalledOnce());
+    await f.drain();
+    await f.shutdown();
+  });
+  it("consuming a running inspection does not acknowledge its future result", async () => {
+    const f = fixture();
+    await f.start();
+    f.setIdle(false);
+    f.bus.on("subagents:rpc:spawn-managed", (raw) => {
+      const { requestId } = raw as { requestId: string };
+      f.bus.emit(`subagents:rpc:spawn-managed:reply:${requestId}`, {
+        success: true,
+        data: { id: "waiting-child", state: "running" },
+      });
+    });
+    const started = await f.tools.get("workflow")?.execute(
+      "running",
+      {
+        script: 'export const meta={name:"pending",description:"test"};return await agent("wait");',
+        background: true,
+      },
+      undefined,
+      undefined,
+      f.ctx,
+    );
+    const read = await f.tools
+      .get("workflow_control")
+      ?.execute(
+        "inspect",
+        { action: "get", runId: started?.details.runId, consume: true },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+    expect(read?.details).toMatchObject({ notificationConsumed: false });
+    expect(f.acks()).toHaveLength(0);
+    await f.shutdown();
+  });
   it("keeps workflow/control and per-call bash/write denials at the actual tool/RPC boundary", async () => {
     const f = fixture();
     await f.start();
