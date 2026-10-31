@@ -1395,8 +1395,15 @@ test("disabled settings freeze retained queues without losing state", async () =
     queue: [storedGoal("later", "queued")],
   };
   const branch = [{ type: "custom", customType: "goal-state", data: frozenState }];
-  const harness = await createHarness({ sessionManager: { getBranch: () => branch, getEntries: () => branch } }, false);
+  const harness = await createHarness(
+    { sessionManager: { getBranch: () => branch, getEntries: () => branch } },
+    disabledSettingsPath,
+  );
 
+  assert.equal(
+    harness.notifications.some(({ message }) => message.startsWith("pi-goal settings ignored:")),
+    false,
+  );
   assert.equal(harness.statuses.get("goal"), "queue off");
   assert.equal(harness.mock.sentUserMessages.length, 0);
   await harness.command("");
