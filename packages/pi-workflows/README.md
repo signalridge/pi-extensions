@@ -269,6 +269,17 @@ The passive progress panel uses a terminal-height row budget, prioritizes live c
 
 ### Background result notifications
 
+To explicitly read and acknowledge a terminal result, call
+`workflow_control({ action: "get", run_id: "...", consume: true })` (`status`
+is an alias). A `notificationConsumed: true` receipt means an acknowledgement
+was observed on the active branch and the pending reminder was consumed.
+Ordinary `get`/`status`, `list`, running results, and cancelled/stale reads do
+not consume future completion. Consumption is scoped to that execution; a
+later resumed execution remains eligible. Identity comes from the durable terminal
+journal entry, not a runtime counter that restarts on restore. Older markers
+without that evidence are not retroactively consumed. Receipts do not delete run history
+or retract messages already handed to Pi.
+
 Completed background runs are buffered in branch-local pending-delivery markers
 (up to 256, expiring after seven days). Notifications wait for an owned, idle
 session with no queued input, input preparation, compaction, or navigation in

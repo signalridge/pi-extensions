@@ -253,6 +253,13 @@ PTY attachment, raw-PID control, SSH support, or durable job scope.
 
 ### Notification safety and recovery
 
+A successful `background_logs` read of a terminal job, or `background_list`
+with that terminal job's explicit ID, consumes its pending exit reminder. An
+all-jobs overview does not consume reminders; running reads do not consume a
+future exit. Unread monitor matches remain pending even when the exit is read.
+Cancelled/failed reads do not acknowledge the exit. Already accepted transcript
+messages cannot be erased by reading their result.
+
 Events remain extension-local while Pi is busy, compacting, navigating sessions,
 or has queued work. Delivery is guarded by the fully settled boundary rather than
 `agent_end`. No background message is inserted between a tool call and its result.

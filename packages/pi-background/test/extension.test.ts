@@ -226,6 +226,154 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("terminal-result consumption", () => {
+  it.each(["background_logs", "background_list"])(
+    "%s preserves the exit when preparing a result fails",
+    async (tool) => {
+      vi.useFakeTimers();
+      const h = harness();
+      await h.emit("session_start");
+      h.setIdle(false);
+      try {
+        await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+        fake.managers[0].manager.get("job-0").status = "failed";
+        fake.managers[0].emit(event());
+        h.status.mockImplementationOnce(() => {
+          throw new Error("status renderer failed");
+        });
+        await expect(h.tools.get(tool)?.execute("read", { id: "job-0" }, undefined, undefined, h.ctx)).rejects.toThrow(
+          "status renderer failed",
+        );
+        const overview = await h.tools.get("background_list")?.execute("overview", {}, undefined, undefined, h.ctx);
+        expect(overview?.details.pendingNotifications).toBe(1);
+        h.setIdle(true);
+        await h.emit("agent_settled");
+        vi.advanceTimersByTime(1000);
+        expect(h.userMessages).toHaveLength(1);
+      } finally {
+        await h.emit("session_shutdown");
+      }
+    },
+  );
+  it.each(["background_logs", "background_list"])(
+    "%s preserves the exit when formatting a result fails",
+    async (tool) => {
+      vi.useFakeTimers();
+      const h = harness();
+      await h.emit("session_start");
+      h.setIdle(false);
+      try {
+        await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+        const job = fake.managers[0].manager.get("job-0");
+        job.status = "failed";
+        fake.managers[0].emit(event());
+        Object.defineProperty(job, "description", {
+          configurable: true,
+          get: vi
+            .fn()
+            .mockImplementationOnce(() => {
+              throw new Error("description unavailable");
+            })
+            .mockReturnValue("job"),
+        });
+        await expect(h.tools.get(tool)?.execute("read", { id: job.id }, undefined, undefined, h.ctx)).rejects.toThrow(
+          "description unavailable",
+        );
+        const overview = await h.tools.get("background_list")?.execute("overview", {}, undefined, undefined, h.ctx);
+        expect(overview?.details.pendingNotifications).toBe(1);
+        h.setIdle(true);
+        await h.emit("agent_settled");
+        vi.advanceTimersByTime(1000);
+        expect(h.userMessages).toHaveLength(1);
+      } finally {
+        await h.emit("session_shutdown");
+      }
+    },
+  );
+  it.each(["background_logs", "background_list"])(
+    "%s returns its consumed result even if post-commit status rendering fails",
+    async (tool) => {
+      vi.useFakeTimers();
+      const h = harness();
+      await h.emit("session_start");
+      h.setIdle(false);
+      try {
+        await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+        fake.managers[0].manager.get("job-0").status = "failed";
+        fake.managers[0].emit(event());
+        h.status
+          .mockImplementationOnce(() => {})
+          .mockImplementationOnce(() => {
+            throw new Error("late status renderer failed");
+          });
+        const read = await h.tools.get(tool)?.execute("read", { id: "job-0" }, undefined, undefined, h.ctx);
+        expect(read?.details.pendingNotifications).toBe(0);
+        h.setIdle(true);
+        await h.emit("agent_settled");
+        vi.advanceTimersByTime(1000);
+        expect(h.userMessages).toHaveLength(0);
+      } finally {
+        await h.emit("session_shutdown");
+      }
+    },
+  );
+  it.each(["background_logs", "background_list"])(
+    "%s for one terminal job consumes its exit without a later wake",
+    async (tool) => {
+      vi.useFakeTimers();
+      const h = harness();
+      await h.emit("session_start");
+      h.setIdle(false);
+      await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+      const job = fake.managers[0].manager.get("job-0");
+      job.status = "failed";
+      job.exitCode = 1;
+      fake.managers[0].emit(event());
+      const result = await h.tools.get(tool)?.execute("read", { id: job.id }, undefined, undefined, h.ctx);
+      expect(result?.details.pendingNotifications).toBe(0);
+      h.setIdle(true);
+      await h.emit("agent_settled");
+      vi.advanceTimersByTime(1000);
+      expect(h.messages).toEqual([]);
+      expect(h.userMessages).toEqual([]);
+      await h.emit("session_shutdown");
+    },
+  );
+  it("overview and running log reads do not acknowledge future terminal results", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.emit("session_start");
+    h.setIdle(false);
+    await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+    await h.tools.get("background_logs")?.execute("read-running", { id: "job-0" }, undefined, undefined, h.ctx);
+    fake.managers[0].manager.get("job-0").status = "exited";
+    fake.managers[0].emit(event());
+    const result = await h.tools.get("background_list")?.execute("overview", {}, undefined, undefined, h.ctx);
+    expect(result?.details.pendingNotifications).toBe(1);
+    h.setIdle(true);
+    await h.emit("agent_settled");
+    vi.advanceTimersByTime(1000);
+    expect(h.userMessages).toHaveLength(1);
+    await h.emit("session_shutdown");
+  });
+  it("a cancelled terminal read leaves its completion unread", async () => {
+    const h = harness();
+    await h.emit("session_start");
+    h.setIdle(false);
+    await h.tools.get("bash_background")?.execute("start", { command: "synthetic" }, undefined, undefined, h.ctx);
+    fake.managers[0].manager.get("job-0").status = "exited";
+    fake.managers[0].emit(event());
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      h.tools.get("background_logs")?.execute("read", { id: "job-0" }, controller.signal, undefined, h.ctx),
+    ).rejects.toThrow();
+    const result = await h.tools.get("background_list")?.execute("overview", {}, undefined, undefined, h.ctx);
+    expect(result?.details.pendingNotifications).toBe(1);
+    await h.emit("session_shutdown");
+  });
+});
+
 describe("status action integration", () => {
   function query(h: ReturnType<typeof harness>) {
     const replies: Array<{ data: { surfaceId: string; providerId: string; sessionId: string } }> = [];

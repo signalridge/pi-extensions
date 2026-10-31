@@ -62,30 +62,38 @@ export interface ToolRuntime {
   manager(ctx: ExtensionContext): JobManager;
   pending(): { pendingNotifications: number; deliveryPaused: boolean };
   cancel(id: string): void;
+  consumeExit?(ctx: ExtensionContext, id: string): ReturnType<ToolRuntime["pending"]>;
 }
 
-function result(data: ToolData, summary?: string) {
-  const lines = data.jobs.map(
+function result(data: ToolData, summary?: string, acknowledge?: () => ReturnType<ToolRuntime["pending"]> | undefined) {
+  // Snapshot and format all job-controlled data before acknowledging a read.
+  const jobs = data.jobs.map(({ watch, ...job }) => ({ ...job, ...(watch ? { watch: { ...watch } } : {}) }));
+  const lines = jobs.map(
     (job) =>
       `${job.id} [${job.status}] ${safeText(job.description)}${job.exitCode !== undefined ? `; exit=${job.exitCode}` : ""}`,
   );
-  const text = [
-    summary,
-    lines.join("\n") || "No background jobs.",
-    `Pending notifications: ${data.pendingNotifications}${data.deliveryPaused ? " (delivery paused; /background retry)" : ""}.`,
+  const leading = [summary, lines.join("\n") || "No background jobs."].filter((part) => part !== undefined);
+  const trailing = [
     data.output,
     data.droppedBytes ? `[${data.droppedBytes} old log bytes discarded]` : undefined,
-  ]
-    .filter((part) => part !== undefined)
-    .join("\n");
-  const structuredContent = {
+  ].filter((part) => part !== undefined);
+  const pending = acknowledge?.() ?? data;
+  const snapshot = {
     ...data,
-    jobs: data.jobs.map(({ watch, ...job }) => ({ ...job, ...(watch ? { watch: { ...watch } } : {}) })),
+    jobs,
+    pendingNotifications: pending.pendingNotifications,
+    deliveryPaused: pending.deliveryPaused,
   };
+  // After commit only owned strings and scalar notification counts remain.
+  const text = [
+    ...leading,
+    `Pending notifications: ${snapshot.pendingNotifications}${snapshot.deliveryPaused ? " (delivery paused; /background retry)" : ""}.`,
+    ...trailing,
+  ].join("\n");
   return {
     content: [{ type: "text" as const, text: truncateUtf8(text, 32 * 1024) }],
-    details: data,
-    structuredContent,
+    details: snapshot,
+    structuredContent: { ...snapshot },
   };
 }
 
@@ -237,12 +245,16 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       namespace,
       annotations: readOnly,
       description:
-        "List running and retained completed session-owned jobs, plus pending notification status. Optional id inspects one job.",
+        "List running and retained completed session-owned jobs, plus pending notification status. Optional id inspects one job and acknowledges its pending exit notice when terminal; overview does not acknowledge notices.",
       parameters: Type.Object({ id: Type.Optional(id) }),
       outputSchema,
-      async execute(_call, params, _signal, _update, ctx) {
+      async execute(_call, params, signal, _update, ctx) {
         const manager = runtime.manager(ctx);
-        return result({ jobs: params.id ? [manager.get(params.id)] : manager.list(), ...runtime.pending() });
+        const jobs = params.id ? [manager.get(params.id)] : manager.list();
+        return result({ jobs, ...runtime.pending() }, undefined, () => {
+          signal?.throwIfAborted();
+          if (params.id && jobs[0].status !== "running") return runtime.consumeExit?.(ctx, params.id);
+        });
       },
     }),
   );
@@ -253,22 +265,30 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       namespace,
       annotations: readOnly,
       description:
-        "Read a bounded tail of retained output (256 KiB total per job), not a disk logfile. Default 200 lines, maximum 1000. Control sequences removed from model-facing text; droppedBytes reports ring-buffer eviction.",
+        "Read a bounded tail of retained output (256 KiB total per job), not a disk logfile. Default 200 lines, maximum 1000. Control sequences removed from model-facing text; droppedBytes reports ring-buffer eviction. A successful terminal-job read acknowledges its pending exit notice; running reads do not consume future completion.",
       parameters: Type.Object({
         id,
         tail: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
         stream: Type.Optional(stream),
       }),
       outputSchema,
-      async execute(_call, params, _signal, _update, ctx) {
+      async execute(_call, params, signal, _update, ctx) {
         const manager = runtime.manager(ctx);
         const log = manager.logs(params.id, params.tail ?? 200, params.stream ?? "both");
-        return result({
-          jobs: [manager.get(params.id)],
-          ...runtime.pending(),
-          output: truncateUtf8(safeText(log.text), 24 * 1024),
-          droppedBytes: log.droppedBytes,
-        });
+        const job = manager.get(params.id);
+        return result(
+          {
+            jobs: [job],
+            ...runtime.pending(),
+            output: truncateUtf8(safeText(log.text), 24 * 1024),
+            droppedBytes: log.droppedBytes,
+          },
+          undefined,
+          () => {
+            signal?.throwIfAborted();
+            if (job.status !== "running") return runtime.consumeExit?.(ctx, params.id);
+          },
+        );
       },
     }),
   );

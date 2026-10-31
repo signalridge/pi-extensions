@@ -32,6 +32,58 @@ afterEach(() => {
 });
 
 describe("notification outbox", () => {
+  it("consumes only observed terminal exits and preserves unread monitor matches", () => {
+    const h = harness();
+    h.setReady(false);
+    h.outbox.enqueue({ ...event("done"), kind: "exit", text: "exit 1" });
+    h.outbox.enqueue(event("done"));
+    h.outbox.enqueue({ ...event("other"), kind: "exit" });
+    h.outbox.consumeExit("done");
+    h.setReady(true);
+    h.outbox.flush();
+    expect(h.sent[0].content).toContain("[match:done]");
+    expect(h.sent[0].content).not.toContain("[exit:done]");
+    expect(h.sent[0].content).toContain("[exit:other]");
+    h.outbox.dispose();
+  });
+  it("reading the last ambiguous exit clears its obsolete delivery pause", () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.outbox.enqueue({ ...event(), kind: "exit" });
+    h.outbox.flush();
+    vi.advanceTimersByTime(30_000);
+    expect(h.outbox.deliveryPaused).toBe(true);
+    h.outbox.consumeExit("job");
+    expect(h.outbox.deliveryPaused).toBe(false);
+    expect(h.outbox.count).toBe(0);
+    h.outbox.enqueue({ ...event("next"), kind: "exit" });
+    h.outbox.flush();
+    expect(h.sent).toHaveLength(2);
+    h.outbox.dispose();
+  });
+  it("consuming a pending exit does not swallow a future completion with that id", () => {
+    const h = harness();
+    h.setReady(false);
+    h.outbox.consumeExit("job");
+    h.outbox.enqueue({ ...event(), kind: "exit" });
+    h.setReady(true);
+    h.outbox.flush();
+    expect(h.sent).toHaveLength(1);
+    h.outbox.dispose();
+  });
+  it("an observed handed-off exit cannot keep an old wake alive or retry", () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.outbox.enqueue({ ...event(), kind: "exit" });
+    h.outbox.flush();
+    const wake = h.sent[0].wakeId;
+    h.outbox.consumeExit("job");
+    expect(h.outbox.ownsWake(wake)).toBe(false);
+    vi.advanceTimersByTime(60_000);
+    expect(h.failed).not.toHaveBeenCalled();
+    expect(h.sent).toHaveLength(1);
+    h.outbox.dispose();
+  });
   it("coalesces output locally while busy, then wakes exactly once", () => {
     vi.useFakeTimers();
     const h = harness();

@@ -122,6 +122,7 @@ import {
   setFallbackSubagent,
 } from "./agent-types.js";
 import { inChildSessionContext } from "./child-context.js";
+import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { INHERIT_CONTEXT_UNAVAILABLE } from "./context-boundary.js";
 import {
   PROTOCOL_CAPABILITIES,
@@ -700,8 +701,19 @@ function activateRootRuntime(
   // ---- Cancellable pending notifications ----
   // Holds notifications briefly so get_subagent_result can cancel them
   // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
   let notificationsRetired = false;
+  let parentRunning = false;
+  const completionOutbox = new CompletionOutbox(
+    (message) => pi.sendMessage<NotificationDetails>(
+      { customType: "subagent-notification", ...message, display: true },
+      { deliverAs: "steer", triggerTurn: true },
+    ),
+    () => parentRunning || currentCtx?.isIdle?.() === false || currentCtx?.hasPendingMessages?.() === true,
+  );
+  pi.on("agent_start", () => { parentRunning = true; });
+  const settleCompletions = () => { parentRunning = false; completionOutbox.onAgentEnd(); };
+  pi.on("agent_end", settleCompletions);
+  pi.on("agent_settled", settleCompletions);
   const invocationUiRetirements = new Set<() => void>();
   const activityRetirements = new WeakMap<AgentActivity, () => void>();
 
@@ -734,35 +746,10 @@ function activateRootRuntime(
     };
   }
 
-  const NUDGE_HOLD_MS = 200;
+  const NUDGE_HOLD_MS = NOTIFICATION_HOLD_MS;
   // A queued result wait must observe completion before its held notification
   // can fire, so successful waits can still suppress that redundant nudge.
   const QUEUE_WAIT_POLL_MS = Math.floor(NUDGE_HOLD_MS / 4);
-
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    if (notificationsRetired) return;
-    cancelNudge(key);
-    pendingNudges.set(
-      key,
-      setTimeout(() => {
-        pendingNudges.delete(key);
-        if (notificationsRetired) return;
-        try {
-          send();
-        } catch {
-          /* ignore stale completion side-effect errors */
-        }
-      }, delay),
-    );
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
-  }
 
   // Completion payloads belong to an attempt, not the mutable record reused by
   // resume. Capture before batch/group holding and before activity is deleted.
@@ -770,6 +757,8 @@ function activateRootRuntime(
     key: string;
     record: AgentRecord;
     activity?: AgentActivity;
+    /** Group membership is finalized separately from the immutable result. */
+    groupId?: string;
     isCurrent: () => boolean;
     consumed: boolean;
     individual: string;
@@ -788,6 +777,10 @@ function activateRootRuntime(
       key: `completion:${record.id}:${++completionSequence}`,
       record: snapshot,
       activity,
+      groupId: record.groupId,
+      // A later resume must not discard an unread immutable completion. The
+      // unique completion key isolates consumption; only root retirement or
+      // detachment invalidates the captured result itself.
       isCurrent: () => !notificationsRetired && rootCurrent() && !record.detached,
       consumed: record.resultConsumed === true,
       individual: formatTaskNotification(snapshot, 500) + (snapshot.outputFile
@@ -814,18 +807,10 @@ function activateRootRuntime(
     const completion = completionNudges.get(record);
     if (!completion) return;
     finishCompletionActivity(completion);
-    scheduleNudge(completion.key, () => {
+    completionOutbox.add({ ids: [completion.key], build: () => {
       if (!completion.isCurrent() || completion.consumed) return;
-      pi.sendMessage<NotificationDetails>(
-        {
-          customType: "subagent-notification",
-          content: completion.individual,
-          display: true,
-          details: completion.individualDetails,
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-    });
+      return { content: completion.individual, details: completion.individualDetails };
+    } });
   }
 
   // ---- Group join manager ----
@@ -837,10 +822,9 @@ function activateRootRuntime(
     });
     for (const completion of completions) finishCompletionActivity(completion);
 
-    const groupKey = `group:${completions.map(completion => completion.key).join(",")}`;
-    scheduleNudge(groupKey, () => {
+    completionOutbox.add({ ids: completions.map(completion => completion.key), build: (ids) => {
       // Recheck retirement and consumption of these exact completions only.
-      const unconsumed = completions.filter(completion => completion.isCurrent() && !completion.consumed);
+      const unconsumed = completions.filter(completion => ids.includes(completion.key) && completion.isCurrent() && !completion.consumed);
       if (unconsumed.length === 0) {
         fleet.update();
         return;
@@ -849,7 +833,10 @@ function activateRootRuntime(
       const notifications = unconsumed
         .map(completion => completion.grouped)
         .join("\n\n");
-      const label = partial
+      const peersRunning = partial && unconsumed.some(completion => completion.groupId &&
+        manager.listAgentsMutable().some(peer => peer.groupId === completion.groupId &&
+          (peer.status === "queued" || peer.status === "running")));
+      const label = peersRunning
         ? `${unconsumed.length} agent(s) finished (partial — others still running)`
         : `${unconsumed.length} agent(s) finished`;
 
@@ -859,16 +846,8 @@ function activateRootRuntime(
         ...(rest.length > 0 ? { others: rest.map(completion => completion.groupedDetails) } : {}),
       };
 
-      pi.sendMessage<NotificationDetails>(
-        {
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
-          display: true,
-          details,
-        },
-        { deliverAs: "followUp", triggerTurn: true },
-      );
-    });
+      return { content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`, details };
+    } });
     fleet.update();
   }, 30_000);
 
@@ -1571,8 +1550,7 @@ function activateRootRuntime(
       if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
       batchFinalizeTimer = undefined;
       currentBatchAgents = [];
-      for (const timer of pendingNudges.values()) clearTimeout(timer);
-      pendingNudges.clear();
+      completionOutbox.dispose();
       agentActivity.clear();
       // session_shutdown is confirmed, unlike either before-event. Start the
       // workflow's owned-agent cleanup while its RPC responder and the old leaf
@@ -1655,8 +1633,6 @@ function activateRootRuntime(
       }
       scheduler.stop();
       manager.abortAll();
-      for (const timer of pendingNudges.values()) clearTimeout(timer);
-      pendingNudges.clear();
       fleet.dispose();
       await manager.dispose();
     })();
@@ -2159,6 +2135,7 @@ function activateRootRuntime(
         const record = manager.getRecordMutable(id);
         if (record) record.groupId = groupId;
         for (const completion of completions) {
+          completion.groupId = groupId;
           // Only the original completion occupies this member's group slot.
           if (groupJoin.onAgentComplete(completion.record) === "pass") sendIndividualNudge(completion.record);
         }
@@ -3627,8 +3604,8 @@ Terse command-style prompts produce shallow, generic work.
     }
     agentToolRef = refreshed;
   };
-  pi.on("before_agent_start", refreshAgentDeclaration);
-  pi.on("turn_end", refreshAgentDeclaration);
+  pi.on("before_agent_start", () => { parentRunning = true; refreshAgentDeclaration(); });
+  pi.on("turn_end", (event) => { refreshAgentDeclaration(); completionOutbox.onTurnEnd(event?.message?.role === "assistant" ? event.message.stopReason : undefined); });
 
   // ---- get_subagent_result tool ----
 
@@ -3714,16 +3691,6 @@ Terse command-style prompts produce shallow, generic work.
           output += record.result?.trim() || "No output.";
         }
 
-        // Mark result as consumed — suppresses the completion notification
-        if (record.status !== "running" && record.status !== "queued") {
-          record.resultConsumed = true;
-          const completion = completionNudges.get(record);
-          if (completion && completion.record.promise === record.promise && completion.record.completedAt === record.completedAt) {
-            completion.consumed = true;
-            cancelNudge(completion.key);
-          }
-        }
-
         // Verbose: include full conversation
         if (params.verbose && record.session) {
           const conversation = getAgentConversation(record.session);
@@ -3732,7 +3699,19 @@ Terse command-style prompts produce shallow, generic work.
           }
         }
 
-        return textResult(output);
+        const response = textResult(output);
+        signal?.throwIfAborted();
+        // Consume only a successfully constructed terminal result, never a
+        // cancelled wait or the future completion of a running attempt.
+        if (record.status !== "running" && record.status !== "queued") {
+          record.resultConsumed = true;
+          const completion = completionNudges.get(record);
+          if (completion && completion.record.promise === record.promise && completion.record.completedAt === record.completedAt) {
+            completion.consumed = true;
+            completionOutbox.cancel(completion.key);
+          }
+        }
+        return response;
       },
     }),
   );

@@ -2614,7 +2614,9 @@ export class WorkflowEngine {
       run.callStatus[terminal.nodeId] = "stopped";
     }
     run.status = "stopped";
-    run.updatedAt = Date.now();
+    // Publish the accepted event's identity, just like other terminal paths.
+    // A slow append must not detach the live state from its durable receipt.
+    run.updatedAt = event.timestamp;
     state.presentation.settle(run.status);
     this.notifyInspection(state);
     if (current()) this.notifyTerminal(state);
