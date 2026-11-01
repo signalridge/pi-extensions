@@ -12,11 +12,19 @@ import { isStaleExtensionContextError, onAgentSettled, setPlanThinkingLevel } fr
 import { formatImplementationHandoff, startFreshImplementationFromState } from "./fresh-implementation.js";
 import { resolveHypaExecutablePaths } from "./hypa-wrapper.js";
 import {
+  createImplementationModelCoordinator,
+  describeImplementationHandoff,
+  type ImplementationModelHandoff,
+  type ImplementationModelTarget,
+  sameModel,
+} from "./implementation-model.js";
+import {
   createImplementationRetentionCoordinator,
   implementationRetentionPreview,
 } from "./implementation-retention.js";
 import { PLAN_HANDOFF_IDENTITY_ENTRY, PlanInputOwnership } from "./input-ownership.js";
 import { invalidPlanMessage, latestAssistantText, parseProposedPlan } from "./message-transform.js";
+import { modelMutationPending } from "./model-mutation.js";
 import { createPlanActionController } from "./plan-action-controller.js";
 import { createPlanExportController } from "./plan-export-controller.js";
 import {
@@ -101,6 +109,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   let workflowController = new AbortController();
   const ownedThinkingChanges: Array<{ previousLevel: string; level: string }> = [];
   let settingOwnedThinking = false;
+  const implementationModels = createImplementationModelCoordinator({
+    pi,
+    setThinkingLevel: (level) => setOwnedThinkingLevel(level),
+  });
   const implementationRetention = createImplementationRetentionCoordinator();
   const inputOwnership = new PlanInputOwnership((data) => pi.appendEntry(PLAN_HANDOFF_IDENTITY_ENTRY, data));
   let stateOrigin: ReturnType<typeof captureStateOrigin> | undefined;
@@ -158,7 +170,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       handler: (ctx) => {
         // Pi's editor captures registrations at startup; replacing a registration
         // does not replace that captured handler until /reload.
-        if (configuredPlanModeToggleShortcut(settings) === nextShortcut) togglePlanMode(ctx);
+        if (configuredPlanModeToggleShortcut(settings) === nextShortcut) return togglePlanMode(ctx);
       },
     });
     toggleShortcut = nextShortcut;
@@ -278,6 +290,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     getArgumentCompletions: completePlanArguments,
     handler: async (args, ctx) => {
       if (!stateIsCurrent(ctx)) return;
+      reconcileModelHandoff(ctx);
       latestCommandContext = ctx;
       const prompt = args.trim();
       const command = prompt.toLowerCase();
@@ -287,8 +300,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
           ctx.ui.notify("Plan mode is already active.", "info");
           return;
         }
-        enterPlanMode(ctx);
-        ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+        await withPlanningModel(ctx, () => {
+          enterPlanMode(ctx);
+          ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+        });
         return;
       }
       if (command === "show") {
@@ -325,8 +340,9 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
             : state.latestPlan
               ? "Plan mode disabled. Proposed plan discarded."
               : "Plan mode disabled.";
-        exitPlanMode(ctx);
+        const restoring = exitPlanMode(ctx);
         ctx.ui.notify(notification, "info");
+        await restoring;
         return;
       }
       if (command === "tools") {
@@ -346,7 +362,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       }
       if (prompt) {
         if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined && !state.enabled)) return;
-        enterPlanModeWithPrompt(prompt, ctx);
+        await withPlanningModel(ctx, () => enterPlanModeWithPrompt(prompt, ctx));
         return;
       }
       if (!ctx.hasUI) {
@@ -393,6 +409,12 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
     if (loadedSettings.notice) ctx.ui.notify(loadedSettings.notice, "warning");
     const persistFlagActivation = pi.getFlag("plan") === true && !state.enabled;
+    const flagHandoff = persistFlagActivation ? state.modelHandoff : undefined;
+    if (flagHandoff) {
+      state = { ...state, modelHandoff: undefined };
+      const restored = await finishModelHandoff(ctx, flagHandoff);
+      if (!restored || generation !== menuGeneration || menuController.signal.aborted) return;
+    }
     if (persistFlagActivation) {
       state = state.savedPlan
         ? {
@@ -413,6 +435,20 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     if (persistFlagActivation) persistState(ctx);
     updateUi(ctx);
   });
+
+  function guardModelMutation(_event: unknown, ctx: ExtensionContext) {
+    if (!modelMutationPending(ctx)) return;
+    // Never await a mutation here: setModel awaits model_select handlers,
+    // which may themselves request navigation or session replacement.
+    ctx.ui.notify(
+      "Plan model change is in progress; retry navigation or session replacement after it finishes.",
+      "warning",
+    );
+    return { cancel: true };
+  }
+  pi.on("session_before_tree", guardModelMutation);
+  pi.on("session_before_switch", guardModelMutation);
+  pi.on("session_before_fork", guardModelMutation);
 
   pi.on("session_tree", (_event, ctx) => {
     // This is the committed boundary: getBranch() now belongs to the target.
@@ -445,13 +481,18 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   });
 
   pi.on("thinking_level_select", (event, ctx) => {
-    if (!stateIsCurrent(ctx)) return;
+    if (menuController.signal.aborted || !stateIsCurrent(ctx)) return;
     const owned = ownedThinkingChanges.findIndex(
       (change) =>
         change.previousLevel === event.previousLevel && (settingOwnedThinking || change.level === event.level),
     );
     if (owned >= 0) {
       ownedThinkingChanges.splice(owned, 1);
+      return;
+    }
+    implementationModels.thinkingSelected();
+    if (state.modelHandoff) {
+      reconcileModelHandoff(ctx);
       return;
     }
     if (!state.enabled || !state.appliedThinkingLevel) return;
@@ -464,6 +505,13 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       };
       persistState(ctx);
     }
+  });
+
+  pi.on("model_select", (event, ctx) => {
+    if (menuController.signal.aborted) return;
+    implementationModels.modelSelected(event.model);
+    if (!stateIsCurrent(ctx)) return;
+    reconcileModelHandoff(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -707,6 +755,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       awaitingAction: false,
       savedPlan: undefined,
       activeImplementation: undefined,
+      modelHandoff: undefined,
     };
     activatePlanModeTools();
     applyPlanThinkingLevel();
@@ -733,9 +782,11 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   function exitPlanMode(ctx: ExtensionContext) {
     if (!stateIsCurrent(ctx)) return;
+    if (state.modelHandoff && rejectBusyModelRestore(ctx)) return;
     inputOwnership.commitHandoffs(ctx, workflowGeneration);
     advanceWorkflow();
     const wasEnabled = state.enabled;
+    const handoff = state.modelHandoff;
     readyPresentationIntent = undefined;
     state = {
       ...state,
@@ -746,6 +797,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       savedPlan: undefined,
       activeImplementation: undefined,
       manualThinkingLevel: undefined,
+      modelHandoff: undefined,
     };
     if (wasEnabled) {
       restoreTools();
@@ -754,18 +806,129 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
     persistState(ctx);
     updateUi(ctx);
+    return handoff ? finishModelHandoff(ctx, handoff).then(() => {}) : undefined;
+  }
+
+  /** End an outstanding implementation handoff before a new planning workflow starts. */
+  function withPlanningModel(ctx: ExtensionContext, enter: () => void) {
+    const handoff = state.modelHandoff;
+    if (!handoff) {
+      enter();
+      return;
+    }
+    if (rejectBusyModelRestore(ctx)) return;
+    const sessionGeneration = menuGeneration;
+    const planWorkflowGeneration = workflowGeneration;
+    state = { ...state, modelHandoff: undefined };
+    persistState(ctx);
+    return finishModelHandoff(ctx, handoff).then((restored) => {
+      if (!restored || sessionGeneration !== menuGeneration || planWorkflowGeneration !== workflowGeneration) return;
+      if (stateIsCurrent(ctx)) enter();
+    });
+  }
+
+  function rejectBusyModelRestore(ctx: ExtensionContext) {
+    if (ctx.isIdle()) return false;
+    ctx.ui.notify("Planning model restoration deferred: session operation is busy; retry when idle.", "warning");
+    return true;
+  }
+
+  async function finishModelHandoff(ctx: ExtensionContext, handoff: ImplementationModelHandoff) {
+    const sessionGeneration = menuGeneration;
+    const workflow = workflowGeneration;
+    const selection = implementationModels.captureSelection(ctx, handoff.previousModel);
+    const isCurrent = () =>
+      sessionGeneration === menuGeneration &&
+      workflow === workflowGeneration &&
+      stateIsCurrent(ctx) &&
+      selection.isCurrent();
+    try {
+      const outcome = await implementationModels.restore(ctx, handoff, isCurrent);
+      if (!isCurrent() || outcome.kind === "obsolete") return false;
+      if (outcome.kind === "busy") {
+        // No physical mutation started. Keep the restore handoff for an idle
+        // retry, including when a synchronous callback made the host busy.
+        state = { ...state, modelHandoff: handoff };
+        persistState(ctx);
+        updateUi(ctx);
+        ctx.ui.notify(outcome.message, "warning");
+        return false;
+      }
+      if (outcome.kind === "unavailable") ctx.ui.notify(outcome.message, "warning");
+      else if (outcome.kind === "restored") {
+        if (outcome.message) ctx.ui.notify(outcome.message, "info");
+        if (outcome.warning) ctx.ui.notify(outcome.warning, "warning");
+      }
+      return isCurrent();
+    } catch (error: unknown) {
+      if (!isCurrent() || isStaleExtensionContextError(error)) return false;
+      const detail = error instanceof Error ? error.message : String(error);
+      try {
+        ctx.ui.notify(`Unable to restore the planning model: ${detail}`, "warning");
+      } catch {
+        // The context can become stale while Pi switches models.
+      }
+      return false;
+    } finally {
+      selection.release();
+    }
+  }
+
+  async function applyImplementationModel(
+    ctx: ExtensionContext,
+    target: Extract<ImplementationModelTarget, { kind: "target" }>,
+    rollBack: () => void,
+  ) {
+    const sessionGeneration = menuGeneration;
+    const implementationWorkflow = workflowGeneration;
+    const implementationId = state.activeImplementation?.id;
+    const selection = implementationModels.captureSelection(ctx, target.model);
+    const isCurrent = () =>
+      sessionGeneration === menuGeneration &&
+      implementationWorkflow === workflowGeneration &&
+      stateIsCurrent(ctx) &&
+      state.activeImplementation?.id === implementationId &&
+      selection.isCurrent();
+    try {
+      const result = await implementationModels.apply(ctx, target, isCurrent);
+      // An obsolete switch cannot compensate into a destination branch/workflow.
+      if (!isCurrent() || result.kind === "obsolete") return false;
+      if (result.kind === "failed") {
+        ctx.ui.notify(
+          `Unable to switch to the implementation model ${result.message}. Implementation was not started; the plan remains available.`,
+          "warning",
+        );
+        rollBack();
+        return false;
+      }
+      if (result.handoff) {
+        state = {
+          ...state,
+          modelHandoff: result.handoff,
+          modelHandoffBoundary: ctx.sessionManager.getBranch().at(-1)?.id,
+        };
+        persistState(ctx);
+        updateUi(ctx);
+        ctx.ui.notify(describeImplementationHandoff(result.handoff), "info");
+      }
+      if (result.warning) ctx.ui.notify(result.warning, "warning");
+      return true;
+    } finally {
+      selection.release();
+    }
   }
 
   function togglePlanMode(ctx: ExtensionContext) {
     if (!stateIsCurrent(ctx)) return;
     if (state.enabled) {
       ctx.ui.notify(planModeDisableNotification(), "info");
-      exitPlanMode(ctx);
-      return;
+      return exitPlanMode(ctx);
     }
     if (savedPlanBlocksNewWorkflow(ctx, state.savedPlan !== undefined)) return;
-    enterPlanMode(ctx);
-    ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+    return withPlanningModel(ctx, () => {
+      enterPlanMode(ctx);
+      ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+    });
   }
 
   function planModeDisableNotification() {
@@ -915,6 +1078,19 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       ctx.ui.notify("Plan mode disabled. No proposed plan is available to implement.", "warning");
       return;
     }
+    const modelTarget = implementationModels.resolve(ctx, settings);
+    if (modelTarget.kind === "unavailable") {
+      ctx.ui.notify(`${modelTarget.message} Implementation was not started; the plan remains available.`, "warning");
+      return;
+    }
+
+    if (modelTarget.kind === "target" && !ctx.isIdle()) {
+      ctx.ui.notify(
+        "Implementation model switch deferred: session operation is busy; retry when idle. The plan remains available.",
+        "warning",
+      );
+      return;
+    }
 
     advanceWorkflow();
     const previousState = state;
@@ -944,8 +1120,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     persistState(ctx);
     updateUi(ctx);
 
-    const sent = sendPlanModeUserMessage(formatImplementationHandoff(plan), ctx);
-    if (!sent) {
+    const rollBack = () => {
       if (savedPlan) {
         state = previousState;
       } else {
@@ -955,6 +1130,20 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       }
       persistState(ctx);
       updateUi(ctx);
+    };
+    // Switch only after Plan thinking is restored, so Pi's model-switch thinking
+    // change is never mistaken for a manual Plan-mode choice.
+    if (modelTarget.kind === "target" && !(await applyImplementationModel(ctx, modelTarget, rollBack))) return;
+    const sent = sendPlanModeUserMessage(formatImplementationHandoff(plan), ctx);
+    if (!sent) {
+      const handoff = state.modelHandoff;
+      if (handoff) {
+        const sessionGeneration = menuGeneration;
+        state = { ...state, modelHandoff: undefined };
+        const restored = await finishModelHandoff(ctx, handoff);
+        if (!restored || sessionGeneration !== menuGeneration) return;
+      }
+      rollBack();
     }
   }
 
@@ -996,8 +1185,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       ...lifecycle,
       start: (signal) => {
         if (signal.aborted || !lifecycle.isCurrent()) return;
-        enterPlanMode(ctx);
-        ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+        return withPlanningModel(ctx, () => {
+          enterPlanMode(ctx);
+          ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+        });
       },
       startWithTools: (names, signal) => {
         if (signal.aborted || !lifecycle.isCurrent()) return;
@@ -1006,8 +1197,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
           selectedToolNames: filterAvailableSelectedToolNames(names, tools),
           selectedToolKeys: undefined,
         };
-        enterPlanMode(ctx);
-        ctx.ui.notify("Plan mode enabled with the selected tools.", "info");
+        return withPlanningModel(ctx, () => {
+          enterPlanMode(ctx);
+          ctx.ui.notify("Plan mode enabled with the selected tools.", "info");
+        });
       },
       settings: (signal) => showSettings(ctx, signal, lifecycle.isCurrent),
     });
@@ -1030,13 +1223,15 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       show: () => showStoredPlan(pi, ctx, state),
       exportPlan: (path, signal) => planExports.export(path, ctx, signal, lifecycle.isCurrent),
       settings: (signal) => showSettings(ctx, signal, lifecycle.isCurrent),
-      startNew: () => {
-        enterPlanMode(ctx);
-        ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
-      },
+      startNew: () =>
+        withPlanningModel(ctx, () => {
+          enterPlanMode(ctx);
+          ctx.ui.notify("Plan mode enabled. I will explore and plan, but not modify files.", "info");
+        }),
       clear: () => {
-        exitPlanMode(ctx);
+        const restoring = exitPlanMode(ctx);
         ctx.ui.notify("Active implementation plan cleared.", "info");
+        return restoring;
       },
     });
   }
@@ -1215,9 +1410,53 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
   }
 
+  function reconcileModelHandoff(ctx: ExtensionContext) {
+    let handoff = state.modelHandoff;
+    if (!handoff) return;
+    const branch = ctx.sessionManager.getBranch();
+    const boundary = state.modelHandoffBoundary
+      ? branch.findIndex((entry) => entry.id === state.modelHandoffBoundary)
+      : -1;
+    // Older handoffs have no provable native publication boundary. Do not
+    // infer thinking provenance from timestamps or callback arrival. Retain
+    // only model ownership, and anchor all future selection auditing now.
+    if (boundary < 0) {
+      const {
+        previousThinkingLevel: _previous,
+        appliedThinkingLevel: _applied,
+        thinkingModel: _model,
+        ...remaining
+      } = handoff;
+      handoff = remaining.appliedModel ? remaining : undefined;
+      state = {
+        ...state,
+        modelHandoff: handoff,
+        modelHandoffBoundary: branch.at(-1)?.id,
+      };
+      persistState(ctx);
+      if (!handoff) return;
+    }
+    const later = boundary >= 0 ? branch.slice(boundary + 1) : [];
+    const model = handoff.appliedModel ?? handoff.thinkingModel;
+    if (!model || !ctx.model || !sameModel(ctx.model, model) || later.some((entry) => entry.type === "model_change")) {
+      state = { ...state, modelHandoff: undefined, modelHandoffBoundary: undefined };
+      persistState(ctx);
+    } else if (handoff.appliedThinkingLevel && later.some((entry) => entry.type === "thinking_level_change")) {
+      const {
+        previousThinkingLevel: _previous,
+        appliedThinkingLevel: _applied,
+        thinkingModel: _model,
+        ...remaining
+      } = handoff;
+      state = { ...state, modelHandoff: remaining.appliedModel ? remaining : undefined };
+      persistState(ctx);
+    }
+  }
+
   function restoreState(ctx: ExtensionContext) {
     state = restorePlanModeState(ctx.sessionManager.getBranch(), STATE_ENTRY_TYPE);
     stateOrigin = captureStateOrigin(ctx);
+    reconcileModelHandoff(ctx);
   }
 
   function updateUi(ctx: ExtensionContext) {

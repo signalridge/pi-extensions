@@ -10,6 +10,19 @@ export function civilDayStart(timestamp: number, dayOffset = 0): number {
   return midnight.getTime();
 }
 
+/**
+ * Midnight on the first of this local month. Built from the civil date, never by
+ * subtracting days or milliseconds, so month length and any DST change earlier
+ * in the month cannot shift it; a skipped midnight normalizes to that day's first instant.
+ */
+export function civilMonthStart(timestamp: number): number {
+  const local = new Date(timestamp);
+  const first = new Date(local.getFullYear(), local.getMonth(), 1);
+  // The multi-argument Date constructor treats years 0–99 as 1900–1999.
+  if (local.getFullYear() < 100) first.setFullYear(local.getFullYear());
+  return first.getTime();
+}
+
 function minuteRemainder(timestamp: number): number {
   const local = new Date(timestamp);
   return (local.getMinutes() * 60 + local.getSeconds()) * 1000 + local.getMilliseconds();

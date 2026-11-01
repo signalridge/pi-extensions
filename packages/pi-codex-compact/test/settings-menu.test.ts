@@ -72,6 +72,7 @@ test("settings screen exposes bounded controls and invalid files remain repairab
       ["stageTimeoutMs", "5 min"],
       ["maxRetries", "2"],
       ["replacementTokenBudget", "64K tokens"],
+      ["layeredFallback", "On"],
       ["notifyOnFallback", "On"],
     ],
   );
@@ -122,6 +123,7 @@ test("menu actions persist exact setting patches", async () => {
   await menu.actions["set-timeout"](action("10 min"));
   await menu.actions["set-retries"](action("1"));
   await menu.actions["set-retention"](action("96K tokens"));
+  await menu.actions["set-layered"](action("Off"));
   await menu.actions["set-notify"](action("Off"));
   assert.deepEqual(memory.patches, [
     { enabled: false },
@@ -129,8 +131,12 @@ test("menu actions persist exact setting patches", async () => {
     { requestTimeoutMs: 600_000 },
     { maxRetries: 1 },
     { replacementTokenBudget: 96_000 },
+    { layeredFallback: false },
     { notifyOnFallback: false },
   ]);
+  const settings = resolveMenuScreen(menu, "settings", memory.runtime.get());
+  if (settings.kind !== "settings") assert.fail("Expected settings screen");
+  assert.equal(settings.items.find((item) => item.id === "layeredFallback")?.currentValue, "Off");
 });
 
 test("TUI manual action compacts once after close and reports fixed credential-free failure", async () => {

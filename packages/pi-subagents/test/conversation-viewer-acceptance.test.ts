@@ -22,7 +22,7 @@ function fixture(messages: TestMessage[] = [user("history")], options: ViewerOpt
   const terminal: PiTui.Terminal = {
     rows: 20, columns: 120, kittyProtocolActive: false,
     start: callback => { input = callback; }, stop: vi.fn(), drainInput: async () => {}, write: vi.fn(),
-    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(),
+    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(), setProgramStatus: vi.fn(),
   };
   const tui = native === "regular" ? new PiTui.TuiMainScreen(terminal) : native === "fullscreen" ? new PiTui.TuiAltScreen(terminal) : { mode: "fullscreen", terminal, requestRender: vi.fn() } as unknown as PiTui.TUI;
   const session = { messages, subscribe: () => vi.fn() } as unknown as AgentSession;

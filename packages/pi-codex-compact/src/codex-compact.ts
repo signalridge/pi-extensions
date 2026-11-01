@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, Context, Model, Tool } from "@earendil-works/pi-ai";
+import type { Api, Context, Model, Provider, ProviderHeaders, Tool } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import * as piCodingAgent from "@earendil-works/pi-coding-agent";
 import {
@@ -9,6 +9,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
+  type SessionBeforeCompactResult,
   type SessionEntry,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
@@ -23,10 +24,12 @@ import {
   createCheckpointDetails,
   fallbackSummary,
   fallbackSummaryVariants,
+  layeredReplacementHistory,
   parseCheckpointDetails,
+  priorLayeredSummary,
   projectCheckpointContext,
 } from "./checkpoint.js";
-import { createDiagnosticTrace, diagnosticSummary, readLastDiagnostic } from "./diagnostics.js";
+import { createDiagnosticTrace, diagnosticSummary, readLastDiagnostic, type TimeoutScope } from "./diagnostics.js";
 import {
   type CompactionCancellationCode,
   type CompactionFailure,
@@ -38,6 +41,7 @@ import {
   formatCompactionCancellation,
   formatCompactionFailure,
 } from "./failure.js";
+import { isLayeredFailure, layeredSummaryInput, requestLayeredSummary } from "./layered-fallback.js";
 import { PreparationBranchFence } from "./preparation-branch.js";
 import { hasCheckpointMarker, rewriteCheckpointMarker } from "./protocol.js";
 import { createRecoveryCommand } from "./recovery-command.js";
@@ -46,6 +50,7 @@ import {
   type CodexCompactSettingsRuntime,
   type CodexCompactSettingsState,
   createCodexCompactSettingsRuntime,
+  effectiveLayeredFallback,
   effectiveStageTimeoutMs,
 } from "./settings.js";
 import { showCodexCompactMenu } from "./settings-menu.js";
@@ -248,6 +253,29 @@ function notifyFailure(
   }
 }
 
+function notifyLayered(
+  ctx: ExtensionContext,
+  settings: CodexCompactSettings,
+  failure: CompactionFailure,
+  diagnostic: string,
+): void {
+  if (!ctx.hasUI || !settings.notifyOnFallback) return;
+  try {
+    ctx.ui.notify(
+      `Codex remote compaction failed; kept the opaque checkpoint and added Pi's readable summary of newer history (layered fallback). ${formatCompactionFailure(failure)} ${diagnostic}`,
+      "warning",
+    );
+  } catch {
+    // A committed layered result must not depend on best-effort UI.
+  }
+}
+
+const LAYERED_CANCELLATION = {
+  off: " Layered fallback is off.",
+  failed: " The layered summary fallback also failed.",
+  timeout: " The layered summary fallback timed out.",
+} as const;
+
 function setCompactionStatus(ctx: ExtensionContext, value: string | undefined): void {
   try {
     ctx.ui.setStatus(STATUS_KEY, value);
@@ -256,11 +284,18 @@ function setCompactionStatus(ctx: ExtensionContext, value: string | undefined): 
   }
 }
 
-function cancelOpaqueCompaction(ctx: ExtensionContext, failure: CompactionFailure, diagnostic = ""): { cancel: true } {
+function cancelOpaqueCompaction(
+  ctx: ExtensionContext,
+  failure: CompactionFailure,
+  diagnostic = "",
+  layered?: keyof typeof LAYERED_CANCELLATION,
+): { cancel: true } {
   try {
     if (ctx.hasUI) {
       ctx.ui.notify(
         `Compaction cancelled to preserve the existing opaque checkpoint. ${formatCompactionFailure(failure)}${
+          layered ? LAYERED_CANCELLATION[layered] : ""
+        }${
           failure.code === "checkpoint_incompatible"
             ? " Retry with its original Codex model or recover a pre-compaction branch."
             : failure.code === "checkpoint_malformed" || failure.code === "checkpoint_projection_failed"
@@ -479,6 +514,22 @@ async function compactRemotely(
   diagnostics.phase("auth");
   if (ctx.mode === "tui" && ctx.hasUI) setCompactionStatus(ctx, "Codex remote compaction…");
   let phase: CompactionFailureCode = "authentication_failed";
+  // Set only once a compatible checkpoint is projected with resolved credentials;
+  // only then may a failed remote request fall back to a layered summary.
+  let layeredSource:
+    | {
+        prior: CodexCheckpointDetails;
+        provider: Provider;
+        model: Model<"openai-codex-responses">;
+        apiKey: string;
+        headers?: ProviderHeaders;
+        env?: Record<string, string>;
+        isCurrent: () => boolean;
+      }
+    | undefined;
+  let success: { outcome: "prepared" | "layered"; error?: CompactionFailureCode; scope?: TimeoutScope } | undefined;
+  let prepared: SessionBeforeCompactResult | undefined;
+  let preparedIsCurrent: (() => boolean) | undefined;
   try {
     const effectiveBeforeAuth = piCodingAgentCompat.buildSessionProjection ? ctx.getSystemPrompt() : undefined;
     const auth = await awaitCompactionAuth(ctx, model, signal, Math.min(deadline, performance.now() + stageTimeoutMs));
@@ -493,6 +544,7 @@ async function compactRemotely(
     const provider = ctx.modelRegistry.getProvider(model.provider);
     if (!provider) throw compactionError("provider_unavailable");
     const providerStream = provider.stream;
+    const providerStreamSimple = provider.streamSimple;
     const authResolver = ctx.modelRegistry.getApiKeyAndHeaders;
     const resolvedAuth = JSON.stringify(auth);
     const authStatus = () => JSON.stringify(ctx.modelRegistry.getProviderAuthStatus?.(model.provider));
@@ -500,6 +552,7 @@ async function compactRemotely(
     const providerIsCurrent = () =>
       ctx.modelRegistry.getProvider(model.provider) === provider &&
       provider.stream === providerStream &&
+      provider.streamSimple === providerStreamSimple &&
       ctx.modelRegistry.getApiKeyAndHeaders === authResolver &&
       JSON.stringify(auth) === resolvedAuth &&
       authStatus() === sourceAuthStatus;
@@ -546,6 +599,34 @@ async function compactRemotely(
       messages: convertToLlm(current.messages),
       tools: requestTools,
     };
+    // Retain the complete request fence for both remote and layered paths,
+    // including equal prompt views that never populate witnessedRequest.
+    const requestIsCurrent = () => {
+      if (!isCurrent()) return false;
+      try {
+        if (
+          providerIsCurrent() &&
+          sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) &&
+          (!piCodingAgentCompat.buildSessionProjection || sameTools(requestTools, activeTools(pi)))
+        )
+          return true;
+      } catch {
+        // Unsupported live state cannot authorize another physical request.
+      }
+      phase = "state_divergence";
+      return false;
+    };
+    if (current.prior) {
+      layeredSource = {
+        prior: current.prior,
+        provider,
+        model: requestModel,
+        apiKey: auth.apiKey,
+        headers: structuredClone(auth.headers),
+        env: structuredClone(auth.env),
+        isCurrent: requestIsCurrent,
+      };
+    }
     const remainingMs = deadline - performance.now();
     if (remainingMs <= 0) throw compactionError("remote_timeout");
     phase = "remote_provider_error";
@@ -553,15 +634,7 @@ async function compactRemotely(
       provider,
       model: requestModel,
       context,
-      isCurrent: () => {
-        if (!isCurrent()) return false;
-        const currentState =
-          providerIsCurrent() &&
-          sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) &&
-          (!piCodingAgentCompat.buildSessionProjection || sameTools(requestTools, activeTools(pi)));
-        if (!currentState) phase = "state_divergence";
-        return currentState;
-      },
+      isCurrent: requestIsCurrent,
       validatePayload: toolState.payloadValidator(ctx.sessionManager, sessionId, prompts),
       apiKey: auth.apiKey,
       headers: auth.headers,
@@ -583,13 +656,7 @@ async function compactRemotely(
     phase = "state_divergence";
     // appendCompaction will snapshot the session's resolved system/tool state;
     // never persist a checkpoint for a request that became stale while in flight.
-    if (
-      !providerIsCurrent() ||
-      !sessionStateMatchesRequest(current.transcript, pi, ctx, sourceBranch, toolState) ||
-      (piCodingAgentCompat.buildSessionProjection && !sameTools(requestTools, activeTools(pi)))
-    ) {
-      throw compactionError("state_divergence");
-    }
+    if (!requestIsCurrent()) throw compactionError("state_divergence");
     phase = "local_compaction_failed";
     const replacementHistory = buildReplacementHistory(response.promptInput, response.item, {
       tokenBudget: settings.replacementTokenBudget,
@@ -603,11 +670,13 @@ async function compactRemotely(
       willRetry: !piCodingAgentCompat.buildSessionProjection && event.willRetry,
     });
     if (!isCurrent()) return cancelInvalidatedPreparation();
+    if (!requestIsCurrent()) throw compactionError("state_divergence");
     if (performance.now() >= deadline) throw compactionError("remote_timeout");
     // Synchronous fingerprinting/retention may outlast timer delivery too.
     if (performance.now() >= deadline) throw compactionError("remote_timeout");
-    diagnostics.finish("prepared");
-    return {
+    success = { outcome: "prepared" };
+    preparedIsCurrent = requestIsCurrent;
+    prepared = {
       compaction: {
         summary: fallbackSummary(details.checkpointId),
         firstKeptEntryId: event.preparation.firstKeptEntryId,
@@ -625,27 +694,117 @@ async function compactRemotely(
     // summary. Historical checkpoints superseded by a native boundary do not
     // block fallback; current malformed/incompatible opaque boundaries do.
     const failure = failureFrom(error, phase);
-    diagnostics.finish(
-      "failure",
-      failure.code,
+    const timeoutScope =
       failure.code === "remote_timeout" || failure.code === "authentication_timeout"
         ? performance.now() >= deadline
           ? "operation"
           : "stage"
-        : "none",
-    );
-    const summary = diagnosticSummary(diagnostics.snapshot());
-    if (isOpaqueCompaction(activeCompaction(event.branchEntries))) {
-      return cancelOpaqueCompaction(ctx, failure, summary);
+        : "none";
+    // A remote failure over a valid compatible checkpoint keeps that opaque
+    // history and summarizes only what this compaction drops after it.
+    const layered = layeredSource && isLayeredFailure(failure.code) ? layeredSource : undefined;
+    const layeredInput =
+      layered && effectiveLayeredFallback(settings) ? layeredSummaryInput(event.preparation, layered.prior) : [];
+    if (layered && layeredInput.length > 0) {
+      if (!layered.isCurrent()) {
+        diagnostics.finish("failure", "state_divergence");
+        return cancelOpaqueCompaction(
+          ctx,
+          compactionFailure("state_divergence"),
+          diagnosticSummary(diagnostics.snapshot()),
+        );
+      }
+      diagnostics.phase("layered_summary");
+      if (ctx.mode === "tui" && ctx.hasUI) setCompactionStatus(ctx, "Codex layered summary…");
+      const result = await requestLayeredSummary({
+        provider: layered.provider,
+        model: layered.model,
+        messages: layeredInput,
+        previousSummary: priorLayeredSummary(layered.prior),
+        customInstructions: event.customInstructions,
+        thinkingLevel: pi.getThinkingLevel(),
+        apiKey: layered.apiKey,
+        headers: layered.headers,
+        env: layered.env,
+        signal,
+        isCurrent: layered.isCurrent,
+        timeoutMs: Math.min(stageTimeoutMs, deadline - performance.now()),
+        maxRetries: settings.maxRetries,
+        fetch,
+      });
+      if (!isCurrent()) return cancelInvalidatedPreparation();
+      let details: CodexCheckpointDetails | undefined;
+      if (result.ok && layered.isCurrent()) {
+        try {
+          // Every field except the replacement history matches the success path.
+          details = createCheckpointDetails({
+            modelId: issuingModelId,
+            replacementHistory: layeredReplacementHistory(layered.prior, result.text, {
+              tokenBudget: settings.replacementTokenBudget,
+            }),
+            keptMessages: keptMessages(event),
+            willRetry: !piCodingAgentCompat.buildSessionProjection && event.willRetry,
+          });
+        } catch {
+          // An unbuildable layered checkpoint cancels like any other failure.
+        }
+      }
+      if (!isCurrent()) return cancelInvalidatedPreparation();
+      if (result.ok && details && layered.isCurrent() && performance.now() < deadline) {
+        diagnostics.usage(result.usage, false);
+        success = { outcome: "layered", error: failure.code, scope: timeoutScope };
+        notifyLayered(ctx, settings, failure, diagnosticSummary(diagnostics.snapshot()));
+        preparedIsCurrent = layered.isCurrent;
+        prepared = {
+          compaction: {
+            summary: fallbackSummary(details.checkpointId),
+            firstKeptEntryId: event.preparation.firstKeptEntryId,
+            tokensBefore: event.preparation.tokensBefore,
+            usage: result.usage,
+            details,
+          },
+        };
+      } else {
+        diagnostics.finish("failure", failure.code, timeoutScope);
+        return cancelOpaqueCompaction(
+          ctx,
+          failure,
+          diagnosticSummary(diagnostics.snapshot()),
+          (result.ok ? performance.now() >= deadline : result.reason === "timeout") ? "timeout" : "failed",
+        );
+      }
+    } else {
+      diagnostics.finish("failure", failure.code, timeoutScope);
+      const summary = diagnosticSummary(diagnostics.snapshot());
+      if (isOpaqueCompaction(activeCompaction(event.branchEntries))) {
+        return cancelOpaqueCompaction(
+          ctx,
+          failure,
+          summary,
+          layered && !effectiveLayeredFallback(settings) ? "off" : undefined,
+        );
+      }
+      notifyFailure(ctx, settings, failure, summary);
+      return undefined;
     }
-    notifyFailure(ctx, settings, failure, summary);
-    return undefined;
   } finally {
-    diagnostics.finish("cancelled");
     if (!ownerSignal.aborted && ctx.mode === "tui" && ctx.hasUI && ctx.sessionManager.getSessionId() === sessionId) {
       setCompactionStatus(ctx, undefined);
     }
+    if (!prepared) diagnostics.finish("cancelled");
   }
+  // UI notification and status cleanup are external callbacks and can re-enter
+  // the SDK. Fence the prepared result AFTER both; no further notification or
+  // cleanup callback may reopen this within-handler publication gap.
+  // Later compaction handlers still need the host's unavailable append-time fence.
+  if (prepared && (!preparedIsCurrent?.() || performance.now() >= deadline)) {
+    diagnostics.finish("cancelled");
+    return { cancel: true };
+  }
+  // finish only updates owned memory and queues persistence; it does not await
+  // I/O or invoke UI callbacks, so it cannot reopen the accepted result fence.
+  if (success) diagnostics.finish(success.outcome, success.error, success.scope);
+  return prepared;
 }
 
 export function createCodexCompactExtension(

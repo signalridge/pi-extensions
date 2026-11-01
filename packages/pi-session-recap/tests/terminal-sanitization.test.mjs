@@ -99,10 +99,10 @@ test("a model recap cannot drive the terminal through the recap widget", async (
   registerApiProvider({
     api: "anthropic-messages",
     stream: () => ({
-      result: async () => ({ role: "assistant", content: [{ type: "text", text: recapText }] }),
+      result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: recapText }] }),
     }),
     streamSimple: () => ({
-      result: async () => ({ role: "assistant", content: [{ type: "text", text: recapText }] }),
+      result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: recapText }] }),
     }),
   });
 

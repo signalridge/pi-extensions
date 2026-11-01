@@ -34,7 +34,11 @@ test("the blur threshold cannot bypass the settlement debounce", async (t) => {
     streamSimple: (_model, context) => {
       calls.push(context);
       return {
-        result: async () => ({ role: "assistant", content: [{ type: "text", text: "Recap after settlement." }] }),
+        result: async () => ({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Recap after settlement." }],
+        }),
       };
     },
   });

@@ -18,6 +18,8 @@ This repository is a Pi package monorepo owned by signalridge.
 - `packages/pi-statusline` is derived from `narumiruna/pi-extensions`.
 - `packages/pi-worktree` is derived from `narumiruna/pi-extensions`.
 - `packages/pi-input-history` is derived from `ouzhenkun/pi-input-history`.
+- `packages/pi-rules` is derived from `can1357/oh-my-pi` (its rule and TTSR system).
+- `packages/pi-secrets` is derived from `can1357/oh-my-pi` (its secret obfuscation).
 - Preserve upstream LICENSE files and document local divergence.
 - Never edit a reference checkout under `~/ghq/github.com/<upstream>`; copy or sync into this repository.
 

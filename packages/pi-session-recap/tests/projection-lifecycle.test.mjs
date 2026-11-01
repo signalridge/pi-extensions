@@ -87,7 +87,13 @@ test("idle fallback waits for settlement through intermediate retry and uses the
     },
     streamSimple: (_model, context) => {
       calls.push(context);
-      return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Current recap." }] }) };
+      return {
+        result: async () => ({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Current recap." }],
+        }),
+      };
     },
   });
 
@@ -152,7 +158,13 @@ test("automatic settlement skips incomplete final turns but keeps earlier comple
     },
     streamSimple: (_model, context) => {
       calls.push(context);
-      return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Completed recap." }] }) };
+      return {
+        result: async () => ({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Completed recap." }],
+        }),
+      };
     },
   });
 
@@ -204,7 +216,13 @@ test("resume drafts from a summary-only projection without restoring omitted his
     },
     streamSimple: (_model, context) => {
       calls.push(context);
-      return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Resume recap." }] }) };
+      return {
+        result: async () => ({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Resume recap." }],
+        }),
+      };
     },
   });
 
@@ -268,7 +286,7 @@ test("a context edit arriving during generation invalidates a projected recap dr
       result: async () => {
         announceStart();
         await response;
-        return { role: "assistant", content: [{ type: "text", text: "Stale recap." }] };
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Stale recap." }] };
       },
     }),
   });
@@ -320,7 +338,7 @@ test("automatic draft rechecks activity after an out-of-window context edit", as
       result: async () => {
         announceStart();
         await response;
-        return { role: "assistant", content: [{ type: "text", text: "Stale recap." }] };
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Stale recap." }] };
       },
     }),
   });
@@ -404,7 +422,7 @@ test("a superseded session's late turn cannot abort the current recap", async ()
       result: async () => {
         announceStart();
         await response;
-        return { role: "assistant", content: [{ type: "text", text: "Current recap." }] };
+        return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Current recap." }] };
       },
     }),
   });

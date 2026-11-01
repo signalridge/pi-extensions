@@ -129,7 +129,31 @@ export function createMockPi(
       providerUnregistrations.push(name);
     },
     on(name: string, handler: MockHandler) {
-      events.set(name, [...(events.get(name) ?? []), handler]);
+      const invoke: MockHandler =
+        name !== "before_agent_start"
+          ? handler
+          : (event, ...args) => {
+              if (!isRecord(event)) throw new Error("Expected before_agent_start payload");
+              const systemPromptOptions = isRecord(event.systemPromptOptions)
+                ? event.systemPromptOptions
+                : {
+                    sections: {},
+                    selectedTools: [...activeTools],
+                    hiddenTools: [],
+                    skills: [],
+                  };
+              const payload = { messageType: "user", ...event, systemPromptOptions };
+              const result = handler(payload, ...args);
+              // Like ExtensionRunner, expose structured mutations to callers. Do not
+              // manufacture a forced systemPrompt, which would hide composition bugs.
+              const aggregate = (value: unknown) =>
+                value ??
+                (isRecord(systemPromptOptions.sections) && Object.keys(systemPromptOptions.sections).length > 0
+                  ? { systemPromptOptions }
+                  : undefined);
+              return result instanceof Promise ? result.then(aggregate) : aggregate(result);
+            };
+      events.set(name, [...(events.get(name) ?? []), invoke]);
     },
     getFlag(name: string) {
       return flags.get(name)?.value;
@@ -316,6 +340,7 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
       getApiKeyAndHeaders: async () => ({ ok: false, error: "missing" }),
       getAvailable: () => [],
       getAll: () => [],
+      find: () => undefined,
       isUsingOAuth: () => false,
     },
     ...overrides,

@@ -5,6 +5,7 @@ import {
   InteractiveMode,
   initTheme,
   SessionManager,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, KeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import extension from "../index.js";
@@ -12,9 +13,10 @@ import { ownedCustom } from "../src/owned-custom.js";
 
 initTheme("dark", false);
 
-// Pi 1.0.4's actual closure captures the draft, restores it synchronously in done,
-// and mounts asynchronously. Native navigateTree does not reset this custom UI.
+// Pi's actual closure captures the draft, restores it synchronously in done, and
+// mounts asynchronously. Native navigateTree does not reset this custom UI.
 function editorHost() {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   const editor = {
     text: "",
     getText() {
@@ -41,12 +43,28 @@ function editorHost() {
         if (component === editor) restores++;
       },
       requestRender() {},
+      hideOverlay() {},
     },
+    // Peripheral reset surfaces are inert; dialog reset/iteration stays the real SDK method.
+    clearExtensionTerminalInputListeners() {},
+    setExtensionFooter() {},
+    setExtensionHeader() {},
+    clearExtensionWidgets() {},
+    setCustomEditorComponent() {},
+    setupAutocompleteProvider() {},
+    updateTerminalTitle() {},
+    setWorkingIndicator() {},
+    setHiddenThinkingLabel() {},
+    footerDataProvider: { clearExtensionStatuses() {} },
+    footer: { invalidate() {} },
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
-  }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
+  }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"]; resetExtensionUI(): void };
   return {
     editor,
     editorContainer,
+    reset: () => host.resetExtensionUI(),
     custom: ((factory, options) =>
       host.showExtensionCustom(factory, options)) as ExtensionCommandContext["ui"]["custom"],
     get focus() {
@@ -221,7 +239,11 @@ for (const preMount of [false, true]) {
     });
     const old = preMount ? undefined : await mounted(host);
     controller.abort();
-    assert.equal(host.restores, 1);
+    assert.deepEqual(host.editorContainer.children, [host.editor]);
+    assert.equal(host.focus, host.editor);
+    // 1.4.0 never replaced the editor for a dialog closed before mounting, so it has no focus to restore.
+    const restores = preMount && VERSION === "1.4.0" ? 0 : 1;
+    assert.equal(host.restores, restores);
     host.editor.setText("replacement draft");
     assert.equal(await pending, undefined);
     let close!: () => void;
@@ -240,11 +262,41 @@ for (const preMount of [false, true]) {
     assert.equal(removed, added);
     assert.deepEqual(host.editorContainer.children, [replacement]);
     assert.equal(host.editor.text, "replacement draft");
-    assert.equal(host.restores, 1);
+    assert.equal(host.restores, restores);
     close();
     await next;
   }, 1000);
 }
+
+test("actual SDK reset disposes [codeDialog, foreignDialog] exactly once and locally settles the code owner", async () => {
+  const host = editorHost();
+  const ctx = { mode: "tui", hasUI: true, ui: { custom: host.custom } } as ExtensionCommandContext;
+  let ownedDisposals = 0;
+  let foreignDisposals = 0;
+  const owned = ownedCustom<string>(ctx, { signal: new AbortController().signal, isCurrent: () => true }, () => ({
+    render: () => [],
+    invalidate() {},
+    dispose: () => {
+      ownedDisposals++;
+    },
+  }));
+  await mounted(host);
+  void host.custom(() => ({
+    render: () => [],
+    invalidate() {},
+    dispose: () => {
+      foreignDisposals++;
+    },
+  }));
+  await Promise.resolve();
+  host.reset();
+  assert.equal(await owned, undefined);
+  assert.equal(ownedDisposals, 1);
+  assert.equal(foreignDisposals, 1);
+  host.reset();
+  assert.equal(ownedDisposals, 1);
+  assert.equal(foreignDisposals, 1);
+});
 
 test("normal picker appends to the TUI draft and run pane closes normally", async () => {
   const fixture = commandHost();

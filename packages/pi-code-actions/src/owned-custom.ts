@@ -20,6 +20,10 @@ export async function ownedCustom<T>(
   let component: DisposableComponent | undefined;
   let rawDone: ((value: T | undefined) => void) | undefined;
   let listening = false;
+  let retire!: () => void;
+  const retired = new Promise<undefined>((resolve) => {
+    retire = () => resolve(undefined);
+  });
   const cleanup = () => {
     if (!listening) return;
     listening = false;
@@ -45,7 +49,7 @@ export async function ownedCustom<T>(
   const onAbort = () => finish(undefined);
   const active = () => !closed && !ownership.signal.aborted && ownership.isCurrent();
   try {
-    const result = await ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
+    const dialog = ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
       rawDone = done;
       listening = true;
       ownership.signal.addEventListener("abort", onAbort, { once: true });
@@ -63,12 +67,19 @@ export async function ownedCustom<T>(
           if (active()) component?.handleInput?.(data);
         },
         dispose: () => {
-          closed = true;
+          // Host reset owns its dialog stack iteration. Calling rawDone here
+          // would splice that same stack and skip the next foreign dialog.
+          // Release our owner locally; explicit finish still closes synchronously.
+          if (!closed) {
+            closed = true;
+            retire();
+          }
           cleanup();
           dispose();
         },
       };
     });
+    const result = await Promise.race([dialog, retired]);
     return ownership.isCurrent() && !ownership.signal.aborted ? result : undefined;
   } finally {
     closed = true;

@@ -74,7 +74,7 @@ function fixture(cwd: string) {
   });
   const host = (extensions: Array<ReturnType<typeof extension>>, streamFunction?: unknown) => {
     const runner = new ExtensionRunner(extensions as never, {} as never, cwd, manager, ctx.modelRegistry as never);
-    // Navigate through Pi 0.99's real host method, with only unrelated model,
+    // Navigate through Pi 1.4.0's real host method, with only unrelated model,
     // rendering, and context machinery replaced by inert test dependencies.
     const session = Object.create(AgentSession.prototype) as AgentSession;
     Object.assign(session, {
@@ -95,7 +95,7 @@ function fixture(cwd: string) {
 
 const settle = async () => { await new Promise((resolve) => setImmediate(resolve)); };
 
-describe.skipIf(!VERSION.startsWith("0.99.") && VERSION !== "1.0.4")("Pi navigation commit boundary", () => {
+describe.skipIf(VERSION !== "1.4.0")("Pi navigation commit boundary", () => {
   let cwd = "";
   let oldCwd = "";
   let oldAgentDir: string | undefined;

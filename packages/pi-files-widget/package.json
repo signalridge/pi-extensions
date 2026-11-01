@@ -21,7 +21,7 @@
     "@earendil-works/pi-tui": "*"
   },
   "scripts": {
-    "postinstall": "node -e \"console.log('pi-files-widget: required deps: bat, delta, glow. Install with: brew install bat git-delta glow')\"",
+    "postinstall": "node -e \"console.log('pi-files-widget: required deps: bat, delta, glow. ' + (process.platform === 'darwin' ? 'Install with: brew install bat git-delta glow' : 'Install instructions: https://github.com/signalridge/pi-extensions/tree/main/packages/pi-files-widget#install'))\"",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "bun test test",
@@ -34,8 +34,8 @@
     ]
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.4",
-    "@earendil-works/pi-tui": "1.0.4"
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0"
   },
   "dependencies": {
     "@signalridge/pi-ui": "^1.4.0"

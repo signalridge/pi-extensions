@@ -57,7 +57,7 @@ for (const stage of ["auth", "response"]) {
                 entered.resolve();
                 await releaseWork.promise;
               }
-              return { role: "assistant", content: [{ type: "text", text: "Stale recap" }] };
+              return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Stale recap" }] };
             },
           };
         },

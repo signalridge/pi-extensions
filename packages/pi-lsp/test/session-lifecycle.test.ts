@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
-import { mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, unwatchFile, watchFile, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,7 +47,10 @@ function harness(hang?: string) {
     isSupportedFile: (name) => name.endsWith(".go"),
     languageIdFor: () => "go",
   };
-  vi.spyOn(adapters, "loadRuntime").mockReturnValue({ adapters: [adapter], timeoutMs: 1_000 });
+  // These cases exercise explicit cancellation within a 10s test deadline.
+  // A shorter transport deadline can win before the real-child readiness event
+  // is observed under suite load, testing a timeout instead of lifecycle drain.
+  vi.spyOn(adapters, "loadRuntime").mockReturnValue({ adapters: [adapter], timeoutMs: 30_000 });
   const mock = createMockPi();
   extension(mock.pi);
   const controller = new AbortController();
@@ -111,14 +114,25 @@ function harness(hang?: string) {
       .map((line) => JSON.parse(line));
   }
   function ready(method: string) {
-    return new Promise<void>((resolve) => {
-      const watcher = watch(log, check);
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(deadline);
+        unwatchFile(log, check);
+      };
+      const deadline = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Fixture never reached ${method}; records: ${JSON.stringify(records())}`));
+      }, 5_000);
       function check() {
         if (records().some((record) => record.method === method)) {
-          watcher.close();
+          cleanup();
           resolve();
         }
       }
+      // Native fs.watch can coalesce/drop append notifications on macOS. Stat
+      // watching observes the persistent readiness record instead of requiring
+      // one particular edge; keep the wait bounded and remove its listener.
+      watchFile(log, { interval: 20, persistent: false }, check);
       check();
     });
   }

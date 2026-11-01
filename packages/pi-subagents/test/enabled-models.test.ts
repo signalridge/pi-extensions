@@ -323,8 +323,31 @@ describe("resolveEnabledModels", () => {
         getAvailable: async () => models,
       } as unknown as ModelRuntime);
       const piKeys = new Set(pi.scopedModels.map(({ model }) => `${model.provider}/${model.id}`));
-      expect(piKeys).toEqual(new Set());
+      // Pi 1.4 resolves a partial within the named provider's models.
+      expect(piKeys).toEqual(new Set(["p/model:high-speed-v2"]));
       expect(resolveEnabledModels(patterns, makeRegistry(models))).toEqual(piKeys);
+    });
+
+    it("agrees with Pi when several providers offer a referenced model", async () => {
+      const models = [
+        { id: "shared-model", name: "Shared", provider: "alpha" },
+        { id: "shared-model", name: "Shared", provider: "beta" },
+        { id: "bracketed[1m]", name: "Bracketed", provider: "alpha" },
+        { id: "bracketed1", name: "Bracketed One", provider: "alpha" },
+      ];
+      for (const [patterns, expected] of [
+        [["shared-model"], ["alpha/shared-model", "beta/shared-model"]],
+        [["shared"], ["alpha/shared-model", "beta/shared-model"]],
+        [["beta/shared"], ["beta/shared-model"]],
+        [["bracketed[1m]"], ["alpha/bracketed[1m]"]],
+      ] as const) {
+        const pi = await resolveModelScopeWithDiagnostics([...patterns], {
+          getAvailable: async () => models,
+        } as unknown as ModelRuntime);
+        const piKeys = new Set(pi.scopedModels.map(({ model }) => `${model.provider}/${model.id}`));
+        expect(piKeys).toEqual(new Set(expected));
+        expect(resolveEnabledModels([...patterns], makeRegistry(models))).toEqual(piKeys);
+      }
     });
 
     it("agrees with Pi when a thinking-suffixed glob matches base and colon IDs", async () => {

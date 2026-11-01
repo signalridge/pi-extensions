@@ -1,7 +1,5 @@
 import { test } from "bun:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { dirname } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIDialogOptions } from "@earendil-works/pi-coding-agent";
 import extension from "../index.js";
 
@@ -79,7 +77,7 @@ function hostFixture(exec?: ExtensionAPI["exec"], snippet = "const a = 1;") {
           ],
         },
         ui: {
-          // Pi 1.0.4 RPC dialogs stay pending until a reply or the supplied signal aborts.
+          // Pi RPC dialogs (unchanged from 1.0.4 to 1.4.0) stay pending until a reply or the supplied signal aborts.
           confirm: (_title: string, _message: string, options?: ExtensionUIDialogOptions) => dialog(false, options),
           select: (_title: string, _items: string[], options?: ExtensionUIDialogOptions) => dialog(undefined, options),
           getEditorText: () => {
@@ -294,40 +292,3 @@ test("normal RPC action selection retains draft consent and runs only after conf
   assert.match(host.notices.at(-1) ?? "", /confirmed snippet/);
   assert.match(host.notices.at(-1) ?? "", /Exit code: 0/);
 });
-
-for (const event of [
-  "session_before_switch",
-  "session_before_fork",
-  "session_before_tree",
-  "session_tree",
-  "session_start",
-  "session_shutdown",
-]) {
-  test(`${event} cancels the command's stalled clipboard utility and removes its private file`, async () => {
-    let file = "";
-    let calls = 0;
-    let execSignal: AbortSignal | undefined;
-    const host = hostFixture(async (_name, args, options) => {
-      calls++;
-      file = (process.platform === "win32" ? args.at(-1)?.match(/"([^"]+)"/)?.[1] : args.at(-1)) ?? "";
-      execSignal = options?.signal;
-      assert.ok(execSignal);
-      return new Promise((_resolve, reject) => {
-        execSignal?.addEventListener("abort", () => reject(new Error("cancelled utility")), { once: true });
-      });
-    });
-    const old = host.context();
-    const pending = host.command("last copy 1", old.ctx);
-    assert.equal(existsSync(file), true);
-    old.retire();
-    host.emit(event);
-    host.replaceDraft();
-    assert.equal(execSignal?.aborted, true);
-    await pending;
-    assert.equal(existsSync(dirname(file)), false);
-    assert.equal(calls, 1);
-    assert.equal(host.retiredReads, 0);
-    assert.equal(host.writes, 0);
-    assert.deepEqual(host.notices, []);
-  }, 1000);
-}

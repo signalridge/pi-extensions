@@ -2,6 +2,8 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+const WINDOWS_LAUNCHER_EXTENSIONS = [".exe", ".cmd", ".bat"];
+
 export function commandExists(command: string, cwd = process.cwd(), pathValue = process.env.PATH ?? "") {
   return resolveCommandPath(command, cwd, process.platform, pathValue) !== undefined;
 }
@@ -49,7 +51,12 @@ export function resolveCommandPath(
   platform: NodeJS.Platform = process.platform,
   pathValue = process.env.PATH ?? "",
 ) {
-  const extensions = platform === "win32" ? ["", ".exe", ".cmd", ".bat"] : [""];
+  // npm installs an extensionless POSIX shim beside its Windows shim. Prefer the
+  // Windows launcher, but never append a suffix to an explicitly runnable name.
+  const extensions =
+    platform === "win32" && !WINDOWS_LAUNCHER_EXTENSIONS.includes(path.extname(command).toLowerCase())
+      ? [...WINDOWS_LAUNCHER_EXTENSIONS, ""]
+      : [""];
   if (command.includes("/") || command.includes("\\")) {
     const commandPath = path.isAbsolute(command) ? command : path.resolve(cwd, command);
     return resolveRunnableFile(commandPath, extensions, platform);

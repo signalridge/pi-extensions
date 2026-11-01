@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { setDefaultsDisabled } from "../src/agent-types.js";
 import subagentsExtension, { formatToolsSuffix } from "../src/index.js";
 import type { AgentConfig } from "../src/types.js";
 
@@ -117,6 +118,32 @@ describe("toolDescriptionMode", () => {
     else process.env.HOME = prevHome;
     rmSync(tmpDir, { recursive: true, force: true });
     rmSync(hermeticAgentDir, { recursive: true, force: true });
+  });
+
+  // The exploration guideline named Explore even when no Explore agent could be
+  // spawned, pointing the model at an agent that does not exist.
+  describe("the exploration guideline names Explore only when it can be spawned", () => {
+    afterEach(() => { setDefaultsDisabled(false); });
+    const exploreLine = (tools: Map<string, any>) =>
+      (tools.get("Agent").promptGuidelines as string[]).find((line) => line.startsWith("For broad codebase exploration"));
+
+    it("suggests Explore by default", () => {
+      expect(exploreLine(setup())).toContain("(e.g. Explore)");
+    });
+
+    it("drops the example when the built-in agents are disabled", () => {
+      const line = exploreLine(setup({ disableDefaultAgents: true }));
+      expect(line).toBe("For broad codebase exploration or research, spawn Agent with an appropriate subagent_type. Otherwise use direct tools (read, grep, find) when the target is already known.");
+    });
+
+    it("drops the example when an agent file disables Explore", () => {
+      const line = exploreLine(setup(undefined, () => {
+        mkdirSync(join(tmpDir, ".pi", "agents"), { recursive: true });
+        writeFileSync(join(tmpDir, ".pi", "agents", "Explore.md"), "---\ndescription: off\nenabled: false\n---\nbody");
+      }));
+      expect(line).toBeDefined();
+      expect(line).not.toContain("Explore");
+    });
   });
 
   it("exposes tier and no raw model or thinking on the LLM-facing schema", () => {

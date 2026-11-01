@@ -1,6 +1,21 @@
 import os from "node:os";
 import path from "node:path";
-import { Key, type KeyId, matchesKey } from "@earendil-works/pi-tui";
+import { stripVTControlCharacters } from "node:util";
+import { Key, type KeyId, matchesKey, renderFakeCursor } from "@earendil-works/pi-tui";
+
+// Since pi-tui 1.2, Input and Editor frame their software cursor in BEL-terminated APC markers
+// that the TUI resolves to reverse video just before writing. Resolve them the same way, so a
+// component's rendered lines read as the bytes a terminal receives.
+const [FAKE_CURSOR_START = "", FAKE_CURSOR_END = ""] = renderFakeCursor("\u0000").split("\u0000");
+
+export function resolveFakeCursors(lines: readonly string[]): string {
+  return lines.join("\n").replaceAll(FAKE_CURSOR_START, "\u001b[7m").replaceAll(FAKE_CURSOR_END, "\u001b[27m");
+}
+
+/** The text a terminal shows for rendered lines: cursor frames resolved, then styling removed. */
+export function visibleText(lines: readonly string[]): string {
+  return stripVTControlCharacters(resolveFakeCursors(lines));
+}
 
 type MockHandler = (...args: unknown[]) => unknown;
 

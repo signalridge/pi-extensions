@@ -2,13 +2,14 @@
  * custom-agents.ts — Load user-defined agents from project (.pi/agents/, plus the shared .agents/agents/ workspace) and global ($PI_CODING_AGENT_DIR/agents/, default ~/.pi/agent/agents/) locations.
  */
 
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { isValidAgentTierKey } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES } from "./agent-types.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { isProjectResource } from "./project-trust.js";
+import { readRegularFileSync } from "./regular-file.js";
 import type { AgentConfig, MemoryScope } from "./types.js";
 import { sanitizeDisplayText } from "./ui/safe-text.js";
 
@@ -81,7 +82,7 @@ function warningReasonKey(reason: string): string {
 /** Best-effort extraction of `name:` from raw frontmatter when strict parsing failed. */
 function peekDeclaredName(path: string): string | undefined {
   try {
-    const raw = readFileSync(path, "utf-8");
+    const raw = readRegularFileSync(path);
     const fmMatch = /^---\s*\n([\s\S]*?)\n---/m.exec(raw);
     if (!fmMatch) return undefined;
     const block = fmMatch[1];
@@ -248,7 +249,12 @@ function loadFromDir(
       description: label(fm.description) ?? sanitizeDisplayText(name),
       builtinToolNames,
       extSelectors,
-      disallowedTools: csvListOptional(fm.disallowed_tools),
+      // `disallowedTools` is Claude Code's spelling of the key. Each entry denies
+      // the tool with exactly that name, as in Claude Code, and the built-in it
+      // maps to, so an extension tool named `glob` stays denied too.
+      disallowedTools: csvListOptional(fm.disallowed_tools ?? fm.disallowedTools)?.flatMap(entry => [
+        ...new Set([entry, normalizeToolName(entry)]),
+      ]),
       askTools: csvListOptional(fm.ask_tools),
       gate: str(fm.gate)?.trim(),
       extensions: inheritField(fm.extensions ?? fm.inherit_extensions),
@@ -302,7 +308,8 @@ function readAgentFile(
   warn: WarningSink,
 ): { frontmatter: Record<string, unknown>; body: string } | undefined {
   try {
-    return parseFrontmatter<Record<string, unknown>>(readFileSync(path, "utf-8"));
+    // A FIFO named *.md must not block the main thread; it is skipped with a warning.
+    return parseFrontmatter<Record<string, unknown>>(readRegularFileSync(path));
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : String(error);
     if (strict) throw new Error(`${path}: ${reason}`);
@@ -429,18 +436,33 @@ function csvList(val: unknown, defaults: string[]): string[] {
   return parseCsvField(val) ?? [];
 }
 
+/** Claude Code tool names whose Pi built-in is named differently. Keys are lowercase. */
+const CLAUDE_CODE_TOOL_ALIASES: Record<string, string> = { glob: "find", multiedit: "edit" };
+
+/**
+ * A tool name as Pi spells it. Built-ins match case-insensitively, so Claude
+ * Code's `Read` and `LS` work, and a Claude Code name for a differently named
+ * built-in maps to it. Anything else is returned unchanged, so the runner still
+ * warns about a name no tool answers to (`WebFetch`, `Task`).
+ */
+function normalizeToolName(name: string): string {
+  const lower = name.toLowerCase();
+  return BUILTIN_TOOL_NAMES.find(builtin => builtin === lower) ?? CLAUDE_CODE_TOOL_ALIASES[lower] ?? name;
+}
+
 /**
  * Partition the `tools:` CSV into the built-in tool allowlist and raw `ext:` selectors.
  * `*` (and the case-insensitive alias `all`, for `tools: all`) expands to all
- * built-ins; plain entries are built-in names; `ext:` entries are extension-tool
- * selectors parsed later by the runner. omitted → all built-ins, no selectors.
+ * built-ins; plain entries are built-in names, in Pi's or Claude Code's
+ * spelling; `ext:` entries are extension-tool selectors parsed later by the
+ * runner. omitted → all built-ins, no selectors.
  * `tools:` present with only `ext:` entries → zero built-ins (use `*`).
  */
 function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelectors: string[] | undefined } {
   const entries = csvList(val, BUILTIN_TOOL_NAMES);
   const isWildcard = (e: string) => e === "*" || e.toLowerCase() === "all";
   const hasWildcard = entries.some(isWildcard);
-  const plain = entries.filter(e => !isWildcard(e) && !e.startsWith("ext:"));
+  const plain = [...new Set(entries.filter(e => !isWildcard(e) && !e.startsWith("ext:")).map(normalizeToolName))];
   const extEntries = entries.filter(e => e.startsWith("ext:"));
   return {
     builtinToolNames: hasWildcard ? [...new Set([...BUILTIN_TOOL_NAMES, ...plain])] : plain,

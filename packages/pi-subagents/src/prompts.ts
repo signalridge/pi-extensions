@@ -105,6 +105,36 @@ ${envBlock}`;
   return activeAgentTag + replaceHeader + (worktreeBlock ? `\n\n${worktreeBlock}` : "") + "\n\n" + config.systemPrompt + extrasSuffix;
 }
 
+/**
+ * The part of the parent's rendered system prompt an append-mode child inherits.
+ *
+ * Pi 1.4 renders the preamble followed by tagged sections in a fixed order:
+ * `tools`, `rules`, `docs` (default preamble only), `addendum`,
+ * `project_context`, `skills`, `cwd`, then sections extensions add during a
+ * turn. The child loads no context files or addendum of its own, so it keeps
+ * those, but its session renders its own `skills` (per its `skills:` setting),
+ * its own `cwd` and its own extension sections after the inherited text.
+ * Inheriting the parent's copies listed skills twice, showed the parent's
+ * skills to `skills: false` or preload-list agents, named the parent's cwd to
+ * a child running elsewhere, and depended on timing: `getSystemPrompt()`
+ * includes extension sections only while the parent's turn runs.
+ *
+ * Returns the text before the `skills` section, or before the `cwd` section
+ * when there are no skills. A prompt without the parent's `cwd` section (a
+ * forced prompt, for example) is returned unchanged.
+ *
+ * @param rendered  The parent's `ctx.getSystemPrompt()`.
+ * @param cwd  The cwd the parent's prompt was rendered with.
+ */
+export function inheritableParentPrompt(rendered: string, cwd: string): string {
+  const cwdAt = rendered.lastIndexOf(`\n\n<cwd>\n${cwd.replace(/\\/g, "/")}\n</cwd>`);
+  if (cwdAt < 0) return rendered;
+  const head = rendered.slice(0, cwdAt);
+  if (!head.endsWith("\n</skills>")) return head;
+  const skillsAt = head.lastIndexOf("\n\n<skills>\n");
+  return skillsAt < 0 ? head : head.slice(0, skillsAt);
+}
+
 /** Fallback base prompt when parent system prompt is unavailable in append mode. */
 const genericBase = `# Role
 You are a general-purpose coding agent for complex, multi-step tasks.

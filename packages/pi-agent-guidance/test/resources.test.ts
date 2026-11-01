@@ -22,7 +22,7 @@ test("deduplicates against actual host context selection, including override and
       const agentDir = join(root, "agent");
       mkdirSync(agentDir);
       let handler;
-      guidance({ on: (_event, callback) => handler = callback });
+      guidance({ on: (event, callback) => { if (event === "before_agent_start") handler = callback; } });
       let counter = 0;
       async function run(files, provider, expected, options) {
         const cwd = join(root, String(counter++));

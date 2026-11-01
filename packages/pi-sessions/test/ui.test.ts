@@ -37,6 +37,7 @@ const terminal: Terminal = {
   clearScreen() {},
   setTitle() {},
   setProgress() {},
+  setProgramStatus() {},
 };
 
 function nativeUi(mode: "regular" | "fullscreen") {

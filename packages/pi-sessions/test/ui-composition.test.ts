@@ -5,6 +5,7 @@ import {
   getKeybindings,
   Input,
   KeybindingsManager,
+  renderFakeCursor,
   setKeybindings,
   type Terminal,
   TUI_KEYBINDINGS,
@@ -51,6 +52,7 @@ async function screen(mode: "regular" | "fullscreen", columns: number, rows: num
     clearScreen() {},
     setTitle() {},
     setProgress() {},
+    setProgramStatus() {},
   };
   const tui = mode === "regular" ? new TuiMainScreen(terminal) : new TuiAltScreen(terminal);
   // Include a real underlying document, so regular-mode viewport composition
@@ -125,7 +127,7 @@ const sessions: SessionRow[] = Array.from({ length: 40 }, (_, i) => ({
   modified: "2026",
 }));
 
-test("renderer sanitizer only retains inverse/reset and IME marker, keeping the insertion cell in bounds", () => {
+test("renderer sanitizer only retains inverse/reset, fake-cursor and IME markers, keeping the insertion cell in bounds", () => {
   for (const width of [1, 2, 40]) {
     const [line] = safeLines(
       [`中文${CURSOR_MARKER}\x1b[7m \x1b[0m\x1b[31mRED\x1b[8mHIDDEN\x1b[2J\x1b]52;c;secret\x07\u202e\u0000`],
@@ -137,6 +139,12 @@ test("renderer sanitizer only retains inverse/reset and IME marker, keeping the 
     const text = line.replaceAll(CURSOR_MARKER, "").replaceAll("\x1b[7m", "").replaceAll("\x1b[0m", "");
     expect(text).toBe(plain(text));
     expect(line).not.toContain("secret");
+    // Since Pi 1.2.0 native Editor/Input draw the cursor cell between zero-width
+    // markers that the TUI resolves; they must survive as markers, not text.
+    const [fake] = safeLines([`中文${CURSOR_MARKER}${renderFakeCursor("x")}tail`], width);
+    expect(visibleWidth(fake)).toBeLessThanOrEqual(width);
+    expect(fake).toContain(`${CURSOR_MARKER}${renderFakeCursor("x").replace(/x.*$/su, "x")}`);
+    if (width === 40) expect(fake).toBe(`中文${CURSOR_MARKER}${renderFakeCursor("x")}tail`);
   }
 });
 
@@ -581,11 +589,13 @@ for (const mode of ["regular", "fullscreen"] as const) {
       expect(frame).not.toMatch(/\x1b\[(?:2J|3A)|\x1b\]52|[\u202e\u009b\u0000]/u);
       const raw = s.tui.getFocusedComponent()?.render(40).join("\n") ?? "";
       expect(raw.split(CURSOR_MARKER)).toHaveLength(2); // only the real IME cursor
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: Pi's zero-width fake-cursor start marker
+      expect(raw.match(/\x1b_pi:fc\x07/gu)).toHaveLength(1); // only the real software cursor
       expect(
         raw
           .replaceAll(CURSOR_MARKER, "")
           // biome-ignore lint/suspicious/noControlCharactersInRegex: only these renderer-owned cursor styles are allowed
-          .replace(/\x1b\[(?:0|7|27)m/gu, "")
+          .replace(/\x1b\[(?:0|7|27)m|\x1b_pi:\/?fc\x07/gu, "")
           .replaceAll("\n", ""),
       ).not.toMatch(/[\p{Cc}\p{Cf}]/u);
     };

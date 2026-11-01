@@ -1,0 +1,66 @@
+{
+  "name": "@signalridge/pi-secrets",
+  "version": "1.2.0",
+  "description": "Reversible secret obfuscation for Pi: provider-bound context carries placeholders, tools receive the real values.",
+  "type": "module",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "secrets",
+    "redaction",
+    "security"
+  ],
+  "piExtension": {
+    "lifecycle": "experimental"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.7",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@types/node": "^24.10.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.1.11"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/signalridge/pi-extensions",
+    "directory": "packages/pi-secrets"
+  },
+  "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-secrets",
+  "bugs": {
+    "url": "https://github.com/signalridge/pi-extensions/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "vitest run test --config vitest.config.ts",
+    "check": "bun run lint && bun run typecheck && bun run test",
+    "format": "biome check --write ."
+  }
+}

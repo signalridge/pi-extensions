@@ -306,6 +306,14 @@ awaits while navigation or shutdown retires the owner, the obsolete
 extension-sourced wake is handled without starting a turn. Interactive/RPC
 input and other extensions' messages are not consumed by this guard.
 
+No wake is sent while the session's latest meaningful response overflowed the model's
+context window and no compaction followed it: that turn would resend the same
+over-window context and fail again. Results are still delivered and acknowledged
+as context, and one warning per overflow episode asks to run `/compact` (or
+`/codex-compact` when installed) or start a new session. A compaction or a later
+successful response restores normal wakes. Aborted responses and transient errors
+(including HTTP 503 and rate limits) do not prove context recovery.
+
 This is a handoff check, not a navigation lock: public hooks cannot fence an
 arbitrary later async input or preparation handler that navigates after our
 input hook has accepted the wake. Earlier transforms must preserve the private

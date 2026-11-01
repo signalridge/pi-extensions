@@ -26,14 +26,18 @@ mutating the original.
   or a fork that retains the checkpoint.
 - Replays the newest compatible checkpoint while preserving later conversation and extension-added
   context.
-- Supports repeated compaction by carrying the previous opaque item into the next Remote V2 request.
+- Supports repeated compaction by carrying the previous opaque item (and any layered summary) into the next
+  Remote V2 request.
 - Requires informed authorization for persisted canonical history before credentials or transport.
   Unconsented compaction cancels, including in headless/RPC modes; it does not launch native fallback.
 - With the hook enabled, an effective opaque boundary cancels compaction before consent or credentials
   if its checkpoint is malformed or the active provider, API, or model ID is incompatible.
 - After authorization, failures can use Pi's native plaintext compaction only when the effective
-  boundary is not an opaque checkpoint. Otherwise compaction cancels to preserve older context;
-  native summarization cannot decode it. Session/branch divergence and user cancellation also cancel.
+  boundary is not an opaque checkpoint; native summarization cannot decode opaque history. Over a valid
+  compatible opaque checkpoint, a remote failure instead keeps that checkpoint and adds Pi's readable
+  summary of only the newly dropped history after it (**layered fallback**, on by default). If that
+  summary also fails, or `layeredFallback` is off, compaction cancels to preserve older context.
+  Session/branch divergence and user cancellation also cancel.
 - Provides `/codex-compact` for manual compaction, effective-route visibility, and bounded settings.
 
 ## Install
@@ -74,7 +78,7 @@ Avoid loading a global npm installation and the local workspace at the same time
 
 Healthy startup, reload, and resume do not emit an experimental warning. In UI-capable modes,
 a short portability warning appears once per loaded extension instance when its first remote
-checkpoint is committed—not on native compaction or failed/cancelled remote attempts. Invalid
+or layered checkpoint is committed—not on native compaction or failed/cancelled remote attempts. Invalid
 settings, fallback failures, and incompatible-model warnings remain visible. Unsupported models
 use Pi-native compaction only without an effective opaque boundary. With an active opaque boundary,
 compaction cancels while this hook is enabled; disabling `enabled` explicitly opts out of that protection.
@@ -121,13 +125,56 @@ Bounded folding accepts the native Codex JSON/zstd transport shape (`method`, `h
 Intermediate opaque results stay in memory. A checkpoint is returned only after **every original
 input occurrence** has been absorbed; raw user backups and the host's retained-tail semantics remain
 unchanged. Failed folds never publish a prefix checkpoint. Existing opaque history is preserved on
-failure (the non-opaque native-fallback policy above is unchanged).
+failure, either unchanged (cancellation) or beneath a layered summary (below); the non-opaque
+native-fallback policy above is unchanged.
 
 The initial target is the smaller of 4 MiB and three bytes per available context token, with an
 8 MiB serialized-request hard cap. This is a heuristic, not an exact token count or a guarantee of
 fit. Structured context-window errors can shrink only to earlier closed boundaries, within the same
 eight-attempt budget and overall authentication/request deadline. The host may start another
 operation; this extension does **not** fix core continuation after failed compaction.
+
+## Layered fallback over an opaque checkpoint
+
+Once the effective boundary is an opaque checkpoint, Pi's native summary cannot replace it without
+losing the older history only that item holds. Cancelling every failed attempt preserves it, but a
+backend that keeps failing leaves the context growing past the model's window. The layered fallback
+keeps the opaque item **exactly** and summarizes only what this compaction drops after it.
+
+It runs only when all of these hold: canonical history is authorized, credentials were resolved,
+the effective checkpoint is valid, compatible with the active model and its kept lineage projects,
+and the authorized remote attempt failed with `remote_http_error`, `remote_timeout`,
+`remote_transport_error`, `remote_provider_error`, `remote_context_window_exceeded`,
+`segmentation_unsupported`, `remote_attempt_budget_exhausted`, `remote_response_invalid` or
+`local_compaction_failed`. Malformed or incompatible checkpoints, missing or denied consent,
+credential failures, the local `loadout_mismatch`/`payload_rejected` guards (unsent drift never
+reaches transport), `state_divergence`, model/branch changes and caller cancellation keep cancelling.
+
+The fallback makes **one** native summary request with Pi's public `generateSummaryWithUsage`, through
+the same provider, model, resolved credentials, abort signal, thinking level and `/compact` focus
+instructions as the failed request. It uses SSE, no cache retention, `maxRetries` transport retries and
+no extra Pi-level retry, within the smaller of `stageTimeoutMs` and the time left of `requestTimeoutMs`.
+Its input is Pi's `messagesToSummarize` plus any split-turn prefix, minus the remote checkpoint's own
+kept messages that its opaque item already contains. The placeholder summary and replay marker are
+never summarized. An aborted, truncated, empty, failed or late summary cancels exactly as before.
+
+On success the hook returns a **version 2** checkpoint: the previous replacement history unchanged,
+followed by one delimited user message carrying the summary, with a new checkpoint ID, marker, kept
+fingerprints and every other field computed as for a remote result. The summary is bounded to
+`replacementTokenBudget` × 4 characters (its end is truncated with a marker) and the whole history to
+8 MiB. Because the summary covers only dropped history, version 2 replays Pi's kept messages verbatim
+after it, whereas a remote opaque item already contains them. Another failure over a layered
+checkpoint uses Pi's update prompt to merge its summary and kept messages into **one** new summary;
+summaries never stack. The next successful remote compaction sends the layered history as input, and
+its new opaque item absorbs the summary, which is not kept as a user backup. Reload, resume and fork
+replay version 2 as they do version 1, and recovery export sends it as its prefix request's prior
+history. Releases 1.10 and earlier treat version 2 as malformed: they cancel compaction and do not
+replay it.
+
+The summary is readable plaintext produced from canonical history under the same authorization as
+Remote V2 (the consent notice already covers Pi's native summary); like any native summary it is lossy
+for the dropped span and bypasses request-local filters. Set `layeredFallback` to `false` to restore
+cancel-only behavior.
 
 ## Explicit recovery export (restricted)
 
@@ -220,17 +267,22 @@ Keep the source and backups; offline fixtures do not establish live server accep
 ## Safe failure diagnostics
 
 A failed authorized attempt reports a fixed reason code, not a guessed backend cause. With an
-active opaque checkpoint, the warning retains **cancelled to preserve the existing opaque checkpoint**
-semantics, for example:
+active opaque checkpoint, a layered result names the remote reason it replaced, and any cancellation
+retains **cancelled to preserve the existing opaque checkpoint** semantics, stating whether the layered
+summary failed, timed out or is off, for example:
 
 ```text
-Compaction cancelled to preserve the existing opaque checkpoint. [remote_http_error; HTTP 429]
+Codex remote compaction failed; kept the opaque checkpoint and added Pi's readable summary of newer history (layered fallback). [remote_http_error; HTTP 503]
+Compaction cancelled to preserve the existing opaque checkpoint. [remote_http_error; HTTP 503] The layered summary fallback also failed.
+Compaction cancelled to preserve the existing opaque checkpoint. [remote_http_error; HTTP 429] Layered fallback is off.
+Compaction cancelled to preserve the existing opaque checkpoint. [authentication_failed]
 ```
 
 Without an effective opaque boundary, an authorized failure can still use Pi-native compaction;
-its optional fallback warning carries the same diagnostic. `notifyOnFallback` does not suppress
-opaque-checkpoint cancellation warnings. Notifications and progress status are best effort: a UI
-failure cannot turn opaque cancellation into native fallback.
+its optional fallback warning carries the same diagnostic. `notifyOnFallback` controls that warning and
+the layered-result notice, but never suppresses opaque-checkpoint cancellation warnings. Notifications
+and progress status are best effort: a UI failure cannot turn opaque cancellation into native fallback
+or undo a layered result.
 
 | Fixed reason code | Known observation (not a provider diagnosis) |
 | --- | --- |
@@ -281,9 +333,9 @@ consumed by the built-in provider, including fragmented CR/LF bytes; the inspect
 bytes and its 8 MiB limit. The normalized branch omits the original `content-length`. Non-success HTTP
 bodies and existing retries are unchanged.
 
-No extra model round, relaxed loadout equality, automatic checkpoint migration, or new retry is
-introduced. Existing bounded provider retries are unchanged. These offline-proven protocol fixes do
-not establish the cause of an unknown live failure.
+The protocol fixes above add no extra model round, relaxed loadout equality, automatic checkpoint
+migration, or new retry. Existing bounded provider retries are unchanged. These offline-proven
+protocol fixes do not establish the cause of an unknown live failure.
 
 Pi snapshots the compaction branch before running extension hooks sequentially. An earlier Goal
 hook can then append plain `custom` records with exactly `customType: "goal-state"`. Preparation
@@ -325,6 +377,7 @@ project-level override.
   "stageTimeoutMs": 300000,
   "maxRetries": 2,
   "replacementTokenBudget": 64000,
+  "layeredFallback": true,
   "notifyOnFallback": true
 }
 ```
@@ -334,10 +387,11 @@ project-level override.
 | `enabled` | `true` | Boolean | Use remote compaction for compatible models and protect active opaque boundaries on all models. Turning it off explicitly permits Pi-native compaction outside both safety and consent gates. | Keep enabled to enforce the gate. |
 | `allowCanonicalHistory` | `false` | Boolean | Explicit persistent authorization to send canonical history and permit native summary fallback when no opaque boundary is active. | Leave off unless you understand the privacy boundary below; toggle in this extension's Settings menu to opt in. |
 | `requestTimeoutMs` | `900000` | Integer from 30,000 to 1,800,000 ms | Hard whole-operation deadline across authentication, all folds, retries, and response-body inspection after authorization. | Default fifteen minutes; explicit existing values remain unchanged. |
-| `stageTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Hard deadline for authentication or one logical fold including transport retries, body inspection and provider completion; capped by remaining total time. | Keep five minutes. |
-| `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures before Pi fallback. | Keep two; use zero when diagnosing the first failure. |
+| `stageTimeoutMs` | `300000` | Integer from 30,000 to 600,000 ms | Hard deadline for authentication, one logical fold, or the layered summary, each including transport retries, body inspection and provider completion; capped by remaining total time. | Keep five minutes. |
+| `maxRetries` | `2` | Integer from 0 to 2 | Retry transient provider transport failures (remote folds and the layered summary) before any fallback. | Keep two; use zero when diagnosing the first failure. |
 | `replacementTokenBudget` | `64000` | Integer from 8,000 to 128,000 tokens | Bound approximate retained user-message text beside the opaque item. | Keep 64K; lower it to reduce session size or raise it only when recent user context is being lost. |
-| `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction takes over. Does not suppress cancellation warnings protecting an active opaque checkpoint. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
+| `layeredFallback` | `true` | Boolean | When an eligible remote failure occurs over a valid compatible opaque checkpoint, keep it and add Pi's readable summary of only the newly dropped history instead of cancelling. `false` restores cancel-only behavior. | Keep enabled so a failing backend cannot strand the session past its context window. |
+| `notifyOnFallback` | `true` | Boolean | Warn when Remote V2 fails and Pi-native compaction or a layered summary takes over. Does not suppress cancellation warnings protecting an active opaque checkpoint. | Keep enabled so silent fallback does not hide protocol or entitlement problems. |
 
 Missing fields use defaults. Settings reload on every `session_start`, including `/reload`, resume,
 and fork. Menu writes apply immediately, preserve unknown JSON fields, serialize within the current
@@ -353,8 +407,9 @@ Neither deadline resets on incoming bytes or progress. For example, five healthy
 can finish within the new fifteen-minute total, but an explicitly configured `requestTimeoutMs: 300000`
 still limits the entire operation to five minutes. Recovery export remains one prefix request bounded
 by the **smaller** of stage and total budgets, including authentication. The global limit remains eight
-actual HTTP attempts across all normal folds and retries; no extra requests or cache-retention changes
-are introduced.
+actual HTTP attempts across all normal folds and retries. The only additional request is the single
+layered summary after an eligible remote failure, bounded by the smaller of one stage and the remaining
+total; a remote attempt that exhausted the total leaves it no time, so compaction cancels.
 
 ### Source-free diagnostics
 
@@ -362,6 +417,10 @@ Run **`/codex-compact diagnostics`** in the TUI to view this session's most rece
 read-only command neither sends a model message nor appends a session entry. It reports the last stage,
 closed outcome/error and timeout scope, fold/HTTP counts, elapsed time, and the captured stage/total
 limits. `prepared` means a complete result was returned to Pi, **not** that the host persisted it.
+`layered` means Remote V2 failed with the reported code and a layered checkpoint was returned instead;
+a `failure` whose last stage is `layered_summary` means that fallback ran and also failed. The error
+code and timeout scope always describe the remote failure. Fold and HTTP-attempt counts cover Remote
+V2 only, while token/cost totals include the layered summary's native usage.
 The normal deadline is checked before returning that result; host commit latency is outside the
 extension's ownership. Recovery also checks the clock at its last pre-publication boundary. A
 publication already begun within budget is not undone or hidden by later durability/cleanup latency.
@@ -377,7 +436,8 @@ session ID is recorded. The provider remains authoritative for usage/cost; no wi
 
 Persistence has at most 128 rows per operation, a bounded queue and a 1 MiB file cap. New files use
 `0600`; readers/writers require a regular, private, single-link file with the extension's schema marker.
-Symlinks, foreign/malformed files and full logs are not rewritten or deleted. A non-waiting owned
+Symlinks, foreign/malformed files and full logs are not rewritten or deleted; releases 1.10 and earlier
+treat rows with the `layered_summary` stage or `layered` outcome as foreign and stop appending. A non-waiting owned
 `.lock` serializes writers across processes/reloads; an existing or stale lock skips logging rather
 than recovering/deleting it. Logging failures never delay the network or checkpoint commit. The
 command uses recent in-memory rows when available and bounds persisted reads to 500 ms. Logging is
@@ -407,9 +467,9 @@ This extension does **not** read `~/.codex/config.toml`.
 - API `openai-codex-responses` on the active model.
 - A working OpenAI Codex OAuth login and Remote V2 entitlement.
 
-The repository's automated SDK regression baseline is **Pi 1.0.4**, matching the package's development
-dependencies. Offline prompt-witness and automatic Goal/Compact composition regressions also run on
-**Pi 1.4.0**, with all four Pi peers from that same host and synthetic credentials/SSE transports.
+The repository's automated SDK regression baseline is **Pi 1.4.0**, matching the package's development
+dependencies. Offline prompt-witness and automatic Goal/Compact composition regressions use all four Pi
+peers from that same host and synthetic credentials/SSE transports.
 These checks do not establish whole-host compatibility, live backend acceptance, or recovery of an
 already oversized conversation. Live backend diagnosis requires a separately authorized retry.
 
@@ -436,11 +496,13 @@ provider transfer, or automatic checkpoint migration is performed.
    SSE request with cache retention disabled.
 4. It requires a completed response containing exactly one non-empty opaque `compaction` item.
 5. It constructs bounded replacement history from recent raw user-role Responses items followed by
-   the opaque item.
+   the opaque item. If an eligible remote failure occurs over a compatible checkpoint instead, the
+   layered fallback reuses that checkpoint's history followed by one readable summary (version 2).
 6. It stores that history and fingerprints of Pi's retained suffix in versioned
    `CompactionEntry.details`.
 7. On later compatible requests, it replaces an exactly validated marker with the persisted
-   replacement history immediately before provider dispatch.
+   replacement history immediately before provider dispatch. A layered checkpoint keeps Pi's retained
+   suffix after it verbatim; a remote one already contains it.
 
 If fingerprints, model identity, payload shape, or marker count do not match exactly, the extension
 leaves Pi's visible fallback context unchanged instead of guessing.
@@ -506,9 +568,9 @@ Remote compaction sends Pi's **persisted canonical projection**, system instruct
 schemas to the selected model's credential-resolved Codex destination. It honors durable
 `context_edit` omissions/replacements; it does not send unprojected raw session entries.
 
-This is **not** a snapshot of the final context sent in an ordinary model request. Pi 1.0.4 exposes
+This is **not** a snapshot of the final context sent in an ordinary model request. Pi exposes
 no such snapshot to extensions. Remote V2 does not invoke ordinary `context`,
-`context_with_system`, or `before_provider_request` handlers. Pi 1.0.4's native summary also bypasses
+`context_with_system`, or `before_provider_request` handlers. Pi's native summary also bypasses
 ordinary context filters. Request-local privacy filters, hidden custom content, and historical
 persisted workflow arming can therefore differ from ordinary model context. No generic text stripping can establish equivalent privacy. New request-local guidance
 that is not persisted does not become canonical history, but existing persisted content remains.
@@ -519,9 +581,10 @@ RPC, denial, cancellation, uncertain dialog result, or retired ownership returns
 is not privacy-safe: Pi's native summary also consumes canonical history without these filters.
 Malformed or provider/API/model-incompatible active opaque checkpoints cancel even before this
 consent step, including on unsupported providers. After explicit authorization, remote failure may
-use that native summary only if the effective compaction boundary is not opaque. An active opaque
-checkpoint cancels instead: the native summary would contain only its portability warning and recent
-messages, losing effective access to its older history. For checkpoint incompatibility, retry with
+use that native summary of the whole history only if the effective compaction boundary is not opaque.
+Over an active opaque checkpoint it would contain only its portability warning and recent messages,
+losing effective access to its older history; the layered fallback instead summarizes only the newly
+dropped history beside the kept opaque item, and otherwise compaction cancels. For checkpoint incompatibility, retry with
 the checkpoint's original model; for other failures, use the safe reason code above to scope a
 manually authorized retry. Alternatively, recover a pre-compaction branch and verify a readable
 summary before migrating. An older opaque
@@ -531,8 +594,9 @@ outside these gates. This is compaction safety, not universal request blocking o
 for unsupported models or other extensions: ordinary mismatched requests still see only the fallback
 marker and retained recent messages.
 
-The session stores the opaque compaction item and bounded recent user-role Responses items,
-including canonical content you authorized even if ordinary filters hid it. Replay can restore that
+The session stores the opaque compaction item, bounded recent user-role Responses items and, for a
+layered checkpoint, one readable summary, including canonical content you authorized even if ordinary
+filters hid it. Replay can restore that
 content after filters have run, including after reload. The authorization setting gates **new
 compactions**, not replay of an existing checkpoint (including one created by an earlier version).
 Opaque items cannot be inspected or selectively redacted. Authorization is not persisted in
@@ -548,6 +612,7 @@ notifications and renderers; this package cannot sanitize those upstream message
 | Serialized opaque compaction item | 2 MiB |
 | Persisted replacement history | 8 MiB |
 | Retained user text | 64K approximate tokens by default; configurable from 8K to 128K |
+| Layered summary text | `replacementTokenBudget` × 4 characters; end truncated with a marker |
 | Settings file | 64 KiB |
 | Transport retries | At most 2 |
 | Request timeout | At most 10 minutes |
@@ -578,9 +643,13 @@ ceilings are intentionally not configurable.
   checkpoint before Pi appends it. Load such handlers before this extension or disable Remote V2 in
   that combination; the extension cannot inspect later handlers' changes.
 - Only **authorized** remote failure without an effective opaque boundary falls back to Pi's
-  plaintext summary. Raw history may still contain both entry kinds, but automatic fallback never
-  supersedes an active opaque checkpoint. Both paths use canonical history, not a guaranteed
-  filter-safe current-model projection.
+  plaintext summary of the whole history. Raw history may still contain both entry kinds, but automatic
+  fallback never supersedes an active opaque checkpoint: over one, the only fallback is the layered
+  summary, which keeps it. All paths use canonical history, not a guaranteed filter-safe current-model
+  projection.
+- A layered summary is one native request over the whole dropped span. A very large span can itself
+  exceed the model's window or fail, and compaction then cancels as before. The summary is lossy for
+  that span; only the older opaque history is kept exactly.
 - Request-local payload hooks such as priority service-tier selection are not dispatched for Remote
   V2. Ordinary and replay requests still compose those hooks in registration order. Remote V2 uses
   provider defaults, not necessarily an ordinary request's selected tier.
@@ -603,6 +672,7 @@ src/settings-menu.ts  Manual compaction, recovery action, and settings TUI
 src/recovery-command.ts Explicit cancellable idle recovery owner and prefix request
 src/recovery-snapshot.ts Canonical occurrence split, tool-pair checks, accounting reset
 src/recovery-export.ts Fresh native graph, replay validation, crash-safe no-replace publication
+src/layered-fallback.ts Native layered summary of newly dropped history after a remote failure
 
 test/                 Protocol, checkpoint, lifecycle, remote, settings, and menu coverage
 ```

@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { test } from "vitest";
 import { LspClient } from "../src/lsp-client.js";
-import { runDiagnostics } from "../src/runner.js";
+import { runDiagnostics, runFix } from "../src/runner.js";
 import type { LspServerAdapter } from "../src/types.js";
 
 const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures/diagnostics-server.mjs");
@@ -365,6 +365,64 @@ test("diagnostics open all files before awaiting push publications", async () =>
       details.files.map(({ diagnostics }) => diagnostics.length),
       [1, 1, 1],
     );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("literal code-action support lets deferred fixes resolve for preview and write", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-literal-actions-"));
+  const file = path.join(root, "main.go");
+  const log = path.join(root, "messages.jsonl");
+  const original = "package main\n";
+  writeFileSync(file, original);
+  const adapter = fixtureAdapter("resolve-literal", 30);
+  adapter.env = { PI_LSP_TEST_LOG: log };
+  const ctx = { ui: { setStatus() {} } };
+
+  try {
+    const preview = await runFix(adapter, { root, path: file, write: false }, 1_000, undefined, ctx, "test");
+    const previewDetails = preview.details as { changed: boolean; text: string; appliedActions: unknown[] };
+    assert.equal(previewDetails.changed, true);
+    assert.equal(previewDetails.text, `// fixed\n${original}`);
+    assert.deepEqual(previewDetails.appliedActions, [{ title: "deferred fixture fix", kind: "source.fixAll.fixture" }]);
+    assert.equal(readFileSync(file, "utf8"), original);
+
+    const written = await runFix(adapter, { root, path: file, write: true }, 1_000, undefined, ctx, "test");
+    assert.equal((written.details as { changed: boolean }).changed, true);
+    assert.equal(readFileSync(file, "utf8"), `// fixed\n${original}`);
+
+    const [initialize] = readFileSync(log, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((message) => message.method === "initialize");
+    const { textDocument, workspace } = initialize.params.capabilities;
+    assert.deepEqual(textDocument.codeAction, {
+      dynamicRegistration: false,
+      codeActionLiteralSupport: {
+        codeActionKind: {
+          valueSet: [
+            "",
+            "quickfix",
+            "refactor",
+            "refactor.extract",
+            "refactor.inline",
+            "refactor.rewrite",
+            "source",
+            "source.organizeImports",
+            "source.fixAll",
+          ],
+        },
+      },
+      resolveSupport: { properties: ["edit"] },
+    });
+    // Navigation capabilities are static too; resource operations are never offered.
+    assert.deepEqual(textDocument.definition, { dynamicRegistration: false, linkSupport: true });
+    assert.equal(textDocument.documentSymbol.hierarchicalDocumentSymbolSupport, true);
+    assert.equal(textDocument.documentSymbol.symbolKind.valueSet.length, 26);
+    assert.deepEqual(textDocument.rename, { dynamicRegistration: false, prepareSupport: false });
+    assert.deepEqual(workspace.workspaceEdit, { documentChanges: true });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

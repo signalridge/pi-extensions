@@ -180,7 +180,7 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     }]);
     const genuine = session.prompt("GENUINE_TEXT");
     await vi.waitFor(() => expect(before).toHaveBeenCalledOnce());
-    expect(session.isIdle).toBe(true); // SDK has not started the agent yet.
+    expect(session.isIdle).toBe(false); // Pi 1.2+ counts the starting run as busy.
     const reply = ask();
     // Flush the outbox timer, not a speculative model poll.
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -269,59 +269,67 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     expect(provider.state.callCount).toBe(0);
   });
 
-  it.each(["wake-first", "genuine-first"])("keeps an accepted wake inert across later native double preparation (%s), preserving genuine text and images", async order => {
+  it.each(["steer", "followUp"] as const)("keeps an accepted wake frame out of the model when genuine input queues (%s) into its starting run, preserving genuine text and images", async delivery => {
     const wakeGate = barrier();
-    const genuineGate = barrier();
     const wakes = vi.fn();
-    const genuineReady = vi.fn();
-    laterBefore.mockImplementation(async event => {
-      if (event.prompt === "GENUINE_TEXT") { genuineReady(); await genuineGate.promise; }
-      else { wakes(); await wakeGate.promise; }
-    });
+    laterBefore.mockImplementation(async () => { wakes(); await wakeGate.promise; });
     const image = pngImage(1);
-    provider.setResponses([context => {
-      const text = JSON.stringify(context);
-      expect(text).toContain("GENUINE_TEXT");
-      expect(text).toContain("PRIVATE_QUESTION");
-      expect(text).not.toContain("pi-subagents-question-wake:");
-      expect(text).not.toContain("subagent-question-frame:");
-      return fauxAssistantMessage(fauxText("genuine preserved"));
-    }]);
+    const contexts: string[] = [];
+    provider.setResponses(Array.from({ length: 2 }, (_, index) => context => {
+      contexts.push(JSON.stringify(context));
+      return fauxAssistantMessage(fauxText(`genuine preserved ${index + 1}`));
+    }));
     const reply = ask();
     await vi.waitFor(() => expect(wakes).toHaveBeenCalledOnce());
-    const genuine = session.prompt("GENUINE_TEXT", { images: [image] });
-    await vi.waitFor(() => expect(genuineReady).toHaveBeenCalledOnce());
-    if (order === "wake-first") {
-      wakeGate.release();
-      await vi.waitFor(() => expect(session.messages.some(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"))).toBe(true));
-      await session.waitForIdle();
-      expect(provider.state.callCount).toBe(0);
-      expect(questions.broker.hasUnannounced()).toBe(true);
-      genuineGate.release();
-      await genuine;
+    // Pi 1.2+ counts the starting wake run as busy and queues input into it
+    // instead of preparing a second, competing prompt.
+    expect(session.isIdle).toBe(false);
+    await session.prompt("GENUINE_TEXT", { images: [image], streamingBehavior: delivery });
+    wakeGate.release();
+    await vi.waitFor(() => expect(session.messages.some(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"))).toBe(true));
+    await session.waitForIdle();
+    expect(wakes).toHaveBeenCalledOnce();
+    // Steering joins the frame's first request; a follow-up waits for its answer.
+    if (delivery === "steer") {
+      expect(provider.state.callCount).toBe(1);
+      expect(contexts[0]).toContain("GENUINE_TEXT");
+      expect(contexts[0]).toContain("PRIVATE_QUESTION");
     } else {
-      genuineGate.release();
-      await genuine;
-      wakeGate.release();
-      await vi.waitFor(() => expect(session.messages.some(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"))).toBe(true));
-      await session.waitForIdle();
+      expect(provider.state.callCount).toBe(2);
+      expect(contexts[0]).toContain("PRIVATE_QUESTION");
+      expect(contexts[0]).not.toContain("GENUINE_TEXT");
+      expect(contexts[1]).toContain("GENUINE_TEXT");
     }
-    expect(provider.state.callCount).toBe(1);
+    for (const context of contexts) {
+      expect(context).not.toContain("pi-subagents-question-wake:");
+      expect(context).not.toContain("subagent-question-frame:");
+    }
     // Native provider errors are message data: assert the response too so an
     // assertion inside the provider callback cannot pass as a swallowed error.
-    expect(session.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "genuine preserved" }] }));
+    expect(session.messages.filter(message => message.role === "assistant")).toEqual(contexts.map((_, index) => expect.objectContaining({ content: [{ type: "text", text: `genuine preserved ${index + 1}` }] })));
     const users = session.messages.filter(message => message.role === "user");
     expect(users).toContainEqual({ role: "user", content: [{ type: "text", text: "GENUINE_TEXT" }, image], timestamp: expect.any(Number) });
     expect(questions.broker.context()).toBeUndefined();
+    // That request was the wake's one-use ACK, so the next question wakes at once.
+    const answered = provider.state.callCount;
+    provider.setResponses([context => {
+      expect(JSON.stringify(context)).toContain("PRIVATE_QUESTION");
+      return fauxAssistantMessage(fauxText("next wake"));
+    }]);
+    const next = ask("next-child");
+    await vi.waitFor(() => expect(provider.state.callCount).toBe(answered + 1));
+    await session.waitForIdle();
+    expect(tokens).toHaveLength(2);
     // Verbatim original control token is still a genuine prompt, with no proof.
     laterBefore.mockReset();
+    const calls = provider.state.callCount;
     provider.setResponses([context => {
       expect(JSON.stringify(context)).toContain(tokens[0]);
       expect(JSON.stringify(context)).not.toContain("PRIVATE_QUESTION");
       return fauxAssistantMessage(fauxText("literal preserved"));
     }]);
     await session.prompt(tokens[0]);
-    expect(provider.state.callCount).toBe(2);
+    expect(provider.state.callCount).toBe(calls + 1);
     expect(session.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ type: "text", text: "literal preserved" }] });
     const proof = session.messages.find(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"));
     const frameToken = proof?.role === "custom" ? (proof.details as { token: string }).token : undefined;
@@ -332,58 +340,56 @@ describe("question outbox on native SDK INPUT and preparation", () => {
       return fauxAssistantMessage(fauxText("historical frame literal preserved"));
     }]);
     await session.prompt(frameToken!);
-    expect(provider.state.callCount).toBe(3);
+    expect(provider.state.callCount).toBe(calls + 2);
     expect(session.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ type: "text", text: "historical frame literal preserved" }] });
     await new Promise(resolve => setTimeout(resolve, 10));
-    expect(tokens).toHaveLength(1);
+    expect(tokens).toHaveLength(2);
     questions.retire();
     expect(await reply).toMatchObject({ status: "unanswered" });
+    expect(await next).toMatchObject({ status: "unanswered" });
   });
 
-  it("never aborts the genuine native run when the later wake preparation releases during genuine streaming", async () => {
+  it.each(["steer", "followUp"] as const)("never aborts genuine %s input queued into a wake run whose question is cancelled during preparation", async delivery => {
     const wakeGate = barrier();
-    const genuineGate = barrier();
     const responseGate = barrier();
     const wakeReady = vi.fn();
-    const genuineReady = vi.fn();
-    laterBefore.mockImplementation(async event => {
-      if (event.prompt === "GENUINE_TEXT") { genuineReady(); await genuineGate.promise; }
-      else { wakeReady(); await wakeGate.promise; }
-    });
+    laterBefore.mockImplementation(async () => { wakeReady(); await wakeGate.promise; });
     provider.setResponses([async (context, options) => {
-      expect(JSON.stringify(context)).toContain("GENUINE_TEXT");
-      expect(JSON.stringify(context)).toContain("PRIVATE_QUESTION");
+      if (delivery === "steer") expect(JSON.stringify(context)).toContain("GENUINE_TEXT");
       await responseGate.promise;
       expect(options.signal?.aborted).toBe(false);
       return fauxAssistantMessage(fauxText("genuine survived stale wake"));
+    }, context => {
+      expect(JSON.stringify(context)).toContain("GENUINE_TEXT");
+      return fauxAssistantMessage(fauxText("follow-up actually delivered"));
     }]);
-    const reply = ask();
+    const controller = new AbortController();
+    const reply = ask("child", controller.signal);
     await vi.waitFor(() => expect(wakeReady).toHaveBeenCalledOnce());
-    const genuine = session.prompt("GENUINE_TEXT");
-    await vi.waitFor(() => expect(genuineReady).toHaveBeenCalledOnce());
-    genuineGate.release();
-    await vi.waitFor(() => expect(provider.state.callCount).toBe(1));
+    await session.prompt("GENUINE_TEXT", { streamingBehavior: delivery });
+    // The frame is stale before its run starts, but the steered input is not.
+    controller.abort();
+    expect(await reply).toMatchObject({ status: "unanswered", reason: "cancelled" });
     wakeGate.release();
-    await vi.waitFor(() => expect(nativeErrors).toHaveBeenCalledWith(expect.objectContaining({ event: "send_user_message", error: expect.stringContaining("already processing") })));
+    await vi.waitFor(() => expect(provider.state.callCount).toBe(1));
     responseGate.release();
-    await genuine;
-    expect(provider.state.callCount).toBe(1);
-    expect(session.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "genuine survived stale wake" }] }));
+    await session.waitForIdle();
+    expect(provider.state.callCount).toBe(delivery === "steer" ? 1 : 2);
+    expect(session.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: [{ type: "text", text: delivery === "steer" ? "genuine survived stale wake" : "follow-up actually delivered" }] }));
+    expect(session.messages.filter(message => message.role === "assistant").map(message => message.role === "assistant" && message.stopReason)).toEqual(delivery === "steer" ? ["stop"] : ["stop", "stop"]);
+    expect(nativeErrors).not.toHaveBeenCalled();
     questions.retire();
-    expect(await reply).toMatchObject({ status: "unanswered" });
   });
 
-  it.each([true, false].flatMap(guard => ["start-user", "end-user", "start-proof", "end-proof", "genuine-first"].map(boundary => ({ guard, boundary }))))("retains the executing native owner through a competing busy settlement ($boundary, guard=$guard)", async ({ boundary, guard }) => {
+  it.each([true, false].flatMap(guard => ["preparation", "start-user", "end-user", "start-proof", "end-proof"].map(boundary => ({ guard, boundary }))))("refuses a busy prompt at a wake boundary without a competing settlement ($boundary, guard=$guard)", async ({ boundary, guard }) => {
     const wakeGate = barrier();
-    const genuineGate = barrier();
     const messageGate = barrier();
     const reached = vi.fn();
-    const wakeReady = vi.fn();
-    const genuineReady = vi.fn();
     let ownerSignal: AbortSignal | undefined;
-    laterBefore.mockImplementation(async event => {
-      if (event.prompt === "GENUINE_TEXT") { genuineReady(); await genuineGate.promise; }
-      else { wakeReady(); await wakeGate.promise; }
+    laterBefore.mockImplementation(async () => {
+      if (boundary !== "preparation") return;
+      reached();
+      await wakeGate.promise;
     });
     laterMessage.mockImplementation(async (phase, event, ctx) => {
       const kind = event.message.role === "user" ? "user" : event.message.role === "custom" && event.message.customType.startsWith("subagent-question-frame:") ? "proof" : "other";
@@ -392,47 +398,40 @@ describe("question outbox on native SDK INPUT and preparation", () => {
       reached();
       await messageGate.promise;
     });
-    provider.setResponses([() => fauxAssistantMessage(fauxText("genuine survived"))]);
+    const contexts: string[] = [];
+    provider.setResponses([context => {
+      contexts.push(JSON.stringify(context));
+      return fauxAssistantMessage(fauxText("wake answered"));
+    }]);
     const reply = ask();
-    await vi.waitFor(() => expect(wakeReady).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(reached).toHaveBeenCalledOnce());
     if (!guard) disableGuard();
-    const genuine = session.prompt("GENUINE_TEXT").then(() => "completed", error => String(error));
-    await vi.waitFor(() => expect(genuineReady).toHaveBeenCalledOnce());
-    if (boundary === "genuine-first") {
-      genuineGate.release();
-      expect(await genuine).toBe("completed");
-      wakeGate.release();
-      await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(2));
-      expect(provider.state.callCount).toBe(guard ? 1 : 2);
-      expect(session.messages).toContainEqual(expect.objectContaining({ role: "assistant", content: [{ type: "text", text: "genuine survived" }] }));
-    } else {
-      wakeGate.release();
-      await vi.waitFor(() => expect(reached).toHaveBeenCalledOnce());
-      expect(ownerSignal).toBeDefined();
-      genuineGate.release();
-      expect(await genuine).toContain("already processing");
-      expect(settlements).toHaveBeenCalledWith(ownerSignal);
-      messageGate.release();
-      await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(2));
-      expect(provider.state.callCount).toBe(guard ? 0 : 1);
-      expect(questions.broker.hasUnannounced()).toBe(true);
-    }
+    // Pi 1.2+ refuses a busy prompt before preparing it, so it can neither
+    // start a competing run nor emit a competing settlement.
+    expect(await session.prompt("GENUINE_TEXT").then(() => "completed", error => String(error))).toContain("already processing");
+    expect(settlements).not.toHaveBeenCalled();
+    if (boundary !== "preparation") expect(ownerSignal?.aborted).toBe(false);
+    wakeGate.release();
+    messageGate.release();
+    await vi.waitFor(() => expect(settlements).toHaveBeenCalledOnce());
+    await session.waitForIdle();
+    expect(provider.state.callCount).toBe(1);
+    expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "wake answered" }] });
+    expect(contexts[0]).not.toContain("GENUINE_TEXT");
+    // The refused prompt does not supersede the executing frame.
+    expect(contexts[0].includes("PRIVATE_QUESTION")).toBe(guard);
+    expect(questions.broker.hasUnannounced()).toBe(!guard);
     expect(nativeErrors).not.toHaveBeenCalled();
     questions.retire();
     expect(await reply).toMatchObject({ status: "unanswered" });
   });
 
-  it.each([true, false].flatMap(guard => [true, false].flatMap(images => ["wake-first", "literal-first"].map(order => ({ guard, images, order })))))("fails closed when an interactive input copies an unprepared frame token ($order, images=$images, guard=$guard)", async ({ order, images, guard }) => {
+  it.each([true, false].flatMap(guard => [true, false].flatMap(images => (["steer", "followUp"] as const).map(delivery => ({ guard, images, delivery })))))("fails closed when an interactive input copies an unprepared frame token ($delivery, images=$images, guard=$guard)", async ({ delivery, images, guard }) => {
     const wakeGate = barrier();
-    const literalGate = barrier();
     let frameToken: string | undefined;
     let first = true;
     before.mockImplementation(async event => {
       if (first) { first = false; frameToken = event.prompt; await wakeGate.promise; }
-    });
-    let literalPreparing = true;
-    laterBefore.mockImplementation(async () => {
-      if (literalPreparing) { literalPreparing = false; await literalGate.promise; }
     });
     const image = pngImage(1);
     const contexts: string[] = [];
@@ -444,30 +443,22 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     await vi.waitFor(() => expect(frameToken).toBeDefined());
     if (!guard) disableGuard();
     const content = [{ type: "text", text: frameToken }, ...(images ? [image] : [])];
-    const genuine = session.prompt(frameToken!, { images: images ? [image] : undefined });
-    await vi.waitFor(() => expect(laterBefore).toHaveBeenCalledOnce());
-    if (order === "wake-first") {
-      wakeGate.release();
-      await vi.waitFor(() => expect(settlements).toHaveBeenCalledOnce());
-      literalGate.release();
-      await genuine;
-    } else {
-      literalGate.release();
-      await genuine;
-      wakeGate.release();
-      await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(2));
-    }
-    expect(provider.state.callCount).toBe(2);
+    // Pi 1.2+ queues input typed while the wake run starts into that run.
+    await session.prompt(frameToken!, { images: images ? [image] : undefined, streamingBehavior: delivery });
+    wakeGate.release();
+    await vi.waitFor(() => expect(settlements).toHaveBeenCalledOnce());
+    await session.waitForIdle();
+    const calls = delivery === "steer" ? 1 : 2;
+    expect(provider.state.callCount).toBe(calls);
     expect(contexts.every(context => !context.includes("PRIVATE_QUESTION"))).toBe(true);
     // The disabled control still has W's earlier native dispatch snapshot;
     // only W can receive that proof, never the copied interactive input.
     const proofs = session.messages.filter(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"));
     expect(proofs).toHaveLength(guard ? 0 : 1);
-    const userIndices = session.messages.flatMap((message, index) => message.role === "user" ? [index] : []);
-    const genuineIndex = userIndices[order === "literal-first" ? 0 : 1];
+    const genuineIndex = session.messages.findLastIndex(message => message.role === "user");
+    expect(session.messages[genuineIndex]).toEqual({ role: "user", content, timestamp: expect.any(Number) });
     expect(session.messages[genuineIndex + 1]).not.toMatchObject({ role: "custom", customType: expect.stringMatching(/^subagent-question-frame:/) });
-    expect(session.messages).toContainEqual({ role: "user", content, timestamp: expect.any(Number) });
-    expect(session.messages.filter(message => message.role === "assistant")).toHaveLength(2);
+    expect(session.messages.filter(message => message.role === "assistant")).toHaveLength(calls);
     expect(nativeErrors).not.toHaveBeenCalled();
     if (!guard) {
       questions.retire();
@@ -484,7 +475,7 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     expect(await recovered).toMatchObject({ status: "unanswered" });
   });
 
-  it.each(["wake-first", "literal-first"])("keeps a copied ambiguous frame question-inert after default AUTO 4096 PNG normalization (%s)", async order => {
+  it.each(["refused", "steer"] as const)("keeps a copied ambiguous frame question-inert after default AUTO 4096 PNG normalization (first copy %s)", async firstCopy => {
     expect(session.settingsManager.getImageAutoResize()).toBe(true);
     const image = pngImage(4096);
     const original = structuredClone(image);
@@ -508,19 +499,14 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     laterBefore.mockClear();
 
     const wakeGate = barrier();
-    const literalGate = barrier();
     let frameToken: string | undefined;
     before.mockImplementation(async event => {
       if (frameToken === undefined) { frameToken = event.prompt; await wakeGate.promise; }
     });
-    let literalPreparing = true;
-    laterBefore.mockImplementation(async () => {
-      if (literalPreparing) { literalPreparing = false; await literalGate.promise; }
-    });
     const contexts: string[] = [];
     const modelUsers: unknown[] = [];
     const signals: AbortSignal[] = [];
-    provider.setResponses(Array.from({ length: 3 }, () => (context, options) => {
+    provider.setResponses(Array.from({ length: 4 }, () => (context, options) => {
       contexts.push(JSON.stringify(context));
       modelUsers.push(...context.messages.filter(message => message.role === "user"));
       if (options.signal) signals.push(options.signal);
@@ -528,35 +514,46 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     }));
     const reply = ask();
     await vi.waitFor(() => expect(frameToken).toBeDefined());
-    const next = ask("another-child"); // Q must stay pending through both frames.
-    const genuine = session.prompt(frameToken!, { images: [image] });
-    await vi.waitFor(() => expect(laterBefore).toHaveBeenCalledOnce());
-    expect(await reply).toMatchObject({ status: "unanswered", reason: expect.stringContaining("ambiguous") });
+    const next = ask("another-child"); // Q must stay pending through the copied wake frame.
+    let later: ReturnType<typeof ask> | undefined;
     const baselineSettlements = settlements.mock.calls.length;
     try {
-      if (order === "wake-first") {
-        wakeGate.release();
-        await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(baselineSettlements + 1));
-        expect(questions.broker.hasUnannounced()).toBe(true);
-        literalGate.release();
-        await genuine;
-      } else {
-        literalGate.release();
-        await genuine;
-        expect(questions.broker.hasUnannounced()).toBe(true);
-        wakeGate.release();
-        await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(baselineSettlements + 2));
-      }
-      expect(provider.state.callCount).toBe(3); // reference, W, G; no abort.
+      // Pi 1.2+ counts the starting wake run as busy: a copy typed meanwhile is
+      // refused or queued into that run, unnormalized. Either way INPUT saw it.
+      const copied = await session.prompt(frameToken!, { images: [image], streamingBehavior: firstCopy === "steer" ? "steer" : undefined })
+        .then(() => "queued", error => String(error));
+      if (firstCopy === "steer") expect(copied).toBe("queued");
+      else expect(copied).toContain("already processing");
+      expect(await reply).toMatchObject({ status: "unanswered", reason: expect.stringContaining("ambiguous") });
+      wakeGate.release();
+      // W's copied frame stays question-inert; once idle, the question still
+      // pending through it gets its own wake.
+      await vi.waitFor(() => expect(settlements).toHaveBeenCalledTimes(baselineSettlements + 2));
+      await session.waitForIdle();
+      expect(tokens).toHaveLength(2);
       expect(contexts).toHaveLength(2);
-      expect(contexts.every(context => !context.includes("PRIVATE_QUESTION"))).toBe(true);
+      expect(contexts[0]).not.toContain("PRIVATE_QUESTION");
+      expect(contexts[1]).toContain("PRIVATE_QUESTION");
+      expect(questions.broker.hasUnannounced()).toBe(false);
+      // The same copy submitted while idle is its own native run, and the SDK
+      // appends its resize hint after the token. A question raised as it is
+      // submitted must not be announced through the copied frame.
+      later = ask("later-child");
+      await session.prompt(frameToken!, { images: [image] });
+      expect(settlements).toHaveBeenCalledTimes(baselineSettlements + 3);
+      expect(provider.state.callCount).toBe(4); // reference, W (with any steered copy), Q wake, G; no abort.
+      expect(contexts).toHaveLength(3);
+      expect(contexts[2]).not.toContain("PRIVATE_QUESTION");
       expect(questions.broker.hasUnannounced()).toBe(true);
-      expect(signals).toHaveLength(2);
+      expect(signals).toHaveLength(3);
       expect(signals.every(signal => !signal.aborted)).toBe(true);
-      expect(session.messages.filter(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"))).toHaveLength(0);
       expect(session.messages.filter(message => message.role === "assistant" && message.stopReason === "aborted")).toHaveLength(0);
-      const genuineUser = session.messages.find(message => message.role === "user" && typeof message.content !== "string" && message.content[0]?.type === "text" && message.content[0].text === `${frameToken}${hint}`);
+      const genuineIndex = session.messages.findIndex(message => message.role === "user" && typeof message.content !== "string" && message.content[0]?.type === "text" && message.content[0].text === `${frameToken}${hint}`);
+      const genuineUser = session.messages[genuineIndex];
       expect(genuineUser).toBeDefined();
+      // Only the later genuine wake carries a proof, never a copied frame.
+      expect(session.messages.filter(message => message.role === "custom" && message.customType.startsWith("subagent-question-frame:"))).toHaveLength(1);
+      expect(session.messages[genuineIndex + 1]).not.toMatchObject({ role: "custom", customType: expect.stringMatching(/^subagent-question-frame:/) });
       const expectedContent = [{ type: "text", text: `${frameToken}${hint}` }, normalizedImage];
       expect(genuineUser?.role === "user" && genuineUser.content).toEqual(expectedContent);
       expect(modelUsers).toContainEqual(expect.objectContaining({ role: "user", content: expectedContent }));
@@ -569,11 +566,11 @@ describe("question outbox on native SDK INPUT and preparation", () => {
       expect(questions.broker.hasUnannounced()).toBe(false);
     } finally {
       wakeGate.release();
-      literalGate.release();
-      await genuine;
+      await session.waitForIdle();
       questions.retire();
     }
     expect(await next).toMatchObject({ status: "unanswered" });
+    expect(await later).toMatchObject({ status: "unanswered" });
   });
 
   it.each(["handled", "throw"])("uses native %s semantics for input-scoped own readiness without releasing another preparing prompt", async outcome => {
@@ -588,26 +585,25 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     });
     laterBefore.mockImplementation(async event => {
       if (event.prompt === "GENUINE_TEXT") { genuineReady(); await genuineGate.promise; }
-      if (event.prompt === "@child mention") await genuineGate.promise;
     });
-    provider.setResponses([
-      () => fauxAssistantMessage(fauxText("first")),
-      () => fauxAssistantMessage(fauxText("second")),
-    ]);
+    provider.setResponses([() => fauxAssistantMessage(fauxText("first"))]);
     const mention = session.prompt("@child mention");
     await vi.waitFor(() => expect(ownedInput).toHaveBeenCalledOnce());
     const genuine = session.prompt("GENUINE_TEXT");
     await vi.waitFor(() => expect(genuineReady).toHaveBeenCalledOnce());
     const reply = ask();
     mentionGate.release();
-    if (outcome === "handled") await mention;
-    else await vi.waitFor(() => expect(laterBefore).toHaveBeenCalledTimes(2));
+    // Pi 1.2+ counts the preparing genuine run as busy: a mention that native
+    // INPUT continues after the throw is refused instead of preparing too.
+    const mentionOutcome = await mention.then(() => "completed", error => String(error));
+    if (outcome === "handled") expect(mentionOutcome).toBe("completed");
+    else expect(mentionOutcome).toContain("already processing");
+    expect(laterBefore).toHaveBeenCalledOnce();
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(tokens).toEqual([]);
     expect(provider.state.callCount).toBe(0);
     genuineGate.release();
     await genuine;
-    if (outcome === "throw") await mention.catch(error => expect(String(error)).toContain("already processing"));
     questions.retire();
     expect(await reply).toMatchObject({ status: "unanswered" });
   });

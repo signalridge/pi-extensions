@@ -50,12 +50,11 @@ The package refuses to start if Pi resolves one of its tool names to an earlier
 extension. Pi can disambiguate duplicate commands; load only one background
 manager rather than relying on registration order.
 
-The workspace test baseline is Pi **1.0.4**. Real-SDK tests cover delivery,
+The workspace test baseline is Pi **1.4.0**. Real-SDK tests cover delivery,
 committed-tree suspended input, and cancelled fork recovery using an offline
-faux provider; they are enabled for **1.0.4** and **1.1.0**. Host peers use `"*"`
-for module ownership, not a promise of compatibility with every host version.
-This version targets local macOS/Linux; baseline acceptance ran on macOS/Pi
-1.0.4, not Linux.
+faux provider on that host. Host peers use `"*"` for module ownership, not a
+promise of compatibility with every host version. This version targets local
+macOS/Linux; baseline acceptance ran on macOS/Pi 1.4.0, not Linux.
 Windows, PTY attachment, SSH execution, and durable external services are
 deliberately outside this first version. Bun-based and standalone Pi hosts require
 a `node` executable on `PATH` for the owned supervisor; missing or stalled startup
@@ -135,6 +134,14 @@ is not replayed when unrelated text is appended; matches suppressed during the
 cooldown are consumed, not delayed. The extension also
 limits automatic wake batches to at most one every ten seconds. Patterns that
 never occur remain silent: inspect the actual output to choose accurate markers.
+
+A wake never starts a turn while the session's latest meaningful response overflowed the
+model's context window and no compaction followed it: that turn would resend the
+same over-window context and fail again. Events are still added to the
+conversation as context, and one warning per overflow episode asks to run
+`/compact` (or `/codex-compact` when installed) or start a new session. A
+compaction or a later successful response restores normal wakes. Aborted responses and
+transient errors (including HTTP 503 and rate limits) do not prove context recovery.
 
 New monitor commands have **no timeout by default**. An optional `timeout_ms`
 bounds their lifetime. When attaching to an existing job, its original timeout
@@ -323,10 +330,6 @@ handles only `bash` must explicitly cover `bash_background` and `monitor` too.
 Plan-mode users must not opt these mutating tools into a read-only loadout.
 There is no automatic change to any other extension's tool selection or settings.
 
-### Optional operation approvals
-
-`@signalridge/pi-approval-core` is a runtime dependency, but no approval extension is enabled automatically. When a human approval service is present at invocation entry, `bash_background` and command-starting `monitor` capture exactly that service before any await and review frozen normalized launch inputs. Denial, cancellation or stale ownership prevents command execution. The invocation-local launch guard checks the live branch owner and **the same captured service** after filesystem startup validation and immediately before sending the supervisor its run command. Service disappearance, replacement, malformed or ambiguous discovery retires that capture and fails closed: no switching peers, second approval prompt or ungated fallback. A supervisor already awaiting dispatch is cleaned up without executing the command. Absence at invocation entry alone preserves ordinary ungated behavior. Existing-job monitor attachment and inspection/control tools do not request launch approval. This cooperative same-process integration is not an OS sandbox.
-
 This package does not resume or mutate a paused `pi-goal`. A background event can
 start a normal agent turn; that is distinct from granting Goal ownership or
 resuming an explicit Goal wait. No undocumented cross-extension protocol is used.
@@ -348,8 +351,8 @@ This is an independent implementation, not a bundled fork. References:
 - [Pi extension API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md): public tools, lifecycle and custom messages.
 
 PTY, SSH, shell-provider protocols and cross-application persistence are not copied
-into this package. The runtime library dependency is `@signalridge/pi-approval-core`;
-Pi modules remain host-provided, and process supervision uses Node builtins.
+into this package. It has no runtime dependencies: Pi modules remain host-provided,
+and process supervision uses Node builtins.
 
 ## Development
 

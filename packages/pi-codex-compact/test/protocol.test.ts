@@ -26,11 +26,14 @@ function fragmentedStream(text: string, chunkSize = 1): ReadableStream<Uint8Arra
   });
 }
 
-function validSse(item = { type: "compaction", encrypted_content: "opaque" }): string {
+function validSse(
+  item: Record<string, unknown> = { type: "compaction", encrypted_content: "opaque" },
+  completedItem: Record<string, unknown> = item,
+): string {
   return [
     ": keepalive\r\n",
     `data: ${JSON.stringify({ type: "response.output_item.done", item })}\r\n\r\n`,
-    `data: ${JSON.stringify({ type: "response.completed", response: { output: [item] } })}\r\n\r\n`,
+    `data: ${JSON.stringify({ type: "response.completed", response: { output: [completedItem] } })}\r\n\r\n`,
   ].join("");
 }
 
@@ -72,6 +75,38 @@ test("collects one compaction from fragmented CRLF SSE and deduplicates complete
   const result = await collectCompactionSse(fragmentedStream(validSse()));
   assert.deepEqual(result.item, { type: "compaction", encrypted_content: "opaque" });
   assert.ok(result.completedResponse);
+});
+
+describe("deduplicates a repeated compaction item whose keys arrive in another order", () => {
+  const item = { id: "cmp_test", type: "compaction", encrypted_content: "opaque" };
+  const reordered = { encrypted_content: "opaque", id: "cmp_test", type: "compaction" };
+  for (const { name, first, repeated } of [
+    { name: "top-level keys", first: item, repeated: reordered },
+    {
+      name: "nested object keys",
+      first: { ...item, metadata: { z: null, a: { number: 1, flag: true } } },
+      repeated: { ...reordered, metadata: { a: { flag: true, number: 1 }, z: null } },
+    },
+    {
+      name: "objects inside arrays",
+      first: { ...item, metadata: [{ b: 2, a: 1 }, null, "text", 0] },
+      repeated: { ...reordered, metadata: [{ a: 1, b: 2 }, null, "text", 0] },
+    },
+  ]) {
+    test(name, async () => {
+      const result = await collectCompactionSse(fragmentedStream(validSse(first, repeated), 7));
+      assert.deepEqual(result.item, first);
+    });
+  }
+
+  test("array order still distinguishes items", async () => {
+    await assert.rejects(
+      collectCompactionSse(
+        fragmentedStream(validSse({ ...item, metadata: [1, 2] }, { ...reordered, metadata: [2, 1] })),
+      ),
+      /2 distinct compaction items; expected exactly one/,
+    );
+  });
 });
 
 for (const type of ["response.completed", "response.done"]) {

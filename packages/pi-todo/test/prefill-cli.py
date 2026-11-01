@@ -1,4 +1,4 @@
-"""Real Pi 1.0.4 offline CLI/PTY regression, stdlib only.
+"""Real Pi 1.4.0 offline CLI/PTY regression, stdlib only.
 Run: python3 packages/pi-todo/test/prefill-cli.py /tmp/todo-prefill-evidence
 Each child has isolated configuration, a 25s deadline, and guaranteed kill/reap.
 """

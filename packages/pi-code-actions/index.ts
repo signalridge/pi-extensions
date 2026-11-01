@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
-import { copyToClipboard, insertIntoEditor, runSnippet } from "./src/actions.js";
+import { copySnippet, insertIntoEditor, runSnippet } from "./src/actions.js";
 import type { Snippet } from "./src/snippets.js";
 import { extractSnippets, extractText } from "./src/snippets.js";
 import type { PickResult } from "./src/ui.js";
@@ -173,10 +173,15 @@ export default function codeActionsExtension(pi: ExtensionAPI) {
       if (!operation.isCurrent() || !action) return;
 
       if (action === "copy") {
-        const ok = await copyToClipboard(pi, snippet.content, operation);
+        if (ctx.mode !== "tui") {
+          if (ctx.hasUI) ctx.ui.notify("Clipboard copying is unavailable outside TUI mode.", "warning");
+          return;
+        }
+        const result = await copySnippet(snippet.content, operation);
         if (!operation.isCurrent()) return;
         if (ctx.hasUI) {
-          ctx.ui.notify(ok ? "Copied to clipboard." : "Failed to copy to clipboard.", ok ? "info" : "error");
+          if (result.copied) ctx.ui.notify("Copied to clipboard.", "info");
+          else ctx.ui.notify(`Failed to copy to clipboard: ${result.reason}`, "error");
         }
         return;
       }

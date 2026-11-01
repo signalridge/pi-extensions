@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { OverflowWakeGuard } from "./context-overflow.js";
 import type { JobManager } from "./contracts.js";
 import { createJobManager } from "./manager.js";
 import { MESSAGE_TYPE, Notifications, safeText, WAKE_PREFIX, wakeIdFromText } from "./notifications.js";
@@ -33,6 +34,7 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
   // Authenticate issued tokens without retaining an unbounded delivery history.
   // emitInput snapshots handlers, so a suspended old input keeps its old guard.
   const wakes = new WakeTokens();
+  const overflowWakes = new OverflowWakeGuard(pi, "background process events are added to the conversation");
 
   function retire(owner: Owner): void {
     if (active !== owner) return;
@@ -118,6 +120,8 @@ export default function backgroundExtension(pi: ExtensionAPI): void {
           !!owner.context.model &&
           owner.context.isIdle() &&
           !owner.context.hasPendingMessages(),
+        // An overflowed parent would resend the same over-window context; deliver as context only.
+        canWake: () => !overflowWakes.holds(owner.context),
         send: (batch) => {
           if (!live(owner) || owner.navigating) return;
           pi.sendMessage(

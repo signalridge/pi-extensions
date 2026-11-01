@@ -11,10 +11,11 @@
  * so existing memories aren't orphaned.
  */
 
-import { existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { readRegularFileSync } from "./regular-file.js";
 import type { MemoryScope } from "./types.js";
 
 /** Maximum lines to read from MEMORY.md */
@@ -41,14 +42,15 @@ export function isSymlink(filePath: string): boolean {
 }
 
 /**
- * Safely read a file, rejecting symlinks.
- * Returns undefined if the file doesn't exist, is a symlink, or can't be read.
+ * Safely read a file, rejecting symlinks and anything but a regular file.
+ * Returns undefined if the file doesn't exist, is a symlink, is not a regular
+ * file (a FIFO must not block the main thread), or can't be read.
  */
 export function safeReadFile(filePath: string): string | undefined {
   if (!existsSync(filePath)) return undefined;
   if (isSymlink(filePath)) return undefined;
   try {
-    return readFileSync(filePath, "utf-8");
+    return readRegularFileSync(filePath, { noFollow: true });
   } catch {
     return undefined;
   }

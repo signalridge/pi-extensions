@@ -643,6 +643,10 @@ export function registerGoalLifecycle(
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    // Pi 1.2+ also announces runs started by an idle custom message. They carry
+    // no prompt and never reached this boundary on earlier hosts, so goal input
+    // accounting must not treat them as prompt boundaries.
+    if (event.messageType === "custom") return;
     runtime.pendingInputWake = undefined;
     runtime.acceptedRunPrompt = typeof event.prompt === "string" ? event.prompt : undefined;
     runtime.inputWakeGoalId = undefined;
@@ -676,7 +680,8 @@ export function registerGoalLifecycle(
       if (ticket) {
         runtime.pendingInputWake = ticket;
         runtime.beginAgentRun(null, undefined);
-        return { systemPrompt: `${event.systemPrompt}\n\n${buildGoalSystemPrompt(ticket.resumedGoal)}` };
+        event.systemPromptOptions.sections.pi_goal = buildGoalSystemPrompt(ticket.resumedGoal);
+        return;
       }
     }
     if (!ownedPromptBoundary && ownedPromptGoalId === undefined && acceptedDirectInput?.realInput) {
@@ -751,9 +756,7 @@ export function registerGoalLifecycle(
       runtime.updateStatus(ctx, runtime.activeGoal);
     }
 
-    return {
-      systemPrompt: `${event.systemPrompt}\n\n${buildGoalSystemPrompt(runtime.activeGoal)}`,
-    };
+    event.systemPromptOptions.sections.pi_goal = buildGoalSystemPrompt(runtime.activeGoal);
   });
 
   pi.on("agent_start", (_event, _ctx) => {

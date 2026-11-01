@@ -24,6 +24,8 @@ Per-thread provider routing identity is selectively ported from [narumiruna/pi-e
 - Uses Pi's current model or an independent model selected in `pi-btw.json`.
 - Uses a pi-btw thinking level that can be changed with Pi's configured thinking shortcut and remembered for next time.
 - Does not append the side question or answer to the main conversation.
+- Optionally gives the main model an `advisor` tool that asks a configured reviewer model for a
+  second opinion (off unless `advisorModel` is set; see [Advisor tool](#advisor-tool)).
 - Works as an independently installable npm Pi extension package.
 
 ## Install
@@ -234,7 +236,76 @@ with a same-directory temporary file and rename. They preserve `model` and unkno
 or invalid files block saves and remain unchanged. Settings must be valid UTF-8 and no larger than
 64 KiB, so unexpectedly large or invalidly encoded files are rejected without being rewritten.
 Separate Pi processes and external editors are outside this in-process ordering boundary. The file
-is read for each `/btw` invocation, so edits apply without `/reload`.
+is read for each `/btw` invocation, so edits apply without `/reload`. The optional `advisorModel`
+key is the exception: it is read once when a session starts (see [Advisor tool](#advisor-tool)).
+
+## Advisor tool
+
+`/btw` is a side channel you open yourself. The optional `advisor` tool is its model-invoked
+counterpart: the main model calls it to ask a stronger reviewer model for a second opinion on its
+current work, without you leaving the main thread. The reviewer's answer comes back as the tool
+result. The tool does not exist unless you name a reviewer, so installs without the setting are
+unchanged.
+
+### Enable and disable
+
+Add `advisorModel` to `pi-btw.json`, in the same `provider/model-id` format as `model`:
+
+```json
+{
+  "advisorModel": "anthropic/claude-opus-4-5"
+}
+```
+
+When a session starts, pi-btw registers `advisor` only if all of these hold:
+
+- `pi-btw.json` is valid and names `advisorModel`. An invalid file leaves the tool unregistered;
+  `/btw` reports why the file was rejected.
+- The reviewer exists in Pi's model registry and is a physical model. An unknown or virtual
+  reviewer produces a startup warning instead of a tool.
+- The session has an attached client (TUI or RPC). Print and JSON runs, and managed subagent child
+  sessions, which run without one, never see the tool.
+
+The setting is read once per session, not per call. To disable the tool, remove `advisorModel`
+and run `/reload` or start a new session.
+
+### What is sent where
+
+`advisor` takes one optional `question` of up to 2,000 characters. On **every** call, the
+reviewer's provider receives a reviewer system prompt and a single message containing that
+question and a text transcript of the **current session branch**: user and assistant messages,
+tool calls with their arguments, tool results, Bash output, and compaction and branch summaries,
+taken from Pi's session projection and capped at the most recent ~40,000 characters. This is the
+same serialization `/btw --with-parent` uses. Images, thinking blocks, the main system prompt and
+tool declarations are not included. As with `--with-parent`, the transcript is **unfiltered**:
+redactions made by parent `context` hooks are not applied. Setting `advisorModel` is your standing
+consent to send it to that destination on each call, so configure only a reviewer you would trust
+with the transcript.
+
+pi-btw applies the same destination rules as `--with-parent`: a virtual reviewer, whose physical
+destination is chosen only at dispatch, and a reviewer whose credentials resolve a different
+endpoint than its registered base URL are refused without a request. The request declares no
+tools, so the reviewer cannot call tools, including `advisor` itself. It uses its own provider
+session ID, one UUID per session, never the main session's ID, so consecutive consultations can
+reuse the reviewer's prompt cache without sharing the main conversation's cache or connection.
+
+`advisor` refuses when the current session model is the reviewer: a model reviewing its own
+transcript costs a request without adding an independent opinion. Switch the main model or name a
+different reviewer. The reviewer uses the session's current thinking level, clamped to what the
+reviewer model supports.
+
+### Results and cost
+
+A successful call returns the reviewer's text, capped at 12,000 characters, with the reviewer's
+`provider/model-id`, thinking level and token usage in the result details. The usage is also
+reported as the tool's nested usage, so Pi includes it in session totals. Missing credentials, a
+provider error, an empty or malformed reply, or cancellation through the tool call's abort signal
+returns an error result; no answer is ever substituted.
+
+Each call is a full request billed by the reviewer's provider: up to ~40,000 characters (roughly
+10,000 tokens) of input plus the reviewer's output, typically on a more expensive model than the
+main one. The main model decides when to call it; the tool's guidelines ask it to consult once per
+decision, before committing to an approach, when stuck, or before declaring complex work done.
 
 ## Why use pi-btw?
 
@@ -246,6 +317,7 @@ Normal assistant messages become part of the main Pi conversation and can distra
 packages/pi-btw/
 ├── src/
 │   ├── index.ts
+│   ├── advisor.ts
 │   ├── btw.ts
 │   ├── bring-to-main.ts
 │   ├── menu.ts
@@ -268,6 +340,25 @@ The package exposes its Pi extension through `package.json`:
   }
 }
 ```
+
+## Provenance
+
+The `advisor` tool adapts the design of `@juicesharp/rpiv-advisor` (MIT) from
+[`juicesharp/rpiv-mono`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-advisor),
+read at commit `46dbdfd`: a model-invoked tool that forwards the current branch to a separately
+configured reviewer model, sends that request with no tools, returns the reviewer's guidance as the
+tool result, and turns every failure into an explicit tool error. The reviewer system prompt and
+tool guidance were rewritten for Pi. Local divergence:
+
+- One `advisorModel` key names the reviewer, resolved through pi-btw's existing model resolution.
+  There is no `/advisor` picker, effort setting, per-model blocklist, tool-inventory prefix or
+  global tool cache.
+- The reviewer receives pi-btw's bounded text transcript (the `--with-parent` serialization), not
+  the raw message list, so images, thinking, system messages and tool declarations never reach it.
+- The interactive-session gate, the same-model refusal and the virtual-model and endpoint-override
+  refusals are local. The empty-response retry and host retry wrapper are not ported.
+- The provider routing identity is an independent UUID per session rather than a value derived
+  from the main session's ID.
 
 ## License
 

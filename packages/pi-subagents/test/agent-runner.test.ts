@@ -139,6 +139,7 @@ vi.mock("../src/env.js", () => ({
 
 vi.mock("../src/prompts.js", () => ({
   buildAgentPrompt: vi.fn(() => "system prompt"),
+  inheritableParentPrompt: vi.fn((rendered: string) => rendered),
 }));
 
 vi.mock("../src/memory.js", () => ({
@@ -436,6 +437,53 @@ describe("agent-runner tier policy", () => {
     await expect(runAgent({ ...ctx, model: parentModel } as any, "Explore", "must fail", { pi, requireAgentTier: true }))
       .rejects.toThrow(/No agent tier selected for "Explore"/);
     expect(createAgentSession).not.toHaveBeenCalled();
+  });
+});
+
+// An untiered subagent runs at the spawning session's thinking level unless the
+// call or the agent file names one. Omitting the option would let Pi apply its
+// per-model or default level (for example "max") instead.
+describe("agent-runner parent thinking fallback", () => {
+  const parentPi = (level: string) => ({ getThinkingLevel: () => level }) as any;
+  const passedThinking = () => (createAgentSession.mock.calls[0]?.[0] as Record<string, unknown> | undefined)?.thinkingLevel;
+
+  it("inherits the parent session level when nothing else sets one", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("INHERITED").session });
+    await runAgent(ctx, "Explore", "Say INHERITED", { pi: parentPi("medium") });
+    expect(passedThinking()).toBe("medium");
+  });
+
+  it("passes a parent at off through instead of Pi's default level", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("OFF").session });
+    await runAgent(ctx, "Explore", "Say OFF", { pi: parentPi("off") });
+    expect(passedThinking()).toBe("off");
+  });
+
+  it("prefers an explicit option over the parent session level", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("EXPLICIT").session });
+    await runAgent(ctx, "Explore", "Say EXPLICIT", { pi: parentPi("medium"), thinkingLevel: "high" });
+    expect(passedThinking()).toBe("high");
+  });
+
+  it("prefers the agent config over the parent session level", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("CONFIG").session });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ thinking: "low" }) as any);
+    await runAgent(ctx, "Explore", "Say CONFIG", { pi: parentPi("medium") });
+    expect(passedThinking()).toBe("low");
+  });
+
+  it("omits the level when no parent level is available", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("DEFAULT").session });
+    await runAgent(ctx, "Explore", "Say DEFAULT", { pi });
+    expect(createAgentSession.mock.calls[0]?.[0]).not.toHaveProperty("thinkingLevel");
+  });
+
+  it("keeps a tier's thinking authoritative over the parent level", async () => {
+    createAgentSession.mockResolvedValue({ session: createSession("TIER").session });
+    const model = { id: "parent", provider: "test", reasoning: true } as any;
+    setAgentTiersSettings({ profiles: { low: { model: "inherit", thinking: "low" } } });
+    await runAgent({ ...ctx, model } as any, "Explore", "Say TIER", { pi: parentPi("off"), agentTier: "low" });
+    expect(passedThinking()).toBe("low");
   });
 });
 

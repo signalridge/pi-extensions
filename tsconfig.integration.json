@@ -1,6 +1,6 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": { "rootDir": "." },
-  "include": ["scripts/editor-composition.test.ts", "scripts/status-navigation.test.ts", "scripts/goal-compaction*.ts", "vitest.integration.config.ts"],
+  "include": ["scripts/editor-composition.test.ts", "scripts/status-navigation.test.ts", "scripts/goal-compaction*.ts", "scripts/goal-rules-composition.test.ts", "vitest.integration.config.ts"],
   "exclude": []
 }

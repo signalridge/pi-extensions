@@ -345,14 +345,14 @@ for (const policy of ["deny", "decline", "once", "native", "fallback"] as const)
 }
 
 for (const notifyOnFallback of [true, false]) {
-  test(`SDK remote failure preserves an effective opaque checkpoint (fallback notices ${notifyOnFallback})`, async () => {
+  test(`SDK strict remote failure preserves an effective opaque checkpoint (fallback notices ${notifyOnFallback})`, async () => {
     const f = await fixture("context", false, "persistent");
     try {
       await f.session.prompt("Public task");
       const first = await f.session.compact();
       assert.ok(parseCheckpointDetails(first.details));
       await f.session.prompt("Continue after the remote checkpoint.");
-      await f.compactSettings.update({ notifyOnFallback });
+      await f.compactSettings.update({ notifyOnFallback, layeredFallback: false });
       const before = f.manager.getBranch();
       const requests = f.requests.length;
       f.failRemote();
@@ -487,7 +487,10 @@ for (const route of ["unsupported", "remote failure"] as const) {
       assert.ok(parseCheckpointDetails(first.details));
       await f.session.prompt("Continue after the opaque checkpoint.");
       if (route === "unsupported") await f.session.setModel(f.unsupportedModel);
-      else f.failRemote();
+      else {
+        f.failRemote();
+        await f.compactSettings.update({ layeredFallback: false });
+      }
       const notify = vi.spyOn(f.ui, "notify").mockImplementation(() => {
         throw new Error("Offline UI unavailable");
       });
@@ -515,6 +518,7 @@ for (const phase of ["start", "final"] as const) {
       assert.ok(parseCheckpointDetails(first.details));
       await f.session.prompt("Continue after the opaque checkpoint.");
       f.failRemote();
+      await f.compactSettings.update({ layeredFallback: false });
       const status = vi.spyOn(f.ui, "setStatus").mockImplementation((_key, value) => {
         if ((phase === "start") === (value !== undefined)) throw new Error("Offline status unavailable");
       });

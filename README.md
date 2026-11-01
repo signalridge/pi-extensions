@@ -84,7 +84,7 @@ Full detail lives in each package's README —
 [`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling. The tested development host is **Pi 1.0.4**.
+FleetView, and scheduling. The tested development host is **Pi 1.4.0**.
 Host-provided peers use `"*"` for module ownership, not as a claim that every Pi
 version is supported. See [compatibility and verification](docs/compatibility.md)
 for current host contracts and integration limits.
@@ -124,19 +124,19 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | `pi-workflows` | JavaScript orchestration over those subagents — fan-out, phases, budgets, quality helpers, journal-backed resume |
 | `pi-goal` | Autonomous `/goal` completion, with opt-in experimental ordered queues |
 | `pi-ralph-wiggum` | Long-running agent loops for iterative development |
-| `pi-plan-mode` | Codex-like read-only `/plan` collaboration mode |
-| `pi-agent-guidance` | Loads provider-specific context files (`CLAUDE.md`, `CODEX.md`, `GEMINI.md`) based on the current model |
+| `pi-plan-mode` | Codex-like read-only `/plan` collaboration mode, with an optional implementation model |
+| `pi-agent-guidance` | Loads provider-specific context files (`CLAUDE.md`, `CODEX.md`, `GEMINI.md`) based on the current model, and context files from subdirectories the agent works in |
 | `pi-ask-user-question` | Structured user-question tool for agents |
 
 ### Developer tools
 
 | Package | What it does |
 | --- | --- |
-| `pi-lsp` | Language-agnostic LSP tools through a shared runner |
+| `pi-lsp` | Language-agnostic LSP diagnostics, fixes, navigation and preview-first rename through a shared runner |
 | `pi-github-pr` | GitHub pull request review, checks, and comment status |
 | `pi-code-actions` | Pick code blocks from recent assistant messages to copy or insert |
 | `pi-files-widget` | In-terminal file browser and viewer |
-| `pi-btw` | `/btw` side-question command; parent-history sharing is per-question opt-in |
+| `pi-btw` | `/btw` side-question command; parent-history sharing is per-question opt-in. Optional `advisor` tool for a second opinion from a configured reviewer model |
 | `pi-stamp` | Transcript timestamps, assistant metadata, and tool timing |
 
 ### Session and interface
@@ -148,7 +148,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | `pi-input-history` | Text-preserving prompt history with grapheme-safe search/highlights and an fzf/atuin-style `Ctrl+R` picker |
 | `pi-welcome` | Startup resource and repository summary card |
 | `pi-session-recap` | While-you-were-away recap above the editor; raw-history requests require explicit model and consent flags |
-| `pi-tab-status` | Terminal tab status indicators |
+| `pi-tab-status` | Terminal tab status indicators and opt-in desktop notifications |
 | `pi-usage-extension` | Usage statistics dashboard |
 
 ### Host and provider integration
@@ -156,7 +156,6 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | Package | What it does |
 | --- | --- |
 | `pi-gpt-fast` | Opt-in OpenAI and Codex priority service tier |
-| `pi-herdr-state` | Reports Pi lifecycle state to herdr |
 
 ### Opt-in
 
@@ -175,10 +174,12 @@ unless a changeset names them: `pi-recall`, `pi-codex-compact`, `pi-analytics`,
 shell jobs and event-driven log monitors; local macOS/Linux only), and
 [`pi-todo`](packages/pi-todo/README.md) (revisioned, branch-local checklists with
 explicit manual controls; not a project backlog or execution scheduler),
-[`pi-approvals`](packages/pi-approvals/README.md) (per-operation reviewed local
-writes/edits and commands; opt-in adapters, not an OS sandbox), and
 [`pi-sessions`](packages/pi-sessions/README.md) (human-owned history navigation
-and editable linked-session handoff; destination draft only, never auto-send).
+and editable linked-session handoff; destination draft only, never auto-send),
+[`pi-rules`](packages/pi-rules/README.md) (project and user rule files: always-on
+guidance, an on-demand index and tool-call reminders or blocks), and
+[`pi-secrets`](packages/pi-secrets/README.md) (reversible placeholders that keep
+secrets out of provider-bound context while tools still get real values).
 
 ### Libraries
 
@@ -189,7 +190,6 @@ as ordinary npm dependencies — never listed in Pi's extension package map.
 | --- | --- |
 | `pi-subagents-protocol` | Side-effect-free wire contracts for the managed subagent protocol |
 | `pi-ui` | Side-effect-free bordered UI, inert display encoding and opt-in public custom-editor preservation adapters |
-| `pi-approval-core` | Side-effect-free local approval contracts, cooperative-adapter validation and reviewed native-tool factories; no Pi resources |
 
 ## Boundaries
 
@@ -245,6 +245,8 @@ See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
 
 - [Package boundaries](docs/package-boundaries.md): runtime ownership, persistence and shared contracts.
 - [Extension portfolio](docs/extension-portfolio.md): each capability's value, alternatives and conditional use.
+- [Retired packages](docs/retired-packages.md): removed packages, their last versions and replacements.
+- [Ecosystem and host review, 2026-11-01](docs/upstream-review-2026-11-01.md): oh-my-pi and ecosystem study, the Pi 1.4.0 baseline move, retirements and ports.
 - [Upstream review, 2026-10-23](docs/upstream-review-2026-10-23.md): pinned sources, selective ports and deferred candidates.
 - [Compatibility and verification](docs/compatibility.md): tested host, dependency ownership and integration limits.
 - [Design decisions](docs/open-decisions.md): isolation, deferred imports, orchestration and resource admission.

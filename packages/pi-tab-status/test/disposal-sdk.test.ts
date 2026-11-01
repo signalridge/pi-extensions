@@ -20,7 +20,7 @@ const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 for (const scenario of ["headless run", "TUI run", "settlement"] as const) {
   test(`installed SDK dispose during ${scenario} leaves no throwing or recurring title timers`, async () => {
-    assert.equal(VERSION, "1.0.4");
+    assert.equal(VERSION, "1.4.0");
     const cwd = mkdtempSync(join(tmpdir(), "tab-dispose-"));
     const agentDir = join(cwd, "agent");
     mkdirSync(agentDir);

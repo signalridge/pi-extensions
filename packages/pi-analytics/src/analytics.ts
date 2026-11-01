@@ -136,6 +136,9 @@ export function createAnalyticsExtension(
       if (generation !== sessionGeneration || tracker !== skillTracker || activeCollector !== collector) {
         return;
       }
+      // Custom runs need the live discovery map too, but must not consume an
+      // explicit user skill or trigger. turn_start attributes them to extensions.
+      if (event.messageType === "custom") return;
       const explicit = tracker.consumeExplicitSkill();
       dispatchedModel = undefined;
       assistant = undefined;
@@ -275,8 +278,12 @@ export function createAnalyticsExtension(
       dispatchedModel = undefined;
       assistant = undefined;
       pendingAttemptWithoutRun = false;
-      pendingTriggerSource = "unknown";
-      skillTracker?.clearPending();
+      // An extension-started cycle did not consume pending user preflight.
+      // Settlement must not erase that input before its own run can begin.
+      if (run?.triggerSource !== "extension") {
+        pendingTriggerSource = "unknown";
+        skillTracker?.clearPending();
+      }
       if (run) await persistRun(run, ctx, generation, owner.signal);
     });
 

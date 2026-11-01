@@ -70,6 +70,20 @@ function hasContextWindowCode(event: JsonObject): boolean {
   );
 }
 
+// The same item can arrive in output_item.done and again in the completed
+// output with its keys in another order. Compare identity with sorted keys at
+// every depth; the stored item and array order stay as received.
+function compactionItemKey(item: JsonObject): string {
+  return JSON.stringify(item, (_key, value: unknown) => {
+    if (!isObject(value)) return value;
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, value[key]]),
+    );
+  });
+}
+
 function compactionItemsFromEvent(event: JsonObject): unknown[] {
   const items: unknown[] = [];
   if (event.type === "response.output_item.done" && isObject(event.item)) {
@@ -162,7 +176,7 @@ export async function collectCompactionSse(
     }
     for (const candidate of compactionItemsFromEvent(parsed)) {
       const item = validateCompactionItem(candidate, options.maxItemBytes);
-      items.set(JSON.stringify(item), item);
+      items.set(compactionItemKey(item), item);
     }
   };
   const processLine = (line: string) => {

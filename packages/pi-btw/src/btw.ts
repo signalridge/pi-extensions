@@ -85,12 +85,12 @@ interface LoadBtwThinkingLevelOptions {
   warn?: (message: string) => void;
 }
 
-type BtwModelRegistry = Pick<ExtensionCommandContext["modelRegistry"], "find" | "getApiKeyAndHeaders">;
+export type BtwModelRegistry = Pick<ExtensionCommandContext["modelRegistry"], "find" | "getApiKeyAndHeaders">;
 
-type BtwProviderRegistry = Pick<ExtensionCommandContext["modelRegistry"], "getProvider"> &
+export type BtwProviderRegistry = Pick<ExtensionCommandContext["modelRegistry"], "getProvider"> &
   Partial<Pick<ExtensionCommandContext["modelRegistry"], "streamSimple">>;
 
-function isVirtualBtwModel(model: Model<Api>): boolean {
+export function isVirtualBtwModel(model: Model<Api>): boolean {
   return model.api === "pi-virtual";
 }
 
@@ -146,6 +146,37 @@ export interface BtwThreadState {
   activitySequence?: number;
 }
 
+export type ConfiguredBtwModelResolution =
+  | { kind: "selected"; selected: ResolvedBtwModel }
+  | { kind: "invalid" }
+  | { kind: "missing" }
+  | { kind: "unavailable"; model: Model<Api>; reason: string }
+  | { kind: "failed"; model: Model<Api>; reason: string }
+  | { kind: "stale" };
+
+/** Resolve one configured `provider/model-id` and its request credentials, without any fallback. */
+export async function resolveConfiguredBtwModel(
+  reference: string,
+  modelRegistry: BtwModelRegistry,
+  isCurrent: () => boolean = () => true,
+): Promise<ConfiguredBtwModelResolution> {
+  const parsed = parseBtwModelReference(reference);
+  if (!parsed) return { kind: "invalid" };
+  const model = modelRegistry.find(parsed.provider, parsed.modelId);
+  if (!model) return { kind: "missing" };
+  if (isVirtualBtwModel(model)) return { kind: "selected", selected: { model, auth: {} } };
+  try {
+    if (!isCurrent()) return { kind: "stale" };
+    const auth = await modelRegistry.getApiKeyAndHeaders(model);
+    if (!isCurrent()) return { kind: "stale" };
+    if (auth.ok) return { kind: "selected", selected: resolvedPhysicalBtwModel(model, auth) };
+    return { kind: "unavailable", model, reason: auth.error };
+  } catch (error: unknown) {
+    if (!isCurrent()) return { kind: "stale" };
+    return { kind: "failed", model, reason: formatError(error) };
+  }
+}
+
 export async function resolveBtwModel({
   settings,
   currentModel,
@@ -157,31 +188,26 @@ export async function resolveBtwModel({
   const reportWarning = (message: string) => warn?.(sanitizeSingleLine(message));
   if (settings.model) {
     const fallback = currentModel ? `${currentModel.provider}/${currentModel.id}` : "the current model";
-    const reference = parseBtwModelReference(settings.model);
-    if (!reference) {
+    const configured = await resolveConfiguredBtwModel(settings.model, modelRegistry, isCurrent);
+    if (configured.kind === "stale") return undefined;
+    if (configured.kind === "selected") return configured.selected;
+    if (configured.kind === "invalid") {
       reportWarning(`pi-btw model ${settings.model} is invalid; falling back to ${fallback}.`);
       return resolveBtwModel({ settings: {}, currentModel, modelRegistry, warn: reportWarning, isCurrent });
     }
-    const configuredModel = modelRegistry.find(reference.provider, reference.modelId);
-    if (!configuredModel) {
+    if (configured.kind === "missing") {
       reportWarning(`pi-btw model ${settings.model} was not found; falling back to ${fallback}.`);
     } else {
+      const configuredModel = configured.model;
       const sameAsCurrent =
         configuredModel === currentModel ||
         (configuredModel.provider === currentModel?.provider && configuredModel.id === currentModel.id);
       const fallbackAction = sameAsCurrent ? "no distinct current model is available" : `falling back to ${fallback}`;
-      if (isVirtualBtwModel(configuredModel)) return { model: configuredModel, auth: {} };
-      try {
-        if (!isCurrent()) return undefined;
-        const auth = await modelRegistry.getApiKeyAndHeaders(configuredModel);
-        if (!isCurrent()) return undefined;
-        if (auth.ok) return resolvedPhysicalBtwModel(configuredModel, auth);
-        const reason = auth.error;
-        reportWarning(`pi-btw model ${settings.model} is unavailable (${reason}); ${fallbackAction}.`);
-      } catch (error: unknown) {
-        if (!isCurrent()) return undefined;
-        reportWarning(`pi-btw model ${settings.model} credentials failed (${formatError(error)}); ${fallbackAction}.`);
-      }
+      reportWarning(
+        configured.kind === "unavailable"
+          ? `pi-btw model ${settings.model} is unavailable (${configured.reason}); ${fallbackAction}.`
+          : `pi-btw model ${settings.model} credentials failed (${configured.reason}); ${fallbackAction}.`,
+      );
       if (sameAsCurrent) return undefined;
     }
   }
@@ -222,7 +248,7 @@ export async function loadBtwThinkingLevel(
 
   options.warn?.(
     sanitizeSingleLine(
-      `pi-btw settings ignored: ${settings.reason}; expected optional model "provider/model-id", thinkingLevel "${BTW_THINKING_LEVELS.join('" | "')}", and boolean rememberThinkingLevelChanges. Using current Pi thinking level.`,
+      `pi-btw settings ignored: ${settings.reason}; expected optional model and advisorModel "provider/model-id", thinkingLevel "${BTW_THINKING_LEVELS.join('" | "')}", and boolean rememberThinkingLevelChanges. Using current Pi thinking level.`,
     ),
   );
   return currentThinkingLevel;
@@ -1235,7 +1261,7 @@ type SessionEntry = {
   message?: SessionMessage;
 };
 
-function buildSessionConversationContext(manager: ExtensionCommandContext["sessionManager"]): string {
+export function buildSessionConversationContext(manager: ExtensionCommandContext["sessionManager"]): string {
   // Pi 0.87+ applies context edits in the projection; raw branch messages can
   // contain omitted or replaced content that must not reach the side provider.
   if (typeof manager.buildSessionProjection === "function") {

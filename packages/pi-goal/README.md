@@ -30,6 +30,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 - Detects budget exhaustion after completed tool activity when assistant usage is persisted, then injects at most one non-user-authored wrap-up instruction and blocks further substantive tools.
 - Keeps retryable provider interruptions and Pi compaction retries active without enqueueing duplicate goal continuations while Pi retries, then marks a matching unresolved error `blocked` only when `agent_settled` proves no retry, compaction, or follow-up remains.
 - Preserves active goals across manual, threshold, and overflow compaction.
+- Blocks a goal whose context overflowed the model window with no compaction after it (an unrecovered overflow error, or a response whose usage exceeds the window) instead of continuing into the same failing request, and says to run `/compact` (or `/codex-compact` when installed) or start a new session, then `/goal resume`. A due `goal_wait` stays paused in that state, with one warning, and wakes after a compaction.
 - Guards auto-follow-ups and Goal-owned kickoff deliveries so duplicate, replaced, stopped, cleared, completed, budget-limited, or stale queued prompts cannot continue or overwrite a newer goal.
 - Rotates the completion guard id when a goal is resumed or edited so delayed old turns cannot complete the newer goal instance.
 - Blocks stale tool calls after in-flight work pauses, blocks, or reaches a usage limit, until fresh non-goal user work, successful reactivation/replacement, or clear.
@@ -38,7 +39,7 @@ Goal mode uses Codex-like persistence instructions and sends guarded continuatio
 
 ## Install
 
-The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
+The current tested host is Pi `1.4.0`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details. The `agent_settled` lifecycle event this extension depends on landed in `0.80.6`.
 
 ```bash
 pi install npm:@signalridge/pi-goal

@@ -35,7 +35,7 @@ for (const override of [false, true]) {
         import agentGuidance from ${JSON.stringify(new URL("../agent-guidance.ts", import.meta.url).href)};
         assert.equal(getAgentDir(), ${JSON.stringify(agentDir)});
         let handler;
-        agentGuidance({ on: (_name, callback) => { handler = callback; } });
+        agentGuidance({ on: (name, callback) => { if (name === "before_agent_start") handler = callback; } });
         const cwd = ${JSON.stringify(project)};
         const run = (provider, id) => handler({ systemPrompt: "base" }, { cwd, model: { provider, id } });
         const prompt = (await run("openai", "gpt-test")).systemPrompt;

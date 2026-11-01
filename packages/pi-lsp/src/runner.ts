@@ -47,6 +47,60 @@ export async function runDiagnostics(
     });
   }
 
+  return withLspClient(
+    adapter,
+    root,
+    timeoutMs,
+    signal,
+    ctx,
+    statusKey,
+    `${adapter.name} diagnostics`,
+    async (client) => {
+      const openedFiles: Array<{ file: string; uri: string }> = [];
+      try {
+        for (const file of files) {
+          throwIfAborted(signal, adapter);
+          const uri = pathToFileURL(file).href;
+          const text = readFileSync(file, "utf8");
+          client.didOpen(uri, text, adapter.languageIdFor(file));
+          openedFiles.push({ file, uri });
+        }
+
+        const entries: DiagnosticEntry[] = await Promise.all(
+          openedFiles.map(async ({ file, uri }) => ({
+            path: path.relative(root, file) || file,
+            uri,
+            diagnostics: await client.diagnostics(uri),
+          })),
+        );
+        throwIfAborted(signal, adapter);
+        return textResult(
+          formatDiagnostics(adapter, entries),
+          { root, command, files: entries, summary: summarize(entries) },
+          boundOutput,
+        );
+      } finally {
+        for (const { uri } of openedFiles) client.didClose(uri);
+      }
+    },
+  );
+}
+
+/**
+ * Own one per-call server: lease admission, cancellation, status, start and
+ * initialize, then confirmed cleanup. A cleanup error never replaces an
+ * operation error.
+ */
+export async function withLspClient<T>(
+  adapter: LspServerAdapter,
+  root: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  ctx: StatusContext,
+  statusKey: string,
+  label: string,
+  operation: (client: LspClient) => Promise<T>,
+): Promise<T> {
   throwIfAborted(signal, adapter);
   const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
   const abort = () => client.close();
@@ -57,39 +111,13 @@ export async function runDiagnostics(
   let operationFailed = false;
   try {
     throwIfAborted(signal, adapter);
-    finishStatus = beginStatus(ctx, statusKey, `${adapter.name} diagnostics`);
+    finishStatus = beginStatus(ctx, statusKey, label);
     throwIfAborted(signal, adapter);
     await client.start();
     throwIfAborted(signal, adapter);
     await client.initialize(root);
     throwIfAborted(signal, adapter);
-
-    const openedFiles: Array<{ file: string; uri: string }> = [];
-    try {
-      for (const file of files) {
-        throwIfAborted(signal, adapter);
-        const uri = pathToFileURL(file).href;
-        const text = readFileSync(file, "utf8");
-        client.didOpen(uri, text, adapter.languageIdFor(file));
-        openedFiles.push({ file, uri });
-      }
-
-      const entries: DiagnosticEntry[] = await Promise.all(
-        openedFiles.map(async ({ file, uri }) => ({
-          path: path.relative(root, file) || file,
-          uri,
-          diagnostics: await client.diagnostics(uri),
-        })),
-      );
-      throwIfAborted(signal, adapter);
-      return textResult(
-        formatDiagnostics(adapter, entries),
-        { root, command, files: entries, summary: summarize(entries) },
-        boundOutput,
-      );
-    } finally {
-      for (const { uri } of openedFiles) client.didClose(uri);
-    }
+    return await operation(client);
   } catch (error) {
     operationFailed = true;
     throw error;
@@ -116,11 +144,8 @@ export async function runFix(
   throwIfAborted(signal, adapter);
   const root = resolveRoot(params.root);
   const file = resolveSupportedFile(adapter, root, params.path);
-  const rootStat = statSync(root);
-  const workspace = { root: realpathSync(root), dev: rootStat.dev, ino: rootStat.ino };
-  // Namespace lookup keeps loading compatible with hosts predating the public queue.
-  const queue = (piHost as { withFileMutationQueue?: <T>(file: string, run: () => Promise<T>) => Promise<T> })
-    .withFileMutationQueue;
+  const workspace = captureWorkspace(root);
+  const queue = fileMutationQueue();
   const run = () =>
     runFixWindow(adapter, { ...params, root, path: file }, timeoutMs, signal, ctx, statusKey, workspace);
   return params.write && queue ? queue(file, run) : run();
@@ -141,21 +166,7 @@ async function runFixWindow(
 
   throwIfAborted(signal, adapter);
   assertFixWorkspace(adapter, root, workspace, file);
-  const { client, releaseWhenClosed } = await acquireClient(adapter, root, timeoutMs);
-  const abort = () => client.close();
-  signal?.addEventListener("abort", abort, { once: true });
-  if (signal?.aborted) abort();
-
-  let finishStatus: (() => void) | undefined;
-  let operationFailed = false;
-  try {
-    throwIfAborted(signal, adapter);
-    finishStatus = beginStatus(ctx, statusKey, `${adapter.name} fix`);
-    throwIfAborted(signal, adapter);
-    await client.start();
-    throwIfAborted(signal, adapter);
-    await client.initialize(root);
-    throwIfAborted(signal, adapter);
+  return withLspClient(adapter, root, timeoutMs, signal, ctx, statusKey, `${adapter.name} fix`, async (client) => {
     const uri = pathToFileURL(file).href;
     assertFixWorkspace(adapter, root, workspace, file);
     const fd = openSync(file, "r");
@@ -210,44 +221,46 @@ async function runFixWindow(
       edits,
       text: !params.write && changed ? newText : undefined,
     });
-  } catch (error) {
-    operationFailed = true;
-    throw error;
-  } finally {
-    try {
-      await shutdownClient(client, operationFailed);
-    } finally {
-      signal?.removeEventListener("abort", abort);
-      releaseWhenClosed();
-      finishStatus?.();
-    }
-    if (!operationFailed) throwIfAborted(signal, adapter);
-  }
+  });
 }
 
-interface FixWorkspace {
+export type FileMutationQueue = <T>(file: string, run: () => Promise<T>) => Promise<T>;
+
+/** Pi's native per-file mutation queue, shared with the built-in edit and write tools. */
+export function fileMutationQueue(): FileMutationQueue | undefined {
+  // Namespace lookup keeps loading compatible with hosts predating the public queue.
+  return (piHost as { withFileMutationQueue?: FileMutationQueue }).withFileMutationQueue;
+}
+
+export interface FixWorkspace {
   root: string;
   dev: number;
   ino: number;
 }
 
-interface FixSnapshot {
+export interface FixSnapshot {
   dev: number;
   ino: number;
   bytes: Buffer;
 }
 
-function sameFile(left: { dev: number; ino: number }, right: { dev: number; ino: number }) {
+export function sameFile(left: { dev: number; ino: number }, right: { dev: number; ino: number }) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function staleFixError(file: string) {
-  return new Error(`File changed while computing LSP fixes; left unchanged: ${file}. Retry the fix.`);
+export function staleFixError(file: string, action: "fix" | "rename" = "fix") {
+  const computed = action === "fix" ? "fixes" : "rename edits";
+  return new Error(`File changed while computing LSP ${computed}; left unchanged: ${file}. Retry the ${action}.`);
 }
 
-function readFixSnapshot(fd: number, file: string): FixSnapshot {
+export function captureWorkspace(root: string): FixWorkspace {
+  const rootStat = statSync(root);
+  return { root: realpathSync(root), dev: rootStat.dev, ino: rootStat.ino };
+}
+
+export function readFixSnapshot(fd: number, file: string, action: "fix" | "rename" = "fix"): FixSnapshot {
   const before = fstatSync(fd);
-  if (!before.isFile()) throw staleFixError(file);
+  if (!before.isFile()) throw staleFixError(file, action);
   const bytes = readFileSync(fd);
   const after = fstatSync(fd);
   if (
@@ -258,37 +271,67 @@ function readFixSnapshot(fd: number, file: string): FixSnapshot {
     before.ctimeMs !== after.ctimeMs ||
     bytes.length !== after.size
   )
-    throw staleFixError(file);
+    throw staleFixError(file, action);
   return { dev: after.dev, ino: after.ino, bytes };
 }
 
-function assertFixWorkspace(adapter: LspServerAdapter, root: string, workspace: FixWorkspace, file: string) {
-  if (realpathSync(root) !== workspace.root || !sameFile(workspace, statSync(root))) throw staleFixError(file);
+export function assertFixWorkspace(
+  adapter: LspServerAdapter,
+  root: string,
+  workspace: FixWorkspace,
+  file: string,
+  action: "fix" | "rename" = "fix",
+) {
+  if (realpathSync(root) !== workspace.root || !sameFile(workspace, statSync(root))) throw staleFixError(file, action);
   // Containment is relative to the captured boundary, never a retargeted root.
-  resolveSupportedFile(adapter, workspace.root, file);
+  return resolveSupportedFile(adapter, workspace.root, file);
 }
 
-function writeFreshFix(
+/** Read-only form of the final write check, so a multi-file write can verify every file first. */
+export function assertFreshFile(
+  adapter: LspServerAdapter,
+  root: string,
+  workspace: FixWorkspace,
+  file: string,
+  original: FixSnapshot,
+  action: "fix" | "rename" = "fix",
+) {
+  assertFixWorkspace(adapter, root, workspace, file, action);
+  const fd = openSync(file, "r");
+  try {
+    const current = readFixSnapshot(fd, file, action);
+    assertFixWorkspace(adapter, root, workspace, file, action);
+    if (!sameFile(original, current) || !sameFile(current, statSync(file)) || !original.bytes.equals(current.bytes))
+      throw staleFixError(file, action);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function writeFreshFix(
   adapter: LspServerAdapter,
   root: string,
   workspace: FixWorkspace,
   file: string,
   original: FixSnapshot,
   text: string,
+  action: "fix" | "rename" = "fix",
 ) {
-  assertFixWorkspace(adapter, root, workspace, file);
+  assertFixWorkspace(adapter, root, workspace, file, action);
   // Open without truncation, then validate both the descriptor and its live
   // workspace path. Write through this descriptor, not a newly followed link.
   const fd = openSync(file, "r+");
   try {
-    const current = readFixSnapshot(fd, file);
-    assertFixWorkspace(adapter, root, workspace, file);
+    const current = readFixSnapshot(fd, file, action);
+    assertFixWorkspace(adapter, root, workspace, file, action);
     if (!sameFile(original, current) || !sameFile(current, statSync(file)) || !original.bytes.equals(current.bytes))
-      throw staleFixError(file);
+      throw staleFixError(file, action);
     const bytes = Buffer.from(text, "utf8");
     let offset = 0;
     while (offset < bytes.length) {
-      offset += writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      const written = writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (written <= 0) throw new Error(`Unable to make progress writing ${file}.`);
+      offset += written;
     }
     ftruncateSync(fd, bytes.length);
   } finally {
@@ -362,7 +405,7 @@ function severityName(severity: number | undefined) {
   return "diagnostic";
 }
 
-function throwIfAborted(signal: AbortSignal | undefined, adapter: LspServerAdapter) {
+export function throwIfAborted(signal: AbortSignal | undefined, adapter: LspServerAdapter) {
   if (signal?.aborted) throw new Error(`${adapter.name} LSP request aborted.`);
 }
 

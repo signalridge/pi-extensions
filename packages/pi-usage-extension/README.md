@@ -6,7 +6,7 @@ A Pi extension that displays aggregated usage statistics across all sessions.
 
 ## Compatibility
 
-- **Tested Pi host:** `1.0.4` — see the `peerDependencies` range for installation compatibility.
+- **Tested Pi host:** `1.4.0` — see the `peerDependencies` range for installation compatibility.
 
 Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped. For partial scans, only missing contributions are counted when all six child cost/token fields exactly sum to the report and each scanned contribution has an exact persisted vector. Inconsistent partial reports remain counted in full and a period-scoped unresolved-overlap insight warns that totals may double-count them, even with zero or unknown recorded cost; no exact residual is invented. This accounting-integrity warning also appears in zero-cost Insights and exports; ordinary spend insights still require recorded cost. Pi 0.87+ also records standalone model-attributed usage (such as cache warming); `/usage` counts it under its actual provider and model without adding a fictitious assistant message. A context edit explains the first request on its own branch only when its target was already in the previous assistant's model-visible context and remains in context after compaction; editing a newly appended user message does not mask a genuine cache-prefix miss. A `cache_warm` call refreshes the cache TTL only for its provider/model on that branch. Parent-linked journal entries also keep sibling compactions and assistant history separate. Sessions recorded by older Pi versions still parse; they simply carry no newer entry types.
 
@@ -136,7 +136,7 @@ The **Graphs** view plots usage over time for the active period as a braille lin
 - **Grouping** (`g` to cycle): by provider, by model, by thinking level, or total only. The top 6 series are shown individually; the rest merge into an `other` series. A bold **Total** line is always drawn.
 - **Cumulative vs per-bucket** (`c` to toggle): running total across the period (default), or the raw per-bucket rate.
 - **Filtering**: move the legend cursor with `↑`/`↓` and toggle series visibility with `Enter`/`Space` (`a` shows all again). The y-axis rescales to the visible series — hide the big lines to zoom into the small ones.
-- **Buckets**: hourly for Today / This Week / Last Week, daily for Last 30 Days / All Time.
+- **Buckets**: hourly for Today / This Week / Last Week and for This Month during its first 8 days; daily for the rest of This Month, Last 30 Days and All Time.
 - **Line clipping**: every series (provider, model, thinking level, `other`, Total) is drawn only between its first and last bucket with usage, so late-starting or retired series don't drag a flat zero/flat tail across the whole period.
 
 A valid assistant `thinkingLevel` (including `off`) records the dispatched response's effort and takes precedence over the selected level. Otherwise, thinking levels are replayed along each session branch from `thinking_level_change` entries; messages with no recorded change in their ancestry (including a fresh root fork) appear as `unknown`. Response effort never changes the branch's selected level. Imported entries without parent links use append order. Auxiliary usage has no reliable thinking-level attribution and appears as `Tools/summaries` in that grouping. Reasoning token counts come from `usage.reasoning` where providers report them; pi only records this field since **pi 0.80.3 (30 June 2026)**, so earlier sessions show zero reasoning tokens even though thinking models were in use.
@@ -148,6 +148,7 @@ A valid assistant `thinkingLevel` (including `off`) records the dispatched respo
 | **Today** | From midnight (00:00) today |
 | **This Week** | From Monday 00:00 of the current week |
 | **Last Week** | Previous week (Monday 00:00 → this Monday 00:00) |
+| **This Month** | Calendar month to date, from 00:00 on the 1st of the current month |
 | **Last 30 Days** | Rolling window: the last 30 calendar days including today (from midnight 29 days back) |
 | **All Time** | All recorded sessions |
 
@@ -155,7 +156,7 @@ Use `Tab` or `←`/`→` to switch between periods.
 
 ### Timezone
 
-Time periods and collection hour buckets are calculated in the local timezone where Pi runs, including half-hour and quarter-hour offsets. Collection and graphs share civil-hour boundaries, splitting at offset transitions so partial hours (such as Lord Howe's 30-minute DST change) and repeated fall-back occurrences remain distinct. Daily graph buckets reconstruct each intended civil midnight independently; a skipped midnight normalizes only that date, not following dates. If you want to override it, set the `TZ` environment variable (IANA timezone, e.g. `TZ=UTC` or `TZ=America/New_York`) before launching Pi.
+Time periods and collection hour buckets are calculated in the local timezone where Pi runs, including half-hour and quarter-hour offsets. Collection and graphs share civil-hour boundaries, splitting at offset transitions so partial hours (such as Lord Howe's 30-minute DST change) and repeated fall-back occurrences remain distinct. Daily graph buckets reconstruct each intended civil midnight independently; a skipped midnight normalizes only that date, not following dates. This Month starts from the civil date of the 1st rather than a count of elapsed days, so month length and a DST change earlier in the month never move it; if DST skips midnight on the 1st, the month starts at that day's first instant. If you want to override it, set the `TZ` environment variable (IANA timezone, e.g. `TZ=UTC` or `TZ=America/New_York`) before launching Pi.
 
 ### Columns
 
@@ -230,6 +231,10 @@ Statistics are parsed recursively from session files in `~/.pi/agent/sessions/`,
 Copied usage is deduplicated by stable entry ID and its complete accounting fingerprint only when scanned session-file lineage proves the observations belong together. Sibling copies require a matching observation in a scanned common ancestor; proof is resolved before aggregation, independent of filename order. Independent reused IDs, conflicting vectors, and distinct parallel entry IDs remain separate. Nested-agent reports are suppressed when all child session files are scanned (resolved across copies of the parent entry, since branch copies change runId-derived paths). Exact partial reports contribute only missing child vectors; inconsistent partial reports retain their aggregate with an unresolved-overlap warning. Missing usage stays under `Tools / summaries`. Tool and summary usage contributes cost and tokens to totals, graphs, project/session mix, and burn trend, but does not count as an assistant message or distort conversation context/cache insights.
 
 Respects the `PI_CODING_AGENT_DIR` environment variable if set.
+
+## Provenance
+
+The This Month period adapts [`tmustier/pi-extensions`](https://github.com/tmustier/pi-extensions) commit `3de53e29` (MIT). The local version computes the month start from the local civil calendar with this package's DST-safe date helpers instead of adjusting a `Date` in place, and adds the period to the graph, export and insight views through the shared tab order.
 
 ## Changelog
 

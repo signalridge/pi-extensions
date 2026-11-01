@@ -30,6 +30,7 @@ import {
   parseSessionBuffer,
   projectLabelFromCwd,
   saveUsageCache,
+  TAB_ORDER,
 } from "../data.ts";
 
 // 2026-07-15 is a Wednesday. Week = Mon 13th 00:00 → …, last week = Mon 6th → Sun 12th.
@@ -40,6 +41,8 @@ const TS_LAST_WEEK = new Date(2026, 6, 10, 10, 0, 0).getTime(); // Friday last w
 const TS_OLD = new Date(2026, 5, 1, 10, 0, 0).getTime(); // 1 June — outside the 30-day window
 const TS_30D_EDGE_IN = new Date(2026, 5, 16, 0, 0, 0).getTime(); // midnight 29 days before 15 July — first instant inside
 const TS_30D_EDGE_OUT = new Date(2026, 5, 15, 23, 59, 59).getTime(); // one second earlier — outside
+const TS_MONTH_EDGE_IN = new Date(2026, 6, 1, 0, 0, 0).getTime(); // first instant of July
+const TS_MONTH_EDGE_OUT = new Date(2026, 6, 1, 0, 0, 0).getTime() - 1; // last instant of June
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "usage-data-"));
@@ -67,6 +70,11 @@ test("agent directory and derived paths match the public Pi API", (t) => {
     const expected = getPiAgentDir();
     assert.equal(getAgentDir(), expected);
     assert.equal(getSessionsDir(), join(expected, "sessions"));
+    // Pi's default per-cwd directory resolves to the shared root; a configured
+    // flat directory (--session-dir, env or setting) is read as-is.
+    assert.equal(getSessionsDir(join(expected, "sessions", "--tmp-project--")), join(expected, "sessions"));
+    const configured = join(tmpdir(), "configured-sessions");
+    assert.equal(getSessionsDir(configured), configured);
     assert.equal(getDefaultCachePath(), join(expected, "usage-extension-cache.json"));
   }
   assert.equal(getAgentDir, getPiAgentDir, "settings/export and accounting share Pi's public resolver");
@@ -1299,6 +1307,40 @@ test("collectUsageData buckets the rolling 30-day window from midnight 29 days b
   // The 30-day window overlaps but does not replace the week buckets.
   assert.equal(data.lastWeek.totals.cost, 4);
   assert.equal(data.today.totals.cost, 8);
+});
+
+test("This Month sits between Last Week and Last 30 Days in the tab order", () => {
+  assert.deepEqual(TAB_ORDER, ["today", "thisWeek", "lastWeek", "thisMonth", "last30Days", "allTime"]);
+});
+
+test("collectUsageData buckets This Month from the first instant of the local first", async (t) => {
+  const { sessionsDir, cachePath } = fixture(t);
+  writeFileSync(
+    join(sessionsDir, "june.jsonl"),
+    `${[sessionLine("s-june", TS_OLD), assistantLine({ id: "june", ts: TS_MONTH_EDGE_OUT, cost: 1 })].join("\n")}\n`,
+  );
+  writeFileSync(
+    join(sessionsDir, "july.jsonl"),
+    `${[
+      sessionLine("s-july", TS_MONTH_EDGE_OUT),
+      assistantLine({ id: "edge-out", ts: TS_MONTH_EDGE_OUT, cost: 2 }), // previous month
+      assistantLine({ id: "edge-in", ts: TS_MONTH_EDGE_IN, cost: 4 }), // first instant of this month
+      assistantLine({ id: "last-week", ts: TS_LAST_WEEK, cost: 8 }),
+      assistantLine({ id: "today", ts: TS_TODAY, cost: 16 }),
+    ].join("\n")}\n`,
+  );
+
+  const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+  assert.ok(data);
+  assert.equal(data.bounds.thisMonthStartMs, TS_MONTH_EDGE_IN);
+  assert.equal(data.thisMonth.totals.messages, 3);
+  assert.equal(data.thisMonth.totals.cost, 28);
+  assert.equal(data.thisMonth.totals.sessions, 1, "a session with only last month's usage is not counted");
+  assert.equal(data.thisMonth.providers.get("anthropic")?.cost, 28);
+  // The month overlaps the other periods without replacing them.
+  assert.equal(data.last30Days.totals.cost, 31);
+  assert.equal(data.lastWeek.totals.cost, 8);
+  assert.equal(data.allTime.totals.cost, 31);
 });
 
 test("collectUsageData ignores files without a session header", async (t) => {
@@ -3120,6 +3162,11 @@ test("projectLabelFromCwd collapses cwds to stable project labels", () => {
   assert.equal(projectLabelFromCwd("/Users/olduser/projects/customers/xpo"), "~/projects/customers");
   assert.equal(projectLabelFromCwd("/home/olduser/work"), "~/work");
   assert.equal(projectLabelFromCwd("/Users/olduser"), "~");
+  // Windows separators and drive paths, including homes from other machines.
+  assert.equal(projectLabelFromCwd("C:\\Users\\rider\\projects\\foo\\sub"), "~/projects/foo");
+  assert.equal(projectLabelFromCwd("C:\\Users\\rider"), "~");
+  assert.equal(projectLabelFromCwd("D:\\work\\repo\\sub"), "work/repo");
+  assert.equal(projectLabelFromCwd("D:/work/repo/.worktrees/x"), "work/repo");
 });
 
 test("loadUsageCache returns empty for a missing cache file", async (t) => {

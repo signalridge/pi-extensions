@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { checkpointGoalActiveTime, formatDuration, formatTokenCount, updateGoalUsage } from "./accounting.js";
+import { compactCommands, contextOverflowEpisode } from "./context-overflow.js";
 import { formatError, notifyTerminal, truncateNotification } from "./errors.js";
 import { appendGoalPromptMarker, extractContinuationMarker, extractGoalPromptMarker } from "./markers.js";
 import {
@@ -102,6 +103,8 @@ export interface StatusContext {
   hasPendingMessages?: () => boolean;
   abort?: () => void;
   sessionManager?: unknown;
+  model?: { contextWindow?: number };
+  modelRegistry?: { find(provider: string, model: string): { contextWindow?: number } | undefined };
 }
 
 export const STATUS_KEY = "goal";
@@ -211,6 +214,8 @@ export class GoalRuntime {
   activeGoal?: ActiveGoal;
   /** The single `goal_wait` safety wake-up. Cancelled with continuation work. */
   private readonly goalWaitTimer = new GoalWaitTimer();
+  /** One wait-hold notice per overflow episode. */
+  private noticedOverflowEpisode?: string;
   /** Terminal details captured for the matching persisted-state snapshot. */
   private terminalDetails?: GoalTerminalDetails;
   private goalStateSink?: (snapshot: GoalStateSnapshot) => void;
@@ -388,6 +393,11 @@ export class GoalRuntime {
       return false;
     }
     if (ctx.isIdle?.() !== true || hasPendingMessages(ctx)) return false;
+    // A response that silently overflowed (no error) still leaves an over-window context.
+    if (contextOverflowEpisode(ctx) !== undefined) {
+      this.blockGoalForContextOverflow(ctx, intent.goalId, "");
+      return false;
+    }
 
     this.clearContinuationDispatchTimer();
     this.continuationIntent = undefined;
@@ -714,6 +724,7 @@ export class GoalRuntime {
     const goal = this.activeGoal;
     if (goal?.id !== recovery.goalId || goal.status !== "active") return false;
     const details = recovery.errorMessage ? `: ${truncateNotification(recovery.errorMessage)}` : "";
+    if (recovery.kind === "compaction_retry") return this.blockGoalForContextOverflow(ctx, goal.id, details);
     const stoppedGoal = this.stopActiveGoal(ctx, {
       kind: "retry_exhausted",
       expectedGoalId: goal.id,
@@ -725,6 +736,37 @@ export class GoalRuntime {
       `Goal blocked after agent error retries were exhausted${details}. Resolve the blocker or run /goal resume to retry.`,
       "warning",
     );
+    return true;
+  }
+
+  /** No compaction followed the overflow, so every further goal turn would overflow again. */
+  private blockGoalForContextOverflow(ctx: StatusContext, goalId: string, details: string) {
+    const stoppedGoal = this.stopActiveGoal(ctx, {
+      kind: "retry_exhausted",
+      expectedGoalId: goalId,
+      reason: `context exceeds the model window${details}`,
+    });
+    if (!stoppedGoal) return false;
+    notifyTerminal(
+      ctx.ui,
+      `Goal blocked: the context exceeds the model's window${details}. Run ${compactCommands(this.pi)}, or start a new session, then /goal resume.`,
+      "warning",
+    );
+    return true;
+  }
+
+  /** A due wait stays paused while its wake would overflow; compaction reschedules it. */
+  private holdsGoalWaitForOverflow(ctx: StatusContext) {
+    const episode = contextOverflowEpisode(ctx);
+    if (episode === undefined) return false;
+    if (episode !== this.noticedOverflowEpisode) {
+      this.noticedOverflowEpisode = episode;
+      notifyTerminal(
+        ctx.ui,
+        `Goal wait is due, but the context exceeds the model's window; the goal stays paused. Run ${compactCommands(this.pi)}, or start a new session.`,
+        "warning",
+      );
+    }
     return true;
   }
 
@@ -825,7 +867,13 @@ export class GoalRuntime {
       this.ambiguousWaitInputGoalId === goal.id ||
       this.pendingInputWake?.waitingGoal === goal ||
       this.pendingDirectInputs.some((pending) => pending.realInput && pending.waiting && pending.goalId === goal.id);
-    if (pendingRealInput || !this.toolPolicy.toolsAvailable() || ctx.isIdle?.() !== true || hasPendingMessages(ctx)) {
+    if (
+      pendingRealInput ||
+      !this.toolPolicy.toolsAvailable() ||
+      ctx.isIdle?.() !== true ||
+      hasPendingMessages(ctx) ||
+      this.holdsGoalWaitForOverflow(ctx)
+    ) {
       // Input preflight and tool-loadout changes need not emit agent_settled.
       // Never infer rejection from elapsed time: a slow accepted input could
       // otherwise race a second prompt. Explicit /goal resume remains available.

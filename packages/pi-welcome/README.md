@@ -18,7 +18,7 @@ an abandoned branch.
 │  Session:    (new)                                                      │
 │  Model:      openai-codex / gpt-5.6-luna · thinking max                 │
 │  Budget:     400K · compacts at 270K                                    │
-│  pi v1.0.4                                                             │
+│  pi v1.4.0                                                             │
 │                                                                         │
 │  Inventory:  live at render                                            │
 │  Context:    AGENTS.md                                                  │
@@ -35,7 +35,7 @@ The card leads with a compact Pi mark and the running host version.
 
 ## Install
 
-The current tested host is Pi `1.0.4`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details.
+The current tested host is Pi `1.4.0`. Host-provided dependencies use `"*"` peers to identify module ownership, not to guarantee compatibility with every Pi version. See the [compatibility guide](https://github.com/signalridge/pi-extensions/blob/main/docs/compatibility.md) for verification details.
 
 ```bash
 pi install npm:@signalridge/pi-welcome

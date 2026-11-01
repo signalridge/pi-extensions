@@ -66,6 +66,7 @@ import {
   type ManagedSpawnTombstone,
   type SpawnOptions,
 } from "./agent-manager.js";
+import { AGENT_RECORD_ENTRY_TYPE, findSavedAgentRecord, type SavedAgentRecord } from "./agent-record-entry.js";
 import {
   getAgentConversation,
   getDefaultMaxTokens,
@@ -124,6 +125,7 @@ import {
 import { inChildSessionContext } from "./child-context.js";
 import { CompletionOutbox, NOTIFICATION_HOLD_MS } from "./completion-outbox.js";
 import { INHERIT_CONTEXT_UNAVAILABLE } from "./context-boundary.js";
+import { OverflowWakeGuard } from "./context-overflow.js";
 import {
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
@@ -703,10 +705,13 @@ function activateRootRuntime(
   // before they reach pi.sendMessage (fire-and-forget).
   let notificationsRetired = false;
   let parentRunning = false;
+  // One guard for completion notices and question wakes: one notice per overflow episode.
+  const overflowWakes = new OverflowWakeGuard(pi, "background subagent results are added to the conversation");
   const completionOutbox = new CompletionOutbox(
+    // An overflowed parent would resend the same over-window context; record the result for the next run instead.
     (message) => pi.sendMessage<NotificationDetails>(
       { customType: "subagent-notification", ...message, display: true },
-      { deliverAs: "steer", triggerTurn: true },
+      { deliverAs: "steer", triggerTurn: !overflowWakes.holds(currentCtx) },
     ),
     () => parentRunning || currentCtx?.isIdle?.() === false || currentCtx?.hasPendingMessages?.() === true,
   );
@@ -939,7 +944,7 @@ function activateRootRuntime(
     if (tombstone.state === "completed")
       pi.events.emit("subagents:completed", eventData);
     else pi.events.emit("subagents:failed", eventData);
-    pi.appendEntry("subagents:record", {
+    pi.appendEntry(AGENT_RECORD_ENTRY_TYPE, {
       id: tombstone.id,
       type: tombstone.type,
       description: tombstone.description,
@@ -998,6 +1003,36 @@ function activateRootRuntime(
     sessionUsageByType.set(record.type, entry);
   }
 
+  /**
+   * Persist a top-level record's terminal state. Every top-level settle writes
+   * one: `get_subagent_result` answers from the latest once the live record is
+   * gone, and other extensions reconstruct history from it.
+   */
+  function persistAgentRecord(record: AgentRecord): void {
+    pi.appendEntry(AGENT_RECORD_ENTRY_TYPE, {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      status: record.status,
+      result: boundedPersistedText(record.result),
+      error: boundedPersistedText(record.error),
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      compactionCount: record.compactionCount,
+      ...(record.outputFile ? { outputFile: record.outputFile } : {}),
+      ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
+        ? { tokens: record.lifetimeUsage.input + record.lifetimeUsage.output }
+        : {}),
+      ...(record.invocation?.agentTier === undefined
+        ? {}
+        : { tier: record.invocation.agentTier }),
+      ...(record.invocation?.agentTierSnapshot
+        ? { tierSnapshot: record.invocation.agentTierSnapshot }
+        : {}),
+      ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
+    });
+  }
+
   const manager = new AgentManager(
     (record) => {
       if (!record.detached) recordSessionUsage(record);
@@ -1029,29 +1064,7 @@ function activateRootRuntime(
         pi.events.emit("subagents:completed", eventData);
       }
 
-      // Persist final record for cross-extension history reconstruction
-      pi.appendEntry("subagents:record", {
-        id: record.id,
-        type: record.type,
-        description: record.description,
-        status: record.status,
-        result: boundedPersistedText(record.result),
-        error: boundedPersistedText(record.error),
-        startedAt: record.startedAt,
-        completedAt: record.completedAt,
-        compactionCount: record.compactionCount,
-        ...(record.outputFile ? { outputFile: record.outputFile } : {}),
-        ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
-          ? { tokens: record.lifetimeUsage.input + record.lifetimeUsage.output }
-          : {}),
-        ...(record.invocation?.agentTier === undefined
-          ? {}
-          : { tier: record.invocation.agentTier }),
-        ...(record.invocation?.agentTierSnapshot
-          ? { tierSnapshot: record.invocation.agentTierSnapshot }
-          : {}),
-        ...(record.owner ? { owner: snapshotOwner(record.owner) } : {}),
-      });
+      persistAgentRecord(record);
 
       // Shutdown still needs authoritative usage, lifecycle and persistence
       // receipts above. Only UI/notification delivery is retired.
@@ -1280,7 +1293,7 @@ function activateRootRuntime(
   // same session. Invalidate pending off-screen mention turns only when the
   // replacement commits: before-switch/tree handlers can still cancel it.
   let sessionGeneration = 0;
-  const parentQuestions = registerParentQuestions(pi, () => currentCtx);
+  const parentQuestions = registerParentQuestions(pi, () => currentCtx, ctx => overflowWakes.holds(ctx));
   manager.setParentQuestionFactory((record, ctx) => {
     const generation = sessionGeneration;
     const sessionId = ctx.sessionManager.getSessionId();
@@ -2697,12 +2710,16 @@ Terse command-style prompts produce shallow, generic work.
     label: "Agent",
     get description() { return agentToolDescription(); },
     promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
-    promptGuidelines: [
+    // A getter like the description: Pi reads it when it rebuilds the tool
+    // registry, after agent files and settings have been (re)loaded.
+    get promptGuidelines() { return [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
-      "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
+      // Name Explore only when it can be spawned: disableDefaultAgents or an
+      // Explore.md with enabled: false would point the model at no agent.
+      `For broad codebase exploration or research, spawn Agent with an appropriate subagent_type${getAvailableTypes().includes("Explore") ? " (e.g. Explore)" : ""}. Otherwise use direct tools (read, grep, find) when the target is already known.`,
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
-    ],
+    ]; },
     parameters: Type.Object({
       prompt: Type.String({
         description: "The task for the agent to perform.",
@@ -3285,6 +3302,10 @@ Terse command-style prompts produce shallow, generic work.
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
+        // A foreground resume settles inline, never through the completion
+        // callback: persist this run's outcome so a later get_subagent_result
+        // cannot answer with the earlier run's saved result.
+        if (!record.parentAgentId && !record.detached) persistAgentRecord(record);
         // A failed resume surfaces the error, plus any partial output THIS
         // resume produced (never the previous turn's answer, #144).
         if (record.status === "error") {
@@ -3609,6 +3630,14 @@ Terse command-style prompts produce shallow, generic work.
 
   // ---- get_subagent_result tool ----
 
+  /** get_subagent_result's answer from a saved record, once the live one is gone. */
+  const formatSavedAgentRecord = (saved: SavedAgentRecord): string =>
+    `Agent: ${saved.id}\n` +
+    `Type: ${getDisplayName(saved.type)} | Status: ${saved.status}${getStatusNote(saved.status)} | Duration: ${formatDuration(saved.startedAt, saved.completedAt)}\n` +
+    `Description: ${saved.description}\n` +
+    "(From the session's saved record: the live record has been cleaned up, so its stats and conversation are gone.)\n\n" +
+    (saved.status === "error" ? `Error: ${saved.error}${partialOutputSuffix(saved)}` : saved.result?.trim() || "No output.");
+
   pi.registerTool(
     defineTool({
       name: SUBAGENT_TOOL_NAMES.GET_RESULT,
@@ -3634,8 +3663,13 @@ Terse command-style prompts produce shallow, generic work.
           }),
         ),
       }),
-      execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
+      execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
         const record = manager.getRecordMutable(params.agent_id);
+        if (!record) {
+          // Evicted, or lost to a reload: answer from the record this branch saved.
+          const saved = findSavedAgentRecord(ctx.sessionManager.getBranch(), params.agent_id);
+          if (saved) return textResult(formatSavedAgentRecord(saved));
+        }
         if (!record || record.parentAgentId || record.detached) {
           return textResult(
             `Agent not found: "${params.agent_id}". It may have been cleaned up.`,
@@ -3681,10 +3715,10 @@ Terse command-style prompts produce shallow, generic work.
 
         if (record.status === "running") {
           output +=
-            "Agent is still running. Use wait: true or check back later.";
+            "Agent is still running. You will be notified when it completes; do not poll. Continue other work, or call again with wait: true only when you are blocked on this result.";
         } else if (record.status === "queued") {
           output +=
-            "Agent is queued and has not started yet. Use wait: true or check back later.";
+            "Agent is queued and has not started yet. You will be notified when it completes; do not poll. Continue other work, or call again with wait: true only when you are blocked on this result.";
         } else if (record.status === "error") {
           output += `Error: ${record.error}${partialOutputSuffix(record)}`;
         } else {

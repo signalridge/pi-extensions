@@ -438,10 +438,10 @@ test("all goal prompt paths share the goal_id guard and hardened audit", async (
   assertHardenedGoalPrompt(initialPrompt);
 
   const systemPrompt = started.mock.events.get("before_agent_start")?.[0]?.({ systemPrompt: "base" }, started.ctx) as
-    | { systemPrompt?: string }
+    | { systemPromptOptions: { sections: { pi_goal: string } } }
     | undefined;
-  assertPromptHasGoalId(systemPrompt?.systemPrompt ?? "", initialGoal.id);
-  assertHardenedGoalPrompt(systemPrompt?.systemPrompt ?? "");
+  assertPromptHasGoalId(systemPrompt?.systemPromptOptions.sections.pi_goal ?? "", initialGoal.id);
+  assertHardenedGoalPrompt(systemPrompt?.systemPromptOptions.sections.pi_goal ?? "");
 
   await started.mock.events.get("agent_end")?.[0]?.(
     { messages: [{ role: "assistant", stopReason: "stop" }] },

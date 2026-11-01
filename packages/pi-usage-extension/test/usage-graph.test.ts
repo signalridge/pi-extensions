@@ -14,6 +14,7 @@ const BOUNDS = {
   todayMs: TODAY,
   weekStartMs: new Date(2026, 6, 13, 0, 0, 0).getTime(), // Monday
   lastWeekStartMs: new Date(2026, 6, 6, 0, 0, 0).getTime(),
+  thisMonthStartMs: new Date(2026, 6, 1, 0, 0, 0).getTime(),
   last30DaysStartMs: new Date(2026, 5, 16, 0, 0, 0).getTime(),
   nowMs: NOW,
 };
@@ -190,6 +191,29 @@ test("buildGraphModel uses daily buckets and the domain rules per period", () =>
   assert.equal(m30.series[0].total, 3, "out-of-window usage must be excluded");
   assert.equal(m30.domainStartMs, BOUNDS.last30DaysStartMs);
   assert.equal(m30.domainEndMs, NOW);
+
+  const month = buildGraphModel(hourly, {
+    period: "thisMonth",
+    metric: "cost",
+    groupBy: "total",
+    cumulative: false,
+    bounds: BOUNDS,
+  });
+  assert.equal(month.domainStartMs, BOUNDS.thisMonthStartMs);
+  assert.equal(month.domainEndMs, NOW);
+  assert.equal(month.bucketMs, DAY, "14.5 days of the month exceed the hourly cap");
+  assert.equal(month.bucketStarts[0], BOUNDS.thisMonthStartMs);
+  assert.equal(month.series[0].total, 2, "previous-month usage must be excluded");
+
+  // Early in the month the same period stays hourly.
+  const early = buildGraphModel(hourly, {
+    period: "thisMonth",
+    metric: "cost",
+    groupBy: "total",
+    cumulative: false,
+    bounds: { ...BOUNDS, nowMs: BOUNDS.thisMonthStartMs + 3 * DAY },
+  });
+  assert.equal(early.bucketMs, HOUR);
 
   // lastWeek has a fixed end (this Monday), not now.
   const lw = buildGraphModel(hourly, {

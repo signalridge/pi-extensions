@@ -68,7 +68,7 @@ export class SafeInput {
 
   private key(data: string): void {
     if (!data) return;
-    // Pi 1.0.4 publicly exports its Kitty decoder. For modifyOtherKeys, inspect
+    // Pi 1.0.4-1.4.0 publicly export their Kitty decoder. For modifyOtherKeys, inspect
     // only codepoint safety; leave all decoding/key semantics to the native UI.
     // biome-ignore lint/suspicious/noControlCharactersInRegex: terminal key protocol
     const modified = /^\x1b\[27;\d+;(\d+)~$/u.exec(data);

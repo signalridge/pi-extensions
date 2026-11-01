@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ParentQuestionBroker, registerParentQuestions } from "../src/parent-questions.js";
 import { createSupervisorTool } from "../src/supervisor.js";
@@ -80,6 +80,30 @@ describe("parent clarification broker", () => {
 });
 
 describe("root wake gates", () => {
+  it.each(["retire", "replacement", "deadline"])("cancels bounded idle-gated compaction recovery on %s", async reason => {
+    vi.useFakeTimers();
+    const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
+    const sendUserMessage = vi.fn();
+    let idle = false;
+    const manager = SessionManager.inMemory();
+    const ctx = { isIdle: () => idle, hasPendingMessages: () => false, sessionManager: manager } as unknown as ExtensionContext;
+    const pi = { on: (name: string, handler: (event: never, ctx: ExtensionContext) => unknown) => handlers.set(name, handler), registerTool: () => {}, sendUserMessage } as unknown as ExtensionAPI;
+    const runtime = registerParentQuestions(pi, () => ctx);
+    const reply = runtime.broker.request(owner(), "pending?");
+    await vi.advanceTimersByTimeAsync(1);
+    handlers.get("session_compact")!({} as never, ctx);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    if (reason === "retire") runtime.retire();
+    else if (reason === "replacement") manager.newSession();
+    else await vi.advanceTimersByTimeAsync(30_000);
+    idle = true;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    runtime.retire();
+    expect(await reply).toMatchObject({ status: "unanswered" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
   it("ACKs a proven current frame at context and never lets an old token clear a new flight", async () => {
     vi.useFakeTimers();
     const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
@@ -102,7 +126,7 @@ describe("root wake gates", () => {
       return { messages };
     }
     const event = startFrame(firstToken);
-    const context = handlers.get("context")!(event as never, ctx) as { messages: unknown[] };
+    const context = handlers.get("context_with_system")!(event as never, ctx) as { messages: unknown[] };
     expect(JSON.stringify(context)).toContain("one?");
     expect(runtime.broker.context()).toBeUndefined(); // bounded one-use display
     handlers.get("agent_end")!({} as never, ctx);
@@ -113,7 +137,7 @@ describe("root wake gates", () => {
     const secondToken = sendUserMessage.mock.calls[1][0];
     expect(handlers.get("input")!({ text: firstToken, source: "extension" } as never, ctx)).toEqual({ action: "handled" });
     const secondEvent = startFrame(secondToken);
-    const secondContext = handlers.get("context")!(secondEvent as never, ctx) as { messages: unknown[] };
+    const secondContext = handlers.get("context_with_system")!(secondEvent as never, ctx) as { messages: unknown[] };
     expect(JSON.stringify(secondContext)).toContain("two?");
     expect(JSON.stringify(secondContext)).not.toContain("one?");
     await vi.advanceTimersByTimeAsync(30_001);
@@ -152,7 +176,7 @@ describe("root wake gates", () => {
       const user = { role: "user", content: [{ type: "text", text: admitted.text }, image] };
       const original = structuredClone(user);
       handlers.get("message_start")!({ message: user } as never, ctx);
-      expect(handlers.get("context")!({ messages: [user] } as never, ctx)).toEqual({ messages: [original] });
+      expect(handlers.get("context_with_system")!({ messages: [user] } as never, ctx)).toEqual({ messages: [original] });
       expect(user).toEqual(original);
       handlers.get("agent_end")!({} as never, ctx);
       signal = undefined;
@@ -199,7 +223,7 @@ describe("root wake gates", () => {
     const original = structuredClone(user);
     handlers.get("agent_start")!({} as never, ctx);
     handlers.get("message_start")!({ message: user } as never, ctx);
-    const result = handlers.get("context")!({ messages: [user] } as never, ctx) as { messages: unknown[] };
+    const result = handlers.get("context_with_system")!({ messages: [user] } as never, ctx) as { messages: unknown[] };
     expect(result.messages[0]).toEqual(original);
     expect(user).toEqual(original);
     expect(JSON.stringify(result.messages).includes("new question?")).toBe(!suppress);
@@ -245,7 +269,7 @@ describe("root wake gates", () => {
     const user = { role: "user", content: [{ type: "text", text: "genuine\u001buser" }, { type: "image", data: "original", mimeType: "image/png" }] };
     const original = structuredClone(user);
     const event = { messages: [user] };
-    const injected = handlers.get("context")!(event as never, ctx) as { messages: unknown[] };
+    const injected = handlers.get("context_with_system")!(event as never, ctx) as { messages: unknown[] };
     expect(injected.messages[0]).toBe(user);
     expect(user).toEqual(original);
     expect(event.messages).toEqual([original]);

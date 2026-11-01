@@ -14,7 +14,7 @@ vi.setConfig({ testTimeout: 30_000 });
 
 // Nested ctx.executeTool was added in Pi 0.99. Older hosts are covered by the
 // mocked loader/policy tests in agent-runner.test.ts.
-describe.skipIf(!VERSION.startsWith("0.99.") && VERSION !== "1.0.4")("child tool policy through real Pi nested calls", () => {
+describe.skipIf(VERSION !== "1.4.0")("child tool policy through real Pi nested calls", () => {
   let root: string;
   let cwd: string;
   let faux: ReturnType<typeof registerFauxProvider>;

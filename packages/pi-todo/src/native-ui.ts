@@ -19,10 +19,12 @@ export async function captureNativeUI(ui: ExtensionUIContext, guard: () => void)
   const draft = ui.getEditorText();
   let native: NativeUI | undefined;
   let finishBridge: (() => void) | undefined;
-  // SDK 1.0.4 custom completion unconditionally pops the last overlay. Use custom
-  // ONLY as a synchronous, non-capturing bridge to the public native TUI/theme.
-  // Complete in onHandle, before another interaction can interleave. Never hide
-  // this custom-created handle directly. Long-lived views use raw showOverlay.
+  // Before Pi 1.3.0 custom completion pops the topmost overlay; later hosts
+  // remove only the dialog's own handle. Use custom ONLY as a synchronous,
+  // non-capturing bridge to the public native TUI/theme. Complete in onHandle,
+  // while the bridge is still topmost and before another interaction can
+  // interleave, so both remove exactly the bridge. Never hide this
+  // custom-created handle directly. Long-lived views use raw showOverlay.
   await ui.custom<void>(
     (tui, theme, _keys, done) => {
       guard();

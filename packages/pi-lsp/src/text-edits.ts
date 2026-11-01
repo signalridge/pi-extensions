@@ -1,36 +1,18 @@
-import type { LspPosition, LspTextEdit, WorkspaceEdit } from "./types.js";
+import { textLines } from "./lines.js";
+import type { LspPosition, LspRange, LspTextEdit, WorkspaceEdit } from "./types.js";
 
 export function positionAt(text: string, offset: number): LspPosition {
   const boundedOffset = Math.max(0, Math.min(offset, text.length));
-  let line = 0;
-  let lineStart = 0;
-
-  for (let index = 0; index < boundedOffset; index += 1) {
-    if (text[index] === "\n") {
-      line += 1;
-      lineStart = index + 1;
-    }
-  }
-
-  return { line, character: boundedOffset - lineStart };
+  const lines = textLines(text);
+  let line = lines.length - 1;
+  while (line > 0 && (lines[line]?.start ?? 0) > boundedOffset) line--;
+  const bounds = lines[line];
+  return { line, character: bounds ? Math.min(boundedOffset, bounds.end) - bounds.start : 0 };
 }
 
-function offsetAt(text: string, position: LspPosition) {
-  let line = 0;
-  let lineStart = 0;
-
-  for (let index = 0; index < text.length && line < position.line; index += 1) {
-    if (text[index] === "\n") {
-      line += 1;
-      lineStart = index + 1;
-    }
-  }
-
-  if (line < position.line) return text.length;
-
-  let lineEnd = text.indexOf("\n", lineStart);
-  if (lineEnd < 0) lineEnd = text.length;
-  return Math.min(lineStart + position.character, lineEnd);
+export function offsetAt(text: string, position: LspPosition) {
+  const bounds = textLines(text)[Math.max(0, position.line)];
+  return bounds ? Math.min(bounds.start + Math.max(0, position.character), bounds.end) : text.length;
 }
 
 export function applyTextEdits(text: string, edits: LspTextEdit[]) {
@@ -79,6 +61,85 @@ function textEditRangesConflict(left: { start: number; end: number }, right: { s
   }
 
   return Math.max(left.start, right.start) < Math.min(left.end, right.end);
+}
+
+/**
+ * Describe the first edit whose range does not exist in `text`, which usually
+ * means the server computed it against different file contents. `offsetAt`
+ * clamps such ranges silently, so multi-file writes check them first.
+ */
+export function findInvalidTextEditRange(text: string, edits: LspTextEdit[]) {
+  const lines = textLines(text);
+  const valid = (position: LspPosition) => {
+    if (!isPosition(position)) return false;
+    const bounds = lines[position.line];
+    return bounds
+      ? position.character <= bounds.end - bounds.start
+      : position.line === lines.length && position.character === 0;
+  };
+  for (const edit of edits) {
+    const { start, end } = edit.range;
+    if (!valid(start) || !valid(end) || offsetAt(text, start) > offsetAt(text, end)) {
+      return `${start.line + 1}:${start.character + 1}-${end.line + 1}:${end.character + 1}`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Validate an untrusted WorkspaceEdit and group its text edits by URI, in
+ * order. Resource operations are returned separately for the caller to reject.
+ */
+export function flattenWorkspaceEdit(edit: unknown) {
+  const files = new Map<string, LspTextEdit[]>();
+  const resourceOperations: Array<{ kind: string; uris: string[] }> = [];
+  const add = (uri: unknown, edits: unknown) => {
+    if (typeof uri !== "string" || !Array.isArray(edits) || !edits.every(isTextEdit)) {
+      throw new Error("LSP server returned a malformed WorkspaceEdit.");
+    }
+    files.set(uri, [...(files.get(uri) ?? []), ...edits]);
+  };
+  if (edit === null || edit === undefined) return { files: [], resourceOperations };
+  if (!isRecord(edit)) throw new Error("LSP server returned a malformed WorkspaceEdit.");
+  if (edit.documentChanges !== undefined) {
+    if (!Array.isArray(edit.documentChanges)) throw new Error("LSP server returned a malformed WorkspaceEdit.");
+    for (const change of edit.documentChanges) {
+      if (!isRecord(change)) throw new Error("LSP server returned a malformed WorkspaceEdit.");
+      if (typeof change.kind === "string") resourceOperations.push(describeResourceOperation(change));
+      else add(isRecord(change.textDocument) ? change.textDocument.uri : undefined, change.edits);
+    }
+  } else if (edit.changes !== undefined) {
+    if (!isRecord(edit.changes)) throw new Error("LSP server returned a malformed WorkspaceEdit.");
+    for (const [uri, edits] of Object.entries(edit.changes)) add(uri, edits);
+  }
+  return { files: [...files].map(([uri, edits]) => ({ uri, edits })), resourceOperations };
+}
+
+function describeResourceOperation(change: Record<string, unknown>) {
+  const uris = change.kind === "rename" ? [change.oldUri, change.newUri] : [change.uri];
+  return { kind: String(change.kind), uris: uris.map(String) };
+}
+
+function isTextEdit(value: unknown): value is LspTextEdit {
+  return isRecord(value) && typeof value.newText === "string" && isRange(value.range);
+}
+
+export function isRange(value: unknown): value is LspRange {
+  return isRecord(value) && isPosition(value.start) && isPosition(value.end);
+}
+
+function isPosition(value: unknown): value is LspPosition {
+  return (
+    isRecord(value) &&
+    Number.isInteger(value.line) &&
+    Number.isInteger(value.character) &&
+    Number(value.line) >= 0 &&
+    Number(value.character) >= 0
+  );
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function collectWorkspaceEdits(edit: WorkspaceEdit | undefined, uri: string) {

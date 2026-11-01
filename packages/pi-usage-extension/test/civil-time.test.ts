@@ -32,3 +32,23 @@ for (const [zone, phase] of [
     assert.equal(result, "");
   });
 }
+
+for (const [zone, phase] of [
+  ["America/New_York", "lengths"],
+  ["America/Asuncion", "skipped-midnight"],
+]) {
+  test(`${zone}/${phase}: This Month starts on the local first`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "usage-civil-month-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const result = execFileSync(
+      "bun",
+      [fileURLToPath(new URL("./civil-month.fixture.ts", import.meta.url)), root, phase],
+      {
+        env: { ...process.env, TZ: zone },
+        encoding: "utf8",
+        timeout: 20_000,
+      },
+    );
+    assert.equal(result, "");
+  });
+}

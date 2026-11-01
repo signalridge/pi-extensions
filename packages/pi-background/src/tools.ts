@@ -1,14 +1,8 @@
 import { resolve } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type TSchema, Type } from "typebox";
-import {
-  assertLaunchCurrent,
-  commandApproval,
-  finalParameters,
-  registerApprovalAdapter,
-  startSnapshot,
-} from "./approval.js";
 import { type JobManager, type JobSnapshot, LIMITS, type WatchOptions } from "./contracts.js";
+import { assertLaunchCurrent, finalParameters, startSnapshot } from "./launch.js";
 import { validateWatch } from "./matcher.js";
 import { safeText, truncateUtf8 } from "./notifications.js";
 
@@ -160,7 +154,7 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       ],
       parameters: backgroundParameters,
       outputSchema,
-      async execute(call, params, signal, _update, ctx) {
+      async execute(_call, params, signal, _update, ctx) {
         const manager = runtime.manager(ctx);
         assertLaunchCurrent(manager, signal);
         const input = finalParameters(backgroundParameters, params);
@@ -171,10 +165,8 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
           timeoutMs: input.timeout_ms ?? 30 * 60 * 1000,
           attention: input.notify ?? "turn",
         });
-        const approval = commandApproval(pi, "bash_background", call, manager, options, signal);
-        if (approval) await approval.pending;
         assertLaunchCurrent(manager, signal);
-        const job = await manager.start(options, signal, approval?.guard);
+        const job = await manager.start(options, signal);
         return result(
           { jobs: [job], ...runtime.pending() },
           "Background job started; do useful independent work while it runs.",
@@ -192,7 +184,7 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
         "Start a long-lived local command OR attach a literal line matcher to an existing job. Supply exactly one of command/id and patterns. Each pattern notifies once by default; repeat uses a cooldown. Not regex; no model calls during monitoring. Attaching replaces prior rules; only future output matches.",
       parameters: monitorParameters,
       outputSchema,
-      async execute(call, params, signal, _update, ctx) {
+      async execute(_call, params, signal, _update, ctx) {
         const manager = runtime.manager(ctx);
         assertLaunchCurrent(manager, signal);
         const input = finalParameters(monitorParameters, params);
@@ -226,10 +218,8 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
             attention: input.notify ?? "turn",
             watch,
           });
-          const approval = commandApproval(pi, "monitor", call, manager, options, signal);
-          if (approval) await approval.pending;
           assertLaunchCurrent(manager, signal);
-          job = await manager.start(options, signal, approval?.guard);
+          job = await manager.start(options, signal);
         }
         return result(
           { jobs: [job], ...runtime.pending() },
@@ -335,7 +325,6 @@ export function registerTools(pi: ExtensionAPI, runtime: ToolRuntime): () => voi
       },
     }),
   );
-  registerApprovalAdapter(pi, schemas, (ctx) => runtime.manager(ctx));
   // Discovery is an action API: only call after runtime binding, not in the factory.
   return () => {
     const collisions = pi

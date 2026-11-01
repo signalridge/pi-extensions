@@ -189,7 +189,7 @@ export function snapshotBranch(cwd: string, branch: readonly SessionEntry[], par
   }
 }
 
-/** Pi 1.0.4 defers custom-only sessions until the first human turn. Materialize
+/** Pi 1.0.4-1.4.0 defer custom-only sessions until the first human turn. Materialize
  * exactly the public native header/entries, then re-open through the public API
  * to keep subsequent append persistence coherent. No synthetic model message. */
 export function persistHandoff(manager: SessionManager): string {

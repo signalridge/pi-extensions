@@ -7,7 +7,7 @@ import * as adapters from "../src/adapters.js";
 import extension from "../src/pi-lsp.js";
 import * as routes from "../src/routes.js";
 
-test("both tool roots are resolved against session cwd, including relative roots", async () => {
+test("every tool root is resolved against session cwd, including relative roots", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "lsp-context-"));
   mkdirSync(join(cwd, "nested"));
   const tools: { name: string; execute: (...args: unknown[]) => Promise<unknown> }[] = [];
@@ -19,16 +19,20 @@ test("both tool roots are resolved against session cwd, including relative roots
   const fix = vi.spyOn(routes, "selectFixRoute").mockImplementation(() => {
     throw stop;
   });
+  const operation = vi.spyOn(routes, "selectOperationRoute").mockImplementation(() => {
+    throw stop;
+  });
   try {
     extension({ registerTool: (tool: never) => tools.push(tool), registerCommand: () => {}, on: () => {} } as never);
     assert.notEqual(cwd, process.cwd());
+    assert.equal(tools.length, 7);
     for (const tool of tools) {
       for (const root of [undefined, "nested"]) {
         await assert.rejects(
           tool.execute("root", { root, path: "main.ts" }, undefined, undefined, { cwd, isProjectTrusted: () => false }),
           (error) => error === stop,
         );
-        const spy = tool.name === "lsp_fix" ? fix : diagnostics;
+        const spy = tool.name === "lsp_fix" ? fix : tool.name === "lsp_diagnostics" ? diagnostics : operation;
         assert.equal(spy.mock.calls.at(-1)?.[1].root, root ? join(cwd, root) : cwd);
       }
     }

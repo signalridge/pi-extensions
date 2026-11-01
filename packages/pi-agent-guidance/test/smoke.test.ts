@@ -14,10 +14,10 @@ function manifest(): {
   return JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
 }
 
-test("registers provider guidance lifecycle handling", () => {
+test("registers provider guidance and subdirectory context lifecycle handling", () => {
   const events: string[] = [];
   agentGuidance({ on: (event: string) => events.push(event) } as never);
-  assert.deepEqual(events, ["before_agent_start"]);
+  assert.deepEqual(events, ["before_agent_start", "turn_start", "tool_result"]);
 });
 
 test("templates are shipped as context files, never declared as Agent Skills", () => {

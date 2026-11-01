@@ -63,6 +63,7 @@ test("malformed bash output crashes the native renderer but is rejected before n
     clearScreen() {},
     setTitle() {},
     setProgress() {},
+    setProgramStatus() {},
   };
   const tui = new TuiMainScreen(terminal);
   const component = new BashExecutionComponent("echo ok", tui);

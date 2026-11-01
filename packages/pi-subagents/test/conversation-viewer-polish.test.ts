@@ -386,7 +386,7 @@ it("uses the actual public regular host with exactly one floating full border", 
   const terminal: PiTui.Terminal = {
     rows: 20, columns: 120, kittyProtocolActive: false,
     start: vi.fn(), stop: vi.fn(), drainInput: async () => {}, write: vi.fn(),
-    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(),
+    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(), setProgramStatus: vi.fn(),
   };
   const tui = new PiTui.TuiMainScreen(terminal);
   tui.addChild(new PiTui.Text("main"));
@@ -409,7 +409,7 @@ it("uses the actual public fullscreen host: observer wheel/focus do not mutate t
   const terminal: PiTui.Terminal = {
     rows: 20, columns: 120, kittyProtocolActive: false,
     start: callback => { input = callback; }, stop: vi.fn(), drainInput: async () => {}, write: vi.fn(),
-    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(),
+    moveBy: vi.fn(), hideCursor: vi.fn(), showCursor: vi.fn(), clearLine: vi.fn(), clearFromCursor: vi.fn(), clearScreen: vi.fn(), setTitle: vi.fn(), setProgress: vi.fn(), setProgramStatus: vi.fn(),
   };
   const tui = new PiTui.TuiAltScreen(terminal);
   const editor = new PiTui.Input(); editor.setValue("main draft");

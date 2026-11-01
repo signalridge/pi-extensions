@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { hasCommand } from "../utils.ts";
+import { hasCommand, missingCommandsMessage } from "../utils.ts";
 
 function fixture(t) {
   const root = mkdtempSync(join(tmpdir(), "files-widget-command-"));
@@ -74,4 +74,17 @@ test("Windows strips matching quotes around search directories", (t) => {
     }),
     true,
   );
+});
+
+test("install advice suggests Homebrew only on macOS and names only the missing packages", () => {
+  assert.equal(
+    missingCommandsMessage(["delta", "glow"], "darwin"),
+    "files-widget requires delta, glow. Install: brew install git-delta glow",
+  );
+  for (const platform of ["linux", "win32"] as const) {
+    assert.equal(
+      missingCommandsMessage(["bat"], platform),
+      "files-widget requires bat. Install with your package manager: https://github.com/signalridge/pi-extensions/tree/main/packages/pi-files-widget#install",
+    );
+  }
 });

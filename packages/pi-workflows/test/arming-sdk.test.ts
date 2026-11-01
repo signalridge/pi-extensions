@@ -643,7 +643,7 @@ describe("workflow arming (real Pi SDK and faux provider)", () => {
     expect(contextText(providerContexts[0])).not.toContain(WORKFLOW_ARMED_DIRECTIVE);
   });
 
-  it("removes an already prepared hidden directive after a later awaited preparation hook navigates", async () => {
+  it("removes an already prepared hidden directive when the branch moves during a later awaited preparation hook", async () => {
     const entered = barrier();
     const release = barrier();
     let hold = false;
@@ -663,9 +663,21 @@ describe("workflow arming (real Pi SDK and faux provider)", () => {
     hold = true;
     const pending = current.prompt("workflow");
     await entered.promise;
-    await current.navigateTree(target, { summarize: false });
-    release.resolve();
+    try {
+      // Pi 1.2+ counts the session busy while a run prepares, so native tree
+      // navigation can no longer land inside before_agent_start.
+      await expect(current.navigateTree(target, { summarize: false })).rejects.toThrow(
+        "Wait for the current response to finish before navigating the session tree.",
+      );
+      // The branch can still move underneath the prepared run. Move the leaf where
+      // that navigation would have (the first user message has no parent): the
+      // admitted directive must stay bound to the branch it was prepared on.
+      current.sessionManager.resetLeaf();
+    } finally {
+      release.resolve();
+    }
     await pending;
+    expect(current.sessionManager.getBranch().map((entry) => entry.type)).toEqual(["message", "message"]);
     expect(hiddenMessages()).toHaveLength(0); // No hidden draft ever enters persistence.
     expect(contextText(providerContexts.at(-1))).not.toContain(WORKFLOW_ARMED_DIRECTIVE);
     expect(lastUser().content).toEqual([{ type: "text", text: "workflow" }]);

@@ -3,6 +3,9 @@
  *
  * `legacy` keeps the original emoji suffixes. `ridgeline` is a text-only,
  * terminal-font-safe style that matches the Signalridge Pi presentation.
+ *
+ * With `PI_TAB_STATUS_NOTIFY` set, the same settled and blocked transitions
+ * also raise a desktop notification.
  */
 
 import { basename } from "node:path";
@@ -10,6 +13,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, StopReason } from "@earendil-works/pi-ai";
 import type {
   AgentEndEvent,
+  AgentSettledEvent,
   AgentStartEvent,
   BeforeAgentStartEvent,
   ExtensionAPI,
@@ -22,8 +26,15 @@ import type {
   ToolResultEvent,
   TurnStartEvent,
 } from "@earendil-works/pi-coding-agent";
+import { sendDesktopNotification } from "./notify.js";
+import { sanitizeTitleText } from "./terminal-text.js";
 
-type StatusState = "new" | "running" | "doneCommitted" | "doneNoCommit" | "timeout";
+export { sanitizeTitleText };
+
+// `cancelled` carries no label: a run the user aborted needs no attention, so
+// the tab returns to its bare project title.
+type StatusState = "new" | "running" | "doneCommitted" | "doneNoCommit" | "timeout" | "cancelled";
+type LabelledState = Exclude<StatusState, "cancelled">;
 export type TabStatusStyle = "legacy" | "ridgeline";
 
 type StatusTracker = {
@@ -32,7 +43,7 @@ type StatusTracker = {
   sawCommit: boolean;
 };
 
-const STATUS_TEXT: Record<StatusState, string> = {
+const STATUS_TEXT: Record<LabelledState, string> = {
   new: ":new",
   running: ":running...",
   doneCommitted: ":✅",
@@ -40,7 +51,7 @@ const STATUS_TEXT: Record<StatusState, string> = {
   timeout: ":🛑",
 };
 
-const RIDGELINE_STATUS_TEXT: Record<StatusState, string> = {
+const RIDGELINE_STATUS_TEXT: Record<LabelledState, string> = {
   new: "new",
   running: "working",
   doneCommitted: "done",
@@ -49,6 +60,15 @@ const RIDGELINE_STATUS_TEXT: Record<StatusState, string> = {
 };
 
 const INACTIVE_TIMEOUT_MS = 180_000;
+
+// Fixed text only: like Pi's native program status, a notification never
+// carries prompts or model output.
+const NOTIFICATION_BODY = {
+  committed: "Finished with a commit",
+  review: "Finished, ready for review",
+  error: "Run ended with an error",
+  stalled: "No activity for 3 minutes",
+} as const;
 const GIT_COMMIT_RE = /\bgit\b[^\n]*\bcommit\b/;
 
 /**
@@ -57,35 +77,6 @@ const GIT_COMMIT_RE = /\bgit\b[^\n]*\bcommit\b/;
  */
 function resolveTabStatusStyle(): TabStatusStyle {
   return process.env.PI_TAB_STATUS_STYLE === "ridgeline" ? "ridgeline" : "legacy";
-}
-
-/**
- * The title is written as an OSC escape sequence, so a directory name is not just
- * untrusted display text: a BEL or ST inside it terminates the sequence early and
- * the remainder lands on the terminal as commands. Neutralize every C0/C1 control
- * and bidi override, then collapse the whitespace that leaves behind.
- *
- * Duplicated rather than shared, per the package boundary rule; `pi-stamp`'s
- * metadata sanitizer is the reference shape.
- */
-export function sanitizeTitleText(value: string): string {
-  let safe = "";
-  for (const character of value) {
-    safe += isUnsafeTerminalCodePoint(character.codePointAt(0) ?? 0) ? " " : character;
-  }
-  return safe.replace(/\s+/gu, " ").trim();
-}
-
-function isUnsafeTerminalCodePoint(codePoint: number): boolean {
-  return (
-    codePoint <= 0x1f ||
-    (codePoint >= 0x7f && codePoint <= 0x9f) ||
-    codePoint === 0x061c ||
-    codePoint === 0x200e ||
-    codePoint === 0x200f ||
-    (codePoint >= 0x202a && codePoint <= 0x202e) ||
-    (codePoint >= 0x2066 && codePoint <= 0x2069)
-  );
 }
 
 function projectName(cwd: string): string {
@@ -102,6 +93,7 @@ export function formatTabTitle(
   state: StatusState,
   style: TabStatusStyle = resolveTabStatusStyle(),
 ): string {
+  if (state === "cancelled") return formatIdleTabTitle(cwd, style);
   const project = projectName(cwd);
   return style === "ridgeline"
     ? `pi · ${project} · ${RIDGELINE_STATUS_TEXT[state]}`
@@ -160,6 +152,21 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  // Called only where a state is entered, never from a title refresh, so one
+  // transition raises at most one notification. Subagent children and other
+  // non-TUI sessions stay silent.
+  const notifyDesktop = (ctx: ExtensionContext, body: string): void => {
+    if (!isTui(ctx)) return;
+    let title: string;
+    try {
+      title = formatIdleTabTitle(ctx.cwd);
+    } catch {
+      retire();
+      return;
+    }
+    sendDesktopNotification(title, body);
+  };
+
   const clearTabTimeout = (): void => {
     if (timeoutId === undefined) return;
     nativeClearTimeout(timeoutId);
@@ -177,6 +184,7 @@ export default function (pi: ExtensionAPI) {
       // blocked while it still holds the run open.
       if (status.running && status.state === "running" && activeToolCallIds.size === 0) {
         setTitle(ctx, "timeout");
+        notifyDesktop(ctx, NOTIFICATION_BODY.stalled);
       }
     }, INACTIVE_TIMEOUT_MS);
     timeoutId = timer;
@@ -279,7 +287,7 @@ export default function (pi: ExtensionAPI) {
     // running forever.
     activeToolCallIds.clear();
   });
-  const settle = (ctx: ExtensionContext, owner: number): void => {
+  const settle = (ctx: ExtensionContext, owner: number, hostAborted: boolean | undefined): void => {
     if (owner !== generation) return;
     // A prior observer can start manual compaction, whose terminal hook runs
     // before isIdle flips and does not cause another agent_settled event.
@@ -291,7 +299,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (!idle) {
-      settlementTimer = setTimeout(() => settle(ctx, owner), 25);
+      settlementTimer = setTimeout(() => settle(ctx, owner, hostAborted), 25);
       settlementTimer.unref?.();
       return;
     }
@@ -301,15 +309,25 @@ export default function (pi: ExtensionAPI) {
     // The run is fully settled, so nothing can still be in flight; clearing here
     // keeps a tool that never reported its end from suppressing later timeouts.
     activeToolCallIds.clear();
+    // Pi 1.1+ reports the abort itself; an abort can also surface as an error
+    // stop reason. Older hosts omit the flag, so infer it from the last stop reason.
+    // The user who aborted a run is already looking at it, so it settles silently.
+    if (hostAborted ?? finalStopReason === "aborted") {
+      setTitle(ctx, "cancelled");
+      return;
+    }
     if (finalStopReason === "error") {
       setTitle(ctx, "timeout");
+      notifyDesktop(ctx, NOTIFICATION_BODY.error);
       return;
     }
     setTitle(ctx, status.sawCommit ? "doneCommitted" : "doneNoCommit");
+    notifyDesktop(ctx, status.sawCommit ? NOTIFICATION_BODY.committed : NOTIFICATION_BODY.review);
   };
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event: AgentSettledEvent, ctx) => {
     cancelSettlement();
-    settle(ctx, generation);
+    const aborted: unknown = (event as { aborted?: unknown }).aborted;
+    settle(ctx, generation, typeof aborted === "boolean" ? aborted : undefined);
   });
   pi.on("session_shutdown", async (_event: SessionShutdownEvent, ctx) => {
     cancelSettlement();

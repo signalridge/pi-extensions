@@ -91,8 +91,8 @@ export function isRetryableGoalInterruption(assistant: AssistantMessageLike) {
   );
 }
 
-export function isGoalContextOverflow(assistant: AssistantMessageLike) {
-  return isContextOverflow(toPiAssistantMessage(assistant));
+export function isGoalContextOverflow(assistant: AssistantMessageLike, contextWindow?: number) {
+  return isContextOverflow(toPiAssistantMessage(assistant), contextWindow);
 }
 
 export function findFinalAssistantMessage(messages: unknown[]): AssistantMessageLike | undefined {
