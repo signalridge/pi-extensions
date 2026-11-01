@@ -11,6 +11,7 @@ import {
   initTheme,
   SessionManager,
   SettingsManager,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { test } from "vitest";
@@ -20,6 +21,7 @@ initTheme("dark", false);
 
 // Test-only SDK host shell: retain actual showExtensionCustom savedText/restoreEditor.
 function editorHost() {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let text = "opening draft";
   let opened!: () => void;
   const mounted = new Promise<void>((resolve) => {
@@ -41,6 +43,8 @@ function editorHost() {
     },
     ui: { setFocus() {}, requestRender() {}, terminal: { rows: 24, columns: 80 } },
     keybindings: { matches: () => false, getKeys: () => [] },
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   const custom: ExtensionCommandContext["ui"]["custom"] = (factory, options) =>
     host.showExtensionCustom(factory, options);

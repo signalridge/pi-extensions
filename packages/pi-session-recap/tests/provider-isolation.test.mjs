@@ -25,7 +25,9 @@ registerApiProvider({
   },
   streamSimple: (model, context) => {
     calls.push({ model, context });
-    return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Safe recap." }] }) };
+    return {
+      result: async () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Safe recap." }] }),
+    };
   },
 });
 

@@ -70,9 +70,10 @@ function fixture(
     id: string;
     parentId: string | null;
     type: string;
-    customType: string;
+    customType?: string;
     data?: unknown;
     content?: string;
+    message?: unknown;
   };
   const entries: Entry[] = [];
   let leaf: string | null = null;
@@ -98,6 +99,7 @@ function fixture(
     mode: "rpc",
     hasUI: false,
     ui: { notify: vi.fn(), setWidget: vi.fn() },
+    model: { contextWindow: 200_000 },
     isIdle: () => idle,
     hasPendingMessages: () => queued,
     sessionManager: { getBranch: branch, getLeafId: () => leaf, getSessionId: () => "delivery-session" },
@@ -154,6 +156,7 @@ function fixture(
     entries,
     pending,
     acks,
+    append,
     setIdle: (value: boolean) => {
       idle = value;
     },
@@ -713,6 +716,62 @@ describe("settled workflow result delivery", () => {
       action: "continue",
       text: "Unrelated extension input",
     });
+    await f.shutdown();
+  });
+
+  it("records results without waking an overflowed parent, notices once, and wakes again after compaction", async () => {
+    const f = fixture();
+    await f.start();
+    f.ctx.hasUI = true;
+    // The parent's last response overflowed the model window and its recovery compaction was cancelled.
+    f.append({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "Your input exceeds the context window of this model",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        timestamp: Date.now(),
+      },
+    });
+    f.append({
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: "HTTP 503 temporarily unavailable",
+        timestamp: Date.now(),
+      },
+    });
+    const deliver = async () => {
+      f.setIdle(false);
+      const runId = await f.run();
+      f.setIdle(true);
+      await f.emit("agent_settled");
+      await vi.waitFor(() => expect(f.pi.sendMessage.mock.calls.at(-1)?.[0].content).toContain(String(runId)));
+      await tick();
+      return runId;
+    };
+
+    await deliver();
+    await deliver();
+    expect(f.pi.sendMessage).toHaveBeenCalledTimes(2);
+    expect(f.acks()).toHaveLength(2);
+    expect(f.pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(f.ctx.ui.notify.mock.calls).toEqual([
+      [
+        "Context exceeds the model's window; workflow results are added to the conversation without starting a turn. Run /compact, or start a new session.",
+        "warning",
+      ],
+    ]);
+
+    f.append({ type: "compaction" });
+    await deliver();
+    await vi.waitFor(() => expect(f.pi.sendUserMessage).toHaveBeenCalledOnce());
+    await f.drain();
+    expect(f.ctx.ui.notify).toHaveBeenCalledOnce();
     await f.shutdown();
   });
 

@@ -2,6 +2,8 @@ import type { EditorComponent, EditorTheme } from "@earendil-works/pi-tui";
 
 import {
   detachLeadingShellBang,
+  FAKE_CURSOR_END,
+  FAKE_CURSOR_START,
   highlightLeadingSlashToken,
   injectPromptSymbol,
   type Paint,
@@ -144,7 +146,11 @@ export class PromptEditorView {
             lines[firstContentIndex] = detached.line;
             this.detachedShellPrompt = detached.detached;
             if (detached.cursorOnPrompt) {
-              prompt = `${detached.hardwareCursorMarker}${INVERSE_ON}${bang}${INVERSE_OFF}`;
+              // Re-emit the cursor in the form the host drew it, so pi-tui 1.2+
+              // still applies its own software-cursor setting to the prompt cell.
+              prompt = detached.fakeCursor
+                ? `${detached.hardwareCursorMarker}${FAKE_CURSOR_START}${bang}${FAKE_CURSOR_END}`
+                : `${detached.hardwareCursorMarker}${INVERSE_ON}${bang}${INVERSE_OFF}`;
             }
           }
         }

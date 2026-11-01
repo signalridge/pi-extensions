@@ -4,14 +4,22 @@ import type { CompactionEntry, SessionEntry } from "@earendil-works/pi-coding-ag
 import { type JsonObject, validateCompactionItem } from "./protocol.js";
 
 export const CHECKPOINT_KIND = "pi-codex-remote-compaction";
+/** Replacement history ends with the opaque item. */
 export const CHECKPOINT_VERSION = 1;
+/**
+ * Replacement history ends with the opaque item followed by exactly one readable
+ * layered summary of history dropped after that item. Version 1 readers reject
+ * it as malformed, so an older extension cancels rather than compacting over it.
+ */
+export const LAYERED_CHECKPOINT_VERSION = 2;
+export type CodexCheckpointVersion = typeof CHECKPOINT_VERSION | typeof LAYERED_CHECKPOINT_VERSION;
 export const REPLACEMENT_TOKEN_BUDGET = 64_000;
 export const REPLACEMENT_BYTE_BUDGET = 8 * 1024 * 1024;
 const MAX_MEDIA_ITEM_BYTES = 2 * 1024 * 1024;
 
 export interface CodexCheckpointDetails {
   kind: typeof CHECKPOINT_KIND;
-  version: typeof CHECKPOINT_VERSION;
+  version: CodexCheckpointVersion;
   checkpointId: string;
   provider: "openai-codex";
   api: "openai-codex-responses";
@@ -93,6 +101,67 @@ function fallbackSummaryForScope(checkpointId: string, scope: string): string {
   ].join(" ");
 }
 
+const LAYERED_SUMMARY_PREFIX =
+  "The conversation between the opaque checkpoint above and the messages below was compacted into the following summary:\n\n<summary>\n";
+const LAYERED_SUMMARY_SUFFIX = "\n</summary>";
+const LAYERED_SUMMARY_TRUNCATED = "\n[summary truncated]";
+
+/** One delimited Responses user message; never the opaque placeholder text. */
+export function layeredSummaryItem(summary: string): JsonObject {
+  return {
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: `${LAYERED_SUMMARY_PREFIX}${summary}${LAYERED_SUMMARY_SUFFIX}` }],
+  };
+}
+
+export function layeredSummaryText(item: unknown): string | undefined {
+  if (!isObject(item) || item.type !== "message" || item.role !== "user" || !Array.isArray(item.content)) return;
+  if (item.content.length !== 1) return;
+  const part = item.content[0];
+  if (!isObject(part) || part.type !== "input_text" || typeof part.text !== "string") return;
+  const { text } = part;
+  if (
+    text.length <= LAYERED_SUMMARY_PREFIX.length + LAYERED_SUMMARY_SUFFIX.length ||
+    !text.startsWith(LAYERED_SUMMARY_PREFIX) ||
+    !text.endsWith(LAYERED_SUMMARY_SUFFIX)
+  )
+    return;
+  return text.slice(LAYERED_SUMMARY_PREFIX.length, -LAYERED_SUMMARY_SUFFIX.length);
+}
+
+/** The readable summary a layered checkpoint carries, for an iterative update. */
+export function priorLayeredSummary(details: CodexCheckpointDetails): string | undefined {
+  return details.version === LAYERED_CHECKPOINT_VERSION
+    ? layeredSummaryText(details.replacementHistory.at(-1))
+    : undefined;
+}
+
+/**
+ * Keep the prior opaque history exactly and replace (never stack) its layered
+ * summary. The summary shares the retained-user-text budget, keeping its head.
+ */
+export function layeredReplacementHistory(
+  prior: CodexCheckpointDetails,
+  summary: string,
+  options: { tokenBudget?: number } = {},
+): JsonObject[] {
+  const maxChars = (options.tokenBudget ?? REPLACEMENT_TOKEN_BUDGET) * 4;
+  const text = summary.trim();
+  if (!text) throw new Error("Layered summary is empty");
+  let bounded = text;
+  if (text.length > maxChars) {
+    let end = maxChars - LAYERED_SUMMARY_TRUNCATED.length;
+    // Never leave half of a surrogate pair at the cut.
+    const code = text.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) end -= 1;
+    bounded = `${text.slice(0, end)}${LAYERED_SUMMARY_TRUNCATED}`;
+  }
+  const base =
+    prior.version === LAYERED_CHECKPOINT_VERSION ? prior.replacementHistory.slice(0, -1) : prior.replacementHistory;
+  return [...structuredClone(base), layeredSummaryItem(bounded)];
+}
+
 function markerMessage(checkpointId: string, timestamp: number): AgentMessage {
   return {
     role: "user",
@@ -116,7 +185,7 @@ function validateCheckpointDetails(value: unknown): CodexCheckpointDetails | und
   if (!isObject(value)) return undefined;
   if (
     value.kind !== CHECKPOINT_KIND ||
-    value.version !== CHECKPOINT_VERSION ||
+    (value.version !== CHECKPOINT_VERSION && value.version !== LAYERED_CHECKPOINT_VERSION) ||
     typeof value.checkpointId !== "string" ||
     value.checkpointId.length < 8 ||
     value.provider !== "openai-codex" ||
@@ -149,9 +218,12 @@ function validateCheckpointDetails(value: unknown): CodexCheckpointDetails | und
     )
       return undefined;
   }
-  const last = value.replacementHistory.at(-1);
+  // Unknown versions were rejected above. A layered history carries exactly one
+  // summary, directly after the opaque item; anything else is malformed.
+  const layered = value.version === LAYERED_CHECKPOINT_VERSION;
+  if (layered && layeredSummaryText(value.replacementHistory.at(-1)) === undefined) return undefined;
   try {
-    validateCompactionItem(last);
+    validateCompactionItem(value.replacementHistory.at(layered ? -2 : -1));
   } catch {
     return undefined;
   }
@@ -250,6 +322,13 @@ export function projectCheckpointContext(
       tailMode === "runtime-omitted" ? details.keptMessageFingerprints.slice(0, -1) : details.keptMessageFingerprints;
     const keptEnd = keptLineageEnd(messages, fingerprints, summaryIndex + 1, timestamp);
     if (keptEnd === undefined) continue;
+    // A remote opaque item was folded from the whole history, kept messages
+    // included. A layered summary covers only what Pi dropped, so a layered
+    // checkpoint replays its verified kept lineage verbatim after the marker.
+    const kept =
+      details.version === LAYERED_CHECKPOINT_VERSION
+        ? messages.slice(summaryIndex + 1, keptEnd).filter((message) => !isOlderCompactionSummary(message, timestamp))
+        : [];
     return [
       ...messages.slice(0, summaryIndex),
       // The marker keeps the anchor's own position, falling back to the checkpoint's
@@ -258,6 +337,7 @@ export function projectCheckpointContext(
         details.checkpointId,
         Number.isFinite(summaryMessage.timestamp) ? summaryMessage.timestamp : createdAt || 0,
       ),
+      ...kept,
       ...messages.slice(keptEnd),
     ];
   }
@@ -304,8 +384,14 @@ export function buildReplacementHistory(
   let remainingChars = tokenBudget * 4;
   if (remainingBytes <= 0) throw new Error("Opaque compaction item exceeds replacement history budget");
   const retainedNewestFirst: JsonObject[] = [];
+  // A prior layered summary was input to this fold and is now absorbed by the
+  // new opaque item, like Codex's own summary messages; it is not a user backup.
   const candidates = input.filter(
-    (item): item is JsonObject => isObject(item) && item.role === "user" && item.type !== "compaction_trigger",
+    (item): item is JsonObject =>
+      isObject(item) &&
+      item.role === "user" &&
+      item.type !== "compaction_trigger" &&
+      layeredSummaryText(item) === undefined,
   );
   for (let index = candidates.length - 1; index >= 0; index--) {
     const candidate = candidates[index];
@@ -344,7 +430,10 @@ export function createCheckpointDetails(input: {
 }): CodexCheckpointDetails {
   const details: CodexCheckpointDetails = {
     kind: CHECKPOINT_KIND,
-    version: CHECKPOINT_VERSION,
+    version:
+      layeredSummaryText(input.replacementHistory.at(-1)) === undefined
+        ? CHECKPOINT_VERSION
+        : LAYERED_CHECKPOINT_VERSION,
     checkpointId: input.checkpointId ?? randomUUID(),
     provider: "openai-codex",
     api: "openai-codex-responses",

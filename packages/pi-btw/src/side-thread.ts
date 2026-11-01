@@ -183,14 +183,45 @@ export async function completeSideQuestion({
   signal,
   completeSimple,
 }: CompleteSideQuestionOptions): Promise<AssistantMessage> {
-  const requestModel = withResolvedBaseUrl(model, auth);
+  return completeSideRequest({
+    model,
+    systemPrompt: SYSTEM_PROMPT,
+    prompt: buildUserPrompt(question, conversationContext),
+    thinkingLevel,
+    auth,
+    sessionId: randomUUID(),
+    signal,
+    completeSimple,
+  });
+}
+
+export interface CompleteSideRequestOptions {
+  model: Model<Api>;
+  systemPrompt: string;
+  prompt: string;
+  thinkingLevel: BtwThinkingLevel;
+  auth: SideQuestionAuth;
+  /** Provider routing identity owned by the caller; never the parent session's ID. */
+  sessionId: string;
+  signal?: AbortSignal;
+  completeSimple: CompleteSimpleFunction;
+}
+
+/** One tool-less, single-message request on the side model's resolved endpoint and credentials. */
+export async function completeSideRequest({
+  model,
+  systemPrompt,
+  prompt,
+  thinkingLevel,
+  auth,
+  sessionId,
+  signal,
+  completeSimple,
+}: CompleteSideRequestOptions): Promise<AssistantMessage> {
   return completeSimple(
-    requestModel,
-    {
-      systemPrompt: SYSTEM_PROMPT,
-      messages: [createUserMessage(buildUserPrompt(question, conversationContext))],
-    },
-    { ...buildStreamOptions(auth, thinkingLevel, signal), sessionId: randomUUID() },
+    withResolvedBaseUrl(model, auth),
+    { systemPrompt, messages: [createUserMessage(prompt)] },
+    { ...buildStreamOptions(auth, thinkingLevel, signal), sessionId },
   );
 }
 
@@ -205,7 +236,7 @@ export function extractAssistantText(response: AssistantMessage): string {
     .trim();
 }
 
-function isAssistantMessage(value: unknown): value is AssistantMessage {
+export function isAssistantMessage(value: unknown): value is AssistantMessage {
   if (value === null || typeof value !== "object") return false;
   const candidate = value as Partial<AssistantMessage>;
   return candidate.role === "assistant" && Array.isArray(candidate.content) && typeof candidate.stopReason === "string";

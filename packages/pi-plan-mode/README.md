@@ -18,6 +18,7 @@ Pi core intentionally does not ship a built-in plan mode; this package provides 
 - Presents the complete plan and lets you implement with the planning conversation or start a fresh linked session carrying only the approved plan, as well as export, save, stay, or discard.
 - Exports ready, saved, or active implementation plans with `/plan export [path]` without overwriting existing paths; the omitted-path destination is configurable, and exporting a ready plan completes and exits Plan mode.
 - Lets each accepted plan remain active, serve only as the first implementation handoff, or clear after the first implementation run; the current retained-plan behavior remains the default.
+- Optionally implements on a different model and thinking level, then returns to the planning model when the implementation ends unless you chose another model meanwhile.
 - Keeps legacy `<proposed_plan>` responses compatible without advertising XML as the primary workflow.
 - Shows Plan mode state in Pi's statusline as `plan active`, `plan ready`, `plan saved`, or `plan implementing`; `@signalridge/pi-statusline` adds the default `📝` icon unless configured otherwise.
 - Persists Plan mode, one session-local saved plan, and active implementation state so resume and compaction retain the exact accepted plan.
@@ -172,7 +173,7 @@ You can also exit directly. Before implementation, direct exit discards the late
 
 ## Settings
 
-Open **Settings** from an inactive `/plan` menu to edit one flat group of workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, **Export destination**, and **Plan mode shortcut**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands` remains JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
+Open **Settings** from an inactive `/plan` menu to edit one flat group of workflow choices: **Plan thinking**, **Plan tools**, **After Implement**, **Export destination**, and **Plan mode shortcut**. You can also edit `$PI_CODING_AGENT_DIR/pi-plan-mode.json` (normally `~/.pi/agent/pi-plan-mode.json`) manually; `safeSubcommands`, `implementationModel`, and `implementationThinkingLevel` remain JSON-only. The file is optional, is read at session start, and is created only after an explicit Settings save or manual edit.
 
 ```json
 {
@@ -203,6 +204,27 @@ A selection accepted through **Choose tools, then start…** or `/plan tools` is
 `implementationPlanRetention` controls the result of the next Implement action. Omit it or use `keep` for **Keep plan active**, the backward-compatible behavior that retains and reinjects the exact plan until `/plan exit` or supersession. Use `clear-on-start` for **Use plan for handoff only**: the first matching implementation request receives the complete plan, then retained state clears before later requests. Use `clear-after-first-run` to retain the plan until that implementation's first fully settled run ends. A resumed cleanup policy re-arms against an accepted user request or positively owned implementation handoff, not an unrelated extension wake. Failed handoff delivery restores the ready or saved plan and does not run automatic cleanup.
 
 Changing this setting applies to the next Implement action only. Each active implementation stores its effective policy, so a later Settings save cannot shorten or extend an implementation already in progress. `/plan exit` remains available under every policy.
+
+### Implementation model
+
+Plan on one model and implement on another. Both keys are optional and off by default:
+
+```json
+{
+  "implementationModel": "provider/model-id",
+  "implementationThinkingLevel": "low"
+}
+```
+
+`implementationModel` is resolved through Pi's model registry when you implement, so it names any model `/model` can select; there is no separate model list. The first `/` separates the provider, and the model ID may contain more slashes. `implementationThinkingLevel` accepts the same values as `thinkingLevel` and defaults to `inherit`. Without `implementationModel` it applies to the current model.
+
+**Implement here** and `/plan implement` switch the session to the implementation model before the implementation request is sent. The switch is recorded in the session, so resuming it continues on the implementation model. `/plan exit`/`off`, **Clear** in the active-implementation menu, or starting a new Plan workflow restores the planning model and the thinking level it had before the handoff, before any new planning request. As with Plan thinking, the restore happens only while the session still shows what the handoff applied: selecting another model during implementation makes that choice yours and nothing is restored, and selecting a thinking level relinquishes the handoff's thinking ownership. The returning model may itself change thinking; the conservative rules below apply to that transition too. Automatic retention cleanup clears the plan, not the model; the next exit or new plan still restores it. Tree navigation never switches models, so a handoff restored from the target branch applies only if the session is still on its model.
+
+Thinking changes during a pending model switch are handled conservatively. Pi's public `thinking_level_select` event has no source: a change before Plan observes the expected `model_select` may be a manual choice or a genuine automatic model-default transition. In either case, Plan warns and keeps the current thinking level instead of forcing `implementationThinkingLevel` or the prior planning level. The model-only handoff may still proceed, but ambiguous thinking is never recorded as extension-owned or later restored from that handoff. Public branch entries detect these changes even if an earlier thinking-event handler delays its callback; callback order is not treated as proof of provenance. A manual thinking change after the expected model is observed cancels the pending operation instead. Unrelated model selections (including away and back) and branch changes also invalidate it.
+
+If the implementation model is not in the registry or has no configured credentials, Implement warns and changes nothing: the plan stays ready (or saved) on the planning model, so you can fix the credentials or the setting and implement again. Implementing on a model you did not configure is never a silent fallback. If Pi still refuses the switch, the handoff is rolled back like a failed delivery. A planning model that can no longer be restored produces a warning and leaves the session where it is.
+
+**Start fresh and implement** does not apply `implementationModel`: its destination must already be on the planning session's model, as described above. Model switches affect only the current session, never Pi's configured default model, and start a new prompt-cache prefix.
 
 ### Export destination
 
@@ -259,7 +281,7 @@ Plan mode inherits Pi's current thinking level by default. Set `thinkingLevel` t
 
 Settings saves are serialized in invocation order inside one Pi process. Each save re-reads the latest valid document, preserves unknown top-level fields and unedited `safeSubcommands`, then publishes through a same-directory temporary file and rename. A missing file stays absent until an explicit save. Invalid JSON, invalid values, oversized content, non-regular files, and read failures make Settings read-only; the existing bytes and previous effective settings remain. This in-process queue is not a cross-process lock, so concurrent separate Pi processes can still race.
 
-Invalid settings produce a warning and fall back to inherited thinking, available safe-built-in tool defaults, `keep`, and `PLAN.md`. Compatibility: a valid legacy `plan-mode.json` remains readable with a warning and is never modified automatically. If Settings is explicitly saved while only that legacy file exists, the extension creates canonical `pi-plan-mode.json` from the complete legacy document, applies the selected change, preserves unknown fields, and leaves the legacy file untouched. If both files exist, the canonical filename takes precedence.
+Invalid settings produce a warning and fall back to inherited thinking, available safe-built-in tool defaults, `keep`, `PLAN.md`, and no implementation model. Compatibility: a valid legacy `plan-mode.json` remains readable with a warning and is never modified automatically. If Settings is explicitly saved while only that legacy file exists, the extension creates canonical `pi-plan-mode.json` from the complete legacy document, applies the selected change, preserves unknown fields, and leaves the legacy file untouched. If both files exist, the canonical filename takes precedence.
 
 ## Codex-like behavior
 

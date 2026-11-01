@@ -643,6 +643,10 @@ export function registerGoalLifecycle(
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    // Pi 1.2+ also announces runs started by an idle custom message. They carry
+    // no prompt and never reached this boundary on earlier hosts, so goal input
+    // accounting must not treat them as prompt boundaries.
+    if (event.messageType === "custom") return;
     runtime.pendingInputWake = undefined;
     runtime.acceptedRunPrompt = typeof event.prompt === "string" ? event.prompt : undefined;
     runtime.inputWakeGoalId = undefined;

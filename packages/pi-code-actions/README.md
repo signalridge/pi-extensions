@@ -50,7 +50,8 @@ Examples:
 
 ## Actions
 
-- Copy: puts the snippet on your clipboard using a private temporary file that is removed afterward
+- Copy (TUI only): puts the snippet on your clipboard through Pi's own clipboard writer, the same one Pi's built-in copy uses. It covers the native clipboard, `pbcopy`, `wl-copy`/`xclip`/`xsel` (which keep owning the Linux selection after the copy), Termux, and WSL, and emits OSC 52 for remote sessions (SSH, mosh, or `PI_CLIPBOARD_OSC52=1`) so the copy reaches the client terminal. A failure reports Pi's reason, such as which clipboard utility to install
+  RPC copy explicitly reports unavailable: terminal clipboard escape sequences cannot reach the client through the server's clipboard writer. RPC supports indexed Insert and Run instead.
 - Insert: appends the snippet to the TUI input editor. RPC cannot read or append to the client draft, so insertion requires confirmation before replacing the entire draft
 - Run: executes the complete snippet with `bash -lc` on POSIX or `powershell -NoProfile -Command` on Windows (asks for confirmation), in the working directory captured before confirmation. Output and the shell's exit code are displayed after cleanup.
 
@@ -58,7 +59,7 @@ Examples:
 
 ## Notes
 
-- Pending dialogs, clipboard utilities, and running snippets are cancelled on pre-switch, pre-fork, pre-tree, session start, committed tree, and shutdown events. A pre-navigation event cancels the interaction even if navigation is later vetoed; this does not provide an atomic post-veto transition.
+- Pending dialogs and running snippets are cancelled on pre-switch, pre-fork, pre-tree, session start, committed tree, and shutdown events. A pending copy stops being awaited at the same events and its outcome is not reported; Pi's clipboard utilities are not cancellable and are bounded by Pi's own timeout. A pre-navigation event cancels the interaction even if navigation is later vetoed; this does not provide an atomic post-veto transition.
 - At pre-navigation boundaries, custom TUI panes close synchronously, restoring their captured draft before navigation can write a new one.
 - Snippet subprocesses are owned locally, not delegated to a background extension. On POSIX, a detached supervisor holds a private process group alive through a 250 ms TERM grace period, then KILLs the group; this also cleans up background children after normal shell exit. Signals never target Pi's/ancestor shells' group or a previously reaped leader. Cleanup waits are bounded (up to two 1-second waits for exit/output closure). On Windows, the live supervisor anchors `taskkill /PID /T /F`, with a 1-second taskkill deadline and direct-parent fallback; this is best-effort tree cleanup, not a Windows Job Object guarantee.
 - When Pi runs under Bun (including compiled standalone builds), snippet supervision requires a Node.js executable named `node` on `PATH`; a missing executable reports a failed run. Node-hosted Pi reuses its Node executable. The supervisor must signal readiness within 5 seconds; stalled startup (for example, inherited `NODE_OPTIONS=--inspect-brk=0`) or disconnected IPC fails the run and triggers owned cleanup. This startup deadline does not limit snippet execution after readiness. Runtime/security options and the snippet environment are inherited unchanged.

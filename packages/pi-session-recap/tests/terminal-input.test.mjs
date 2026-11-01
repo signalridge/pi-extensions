@@ -15,7 +15,13 @@ function harness(t, mode = "tui") {
     },
     streamSimple: () => {
       calls.push("provider");
-      return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Completed work." }] }) };
+      return {
+        result: async () => ({
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "Completed work." }],
+        }),
+      };
     },
   });
   const events = new Map();

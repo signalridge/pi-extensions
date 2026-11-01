@@ -3,12 +3,16 @@ import {
   PLAN_MODE_COMPLETE_TOOL_NAME,
   planFromCompletionDetails,
 } from "./completion-tool.js";
+import type { ImplementationModelHandoff } from "./implementation-model.js";
 import {
   IMPLEMENTATION_PLAN_RETENTIONS,
   type ImplementationPlanRetention,
   PLAN_MODE_THINKING_LEVELS,
   type PlanModeFixedThinkingLevel,
+  type PlanModeModelReference,
 } from "./settings.js";
+
+const MAX_PERSISTED_MODEL_FIELD_LENGTH = 512;
 
 export type PlanCompletionSource = typeof PLAN_MODE_COMPLETE_TOOL_NAME | "legacy_proposed_plan";
 
@@ -37,6 +41,8 @@ export interface PlanModeState {
   previousThinkingLevel?: PlanModeFixedThinkingLevel;
   appliedThinkingLevel?: PlanModeFixedThinkingLevel;
   manualThinkingLevel?: PlanModeFixedThinkingLevel;
+  /** Present only after an implementation handoff switched model or thinking; never while planning. */
+  modelHandoff?: ImplementationModelHandoff;
 }
 
 type SessionEntry = {
@@ -84,7 +90,35 @@ export function restorePlanModeState(entries: unknown[], stateEntryType: string)
     previousThinkingLevel: enabled ? fixedThinkingLevel(entry.data.previousThinkingLevel) : undefined,
     appliedThinkingLevel: enabled ? fixedThinkingLevel(entry.data.appliedThinkingLevel) : undefined,
     manualThinkingLevel: enabled ? fixedThinkingLevel(entry.data.manualThinkingLevel) : undefined,
+    modelHandoff: enabled ? undefined : normalizeModelHandoff(entry.data.modelHandoff),
   };
+}
+
+function normalizeModelHandoff(value: unknown): ImplementationModelHandoff | undefined {
+  if (!isRecord(value)) return undefined;
+  const appliedModel = modelReference(value.appliedModel);
+  const previousModel = appliedModel ? modelReference(value.previousModel) : undefined;
+  const appliedThinkingLevel = fixedThinkingLevel(value.appliedThinkingLevel);
+  const previousThinkingLevel = appliedThinkingLevel ? fixedThinkingLevel(value.previousThinkingLevel) : undefined;
+  const handoff: ImplementationModelHandoff = {
+    ...(appliedModel ? { appliedModel } : {}),
+    ...(previousModel ? { previousModel } : {}),
+    ...(appliedThinkingLevel && previousThinkingLevel ? { appliedThinkingLevel, previousThinkingLevel } : {}),
+  };
+  return Object.keys(handoff).length > 0 ? handoff : undefined;
+}
+
+function modelReference(value: unknown): PlanModeModelReference | undefined {
+  if (!isRecord(value)) return undefined;
+  const { provider, id } = value;
+  return typeof provider === "string" &&
+    typeof id === "string" &&
+    provider.length > 0 &&
+    id.length > 0 &&
+    provider.length <= MAX_PERSISTED_MODEL_FIELD_LENGTH &&
+    id.length <= MAX_PERSISTED_MODEL_FIELD_LENGTH
+    ? { provider, id }
+    : undefined;
 }
 
 function normalizeSavedPlan(value: unknown): SavedPlan | undefined {

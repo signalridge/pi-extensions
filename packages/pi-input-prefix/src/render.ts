@@ -6,6 +6,16 @@ const ANSI_SGR = /\u001B\[[0-9;]*m/g;
 /** Zero-width marker used by pi-tui to place the hardware cursor for IME. */
 export const HARDWARE_CURSOR_MARKER = "\x1b_pi:c\x07";
 
+/**
+ * Zero-width markers pi-tui 1.2+ draws around the cell shown as the software
+ * cursor; the TUI turns them into reverse video (or drops them when only the
+ * hardware cursor is shown). Earlier hosts emitted reverse-video SGR directly.
+ * Defined here rather than imported so older hosts still load this module.
+ */
+export const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
+export const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
+const ZERO_WIDTH_MARKERS = [HARDWARE_CURSOR_MARKER, FAKE_CURSOR_START, FAKE_CURSOR_END];
+
 /** Prompt glyph used whenever the configured override is absent or unusable. */
 const DEFAULT_PROMPT_MARKER = ">";
 
@@ -38,6 +48,7 @@ function firstGraphemeCluster(value: string): string {
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: Pi's shell prompt marker is ANSI encoded.
 const INVERSE_BANG = /^\x1b\[7m!\x1b\[(?:0|27)m/;
+const FAKE_CURSOR_BANG = `${FAKE_CURSOR_START}!${FAKE_CURSOR_END}`;
 const EDITOR_LEFT_PADDING = "    ";
 
 export type Paint = (text: string) => string;
@@ -45,6 +56,8 @@ export type Paint = (text: string) => string;
 export interface DetachedShellPrompt {
   line: string;
   cursorOnPrompt: boolean;
+  /** The cursor on the bang used pi-tui's software-cursor markers, not inline reverse video. */
+  fakeCursor: boolean;
   hardwareCursorMarker: string;
   detached: boolean;
 }
@@ -63,6 +76,7 @@ export function detachLeadingShellBang(line: string): DetachedShellPrompt {
     return {
       line,
       cursorOnPrompt: false,
+      fakeCursor: false,
       hardwareCursorMarker: "",
       detached: false,
     };
@@ -78,11 +92,22 @@ export function detachLeadingShellBang(line: string): DetachedShellPrompt {
     rest = rest.slice(HARDWARE_CURSOR_MARKER.length);
   }
 
+  if (rest.startsWith(FAKE_CURSOR_BANG)) {
+    return {
+      line: `${prefix + rest.slice(FAKE_CURSOR_BANG.length)} `,
+      cursorOnPrompt: true,
+      fakeCursor: true,
+      hardwareCursorMarker,
+      detached: true,
+    };
+  }
+
   const cursorBang = rest.match(INVERSE_BANG);
   if (cursorBang?.[0]) {
     return {
       line: `${prefix + rest.slice(cursorBang[0].length)} `,
       cursorOnPrompt: true,
+      fakeCursor: false,
       hardwareCursorMarker,
       detached: true,
     };
@@ -92,6 +117,7 @@ export function detachLeadingShellBang(line: string): DetachedShellPrompt {
     return {
       line: `${prefix + rest.slice(1)} `,
       cursorOnPrompt: false,
+      fakeCursor: false,
       hardwareCursorMarker: "",
       detached: true,
     };
@@ -100,6 +126,7 @@ export function detachLeadingShellBang(line: string): DetachedShellPrompt {
   return {
     line,
     cursorOnPrompt: false,
+    fakeCursor: false,
     hardwareCursorMarker: "",
     detached: false,
   };
@@ -116,7 +143,7 @@ export function injectPromptSymbol(line: string, symbol: string): string | undef
 }
 
 function stripVisualControls(text: string): string {
-  return stripSgr(text).replaceAll(HARDWARE_CURSOR_MARKER, "");
+  return ZERO_WIDTH_MARKERS.reduce((plain, marker) => plain.replaceAll(marker, ""), stripSgr(text));
 }
 
 function mapVisibleIndexToRaw(line: string, visibleIndex: number): number {
@@ -125,8 +152,9 @@ function mapVisibleIndexToRaw(line: string, visibleIndex: number): number {
   let visibleCount = 0;
 
   while (rawIndex < line.length && visibleCount < visibleIndex) {
-    if (line.startsWith(HARDWARE_CURSOR_MARKER, rawIndex)) {
-      rawIndex += HARDWARE_CURSOR_MARKER.length;
+    const marker = ZERO_WIDTH_MARKERS.find((candidate) => line.startsWith(candidate, rawIndex));
+    if (marker !== undefined) {
+      rawIndex += marker.length;
       continue;
     }
 

@@ -330,6 +330,35 @@ Custom tools.`);
     expect(result.get("custom-tools")!.builtinToolNames).toEqual(["read", "my_custom_tool", "grep"]);
   });
 
+  it("maps Claude Code tool names to Pi built-ins and keeps unknown names for the runner to warn about", () => {
+    writeAgent("claude-code", `---
+tools: Read, Glob, Grep, LS, Bash, MultiEdit, Edit, WebFetch
+---
+
+Claude Code agent.`);
+
+    expect(loadCustomAgents(tmpDir).get("claude-code")!.builtinToolNames)
+      .toEqual(["read", "find", "grep", "ls", "bash", "edit", "WebFetch"]);
+  });
+
+  it("reads Claude Code's disallowedTools key, denying each name and the built-in it maps to", () => {
+    writeAgent("claude-deny", `---
+disallowedTools: Write, Glob, web_tool
+---
+
+Denylist.`);
+    writeAgent("pi-deny-wins", `---
+disallowed_tools: bash
+disallowedTools: write
+---
+
+Both keys.`);
+
+    const agents = loadCustomAgents(tmpDir);
+    expect(agents.get("claude-deny")!.disallowedTools).toEqual(["Write", "write", "Glob", "find", "web_tool"]);
+    expect(agents.get("pi-deny-wins")!.disallowedTools).toEqual(["bash"]);
+  });
+
   it("partitions tools: ext: entries out of builtinToolNames into extSelectors", () => {
     writeAgent("ext-agent", `---
 tools: read, ext:foo, ext:bar/x

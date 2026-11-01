@@ -123,6 +123,8 @@ function domainFor(
       return { startMs: bounds.weekStartMs, endMs: bounds.nowMs };
     case "lastWeek":
       return { startMs: bounds.lastWeekStartMs, endMs: bounds.weekStartMs };
+    case "thisMonth":
+      return { startMs: bounds.thisMonthStartMs, endMs: bounds.nowMs };
     case "last30Days":
       return { startMs: bounds.last30DaysStartMs, endMs: bounds.nowMs };
     case "allTime": {

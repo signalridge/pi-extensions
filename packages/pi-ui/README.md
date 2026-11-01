@@ -33,7 +33,7 @@ This is a pure display helper, not a reversible serialization or identity encodi
 
 ## Preserve editor changes across custom UI
 
-`withPreservedCustomEditor(ctx)` is an opt-in context adapter for `ui.custom()` interactions that write to the main editor (for example, quoting a message and editing the quote). SDK 1.0.4 normally restores the draft saved when a non-overlay custom UI opened, discarding editor writes made while it was open.
+`withPreservedCustomEditor(ctx)` is an opt-in context adapter for `ui.custom()` interactions that write to the main editor (for example, quoting a message and editing the quote). The SDK (1.0.4 through 1.4.0) normally restores the draft saved when a non-overlay custom UI opened, discarding editor writes made while it was open.
 
 ```ts
 import { withBorderedCustomUi, withPreservedCustomEditor } from "@signalridge/pi-ui";
@@ -44,7 +44,7 @@ await runMenu(menuCtx, menu, options);
 
 Both composition orders work. Only the public custom factory/completion callback and returned promises are wrapped; native dialogs and editor methods are unchanged. Options, components, disposal, and `waitForPending()` ownership stay with the host. No listeners, renderer patches, private host access, settings, or extension registration are added.
 
-The adapter captures current editor text immediately before the first `done(result)`. After host completion, it replays a changed capture **only if the editor still equals the opening snapshot**. SDK 1.0.4's synchronous restoration is repaired before `done()` returns; the returned promise also covers deferred restoration. A later destination writer whose text differs from the opening snapshot wins, including a writer during host disposal. Duplicate completion is inert. Unchanged drafts incur no extra editor write. Sync/async factory failures capture before propagating the original error; preservation never masks that error. Throwing or invalid editor access disables preservation rather than retrying against a retired context.
+The adapter captures current editor text immediately before the first `done(result)`. After host completion, it replays a changed capture **only if the editor still equals the opening snapshot**. The SDK's synchronous restoration is repaired before `done()` returns; the returned promise also covers deferred restoration. A later destination writer whose text differs from the opening snapshot wins, including a writer during host disposal. Duplicate completion is inert. Unchanged drafts incur no extra editor write. Sync/async factory failures capture before propagating the original error; preservation never masks that error. Throwing or invalid editor access disables preservation rather than retrying against a retired context.
 
 ### Public-API limits
 

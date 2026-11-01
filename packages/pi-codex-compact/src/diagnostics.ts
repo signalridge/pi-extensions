@@ -19,6 +19,7 @@ const PHASES = [
   "provider_done",
   "completion_wait",
   "fold_done",
+  "layered_summary",
   "outcome",
 ] as const;
 const SCOPES = ["none", "stage", "operation"] as const;
@@ -28,7 +29,8 @@ const traces = new WeakSet<object>();
 export function trustedDiagnosticTrace(value: DiagnosticTrace | undefined): DiagnosticTrace | undefined {
   return value && traces.has(value) ? value : undefined;
 }
-const OUTCOMES = ["running", "prepared", "exported", "failure", "cancelled"] as const;
+// `layered`: Remote V2 failed (see `error`) and a layered checkpoint was returned.
+const OUTCOMES = ["running", "prepared", "layered", "exported", "failure", "cancelled"] as const;
 export type DiagnosticPhase = (typeof PHASES)[number];
 export type TimeoutScope = (typeof SCOPES)[number];
 export interface DiagnosticEvent {
@@ -245,7 +247,8 @@ export interface DiagnosticTrace {
   fold(): void;
   attempt(): void;
   bytes(direction: "request" | "response", count: number): void;
-  usage(usage: Usage): void;
+  /** `fold: false` adds a non-fold request's usage without counting a completed fold. */
+  usage(usage: Usage, fold?: boolean): void;
   finish(
     outcome: Exclude<DiagnosticEvent["outcome"], "running">,
     error?: CompactionFailureCode,
@@ -349,10 +352,10 @@ export function createDiagnosticTrace(
       if (!finished && !finishing && finite(count) && finite(state[key] + count))
         state = { ...state, [key]: state[key] + count };
     },
-    usage: (usage) => {
+    usage: (usage, fold = true) => {
       if (finished || finishing) return;
       try {
-        const next = { ...state, completed: state.completed + 1 };
+        const next = { ...state, completed: state.completed + (fold ? 1 : 0) };
         for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
           const value: unknown = usage[key];
           if (finite(value) && finite(next[key] + value)) next[key] += value;

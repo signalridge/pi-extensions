@@ -20,6 +20,11 @@ export interface LspRange {
   end: LspPosition;
 }
 
+export interface LspLocation {
+  uri: string;
+  range: LspRange;
+}
+
 export interface LspDiagnostic {
   range: LspRange;
   severity?: number;
@@ -39,6 +44,8 @@ export interface WorkspaceEdit {
   documentChanges?: Array<{
     textDocument?: { uri?: string; version?: number | null };
     edits?: LspTextEdit[];
+    // Resource operations (create/rename/delete) carry a kind instead of edits.
+    kind?: string;
   }>;
 }
 
@@ -64,9 +71,16 @@ export interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export const LSP_OPERATIONS = ["diagnostics", "fix", "definition", "references", "hover", "symbols", "rename"] as const;
+
+/** A pi-lsp tool, named without its `lsp_` prefix, that a server can be routed for. */
+export type LspOperation = (typeof LSP_OPERATIONS)[number];
+
 export interface ConfiguredLspServer {
   command: string[];
   extensions: string[];
+  // Operations this server is routed for. Omitted means every operation.
+  operations?: LspOperation[];
   env?: Record<string, string>;
   initialization?: Record<string, unknown>;
   skipDirectories?: string[];
@@ -94,6 +108,8 @@ export interface LspServerAdapter {
   defaultCommand: ServerCommand;
   missingCommandHint: string;
   extensions: string[];
+  // Undefined routes every operation.
+  operations?: ReadonlySet<LspOperation>;
   env?: Record<string, string>;
   initialization?: Record<string, unknown>;
   skipDirectories: Set<string>;

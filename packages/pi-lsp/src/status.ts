@@ -1,5 +1,7 @@
 import type { StatusContext } from "./types.js";
 
+export const STATUS_KEY = "lsp";
+
 // Calls receive distinct contexts/UI wrappers, but share the host session identity.
 const sessions = new Map<string | object, Map<string, Map<symbol, string>>>();
 

@@ -20,7 +20,7 @@ import { MESSAGE_TYPE, Notifications } from "../src/notifications.js";
 import { nativeUIFixture } from "./tui-fixture.js";
 
 // Real host loader, lifecycle, provider dispatch and tool pipeline. No paid model.
-describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "win32")(
+describe.skipIf(!["1.4.0"].includes(VERSION) || process.platform === "win32")(
   "background on supported installed Pi",
   () => {
     const cleanup: (() => Promise<void>)[] = [];
@@ -72,7 +72,9 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
             name: "probes",
             factory: (pi) => {
               pi.on("before_agent_start", (event) => {
-                prompts.push(event.prompt);
+                // Pi 1.2+ also prepares idle custom-message runs; record every run
+                // so a custom-message wake cannot slip past the run assertions.
+                prompts.push(event.messageType === "custom" ? `custom:${event.message.customType}` : event.prompt);
               });
               pi.on("input", (event) => {
                 inputs.push(event.source);
@@ -210,7 +212,7 @@ describe.skipIf(!["1.0.4", "1.1.0"].includes(VERSION) || process.platform === "w
       );
       expect(notification).toMatchObject({ role: "custom", customType: MESSAGE_TYPE });
       expect(JSON.stringify(wake.mock.calls[0][0].messages)).toContain("[exit:");
-      expect(prompts).toHaveLength(2); // Idle custom-message wakes would skip this hook.
+      expect(prompts).toHaveLength(2); // The wake is a public prompt run, not a custom-message run.
       expect(prompts[1]).toContain("Background process wake [");
       expect(inputs).toEqual(["interactive", "extension"]);
       const result = session.messages.find(

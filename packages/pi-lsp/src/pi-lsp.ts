@@ -1,14 +1,19 @@
-import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { defineTool, type ExtensionAPI, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { type TSchema, Type } from "typebox";
 import { consumeLspConfigNotice, loadRuntime } from "./adapters.js";
 import { commandExists, commandPathValue } from "./command.js";
 import { resolveRoot } from "./files.js";
+import {
+  lspDefinitionTool,
+  lspHoverTool,
+  lspReferencesTool,
+  lspRenameTool,
+  lspSymbolsTool,
+} from "./navigation-tools.js";
 import { selectDiagnosticRoutes, selectFixRoute } from "./routes.js";
 import { DEFAULT_FILE_LIMIT, runDiagnostics, runFix, textResult } from "./runner.js";
 import { LspSessionScope } from "./session-lifecycle.js";
-import { resetStatus } from "./status.js";
-
-const STATUS_KEY = "lsp";
+import { resetStatus, STATUS_KEY } from "./status.js";
 
 const ServerParameter = Type.Optional(
   Type.Union([Type.String(), Type.Array(Type.String())], {
@@ -146,24 +151,22 @@ export default function lsp(pi: ExtensionAPI) {
   };
   const sessionFor = (key: object) => sessions.get(key) ?? newScope(key);
 
-  pi.registerTool({
-    ...lspDiagnosticsTool,
-    execute(id, params, signal, onUpdate, ctx) {
-      const scope = sessionFor(ctx.sessionManager ?? ctx);
-      return scope.run(signal, (ownedSignal) =>
-        lspDiagnosticsTool.execute(id, params, ownedSignal, onUpdate, scope.context(ctx)),
-      );
-    },
-  });
-  pi.registerTool({
-    ...lspFixTool,
-    execute(id, params, signal, onUpdate, ctx) {
-      const scope = sessionFor(ctx.sessionManager ?? ctx);
-      return scope.run(signal, (ownedSignal) =>
-        lspFixTool.execute(id, params, ownedSignal, onUpdate, scope.context(ctx)),
-      );
-    },
-  });
+  // Every tool runs as one session-owned invocation that shutdown and replacement drain.
+  const register = <TParams extends TSchema, TDetails>(tool: ToolDefinition<TParams, TDetails>) =>
+    pi.registerTool({
+      ...tool,
+      execute(id, params, signal, onUpdate, ctx) {
+        const scope = sessionFor(ctx.sessionManager ?? ctx);
+        return scope.run(signal, (ownedSignal) => tool.execute(id, params, ownedSignal, onUpdate, scope.context(ctx)));
+      },
+    });
+  register(lspDiagnosticsTool);
+  register(lspFixTool);
+  register(lspDefinitionTool);
+  register(lspReferencesTool);
+  register(lspHoverTool);
+  register(lspSymbolsTool);
+  register(lspRenameTool);
 
   pi.registerCommand("lsp", {
     description: "Show shared LSP extension configuration",

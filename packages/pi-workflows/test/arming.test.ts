@@ -1,9 +1,17 @@
+import type {
+  BeforeAgentStartEvent,
+  ContextEvent,
+  ExtensionContext,
+  InputEvent,
+  MessageStartEvent,
+} from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_TRIGGER_WORD,
   deduplicateWorkflowDirective,
   hasTriggerWord,
   WORKFLOW_ARMED_DIRECTIVE,
+  WorkflowTurnArming,
 } from "../src/arming.js";
 
 describe("hasTriggerWord — what counts as typing the word", () => {
@@ -112,5 +120,40 @@ describe("WORKFLOW_ARMED_DIRECTIVE", () => {
 
     expect(deduplicated).toBe(`run a workflow\n\n${WORKFLOW_ARMED_DIRECTIVE}\nEffort: ULTRA\n\n`);
     expect(deduplicated.split(WORKFLOW_ARMED_DIRECTIVE)).toHaveLength(2);
+  });
+});
+
+describe("WorkflowTurnArming — idleness at the preparation boundary", () => {
+  const prompt = "run a workflow";
+  const user = { role: "user", content: [{ type: "text", text: prompt }], timestamp: 1 };
+  const branch = [
+    { type: "message", id: "anchor", message: { role: "assistant", content: [], timestamp: 0 } },
+    { type: "message", id: "prompt", message: user },
+  ];
+
+  function overlay(messageType: "user" | undefined, idleDuringPreparation: boolean): unknown {
+    let idle = true;
+    const ctx = {
+      isIdle: () => idle,
+      sessionManager: { getSessionId: () => "session", getLeafId: () => "anchor", getBranch: () => branch },
+    } as unknown as ExtensionContext;
+    const arming = new WorkflowTurnArming();
+    arming.observe({ type: "input", text: prompt, source: "interactive" } as InputEvent, ctx, true, "off");
+    idle = idleDuringPreparation;
+    const start = { type: "before_agent_start", prompt, systemPrompt: "", ...(messageType ? { messageType } : {}) };
+    arming.consume(start as unknown as BeforeAgentStartEvent, ctx);
+    arming.messageStarted({ type: "message_start", message: user } as unknown as MessageStartEvent, ctx);
+    const result = arming.filterContext({ type: "context", messages: [user] } as unknown as ContextEvent, ctx);
+    const added = result?.messages.at(-1);
+    return added?.role === "custom" ? added.content : undefined;
+  }
+
+  it("admits a prompt while Pi 1.2+ reports its own starting run as busy", () => {
+    expect(overlay("user", false)).toBe(WORKFLOW_ARMED_DIRECTIVE);
+  });
+
+  it("refuses on a host without messageType once another run started during preparation", () => {
+    expect(overlay(undefined, true)).toBe(WORKFLOW_ARMED_DIRECTIVE);
+    expect(overlay(undefined, false)).toBeUndefined();
   });
 });

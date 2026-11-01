@@ -133,10 +133,16 @@ const dateStart = (time: number, delta = 0) => {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate() + delta).getTime();
 };
 const sinceMonday = now.getDay() === 0 ? 6 : now.getDay() - 1;
+// Months in these phases start on a civil date with an ordinary midnight.
+const monthStart = (time: number) => {
+  const date = new Date(time);
+  return new Date(date.getFullYear(), date.getMonth(), 1).getTime();
+};
 const expectedBounds = {
   todayMs: dateStart(now.getTime()),
   weekStartMs: dateStart(now.getTime(), -sinceMonday),
   lastWeekStartMs: dateStart(now.getTime(), -sinceMonday - 7),
+  thisMonthStartMs: monthStart(now.getTime()),
   last30DaysStartMs: dateStart(now.getTime(), -29),
   nowMs: now.getTime(),
 };
@@ -156,6 +162,7 @@ for (let pass = 0; pass < 2; pass++) {
     today: expectedBounds.todayMs,
     thisWeek: expectedBounds.weekStartMs,
     lastWeek: expectedBounds.lastWeekStartMs,
+    thisMonth: expectedBounds.thisMonthStartMs,
     last30Days: expectedBounds.last30DaysStartMs,
     allTime: -Infinity,
   };

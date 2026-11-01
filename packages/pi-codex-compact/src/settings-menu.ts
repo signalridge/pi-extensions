@@ -5,6 +5,7 @@ import {
   type CodexCompactSettings,
   type CodexCompactSettingsRuntime,
   type CodexCompactSettingsState,
+  effectiveLayeredFallback,
   effectiveStageTimeoutMs,
 } from "./settings.js";
 
@@ -18,6 +19,7 @@ type Action =
   | "set-stage-timeout"
   | "set-retries"
   | "set-retention"
+  | "set-layered"
   | "set-notify";
 
 export interface SettingsMenuOwner {
@@ -162,9 +164,18 @@ export function createCodexCompactMenu(
             action: "set-retention",
           },
           {
+            id: "layeredFallback",
+            label: "Layered fallback",
+            description:
+              "If Remote V2 fails over an opaque checkpoint, keep it and add Pi's readable summary of newer history. Off cancels instead.",
+            currentValue: effectiveLayeredFallback(state.settings) ? "On" : "Off",
+            values: ["On", "Off"],
+            action: "set-layered",
+          },
+          {
             id: "notifyOnFallback",
             label: "Fallback notifications",
-            description: "Warn when Remote V2 fails and native Pi compaction takes over.",
+            description: "Warn when Remote V2 fails and native Pi compaction or a layered summary takes over.",
             currentValue: state.settings.notifyOnFallback ? "On" : "Off",
             values: ["On", "Off"],
             action: "set-notify",
@@ -202,6 +213,7 @@ export function createCodexCompactMenu(
         update(runtime, ctx, { maxRetries: Number.parseInt(value ?? "2", 10) }, signal),
       "set-retention": ({ ctx, value, signal }) =>
         update(runtime, ctx, { replacementTokenBudget: Number.parseInt(value ?? "64", 10) * 1000 }, signal),
+      "set-layered": ({ ctx, value, signal }) => update(runtime, ctx, { layeredFallback: value === "On" }, signal),
       "set-notify": ({ ctx, value, signal }) => update(runtime, ctx, { notifyOnFallback: value === "On" }, signal),
     },
   };

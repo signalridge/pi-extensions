@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 import {
   detachLeadingShellBang,
+  FAKE_CURSOR_END,
+  FAKE_CURSOR_START,
   HARDWARE_CURSOR_MARKER,
   highlightLeadingSlashToken,
   injectPromptSymbol,
@@ -61,6 +63,18 @@ describe("detachLeadingShellBang", () => {
     const detached = detachLeadingShellBang(line);
     assert.equal(detached.detached, true);
     assert.equal(detached.cursorOnPrompt, true);
+    assert.equal(detached.hardwareCursorMarker, HARDWARE_CURSOR_MARKER);
+    assert.equal(detached.line, "    git status         ");
+  });
+
+  // pi-tui 1.2+ draws the software cursor between zero-width markers instead
+  // of inline reverse video.
+  test("reports the cursor on the bang drawn with pi-tui's software-cursor markers", () => {
+    const line = `    ${HARDWARE_CURSOR_MARKER}${FAKE_CURSOR_START}!${FAKE_CURSOR_END}git status        `;
+    const detached = detachLeadingShellBang(line);
+    assert.equal(detached.detached, true);
+    assert.equal(detached.cursorOnPrompt, true);
+    assert.equal(detached.fakeCursor, true);
     assert.equal(detached.hardwareCursorMarker, HARDWARE_CURSOR_MARKER);
     assert.equal(detached.line, "    git status         ");
   });
@@ -160,6 +174,18 @@ describe("highlightLeadingSlashToken", () => {
     assert.match(highlighted, /\x1b\[35m/);
     // biome-ignore lint/suspicious/noControlCharactersInRegex: Test asserts ANSI styling output.
     assert.match(highlighted, /\x1b\[1m/);
+  });
+
+  test("maps the command token through pi-tui's zero-width software-cursor markers", () => {
+    const line = `    /he${HARDWARE_CURSOR_MARKER}${FAKE_CURSOR_START}l${FAKE_CURSOR_END}p arg   `;
+    const highlighted = highlightLeadingSlashToken(line, (text) => `[${text}]`);
+    assert.equal(highlighted, `    [/he${HARDWARE_CURSOR_MARKER}${FAKE_CURSOR_START}l${FAKE_CURSOR_END}p] arg   `);
+    const onSlash = `    ${HARDWARE_CURSOR_MARKER}${FAKE_CURSOR_START}/${FAKE_CURSOR_END}help   `;
+    assert.equal(
+      highlightLeadingSlashToken(onSlash, (text) => `[${text}]`),
+      // Leading zero-width markers fall inside the painted token, as the hardware marker does.
+      `    [${HARDWARE_CURSOR_MARKER}${FAKE_CURSOR_START}/${FAKE_CURSOR_END}help]   `,
+    );
   });
 
   // Only a LEADING slash names a command. A path has text before its slash, so

@@ -12,7 +12,7 @@ const fixtureToken = "fixture-token-value";
 test("removes the positional token before constructing publish argv", () => {
   const parsed = parsePublishWithTokenArgs([
     fixtureToken,
-    "--package=pi-herdr-state",
+    "--package=pi-gpt-fast",
     "--tag",
     "latest",
     "--include-experimental",
@@ -22,7 +22,7 @@ test("removes the positional token before constructing publish argv", () => {
   assert.equal(parsed.tokenSource, "argument");
   assert.equal(parsed.token, fixtureToken);
   assert.deepEqual(parsed.publishArgs, [
-    "--package=pi-herdr-state",
+    "--package=pi-gpt-fast",
     "--tag",
     "latest",
     "--include-experimental",

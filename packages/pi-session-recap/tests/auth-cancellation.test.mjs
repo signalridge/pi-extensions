@@ -13,7 +13,13 @@ registerApiProvider({
   },
   streamSimple: (_model, context, options) => {
     providerCalls.push({ context, options });
-    return { result: async () => ({ role: "assistant", content: [{ type: "text", text: "Current recap." }] }) };
+    return {
+      result: async () => ({
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "Current recap." }],
+      }),
+    };
   },
 });
 

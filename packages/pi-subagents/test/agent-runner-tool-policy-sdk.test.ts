@@ -15,7 +15,7 @@ vi.setConfig({ testTimeout: 30_000 });
 
 // Tool exposure and nested ctx.executeTool are public Pi 0.99 APIs. The older
 // supported loaders are exercised by agent-runner.test.ts and loader-sdk.test.ts.
-describe.skipIf(!VERSION.startsWith("0.99.") && VERSION !== "1.0.4" && VERSION !== "1.1.0")("child tool policy on real Pi", () => {
+describe.skipIf(VERSION !== "1.4.0")("child tool policy on real Pi", () => {
   let root: string;
   let cwd: string;
   let agentDir: string;

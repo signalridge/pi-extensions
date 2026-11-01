@@ -17,7 +17,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { civilDayStart, civilHourStart } from "./civil-time.js";
+import { civilDayStart, civilHourStart, civilMonthStart } from "./civil-time.js";
 import { buildObservationProofs } from "./lineage-proof.js";
 
 export { getAgentDir };
@@ -162,6 +162,7 @@ export interface PeriodBounds {
   todayMs: number;
   weekStartMs: number;
   lastWeekStartMs: number;
+  thisMonthStartMs: number;
   last30DaysStartMs: number;
   nowMs: number;
 }
@@ -170,6 +171,7 @@ export interface UsageData {
   today: TimeFilteredStats;
   thisWeek: TimeFilteredStats;
   lastWeek: TimeFilteredStats;
+  thisMonth: TimeFilteredStats;
   last30Days: TimeFilteredStats;
   allTime: TimeFilteredStats;
   /** Deduped usage bucketed by hour start (ms) → series key → metrics. */
@@ -177,9 +179,9 @@ export interface UsageData {
   bounds: PeriodBounds;
 }
 
-export type TabName = "today" | "thisWeek" | "lastWeek" | "last30Days" | "allTime";
+export type TabName = "today" | "thisWeek" | "lastWeek" | "thisMonth" | "last30Days" | "allTime";
 
-export const TAB_ORDER: TabName[] = ["today", "thisWeek", "lastWeek", "last30Days", "allTime"];
+export const TAB_ORDER: TabName[] = ["today", "thisWeek", "lastWeek", "thisMonth", "last30Days", "allTime"];
 
 export type UsageSource = "assistant" | "auxiliary" | "usage";
 
@@ -261,8 +263,18 @@ export interface ParsedSessionFile {
 // Paths
 // =============================================================================
 
-export function getSessionsDir(): string {
-  return join(getAgentDir(), "sessions");
+/**
+ * The root holding every session file Pi writes. Pi keeps default sessions in
+ * per-cwd directories below `<agentDir>/sessions`, but `--session-dir`,
+ * `PI_CODING_AGENT_SESSION_DIR` and the `sessionDir` setting store them flat in
+ * the configured directory. Pass the active session's directory (as Pi resolved
+ * it) to follow the configured location instead of re-parsing Pi's options.
+ */
+export function getSessionsDir(activeSessionDir?: string): string {
+  const defaultRoot = join(getAgentDir(), "sessions");
+  if (!activeSessionDir) return defaultRoot;
+  const dir = resolve(activeSessionDir);
+  return dirname(dir) === resolve(defaultRoot) ? defaultRoot : dir;
 }
 
 export function getDefaultCachePath(): string {
@@ -1893,23 +1905,30 @@ function emptyPeriodRawData(): PeriodRawData {
  */
 export function projectLabelFromCwd(cwd: string): string {
   if (!cwd) return "(unknown)";
+  // Compare Windows paths (C:\Users\me\...) in their forward-slash form; the
+  // label displays that normalized form.
+  const normalized = cwd.replaceAll("\\", "/");
   // Collapse any home-directory prefix to "~", not just the current user's —
   // session stores merged from other machines can carry a different username.
-  const home = homedir();
+  const home = homedir().replaceAll("\\", "/");
   let homePrefix: string | null = null;
-  if (cwd === home || cwd.startsWith(`${home}/`)) {
+  if (normalized === home || normalized.startsWith(`${home}/`)) {
     homePrefix = home;
   } else {
-    const m = /^(\/Users\/[^/]+|\/home\/[^/]+)(?=\/|$)/.exec(cwd);
+    const m = /^(\/Users\/[^/]+|\/home\/[^/]+|[A-Za-z]:\/Users\/[^/]+)(?=\/|$)/.exec(normalized);
     if (m?.[1]) homePrefix = m[1];
   }
-  if (homePrefix !== null && cwd.length <= homePrefix.length) return "~";
-  let rel = homePrefix !== null ? cwd.slice(homePrefix.length + 1) : cwd;
+  if (homePrefix !== null && normalized.length <= homePrefix.length) return "~";
+  let rel = homePrefix !== null ? normalized.slice(homePrefix.length + 1) : normalized;
   const wt = rel.indexOf("/.worktrees/");
   if (wt !== -1) rel = rel.slice(0, wt);
   const parts = rel.split("/").filter(Boolean);
-  const label = parts.slice(0, 2).join("/");
-  return homePrefix !== null ? `~/${label}` : `/${label}`;
+  if (homePrefix !== null) return `~/${parts.slice(0, 2).join("/")}`;
+  // A drive path outside a home (D:/work/repo/sub) keeps its meaningful
+  // segments rather than the drive letter.
+  const drive = /^[A-Za-z]:$/.test(parts[0] ?? "");
+  const label = (drive ? parts.slice(1) : parts).slice(0, 2).join("/");
+  return drive ? label : `/${label}`;
 }
 
 function emptyUsageData(bounds: PeriodBounds): UsageData {
@@ -1917,6 +1936,7 @@ function emptyUsageData(bounds: PeriodBounds): UsageData {
     today: emptyTimeFilteredStats(),
     thisWeek: emptyTimeFilteredStats(),
     lastWeek: emptyTimeFilteredStats(),
+    thisMonth: emptyTimeFilteredStats(),
     last30Days: emptyTimeFilteredStats(),
     allTime: emptyTimeFilteredStats(),
     hourly: new Map(),
@@ -1970,6 +1990,7 @@ function getPeriodsForTimestamp(
   todayMs: number,
   weekStartMs: number,
   lastWeekStartMs: number,
+  thisMonthStartMs: number,
   last30DaysStartMs: number,
 ): TabName[] {
   const periods: TabName[] = ["allTime"];
@@ -1979,6 +2000,7 @@ function getPeriodsForTimestamp(
   } else if (timestamp >= lastWeekStartMs) {
     periods.push("lastWeek");
   }
+  if (timestamp >= thisMonthStartMs) periods.push("thisMonth");
   if (timestamp >= last30DaysStartMs) periods.push("last30Days");
   return periods;
 }
@@ -1995,11 +2017,19 @@ function addMessagesToUsageData(
   todayMs: number,
   weekStartMs: number,
   lastWeekStartMs: number,
+  thisMonthStartMs: number,
   last30DaysStartMs: number,
   rawByPeriod: Record<TabName, PeriodRawData>,
   costByDayIdx: Map<number, number>,
 ): void {
-  const sessionContributed = { today: false, thisWeek: false, lastWeek: false, last30Days: false, allTime: false };
+  const sessionContributed = {
+    today: false,
+    thisWeek: false,
+    lastWeek: false,
+    thisMonth: false,
+    last30Days: false,
+    allTime: false,
+  };
 
   for (let mi = 0; mi < messages.length; mi++) {
     const msg = messages[mi];
@@ -2017,7 +2047,14 @@ function addMessagesToUsageData(
 
     addToHourlyBuckets(data.hourly, msg);
 
-    const periods = getPeriodsForTimestamp(msg.timestamp, todayMs, weekStartMs, lastWeekStartMs, last30DaysStartMs);
+    const periods = getPeriodsForTimestamp(
+      msg.timestamp,
+      todayMs,
+      weekStartMs,
+      lastWeekStartMs,
+      thisMonthStartMs,
+      last30DaysStartMs,
+    );
     const tokens = {
       // Count fresh tokens processed this turn.
       // Include cacheWrite because those prompt tokens were newly written and billed.
@@ -2102,6 +2139,7 @@ function addMessagesToUsageData(
   if (sessionContributed.today) data.today.totals.sessions++;
   if (sessionContributed.thisWeek) data.thisWeek.totals.sessions++;
   if (sessionContributed.lastWeek) data.lastWeek.totals.sessions++;
+  if (sessionContributed.thisMonth) data.thisMonth.totals.sessions++;
   if (sessionContributed.last30Days) data.last30Days.totals.sessions++;
   if (sessionContributed.allTime) data.allTime.totals.sessions++;
 }
@@ -2384,6 +2422,8 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
   const daysSinceMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
   const weekStartMs = civilDayStart(now.getTime(), -daysSinceMonday);
   const lastWeekStartMs = civilDayStart(now.getTime(), -daysSinceMonday - 7);
+  // Calendar month to date, from the first instant of the local first.
+  const thisMonthStartMs = civilMonthStart(now.getTime());
   // Rolling 30 calendar days including today.
   const last30DaysStartMs = civilDayStart(now.getTime(), -29);
 
@@ -2512,11 +2552,19 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
   }
 
   // 6. Aggregate in sorted path order with cross-file dedupe.
-  const data = emptyUsageData({ todayMs, weekStartMs, lastWeekStartMs, last30DaysStartMs, nowMs: now.getTime() });
+  const data = emptyUsageData({
+    todayMs,
+    weekStartMs,
+    lastWeekStartMs,
+    thisMonthStartMs,
+    last30DaysStartMs,
+    nowMs: now.getTime(),
+  });
   const rawByPeriod: Record<TabName, PeriodRawData> = {
     today: emptyPeriodRawData(),
     thisWeek: emptyPeriodRawData(),
     lastWeek: emptyPeriodRawData(),
+    thisMonth: emptyPeriodRawData(),
     last30Days: emptyPeriodRawData(),
     allTime: emptyPeriodRawData(),
   };
@@ -2625,6 +2673,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
       todayMs,
       weekStartMs,
       lastWeekStartMs,
+      thisMonthStartMs,
       last30DaysStartMs,
       rawByPeriod,
       costByDayIdx,

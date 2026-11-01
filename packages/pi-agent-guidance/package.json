@@ -1,7 +1,7 @@
 {
   "name": "@signalridge/pi-agent-guidance",
   "version": "1.2.6",
-  "description": "Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on current model.",
+  "description": "Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on current model, and context files from the subdirectories the agent works in.",
   "license": "MIT",
   "author": "Thomas Mustier",
   "keywords": [
@@ -25,7 +25,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.0.4"
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0"
   },
   "type": "module",
   "private": false,

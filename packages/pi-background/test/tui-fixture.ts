@@ -41,6 +41,7 @@ export function nativeUIFixture(fullscreen = true) {
     clearScreen: () => {},
     setTitle: () => {},
     setProgress: () => {},
+    setProgramStatus: () => {},
   } satisfies Terminal;
   const tui = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
   const theme = { fg: (_color: string, text: string) => text } as unknown as Theme;

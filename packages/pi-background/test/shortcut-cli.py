@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import struct
@@ -105,6 +106,14 @@ class CLIHost:
         frames = self.of("frame")
         return "\n".join(frames[-1]["lines"]) if frames else ""
 
+    def selected_id(self):
+        for row in self.text().splitlines():
+            if row.startswith(">"):
+                match = re.search(r" · ([A-Za-z0-9_-]{8})$", row)
+                if match:
+                    return match.group(1)
+        return None
+
     def close(self):
         try:
             self.key(b"\x03")
@@ -197,13 +206,16 @@ for mode in ["fullscreen", "regular"]:
             host.key(ESC)
             host.wait(lambda: "Background details" in host.text())
             host.key(ESC)
+            host.wait(lambda: "Background tasks" in host.text() and host.selected_id() is not None)
+            previous_selected = host.selected_id()
             host.key(b"\x1b[B")
-            selected = next(row for row in host.text().splitlines() if row.startswith(">"))
+            host.wait(lambda: host.selected_id() is not None and host.selected_id() != previous_selected)
+            selected = host.selected_id()
             opens = len(host.of("open"))
             turns = len(host.of("agent-start"))
             host.key(TASKS)
             check(len(host.of("open")) == opens, "repeat does not replace task selector")
-            check(selected in host.text(), "repeat preserves stable task selection")
+            check(host.selected_id() == selected, "repeat preserves stable task selection")
             host.key(b"\r")
             host.wait(lambda: "Background details" in host.text())
             host.key(b"\r")

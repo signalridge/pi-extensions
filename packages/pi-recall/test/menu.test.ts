@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import { stripVTControlCharacters } from "node:util";
 import { Key, type KeyId, matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import { resolveMenuScreen, runMenu } from "@narumitw/pi-tui-kit";
 import { createRpcHarness, createTuiHarness } from "@narumitw/pi-tui-kit/testing";
 import { test } from "vitest";
 import { createRecallMenu, type RecallMenuSource, showRecallMenu } from "../src/menu.js";
 import { formatRecallQuote, type MessageCandidate, type RecallMessageRecord } from "../src/messages.js";
-import { createMockContext } from "./support.js";
+import { createMockContext, visibleText } from "./support.js";
 
 function candidate(entryId: string): MessageCandidate {
   return {
@@ -241,7 +240,7 @@ test("TUI query survives picker re-entry in one Recall flow and resets in a fres
   });
   await firstTui.waitForOpen();
   firstTui.type("saved-a");
-  assert.match(stripVTControlCharacters(firstTui.render().join("\n")), /1 match/);
+  assert.match(visibleText(firstTui.render()), /1 match/);
   firstTui.press("tui.select.confirm");
   assert.deepEqual(await first, { kind: "to", screen: "selected" });
 
@@ -253,7 +252,7 @@ test("TUI query survives picker re-entry in one Recall flow and resets in a fres
     itemId: "recall",
   });
   await reopenedTui.waitForOpen();
-  const reopenedSearch = stripVTControlCharacters(reopenedTui.render().join("\n"))
+  const reopenedSearch = visibleText(reopenedTui.render())
     .split("\n")
     .find((line) => line.startsWith("Search:"));
   assert.match(reopenedSearch ?? "", /saved-a/);
@@ -269,7 +268,7 @@ test("TUI query survives picker re-entry in one Recall flow and resets in a fres
     itemId: "recall",
   });
   await freshTui.waitForOpen();
-  const freshSearch = stripVTControlCharacters(freshTui.render().join("\n"))
+  const freshSearch = visibleText(freshTui.render())
     .split("\n")
     .find((line) => line.startsWith("Search:"));
   assert.doesNotMatch(freshSearch ?? "", /saved-a/);
@@ -318,16 +317,16 @@ test("TUI direct delete confirms the selected message, shows progress, and resto
   tui.type("saved");
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
-  const confirmationView = stripVTControlCharacters(tui.render().join("\n"));
+  const confirmationView = visibleText(tui.render());
   assert.match(confirmationView, /Delete saved message/);
   assert.match(confirmationView, /saved text saved-other/);
   tui.press("tui.select.confirm");
   await waitForOpenCount(tui, 3, choosing);
   await started;
-  assert.match(stripVTControlCharacters(tui.render().join("\n")), /Deleting saved message/);
+  assert.match(visibleText(tui.render()), /Deleting saved message/);
   releaseDelete();
   await waitForOpenCount(tui, 4, choosing);
-  const restored = stripVTControlCharacters(tui.render().join("\n"));
+  const restored = visibleText(tui.render());
   assert.match(restored, /Scope: All \(1\).*1 match/);
   assert.match(restored, /Search: .*saved/);
   assert.match(restored, /saved text saved-cur…/);
@@ -366,11 +365,11 @@ test("cancelling direct delete is side-effect free and restores query and select
   tui.type("saved-a");
   tui.send("\u0004");
   await waitForOpenCount(tui, 2, choosing);
-  const confirmationView = stripVTControlCharacters(tui.render().join("\n"));
+  const confirmationView = visibleText(tui.render());
   assert.match(confirmationView, /Delete saved message/);
   tui.press("tui.select.cancel");
   await waitForOpenCount(tui, 3, choosing);
-  const restored = stripVTControlCharacters(tui.render().join("\n"));
+  const restored = visibleText(tui.render());
   assert.match(restored, /Search: .*saved-a/);
   assert.match(restored, /> assistant .*saved text saved-a/);
   assert.equal(deleteCalls, 0);

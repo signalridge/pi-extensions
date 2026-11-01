@@ -24,7 +24,7 @@ function isolated(config: string, script: string) {
          const warnings = [];
          console.warn = (message) => warnings.push(message);
          let handler;
-         guidance({ on: (_event, fn) => handler = fn });
+         guidance({ on: (event, fn) => { if (event === "before_agent_start") handler = fn; } });
          const run = (id = "gpt-5.4", provider = "openai") => handler({ systemPrompt: "base" }, { cwd: ${JSON.stringify(cwd)}, model: { provider, id } });
          ${script}`,
       ],
@@ -47,6 +47,7 @@ for (const config of [
   '{"models":null}',
   '{"models":{"*":{"file":"SPECIAL.md"}}}',
   '{"providers":{"openai":["SPECIAL.md"]},"models":[]}',
+  '{"providers":{"openai":["SPECIAL.md"]},"subdirectoryContext":"no"}',
 ]) {
   test(`invalid config falls back safely and warns once: ${config}`, () => {
     isolated(

@@ -23,10 +23,12 @@
  * provider registers in a different `pi-ai` module instance than the one
  * pi-coding-agent streams through, which is brittle and orthogonal to gating.)
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fauxProvider } from "@earendil-works/pi-ai";
+import { createAgentSession, DefaultResourceLoader, ModelRegistry, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
@@ -164,5 +166,96 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     expect(active).toContain(EXT_TOOL); // selected → surfaces despite the flip
     expect(active).toContain("read");
     expect(active).not.toContain("bash"); // builtinToolNames: ["read"] only
+  });
+  // An append-mode child inherits the parent's rendered prompt as its preamble,
+  // and its own session renders skills and cwd after it. The parent's copies of
+  // those sections must not be inherited, or the child lists them twice.
+  describe("append mode inherits a real Pi 1.4 parent prompt without its skills and cwd", () => {
+    let agentDir: string;
+    let previousAgentDir: string | undefined;
+
+    beforeEach(() => {
+      agentDir = mkdtempSync(join(tmpdir(), "subagents-e2e-agent-"));
+      previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      mkdirSync(join(agentDir, "skills", "demo-skill"), { recursive: true });
+      writeFileSync(join(agentDir, "skills", "demo-skill", "SKILL.md"),
+        "---\nname: demo-skill\ndescription: A demo skill for the prompt test.\n---\n\nDemo.\n");
+      writeFileSync(join(cwd, "AGENTS.md"), "PROJECT RULE: say hi.\n");
+    });
+    afterEach(() => {
+      if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+      rmSync(agentDir, { recursive: true, force: true });
+    });
+
+    /** The prompt a real Pi session renders for `cwd`: preamble, project context, skills, cwd. */
+    async function realParentPrompt(): Promise<string> {
+      const provider = fauxProvider({ provider: "prompt-parent", models: [{ id: "parent", contextWindow: 200_000 }] });
+      const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
+      runtime.registerNativeProvider(provider.provider);
+      await runtime.refresh({ allowNetwork: false });
+      const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true });
+      await loader.reload();
+      const { session } = await createAgentSession({
+        cwd, agentDir, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd),
+        settingsManager: SettingsManager.inMemory({}), model: provider.getModel(), modelRuntime: runtime, modelRegistry: new ModelRegistry(runtime),
+      });
+      const prompt = session.systemPrompt;
+      session.dispose();
+      return prompt;
+    }
+
+    async function childPrompt(parentPrompt: string, skills: AgentConfig["skills"]): Promise<string> {
+      registerAgents(new Map([["twin", {
+        name: "twin", description: "twin", builtinToolNames: BUILTINS, extensions: false, skills,
+        systemPrompt: "", promptMode: "append", inheritContext: false, runInBackground: false, isolated: false,
+      } as AgentConfig]]));
+      const model = faux.getModel();
+      const modelRegistry: any = {
+        find: () => model, getAll: () => [model], getAvailable: () => [model],
+        hasConfiguredAuth: () => true, isUsingOAuth: () => false,
+        getApiKeyAndHeaders: async () => ({ apiKey: "faux", headers: {} }),
+        registerProvider: () => {}, unregisterProvider: () => {},
+        runtime: {
+          getModel: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+          getAuth: async () => ({ apiKey: "faux" }),
+          stream: () => { throw new Error("fixture has no provider dispatch"); },
+          streamSimple: () => { throw new Error("fixture has no provider dispatch"); },
+          hasConfiguredAuth: () => true,
+        },
+      };
+      const ctx: any = { cwd, isProjectTrusted: () => true, getSystemPrompt: () => parentPrompt, model, modelRegistry };
+      let prompt = "";
+      try {
+        await runAgent(ctx, "twin", "go", { pi: makePi(), model, onSessionCreated: (s) => { prompt = s.systemPrompt; } });
+      } catch {
+        // Only the prompt built at construction matters.
+      }
+      return prompt;
+    }
+
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+
+    it("skills: true lists the skills and the cwd once, and keeps the project context", async () => {
+      const parent = await realParentPrompt();
+      expect(count(parent, "<name>demo-skill</name>")).toBe(1);
+      expect(count(parent, "<cwd>")).toBe(1);
+      expect(parent).toContain("PROJECT RULE: say hi.");
+
+      const child = await childPrompt(parent, true);
+      expect(count(child, "<name>demo-skill</name>")).toBe(1);
+      expect(count(child, "<available_skills>")).toBe(1);
+      expect(count(child, "<cwd>")).toBe(1);
+      expect(count(child, "PROJECT RULE: say hi.")).toBe(1);
+      // The inherited part is still a byte prefix of the parent's prompt.
+      expect(child.startsWith(parent.slice(0, parent.indexOf("\n\n<skills>\n")))).toBe(true);
+    });
+
+    it("skills: false shows none of the parent's skills", async () => {
+      const child = await childPrompt(await realParentPrompt(), false);
+      expect(child).not.toContain("demo-skill");
+      expect(child).toContain("PROJECT RULE: say hi.");
+    });
   });
 });

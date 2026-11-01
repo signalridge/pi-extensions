@@ -23,6 +23,8 @@ export interface NotificationBatch {
 export interface NotificationHost {
   createWakeId?(): string;
   ready(): boolean;
+  /** False while a turn must not start; turn-attention events are then delivered as context only. */
+  canWake?(): boolean;
   send(batch: NotificationBatch): void;
   failed(message: string): void;
 }
@@ -145,7 +147,9 @@ export class Notifications {
       entries.set(id, entry);
       parts.push(part);
     }
-    const triggerTurn = [...entries.values()].some((entry) => entry.events.some((event) => event.attention === "turn"));
+    const triggerTurn =
+      [...entries.values()].some((entry) => entry.events.some((event) => event.attention === "turn")) &&
+      this.host.canWake?.() !== false;
     const delay = MIN_WAKE_INTERVAL_MS - (Date.now() - this.lastWakeAt);
     if (triggerTurn && delay > 0) {
       this.schedule(delay);

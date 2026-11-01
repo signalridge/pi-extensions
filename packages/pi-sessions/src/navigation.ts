@@ -57,7 +57,7 @@ async function switchChosen(owner: Owner, ui: HumanUI, chosen: SessionRow): Prom
     crossWorkspace &&
     !(await ui.confirm(
       "Cross-workspace session",
-      `History belongs to: ${label(candidate.header.cwd, 600)}\nActive workspace now: ${label(ctx.cwd, 600)}\nPi 1.0.4 native switching rebinds tools/resources to the session workspace (not process.chdir). Other hosts may retain their workspace; the actual active workspace will be reported after switching. Continue?`,
+      `History belongs to: ${label(candidate.header.cwd, 600)}\nActive workspace now: ${label(ctx.cwd, 600)}\nPi 1.0.4-1.4.0 native switching rebinds tools/resources to the session workspace (not process.chdir). Other hosts may retain their workspace; the actual active workspace will be reported after switching. Continue?`,
     ))
   )
     return;

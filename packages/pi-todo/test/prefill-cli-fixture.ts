@@ -6,7 +6,7 @@ import todo from "../src/extension.js";
 import { type Snapshot, STATE_TYPE, validateSnapshot } from "../src/state.js";
 
 export default function fixture(pi: ExtensionAPI): void {
-  if (VERSION !== "1.0.4") throw new Error(`CLI proof requires Pi 1.0.4, got ${VERSION}`);
+  if (VERSION !== "1.4.0") throw new Error(`CLI proof requires Pi 1.4.0, got ${VERSION}`);
   const path = process.env.PI_TODO_CLI_EVIDENCE;
   if (!path) throw new Error("Missing CLI evidence destination");
   const record = (event: string, data: object) => appendFileSync(path, `${JSON.stringify({ event, ...data })}\n`);

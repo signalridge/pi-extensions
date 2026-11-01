@@ -2,10 +2,30 @@
 
 ## Tested host and dependency ownership
 
-The workspace development baseline is **Pi 1.0.4**, pinned exactly in the root
+The workspace development baseline is **Pi 1.4.0**, pinned exactly in the root
 `package.json` and any package-local Pi development dependencies. A newer host
 must pass its own acceptance run; a newer upstream release or a successful
 individual test does not qualify the whole repository.
+
+The baseline moved from 1.0.4 to 1.4.0 with a full acceptance run. Host
+changes that extensions must account for since 1.0.4:
+
+- `before_agent_start` is a union on `messageType` (Pi 1.2): `"user"` carries
+  `prompt` and `images`, `"custom"` carries the `message` of a run started by an
+  idle `pi.sendMessage(..., { triggerTurn: true })`, which earlier hosts never
+  announced there. Code that keys on the prompt must skip custom runs; code
+  that shapes every request (system prompt sections, tool policy) should not.
+- The session counts as busy while its own run starts (Pi 1.2), including
+  inside `before_agent_start`; `ctx.isIdle()` there no longer distinguishes
+  "another run started meanwhile", and `pi.sendMessage()` queues into the
+  starting run.
+- Closing an overlay dialog removes only its own overlay (Pi 1.3); 1.0.4
+  removed the topmost one. `Editor` and `Input` draw the cursor between
+  invisible markers (pi-tui 1.2), which line sanitizers must admit.
+- Interactive extension dialogs form a stack (Pi 1.3), and `/reload` disposes
+  open dialogs without closing them; a dialog owner must settle on dispose.
+- `Terminal.setProgramStatus()` (OSC 7501, Pi 1.1) and `durationMs`/`outputPad`
+  on the tool render context are required members of their interfaces.
 
 Host-provided modules belong in `peerDependencies` with the literal range `"*"`,
 not runtime or optional dependencies:
@@ -34,9 +54,9 @@ contracts and [design decisions](open-decisions.md) for implementation constrain
   admission on actual calls, including nested calls. Model-only terminal tools
   cannot safely delegate their top-level termination semantics to nested calls.
 - An extension hook returning `undefined` ordinarily leaves the host path
-  unchanged. In Pi 1.0.4, throwing in `before_provider_request` is reported but
-  does not block dispatch; compaction cancellation requires `{ cancel: true }`.
-- Pi 1.0.4 cancellable lifecycle dispatch stops at an earlier extension's veto.
+  unchanged. Throwing in `before_provider_request` is reported but does not
+  block dispatch; compaction cancellation requires `{ cancel: true }`.
+- Cancellable lifecycle dispatch stops at an earlier extension's veto.
   Ownership fences cover delivered events and observable state, not every
   attempted navigation. RPC supplies no client-local draft epoch or conditional
   editor write; clients must reject stale consent and preserve newer drafts.
@@ -58,12 +78,11 @@ contracts and [design decisions](open-decisions.md) for implementation constrain
 - Background jobs are local, session-owned macOS/Linux processes. They are not
   persistent services, PTYs, remote backends or an OS sandbox. Managed children
   exclude this asynchronous process owner.
-- Approvals require explicit native-backend certification and cooperative
-  adapters for noncanonical tools. They do not cover arbitrary extension-side
-  I/O. Reviewed bash has narrower runtime requirements than edit/write; see the
-  [Approvals README](../packages/pi-approvals/README.md).
 - Codex opaque checkpoints require the extension and the issuing compatible
-  model for full replay. Native summary generation cannot decode them. Do not
+  model for full replay. A layered checkpoint (format v2: the previous opaque
+  history plus a readable summary of what a failed remote compaction would
+  have dropped) cannot be read by `pi-codex-compact` 1.10 or earlier, which
+  cancel compaction over it; do not downgrade past a layered checkpoint. Native summary generation cannot decode them. Do not
   treat model switching, disabling the extension or `/compact` as lossless
   migration; retain a private backup and verify a readable recovery summary.
   Canonical-history authorization is not a generic request-filter guarantee.
@@ -73,8 +92,9 @@ contracts and [design decisions](open-decisions.md) for implementation constrain
 - Analytics event observations are best-effort derived metrics, not a complete
   request log or billing ledger. Cache-warming/reload hooks do not always expose
   physical-request ownership.
-- Priority-tier request rewriting does not provide a host pricing bridge. In
-  Pi 1.0.4, requested and returned tiers can be accounted differently; do not
+- Priority-tier request rewriting does not provide a host pricing bridge. Pi
+  prices from the tier the response reports (unchanged through 1.4.0), so
+  requested and returned tiers can be accounted differently; do not
   duplicate a pricing catalogue in an extension to conceal that limitation.
 - Native external-editor lifetime, cross-extension focus observation and
   concurrent filesystem writers remain host/OS boundaries, not guarantees made

@@ -127,6 +127,11 @@ export function createAnalyticsExtension(
     });
 
     pi.on("before_agent_start", async (event, ctx) => {
+      // Pi 1.2+ also announces runs started by an idle custom message (for example
+      // a subagent completion). No input preceded them, so they must not consume
+      // the user's pending trigger or explicit skill; turn_start records them as
+      // extension-triggered, exactly as on hosts that never announced them here.
+      if (event.messageType === "custom") return;
       const generation = sessionGeneration;
       const tracker = skillTracker;
       const activeCollector = collector;

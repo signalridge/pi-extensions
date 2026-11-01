@@ -122,8 +122,18 @@ test("native custom notifications reach the provider with authoritative safety-p
         );
       },
     ]);
+    // The command hands its prompt to fire-and-forget pi.sendUserMessage(), whose
+    // run may not have started when the command returns. Wait for that run to
+    // settle instead of relying on how many awaits precede it.
+    const resumedRunSettled = new Promise<void>((resolve) => {
+      const unsubscribe = session.subscribe((event) => {
+        if (event.type !== "agent_settled") return;
+        unsubscribe();
+        resolve();
+      });
+    });
     await session.prompt("/goal resume");
-    await session.agent.waitForIdle();
+    await resumedRunSettled;
     expect(requests).toBe(3);
     expect(state().goal).toBeNull();
   } finally {

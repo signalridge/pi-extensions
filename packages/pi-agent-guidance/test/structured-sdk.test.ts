@@ -191,19 +191,56 @@ test("structured custom preamble/context and an intentional earlier forceSystemP
     expect(rendered).toContain("legitimate custom preamble");
     expect(rendered).toContain("legitimate custom context");
     expect(rendered).toContain("project provider guidance");
-    const result = await session.extensionRunner?.emitBeforeAgentStart("hello", undefined, {
-      cwd: session.cwd,
-      forceSystemPrompt: "intentional full replacement",
-      contextFiles: [],
-      sections: { provider_context: "existing provider section\n\n" },
-    });
+    const result = await session.extensionRunner?.emitBeforeAgentStart(
+      { messageType: "user", prompt: "hello" },
+      {
+        cwd: session.cwd,
+        forceSystemPrompt: "intentional full replacement",
+        contextFiles: [],
+        sections: { provider_context: "existing provider section\n\n" },
+      },
+    );
     expect(result?.systemPromptOptions.forceSystemPrompt).toContain("intentional full replacement");
     expect(result?.systemPromptOptions.forceSystemPrompt).toContain("project provider guidance");
     expect(result?.systemPromptOptions.sections.provider_context).toStartWith("existing provider section");
     if (!result) throw new Error("missing SDK runner");
-    const again = await session.extensionRunner?.emitBeforeAgentStart("hello", undefined, result.systemPromptOptions);
+    const again = await session.extensionRunner?.emitBeforeAgentStart(
+      { messageType: "user", prompt: "hello" },
+      result.systemPromptOptions,
+    );
     expect(again?.systemPromptOptions.forceSystemPrompt).toEqual(result.systemPromptOptions.forceSystemPrompt);
     expect(again?.systemPromptOptions.sections.provider_context.split("project provider guidance")).toHaveLength(2);
+  });
+});
+
+test("an idle custom-message run gets the same provider guidance as a user prompt", async () => {
+  await fixture(async ({ faux, start }) => {
+    const rendered: string[] = [];
+    faux.setResponses(
+      Array.from({ length: 2 }, () => (context: TranscriptContext) => {
+        rendered.push(systemText(context));
+        return fauxAssistantMessage("done");
+      }),
+    );
+    const triggers: string[] = [];
+    const probe: ExtensionFactory = (pi) => {
+      pi.on("before_agent_start", (event) => {
+        triggers.push(event.messageType);
+      });
+    };
+    const session = await start([guidance, probe]);
+    await session.sendCustomMessage(
+      { customType: "guidance-probe", content: "background work finished", display: false },
+      { triggerTurn: true },
+    );
+    await session.waitForIdle();
+    await session.prompt("plain follow-up");
+    expect(triggers).toEqual(["custom", "user"]);
+    expect(rendered).toHaveLength(2);
+    for (const prompt of rendered) {
+      expect(prompt.split("global provider guidance")).toHaveLength(2);
+      expect(prompt.split("project provider guidance")).toHaveLength(2);
+    }
   });
 });
 

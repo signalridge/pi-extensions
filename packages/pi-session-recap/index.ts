@@ -162,6 +162,15 @@ export function buildRecapContext(entries: ProjectedSessionEntry[], branchEntrie
     // The recap is an independent provider request, not a continuation of that agent.
     .filter((message) => message.role !== "system")
     .map((message) => {
+      // pi-ai sizes max_tokens from the last assistant usage, which here describes
+      // the whole session. Past the recap model's window that clamps the recap to
+      // about one token, so the copies are sized by their own content instead.
+      if (message.role === "assistant") {
+        return {
+          ...message,
+          usage: { ...message.usage, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+        };
+      }
       if (message.role !== "toolResult") return message;
       return {
         ...message,
@@ -386,6 +395,13 @@ async function generateRecap(
   }
 
   if (signal?.aborted || !isCurrent()) return undefined;
+  // pi-ai resolves rather than throws when a stream fails, is aborted, or hits
+  // the token cap, handing back only the text that arrived before the cut.
+  // Render a cleanly stopped response only; surface a genuine failure.
+  if (response.stopReason === "error") {
+    throw new Error(response.errorMessage || "the recap request failed mid-stream");
+  }
+  if (response.stopReason !== "stop") return undefined;
   const text = response.content
     .filter((c): c is { type: "text"; text: string } => c.type === "text")
     .map((c) => c.text)
@@ -394,6 +410,14 @@ async function generateRecap(
     .trim();
 
   return text ? { kind: "recap", text } : undefined;
+}
+
+// Never write to the console: Pi does not intercept it, so the text lands on
+// the terminal mid-frame. Only the message belongs in a notification.
+function reportFailure(ctx: ExtensionContext, err: unknown): void {
+  if (!ctx.hasUI) return;
+  const message = err instanceof Error ? err.message : String(err);
+  ctx.ui.notify(`session-recap: ${sanitizeTerminalText(message, false)}`, "error");
 }
 
 function hasInteractiveUi(ctx: ExtensionContext): boolean {
@@ -785,7 +809,7 @@ export default function (pi: ExtensionAPI) {
       clearPostSettleTimer();
       showRecap(ctx, result.text);
     } catch (err) {
-      if (!controller.signal.aborted && isCurrent()) console.error("[session-recap] failed:", err);
+      if (!controller.signal.aborted && isCurrent()) reportFailure(ctx, err);
     } finally {
       if (activeController === controller) {
         activeController = undefined;
@@ -808,8 +832,7 @@ export default function (pi: ExtensionAPI) {
         return generateAndShow(ctx, reason);
       })
       .catch((err: unknown) => {
-        if (ownsOrigin() && isCurrentIdentity(generation, sessionManager))
-          console.error("[session-recap] failed:", err);
+        if (ownsOrigin() && isCurrentIdentity(generation, sessionManager)) reportFailure(ctx, err);
       });
   };
 
@@ -1039,13 +1062,17 @@ export default function (pi: ExtensionAPI) {
     attachFocusReporting(ctx);
     attachTerminalInput(ctx);
     if (!automaticEnabled() || !hasRecapUi(ctx)) return;
-    if (event.reason === "resume" || event.reason === "fork") {
+    // Pi reports a session reopened from the command line (`pi -c`, `pi -r`,
+    // `--session`) as "startup"; only an in-process switch reports "resume". A
+    // fresh session has no meaningful activity and is skipped by generation.
+    if (event.reason === "startup" || event.reason === "resume" || event.reason === "fork") {
       const generation = sessionGeneration;
       const sessionManager = ctx.sessionManager;
       const ownsOrigin = captureSessionOrigin(ctx);
       const timer = setTimeout(() => {
         if (resumeTimer === timer) resumeTimer = undefined;
-        if (!isCurrentIdentity(generation, sessionManager)) return;
+        // `pi -c "<prompt>"` starts work at once; a recap would be stale on arrival.
+        if (!isCurrentIdentity(generation, sessionManager) || agentActive) return;
         runGenerationSafely(ctx, "resume", generation, sessionManager, ownsOrigin);
       }, 300);
       resumeTimer = timer;

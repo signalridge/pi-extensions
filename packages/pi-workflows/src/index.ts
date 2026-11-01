@@ -8,6 +8,7 @@ import { Type } from "@sinclair/typebox";
 import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMING_MESSAGE_TYPE, WorkflowTurnArming } from "./arming.js";
 import { BUILTIN_WORKFLOWS, validateBuiltinArgs } from "./builtins.js";
 import { type CommandResult, resolveCodeReviewScope } from "./code-review-scope.js";
+import { OverflowWakeGuard } from "./context-overflow.js";
 import { type ScriptStartOptions, type ScriptStartResult, WorkflowEngine, WorkflowWaitAbortedError } from "./engine.js";
 import { JOURNAL_ENTRY_TYPE, type SessionEntryLike } from "./journal.js";
 import {
@@ -361,6 +362,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
   let keywordTriggerEnabled = workflowSettings.keywordTriggerEnabled;
   /** Public sends are void: acceptance is checked against the owning branch. */
   let deliveryContext: ExtensionContext | undefined;
+  const overflowWakes = new OverflowWakeGuard(pi, "workflow results are added to the conversation");
   let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
   let inputPreparing = false;
   const turnArming = new WorkflowTurnArming();
@@ -1808,7 +1810,8 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     try {
       if (!isCurrent()) return;
       // Never use a custom-message triggerTurn: that skips input preparation
-      // and before_agent_start. The void API is NOT an acceptance promise.
+      // (and, before Pi 1.2, before_agent_start). The void API is NOT an
+      // acceptance promise.
       const missing = batch.filter(([runId]) => !persisted(runId));
       if (missing.length > 0)
         pi.sendMessage(
@@ -1842,7 +1845,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       }
       // An earlier input hook can await while the same manager navigates. Keep
       // exact owner evidence until our input hook consumes this private wake.
-      if (isCurrent() && engine) {
+      // An overflowed parent would resend the same over-window context: the
+      // acknowledged results above wait for the next run instead.
+      if (isCurrent() && engine && !overflowWakes.holds(ctx)) {
         const wake = `${DELIVERY_WAKE_PREFIX}${randomUUID()}] ${DELIVERY_WAKE_TEXT}`;
         wakeAdmissions.set(wake, { generation, context: ctx, engine, anchor: deliveryBranchAnchor });
         while (wakeAdmissions.size > MAX_WAKE_ADMISSIONS) {

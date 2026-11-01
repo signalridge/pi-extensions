@@ -1,8 +1,5 @@
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 import { type ActionOwnership, ownedCustom } from "./owned-custom.js";
@@ -10,45 +7,40 @@ import { executeSnippet } from "./snippet-process.js";
 
 export type { ActionOwnership } from "./owned-custom.js";
 
-export async function copyToClipboard(pi: ExtensionAPI, content: string, ownership: ActionOwnership): Promise<boolean> {
-  if (!ownership.isCurrent() || ownership.signal.aborted) return false;
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-code-"));
+export type CopyResult = { copied: true } | { copied: false; reason: string };
+
+const CANCELLED: CopyResult = { copied: false, reason: "cancelled" };
+
+/**
+ * Copy through Pi's own clipboard writer, which also reaches remote clients over OSC 52,
+ * Termux and WSL. Pi bounds its clipboard utilities with its own timeout and cannot be
+ * cancelled, so a retired operation stops waiting and its outcome is never reported.
+ */
+export async function copySnippet(
+  content: string,
+  ownership: ActionOwnership,
+  write: (text: string) => Promise<void> = copyToClipboard,
+): Promise<CopyResult> {
+  if (!ownership.isCurrent() || ownership.signal.aborted) return CANCELLED;
+  let onAbort: (() => void) | undefined;
+  const cancelled = new Promise<CopyResult>((resolve) => {
+    onAbort = () => resolve(CANCELLED);
+    ownership.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  const copying = Promise.resolve()
+    .then(() => write(content))
+    .then(
+      (): CopyResult => ({ copied: true }),
+      (error: unknown): CopyResult => ({
+        copied: false,
+        reason: error instanceof Error ? error.message : String(error),
+      }),
+    );
   try {
-    fs.chmodSync(tmpDir, 0o700);
-    const tmpPath = path.join(tmpDir, "clipboard.txt");
-    fs.writeFileSync(tmpPath, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
-
-    const commands: Array<{ command: string; args: string[] }> = [];
-    if (process.platform === "darwin") {
-      commands.push({ command: "sh", args: ["-c", 'exec pbcopy < "$1"', "pi-clipboard", tmpPath] });
-    } else if (process.platform === "win32") {
-      commands.push({
-        command: "powershell",
-        args: ["-NoProfile", "-Command", `Get-Content -Raw "${tmpPath}" | Set-Clipboard`],
-      });
-    } else {
-      // Replace the shell so Pi's cancellation targets the utility, not a pipeline parent.
-      // Pass the private path as data: temporary-directory names can contain shell syntax.
-      commands.push({ command: "sh", args: ["-c", 'exec wl-copy < "$1"', "pi-clipboard", tmpPath] });
-      commands.push({ command: "sh", args: ["-c", 'exec xclip -selection clipboard < "$1"', "pi-clipboard", tmpPath] });
-      commands.push({ command: "sh", args: ["-c", 'exec xsel --clipboard --input < "$1"', "pi-clipboard", tmpPath] });
-    }
-
-    for (const cmd of commands) {
-      if (!ownership.isCurrent() || ownership.signal.aborted) return false;
-      try {
-        const result = await pi.exec(cmd.command, cmd.args, { signal: ownership.signal });
-        if (!ownership.isCurrent() || ownership.signal.aborted) return false;
-        if (result.code === 0 && !result.killed) return true;
-      } catch {
-        if (!ownership.isCurrent() || ownership.signal.aborted) return false;
-        // Try the next utility only while this operation still owns the clipboard action.
-      }
-    }
-
-    return false;
+    const result = await Promise.race([copying, cancelled]);
+    return ownership.isCurrent() && !ownership.signal.aborted ? result : CANCELLED;
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    if (onAbort) ownership.signal.removeEventListener("abort", onAbort);
   }
 }
 

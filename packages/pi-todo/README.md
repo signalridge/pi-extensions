@@ -32,7 +32,7 @@ Task values are rendered inertly: native edit prefills and incoming text/pastes 
 
 Character commands also accept Kitty CSI-u input, preserving case and modifiers; pasted text never invokes them. In Description, the configured `tui.input.submit` advances to Dependencies without clearing text or Undo. Configured `tui.input.newLine` takes precedence and remains native multiline editing.
 
-Ordinary owned overlays preserve the main draft and insertion position. Native session replacement remains host-owned: Pi 1.0.4 resets the cursor to the end on new/reload, and native fork prefills the selected user message. Todo does not patch private cursor state or overwrite the host's intended fork draft to conceal those native behaviors.
+Ordinary owned overlays preserve the main draft and insertion position. Native session replacement remains host-owned: Pi resets the cursor to the end on new/reload, and native fork prefills the selected user message. Todo does not patch private cursor state or overwrite the host's intended fork draft to conceal those native behaviors.
 
 RPC, print, and JSON tools work without custom terminal UI. `/todo` outside TUI gives a tool usage hint and does not mutate. It owns only the `pi-todo` compact status key, not the footer, editor, or other extension status keys. It never changes active tools or bypasses Plan-mode tool policy; manual edits are explicit user-owned command operations.
 
@@ -56,4 +56,4 @@ Implementation is original; no extension implementation is copied from Pi's exam
 
 `bun run check` in this package runs lint, typecheck, and Vitest, including real public SDK tool pipelines and terminal renderer fixtures. No external provider calls are required.
 
-`python3 test/prefill-cli.py /tmp/todo-prefill-evidence` additionally runs the real Pi 1.0.4 offline CLI in regular and fullscreen PTYs with isolated remapped keybindings and bounded child lifetimes.
+`python3 test/prefill-cli.py /tmp/todo-prefill-evidence` additionally runs the real Pi 1.4.0 offline CLI in regular and fullscreen PTYs with isolated remapped keybindings and bounded child lifetimes.

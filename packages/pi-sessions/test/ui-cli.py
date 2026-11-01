@@ -1,4 +1,4 @@
-"""Real Pi 1.0.4 CLI/PTY UI acceptance, stdlib only; no live provider calls.
+"""Real Pi 1.4.0 CLI/PTY UI acceptance, stdlib only; no live provider calls.
 Run: python3 packages/pi-sessions/test/ui-cli.py /tmp/pi-sessions-ui-cli
 Frames use public SDK post-composition APIs inside the actual CLI, not render()
 instrumentation. Raw terminal output and JSONL frames remain in the output dir.

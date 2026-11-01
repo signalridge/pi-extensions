@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { type ExtensionUIContext, InteractiveMode, initTheme } from "@earendil-works/pi-coding-agent";
+import { type ExtensionUIContext, InteractiveMode, initTheme, VERSION } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import { withBorderedCustomUi, withPreservedCustomEditor } from "../src/index.js";
 
 initTheme("dark", false);
 
-// Test-only host internals: exercise the installed SDK 1.0.4 savedText path,
+// Test-only host internals: exercise the installed SDK's real savedText path,
 // exposing the same public UI API an extension receives. No production patches.
+// Both qualified hosts restore the opening draft synchronously inside done().
 function sdkHost() {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let text = "original draft";
   let invalid = false;
   let writes = 0;
@@ -37,6 +39,8 @@ function sdkHost() {
       hideOverlay() {},
     },
     keybindings: {},
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as { createExtensionUIContext(): ExtensionUIContext };
   const native = host.createExtensionUIContext();
   const ui: ExtensionUIContext = {

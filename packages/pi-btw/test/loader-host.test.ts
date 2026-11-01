@@ -4,6 +4,7 @@ import {
   type ExtensionCommandContext,
   InteractiveMode,
   initTheme,
+  VERSION,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { test, vi } from "vitest";
@@ -15,18 +16,24 @@ initTheme("dark", false);
 // The installed host only disposes mounted components. In particular it does
 // not mount (or dispose) a factory result whose done() ran in an earlier microtask.
 function createLoaderHost() {
+  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let text = "original draft";
-  let focus: unknown;
   let mounted: Component | undefined;
   let mounts = 0;
   let restores = 0;
   const render = vi.fn();
   const editor = { getText: () => text, setText: (value: string) => (text = value) };
+  // The editor starts visible and focused until a dialog mounts in its place.
+  let focus: unknown = editor;
+  let visible: unknown[] = [editor];
   const host = Object.assign(Object.create(InteractiveMode.prototype) as object, {
     editor,
     editorContainer: {
-      clear() {},
+      clear() {
+        visible = [];
+      },
       addChild(component: Component) {
+        visible.push(component);
         if (component === (editor as unknown as Component)) restores++;
         else {
           mounted = component;
@@ -42,6 +49,8 @@ function createLoaderHost() {
       requestRender: render,
     },
     keybindings: { matches: () => false, getKeys: () => [] },
+    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   return {
     custom: ((factory, options) =>
@@ -53,6 +62,9 @@ function createLoaderHost() {
     },
     get focus() {
       return focus;
+    },
+    get visible() {
+      return visible;
     },
     get mounted() {
       return mounted;
@@ -90,11 +102,14 @@ test.each(["virtual", "unavailable"] as const)(
       model:
         outcome === "virtual" ? { api: "pi-virtual", provider: "test", id: "virtual", reasoning: false } : undefined,
     });
+    // 1.0.4 reattaches the editor on every close; 1.4.0 never replaced it for a dialog closed before mounting.
+    const restoresPerRun = VERSION === "1.4.0" ? 0 : 1;
     try {
       for (let invocation = 0; invocation < 3; invocation++) {
         await command.run();
         assert.equal(host.mounts, 0);
-        assert.equal(host.restores, invocation + 1);
+        assert.deepEqual(host.visible, [host.editor]);
+        assert.equal(host.restores, (invocation + 1) * restoresPerRun);
         assert.equal(dispose.mock.calls.length, invocation + 1);
         assert.equal(vi.getTimerCount(), 0);
       }

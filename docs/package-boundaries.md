@@ -4,9 +4,7 @@ This repository keeps Pi extensions independently publishable. Packages communic
 through Pi's public APIs and `pi.events`; no extension imports another extension's
 source. Shared wire validation lives in `@signalridge/pi-subagents-protocol`, a
 library dependency that is not a Pi resource and must not be added to `settings.json`.
-The same resource-free rule applies to `@signalridge/pi-approval-core`, which
-provides local approval contracts and reviewed native-tool factories, not a
-permission policy or an independently enabled extension.
+The same resource-free rule applies to `@signalridge/pi-ui`.
 
 ## Ownership matrix
 
@@ -15,16 +13,27 @@ permission policy or an independently enabled extension.
 | Footer | `pi-statusline` | Owns footer rendering, presets, and statusline settings. It consumes Pi lifecycle state and bounded status snapshots; it does not persist analytics or mutate another package's settings. |
 | Input editor | `pi-input-prefix` | Installs the synchronous themed editor base and owns `PI_INPUT_PREFIX`. |
 | Input history | `pi-input-history` | Decorates the current editor factory and owns history persistence/search. It must call the current factory so registration order remains safe. |
-| Terminal title | `pi-tab-status` | Owns terminal title state and `PI_TAB_STATUS_STYLE`; it is TUI-only and does not own the footer. |
+| Terminal title | `pi-tab-status` | Owns terminal title state, `PI_TAB_STATUS_STYLE` and the opt-in `PI_TAB_STATUS_NOTIFY` desktop notifications; it is TUI-only and does not own the footer or Pi's native OSC 7501 program status. Use one desktop notifier per session. |
 | Startup card | `pi-welcome` | Owns one additive `welcome-card` transcript entry. Pi owns native startup/resource diagnostics. |
 | Away recap | `pi-session-recap` | Owns recap presentation and bounded transcript-derived context; it does not become a second session store. |
 | Session checklist | `pi-todo` | Owns revisioned current-branch snapshots, its manual overlay and status key; completion is a checklist assertion, not execution evidence or shared task claiming. |
-| Human approval | `pi-approvals` | Owns per-operation human decisions, pending review UI and service leases; it does not grant tool admission, project trust or OS isolation. |
+| Secret obfuscation | `pi-secrets` | Owns `pi-secrets.json`, its per-install `pi-secrets.key`, the provider-bound placeholder rewrite in `context_with_system`, placeholder restoration in `tool_call` and `/secrets`. It never mutates stored entries and does not cover the system prompt, tool definitions, compaction requests or other extensions' side requests. |
+| Rule files | `pi-rules` | Owns rule discovery, the `pi_rules` prompt section, `read_rule`, `/rules`, its `pi-rules:delivered` branch entries and hidden `pi-rules:reminder` messages. It does not own context files (`AGENTS.md` and provider files stay with Pi and `pi-agent-guidance`) and is not a permission policy. |
 | Session navigation/handoff | `pi-sessions` | Owns explicit preview/consent and editable summary transfer through native replacement; it does not replace native history, change process cwd or send the destination draft. |
 | Usage UI | `pi-usage-extension` | Owns usage views/export commands. It consumes usage records and does not define analytics storage rotation. |
 | Analytics | `pi-analytics` | Owns its experimental analytics files, generation rotation, and queries. |
 | Transcript metadata | `pi-stamp` | Owns timestamp/tool-timing metadata entries and their bounded format. |
 | Active worktime | `pi-worktime` | Owns per-session active-span accounting, the `worktime` status key, and validated `worktime:update` payloads; status updates are TUI-only and consumers must not clear or reinterpret its state. |
+
+No extension starts a run on its own initiative — a completion notice, background
+wake, workflow delivery or goal continuation — while an unrecovered context
+overflow remains on the branch. Only a later successful assistant response or
+compaction ends the episode; aborted responses and transient provider errors do
+not establish recovery. Such a run cannot succeed and is billed for the whole oversized context. The content is still
+delivered without triggering a turn, one notice per overflow episode tells the
+user to compact or start a new session, and normal waking resumes after a
+compaction. Each package implements this check locally from Pi's
+`isContextOverflow`.
 
 Each UI package may listen to native Pi lifecycle events, but custom event payloads
 must be validated at the consumer boundary. A package may publish a status key only
@@ -79,8 +88,7 @@ Separate responsibilities do not mean every extension should be enabled:
 - Statusline is a presentation preference, not a prerequisite for extension
   statuses: Pi's native footer also renders status keys. Keep one footer owner
   and one effective owner for each editor shortcut or external state reporter.
-- Prefix and Welcome are optional presentation choices; Herdr State is useful
-  only with its corresponding external integration. Provider guidance and
+- Prefix and Welcome are optional presentation choices. Provider guidance and
   priority-tier selection are useful only when their specific behavior is wanted.
 
 Libraries are dependencies, never independently enabled extensions. Experimental
@@ -96,10 +104,7 @@ discard logs/outbox state. There is no persistence or cross-extension process-co
 protocol. The optional [status-action UI contract](status-navigation.md) only admits
 explicit user navigation to the owning extension's view; it grants no job-control
 or execution authority. Permission policies must cover its launch tools separately from `bash`.
-When `pi-approvals` is loaded, launch adapters capture its local service and wait
-before starting a command; a captured broken/retired service cannot become an
-unreviewed fallback. Attaching a watch to an existing job is not a new command
-launch. This approval capability is not a cross-extension job-control API.
+Attaching a watch to an existing job is not a new command launch.
 Asynchronous events are recorded without a turn, then a bounded extension-sourced
 user message takes the normal prompt-hook path. This does not resume Goal state.
 Managed subagent sessions exclude `pi-background`: process-driven child turns
@@ -128,9 +133,13 @@ cannot outlive their manager's completion or isolated-workspace cleanup.
   prefill intent, never a raw unsent draft. Exclusive private native snapshots
   preserve unsaved parents; custom-only destination recovery is explicitly
   materialized and reopened through public APIs, without a synthetic model turn.
-- `pi-approvals` retains bounded pending decisions in memory, never a reusable
-  persistent grant. Session/branch retirement, changed input/file state and
-  cancellation invalidate the specific operation.
+- `pi-rules` records each delivered reminder or block as a `pi-rules:delivered`
+  entry on the current branch and recomputes its repeat policy from that branch,
+  so reload and resume do not repeat a delivery and `/tree` re-arms it on a
+  branch where it never fired.
+- `pi-agent-guidance` records each delivered subdirectory context file on the
+  current branch and reads the compaction-aware branch view, so compaction,
+  `/tree` or a changed file delivers it again.
 - User sessions, permissions, keybindings, auth, workflow projects, and legacy
   workflow settings remain user-owned data during migration.
 
@@ -142,7 +151,10 @@ lifecycle callbacks, synthesis, cleanup, and the terminal journal append settle.
 
 ## Policy and developer integrations
 
-`pi-plan-mode` owns read-only command policy and plan persistence. `pi-worktree`
+`pi-plan-mode` owns read-only command policy, plan persistence and the opt-in
+implementation-model handoff; it restores the planning model only when the live
+model is still the one it applied, and does not compete with Subagents tiers or
+virtual-model routing. `pi-worktree`
 owns repository-scoped locking, identity verification, quarantine, and safe Git
 mutation. It remains opt-in because worktree creation changes repository state
 and requires an explicit ownership and cleanup policy.
@@ -154,24 +166,30 @@ owned by `@signalridge/pi-ui`: it only adapts Pi's public custom-component bound
 does not own extension state or menu semantics, and is used when multiple packages
 need the same visual contract.
 
-## Human operation approval
+`pi-btw`'s opt-in `advisor` tool is the model-invoked counterpart of its human
+side questions: one configured reviewer model, no tools in the reviewer request,
+no availability in non-UI or child sessions. It does not own continuation; the
+main model decides what to do with the answer.
 
-`pi-approval-core` defines local version-1 query/lifecycle/adapter contracts;
-managed protocol v4 and workflow journal v4 are unchanged. `pi-approvals` is the
-opt-in human authority. Root canonical replacements require explicit
-`--approvals-native-tools` certification that their backends are standard local
-Pi tools; without it, original backends are not replaced and canonical mutations
-are denied. Noncanonical command/mutation-shaped tools require a live cooperative
-adapter matching the effective schema identity, not an assumed universal gate.
+## Tool-call policy
 
-Managed children capture the root service before awaiting and install reviewed
-implementations only for already admitted tools. Existing Plan policy, project
-trust, child tool admission and `ask_tools` remain authoritative. Ordinary parent
-clarification cannot approve an operation. Human review is explicitly opened with
-`/approvals`; no model-callable approval responder is installed. RPC confirmations
-use native transport nonces, not lifecycle request IDs. These controls serialize
-cooperating same-process native mutations, not arbitrary external writers, remote
-backends or unknown execution capabilities; they are not an OS sandbox.
+`pi-rules` enforces rule files at `tool_call`: a `block` rule returns Pi's
+`{ block: true, reason }`, a `remind` rule lets the call run and steers a hidden
+reminder after it. Pi stops at the first handler that blocks, so load `pi-rules`
+before a permission extension that prompts a human: otherwise a person can
+approve a call that a rule then refuses. Rules are guidance enforced on matching
+input, not a permission policy, sandbox or substitute for project trust; project
+rule files load only in trusted projects. Permission, approval and command
+blocking belong to dedicated permission extensions, which must cover
+`bash_background` and `monitor` as well as `bash`.
+
+`pi-secrets` restores placeholders to real values in `tool_call`, so handlers
+that load before it see placeholders and handlers that load after it see
+values. Load it first when later policy (rules, permissions) must judge the
+command that actually runs. Its outbound rewrite runs in `context_with_system`,
+after every `context` handler regardless of load order, but in load order among
+other `context_with_system` handlers: text that `pi-subagents` injects there for
+pending parent questions is obfuscated only when `pi-subagents` loads first.
 
 ## Shared third-party surfaces
 

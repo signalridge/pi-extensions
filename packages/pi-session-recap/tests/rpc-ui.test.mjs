@@ -6,10 +6,18 @@ import sessionRecap from "../index.ts";
 registerApiProvider({
   api: "anthropic-messages",
   stream: () => ({
-    result: async () => ({ role: "assistant", content: [{ type: "text", text: "RPC recap text." }] }),
+    result: async () => ({
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "RPC recap text." }],
+    }),
   }),
   streamSimple: () => ({
-    result: async () => ({ role: "assistant", content: [{ type: "text", text: "RPC recap text." }] }),
+    result: async () => ({
+      role: "assistant",
+      stopReason: "stop",
+      content: [{ type: "text", text: "RPC recap text." }],
+    }),
   }),
 });
 
@@ -121,10 +129,11 @@ async function flushRecap() {
   for (let index = 0; index < 10; index += 1) await Promise.resolve();
 }
 
-test("RPC resume and fork sessions automatically show recaps", async (t) => {
+test("RPC resumed, CLI-reopened and forked sessions automatically show recaps", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
 
-  for (const reason of ["resume", "fork"]) {
+  // `pi -c`, `pi -r` and `--session` reopen an existing session as "startup".
+  for (const reason of ["resume", "startup", "fork"]) {
     calls.length = 0;
     const handler = pi.handlers.get("session_start");
     assert.equal(typeof handler, "function");
@@ -152,7 +161,8 @@ test("RPC agent settlement automatically shows an idle recap", async (t) => {
   const agentSettled = pi.handlers.get("agent_settled");
   assert.equal(typeof sessionStart, "function");
   assert.equal(typeof agentSettled, "function");
-  await sessionStart({ reason: "startup" }, ctx);
+  // A reload binds the session without the reopen recap, isolating the idle path.
+  await sessionStart({ reason: "reload" }, ctx);
   calls.length = 0;
   await agentSettled({}, ctx);
 
@@ -166,4 +176,16 @@ test("RPC agent settlement automatically shows an idle recap", async (t) => {
     recapWidgets().map(({ content }) => content),
     [["✦ recap", "RPC recap text."]],
   );
+});
+
+test("a session reopened with a prompt that starts work at once shows no stale recap", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  calls.length = 0;
+  await pi.handlers.get("session_start")({ reason: "startup" }, ctx);
+  await pi.handlers.get("agent_start")({}, ctx);
+  t.mock.timers.tick(300);
+  await flushRecap();
+  assert.deepEqual(recapWidgets(), []);
+  await pi.handlers.get("agent_end")?.({ messages: [] }, ctx);
+  await pi.handlers.get("agent_settled")?.({}, ctx);
 });

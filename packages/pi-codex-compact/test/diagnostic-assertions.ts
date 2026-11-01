@@ -6,7 +6,7 @@ export function withoutDiagnosticSummary(message: string): string {
   if (start < 0) return message;
   assert.match(
     message.slice(start),
-    /^ Last stage: (auth|payload|fetch|headers|first_body|wire_terminal|provider_done|completion_wait|fold_done); \d+\/\d+ folds, \d+ HTTP attempts, \d+ ms; timeout=(none|stage|operation), stage\/total=\d+\/\d+ ms\. See \/codex-compact diagnostics\.$/,
+    /^ Last stage: (auth|payload|fetch|headers|first_body|wire_terminal|provider_done|completion_wait|fold_done|layered_summary); \d+\/\d+ folds, \d+ HTTP attempts, \d+ ms; timeout=(none|stage|operation), stage\/total=\d+\/\d+ ms\. See \/codex-compact diagnostics\.$/,
   );
   return message.slice(0, start);
 }

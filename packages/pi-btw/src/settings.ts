@@ -11,6 +11,8 @@ const MAX_SETTINGS_BYTES = 64 * 1024;
 
 export interface BtwSettings {
   model?: string;
+  /** Reviewer for the model-invoked `advisor` tool; absent keeps the tool unregistered. */
+  advisorModel?: string;
   thinkingLevel?: BtwThinkingLevel;
   rememberThinkingLevelChanges?: boolean;
 }
@@ -42,6 +44,11 @@ export function normalizeBtwSettings(value: unknown): BtwSettings | undefined {
     const model = Reflect.get(value, "model");
     if (typeof model !== "string" || !parseBtwModelReference(model)) return undefined;
     settings.model = model;
+  }
+  if (Object.hasOwn(value, "advisorModel")) {
+    const advisorModel = Reflect.get(value, "advisorModel");
+    if (typeof advisorModel !== "string" || !parseBtwModelReference(advisorModel)) return undefined;
+    settings.advisorModel = advisorModel;
   }
   if (Object.hasOwn(value, "thinkingLevel")) {
     const thinkingLevel = Reflect.get(value, "thinkingLevel");

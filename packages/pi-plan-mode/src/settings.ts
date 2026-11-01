@@ -82,6 +82,7 @@ const BASE_KEYS = new Set([
   ...Array.from({ length: 12 }, (_unused, index) => `f${index + 1}`),
 ]);
 const MAX_PLAN_EXPORT_PATH_LENGTH = 4096;
+const MAX_MODEL_REFERENCE_LENGTH = 512;
 
 export type PlanModeThinkingLevel = (typeof PLAN_MODE_THINKING_LEVELS)[number];
 export type ImplementationPlanRetention = (typeof IMPLEMENTATION_PLAN_RETENTIONS)[number];
@@ -93,6 +94,12 @@ export interface PlanModeSettings {
   defaultPlanExportPath?: string;
   safeSubcommands?: SafeSubcommands;
   toggleShortcut?: KeyId;
+  implementationModel?: string;
+  implementationThinkingLevel?: PlanModeThinkingLevel;
+}
+export interface PlanModeModelReference {
+  provider: string;
+  id: string;
 }
 export interface PlanModeSettingsPatch {
   thinkingLevel?: PlanModeThinkingLevel;
@@ -164,7 +171,37 @@ export function normalizePlanModeSettings(value: unknown): PlanModeSettings | un
     if (!safeSubcommands) return undefined;
     settings.safeSubcommands = safeSubcommands;
   }
+  if (Object.hasOwn(value, "implementationModel")) {
+    const implementationModel = Reflect.get(value, "implementationModel");
+    if (typeof implementationModel !== "string" || !parseModelReference(implementationModel)) return undefined;
+    settings.implementationModel = implementationModel.trim();
+  }
+  if (Object.hasOwn(value, "implementationThinkingLevel")) {
+    const implementationThinkingLevel = Reflect.get(value, "implementationThinkingLevel");
+    if (!PLAN_MODE_THINKING_LEVELS.includes(implementationThinkingLevel as PlanModeThinkingLevel)) {
+      return undefined;
+    }
+    settings.implementationThinkingLevel = implementationThinkingLevel as PlanModeThinkingLevel;
+  }
   return settings;
+}
+
+/** Split `provider/model-id` at the first slash; model IDs may contain further slashes. */
+export function parseModelReference(value: string): PlanModeModelReference | undefined {
+  const normalized = value.trim();
+  const separator = normalized.indexOf("/");
+  if (
+    normalized.length > MAX_MODEL_REFERENCE_LENGTH ||
+    separator <= 0 ||
+    separator === normalized.length - 1 ||
+    [...normalized].some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return /\s/u.test(character) || codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f);
+    })
+  ) {
+    return undefined;
+  }
+  return { provider: normalized.slice(0, separator), id: normalized.slice(separator + 1) };
 }
 
 function normalizeToolNames(value: unknown) {
@@ -456,6 +493,17 @@ function safeReadError(error: unknown) {
 
 export function configuredThinkingLevel(settings: PlanModeSettings): PlanModeFixedThinkingLevel | undefined {
   return settings.thinkingLevel === "inherit" ? undefined : settings.thinkingLevel;
+}
+
+export function configuredImplementationModel(settings: PlanModeSettings): PlanModeModelReference | undefined {
+  return settings.implementationModel ? parseModelReference(settings.implementationModel) : undefined;
+}
+
+export function configuredImplementationThinkingLevel(
+  settings: PlanModeSettings,
+): PlanModeFixedThinkingLevel | undefined {
+  const level = settings.implementationThinkingLevel ?? "inherit";
+  return level === "inherit" ? undefined : level;
 }
 
 export function configuredImplementationPlanRetention(settings: PlanModeSettings): ImplementationPlanRetention {

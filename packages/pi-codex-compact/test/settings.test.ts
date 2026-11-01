@@ -7,6 +7,7 @@ import {
   type CodexCompactSettings,
   createCodexCompactSettingsRuntime,
   DEFAULT_CODEX_COMPACT_SETTINGS,
+  effectiveLayeredFallback,
   effectiveStageTimeoutMs,
   loadCodexCompactSettings,
   normalizeCodexCompactSettings,
@@ -34,6 +35,9 @@ test("normalizes defaults and bounded user settings", () => {
   assert.equal(normalizeCodexCompactSettings({ maxRetries: 3 }), undefined);
   assert.equal(normalizeCodexCompactSettings({ requestTimeoutMs: 10 }), undefined);
   assert.equal(normalizeCodexCompactSettings({ replacementTokenBudget: 1_000_000 }), undefined);
+  assert.equal(normalizeCodexCompactSettings({})?.layeredFallback, true);
+  assert.equal(normalizeCodexCompactSettings({ layeredFallback: false })?.layeredFallback, false);
+  assert.equal(normalizeCodexCompactSettings({ layeredFallback: "off" }), undefined);
 });
 
 test("legacy injected settings remain source-compatible without the new optional stage key", () => {
@@ -46,6 +50,8 @@ test("legacy injected settings remain source-compatible without the new optional
     notifyOnFallback: true,
   };
   assert.equal(effectiveStageTimeoutMs(legacy), 300_000);
+  assert.equal(effectiveLayeredFallback(legacy), true);
+  assert.equal(effectiveLayeredFallback({ layeredFallback: false }), false);
 });
 
 test("stage and whole-operation defaults are independent and explicit legacy totals stay honored", () => {

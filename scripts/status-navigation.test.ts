@@ -65,6 +65,7 @@ function terminalHost(fullscreen: boolean) {
     clearScreen() {},
     setTitle() {},
     setProgress() {},
+    setProgramStatus() {},
   } satisfies Terminal;
   const tui = fullscreen ? new TuiAltScreen(terminal) : new TuiMainScreen(terminal);
   const keys = new KeybindingsManager(TUI_KEYBINDINGS);

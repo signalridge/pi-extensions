@@ -2,7 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { InternalLspServer, LspConfig, LspServerAdapter } from "./types.js";
+import {
+  type InternalLspServer,
+  LSP_OPERATIONS,
+  type LspConfig,
+  type LspOperation,
+  type LspServerAdapter,
+} from "./types.js";
 
 const COMMON_SKIP_DIRECTORIES = new Set([
   ".git",
@@ -50,6 +56,15 @@ export const DEFAULT_SERVER_CONFIGS: InternalLspServer[] = [
     name: "biome",
     command: ["biome", "lsp-proxy"],
     extensions: BIOME_EXTENSIONS,
+    // A linter and formatter: it advertises no navigation or rename providers.
+    operations: ["diagnostics", "fix"],
+  },
+  {
+    name: "typescript-language-server",
+    command: ["typescript-language-server", "--stdio"],
+    extensions: [".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"],
+    // Navigation only, so TS/JS diagnostics and fixes keep routing to Biome alone.
+    operations: ["definition", "references", "hover", "symbols", "rename"],
   },
   {
     name: "ty",
@@ -381,6 +396,7 @@ function normalizeServer(name: string, value: unknown, label: string): InternalL
     name,
     command,
     extensions,
+    operations: optionalOperationsField(value, "operations", label),
     env: optionalStringRecordField(value, "env", label),
     initialization: optionalRecordField(value, "initialization", label),
     skipDirectories: optionalDirectoryNamesField(value, "skipDirectories", label),
@@ -408,6 +424,7 @@ function configToAdapter(config: InternalLspServer): LspServerAdapter {
     defaultCommand: { command, args },
     missingCommandHint: `Install ${config.name} or update its command in pi-lsp.json.`,
     extensions: config.extensions,
+    operations: config.operations ? new Set(config.operations) : undefined,
     env: config.env,
     initialization: config.initialization,
     skipDirectories: new Set([...COMMON_SKIP_DIRECTORIES, ...(config.skipDirectories ?? [])]),
@@ -504,6 +521,16 @@ function stringArrayField(value: Record<string, unknown>, field: string, label: 
     throw new Error(`${label}.${field} must be an array of strings.`);
   }
   return fieldValue;
+}
+
+function optionalOperationsField(value: Record<string, unknown>, field: string, label: string) {
+  const fieldValue = value[field];
+  if (fieldValue === undefined) return undefined;
+  const valid = (item: unknown): item is LspOperation => LSP_OPERATIONS.some((operation) => operation === item);
+  if (!Array.isArray(fieldValue) || fieldValue.length === 0 || !fieldValue.every(valid)) {
+    throw new Error(`${label}.${field} must be a non-empty array of: ${LSP_OPERATIONS.join(", ")}.`);
+  }
+  return [...new Set(fieldValue)];
 }
 
 function optionalPositiveNumberField(value: Record<string, unknown>, field: string, label: string) {

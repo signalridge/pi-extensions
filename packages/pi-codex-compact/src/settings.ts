@@ -16,10 +16,16 @@ export interface CodexCompactSettings {
   maxRetries: number;
   replacementTokenBudget: number;
   notifyOnFallback: boolean;
+  /** Optional for injected runtimes created before the layered fallback existed. */
+  layeredFallback?: boolean;
 }
 
 export function effectiveStageTimeoutMs(settings: Pick<CodexCompactSettings, "stageTimeoutMs">): number {
   return settings.stageTimeoutMs ?? 300_000;
+}
+
+export function effectiveLayeredFallback(settings: Pick<CodexCompactSettings, "layeredFallback">): boolean {
+  return settings.layeredFallback !== false;
 }
 
 export const DEFAULT_CODEX_COMPACT_SETTINGS: Readonly<CodexCompactSettings> = Object.freeze({
@@ -30,6 +36,7 @@ export const DEFAULT_CODEX_COMPACT_SETTINGS: Readonly<CodexCompactSettings> = Ob
   maxRetries: 2,
   replacementTokenBudget: 64_000,
   notifyOnFallback: true,
+  layeredFallback: true,
 });
 
 const LIMITS = Object.freeze({
@@ -71,6 +78,9 @@ export function normalizeCodexCompactSettings(value: unknown): CodexCompactSetti
   if (Object.hasOwn(value, "notifyOnFallback") && typeof value.notifyOnFallback !== "boolean") {
     return undefined;
   }
+  if (Object.hasOwn(value, "layeredFallback") && typeof value.layeredFallback !== "boolean") {
+    return undefined;
+  }
   for (const [field, limits] of Object.entries(LIMITS) as Array<
     [keyof typeof LIMITS, { minimum: number; maximum: number }]
   >) {
@@ -96,6 +106,10 @@ export function normalizeCodexCompactSettings(value: unknown): CodexCompactSetti
       typeof value.notifyOnFallback === "boolean"
         ? value.notifyOnFallback
         : DEFAULT_CODEX_COMPACT_SETTINGS.notifyOnFallback,
+    layeredFallback:
+      typeof value.layeredFallback === "boolean"
+        ? value.layeredFallback
+        : DEFAULT_CODEX_COMPACT_SETTINGS.layeredFallback,
   };
 }
 

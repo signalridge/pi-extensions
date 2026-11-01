@@ -151,6 +151,30 @@ describe("get_subagent_result wait:true on a queued agent", () => {
     await lifecycle.get("session_shutdown")?.();
   }, 20_000);
 
+  it("tells the model it will be notified rather than to poll a running or queued agent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    await lifecycle.get("session_start")?.({}, ctx());
+
+    const resolvers = deferredRuns();
+    const spawned: Array<{ id: string; queued: boolean }> = [];
+    while (spawned.length < 10 && !spawned.at(-1)?.queued) spawned.push(await spawnBackground(tools));
+    const running = spawned[0];
+    const queued = spawned.at(-1)!;
+    expect(running.queued).toBe(false);
+    expect(queued.queued, "expected to hit the concurrency limit within 10 spawns").toBe(true);
+
+    const read = async (id: string) => textOf(await tools
+      .get("get_subagent_result")
+      .execute("tc-read", { agent_id: id }, undefined, undefined, ctx()));
+    const guidance = "You will be notified when it completes; do not poll. Continue other work, or call again with wait: true only when you are blocked on this result.";
+    expect((await read(running.id)).split("\n").at(-1)).toBe(`Agent is still running. ${guidance}`);
+    expect((await read(queued.id)).split("\n").at(-1)).toBe(`Agent is queued and has not started yet. ${guidance}`);
+
+    while (resolvers.length > 0) resolvers.shift()!();
+    await lifecycle.get("session_shutdown")?.();
+  });
+
   it("aborts a running result wait without aborting or consuming the child", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);

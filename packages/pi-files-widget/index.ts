@@ -12,7 +12,7 @@ import { type BrowserController, createFileBrowser } from "./browser.js";
 import { formatCommentMessage } from "./comment.js";
 import { POLL_INTERVAL_MS } from "./constants.js";
 import { resolveToolPath } from "./paths.js";
-import { hasCommand } from "./utils.js";
+import { hasCommand, missingCommandsMessage, REQUIRED_COMMANDS } from "./utils.js";
 
 function resolveInitialPath(arg: string | undefined, cwd: string): { path: string; error?: string } {
   if (!arg) return { path: cwd };
@@ -47,8 +47,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
   let closeActiveInteraction: (() => void) | undefined;
   let completeActiveInteraction: (() => void) | undefined;
   let sessionGeneration = 0;
-  const requiredDeps = ["bat", "delta", "glow"] as const;
-  const getMissingDeps = () => requiredDeps.filter((dep) => !hasCommand(dep));
+  const getMissingDeps = () => REQUIRED_COMMANDS.filter((dep) => !hasCommand(dep));
 
   pi.registerCommand("readfiles", {
     description: "Open file browser (optional: /readfiles <path> to start outside the current directory)",
@@ -63,7 +62,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
       const cwd = ctx.cwd;
       const missing = getMissingDeps();
       if (missing.length > 0) {
-        ctx.ui.notify(`files-widget requires ${missing.join(", ")}. Install: brew install bat git-delta glow`, "error");
+        ctx.ui.notify(missingCommandsMessage(missing), "error");
         return;
       }
 
@@ -211,9 +210,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
     closeActiveInteraction?.();
     mutations.clear();
     const missing = ctx.mode === "tui" && ctx.hasUI ? getMissingDeps() : [];
-    if (missing.length > 0) {
-      ctx.ui.notify(`files-widget requires ${missing.join(", ")}. Install: brew install bat git-delta glow`, "error");
-    }
+    if (missing.length > 0) ctx.ui.notify(missingCommandsMessage(missing), "error");
 
     agentModifiedFiles.clear();
     observedChangedFiles.clear();

@@ -50,6 +50,7 @@ test("TUI intent stores only SHA256 of the explicitly consented unsent source dr
     clearScreen() {},
     setTitle() {},
     setProgress() {},
+    setProgramStatus() {},
   };
   const tui = new TuiMainScreen(terminal);
   const host = Object.assign(Object.create(InteractiveMode.prototype) as object, {

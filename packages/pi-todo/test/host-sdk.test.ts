@@ -36,7 +36,7 @@ async function fixture(
     fileBacked?: boolean;
   } = {},
 ) {
-  expect(["1.0.4", "1.1.0"]).toContain(VERSION);
+  expect(VERSION).toBe("1.4.0");
   const cwd = mkdtempSync(join(tmpdir(), "todo-sdk-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir);

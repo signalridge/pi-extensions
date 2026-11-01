@@ -17,6 +17,31 @@ export function directoryUri(directory: string) {
   return pathToFileURL(directory.endsWith(path.sep) ? directory : `${directory}${path.sep}`).href;
 }
 
+/**
+ * Show a file relative to the workspace root, also when a server reports its
+ * real path through a symlinked root, and absolute when it is outside.
+ */
+export function displayPath(root: string, file: string) {
+  const realRoot = realpathOrSelf(root);
+  for (const [parent, child] of [
+    [root, file],
+    [realRoot, file],
+    [realRoot, realpathOrSelf(file)],
+  ] as const) {
+    if (isInsidePath(parent, child)) return path.relative(parent, child) || child;
+  }
+  return file;
+}
+
+function realpathOrSelf(file: string) {
+  try {
+    return realpathSync(file);
+  } catch {
+    // A missing path still displays lexically.
+    return file;
+  }
+}
+
 export function resolveSupportedFile(adapter: LspServerAdapter, root: string, filePath: string) {
   const resolvedPath = resolveWorkspacePath(root, filePath, "File path");
   if (!existsSync(resolvedPath)) throw new Error(`${adapter.name} file does not exist: ${resolvedPath}`);

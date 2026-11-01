@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { stripVTControlCharacters } from "node:util";
 import { CURSOR_MARKER, type Focusable, visibleWidth } from "@earendil-works/pi-tui";
 import { test } from "vitest";
 import type { RecallMessageRecord } from "../src/messages.js";
 import { ScopedRecallPicker, sanitizeTerminalText } from "../src/picker.js";
+import { resolveFakeCursors, visibleText } from "./support.js";
 
 const ESCAPE = String.fromCharCode(0x1b);
 const BELL = String.fromCharCode(0x07);
@@ -227,7 +227,8 @@ test("preserves query spaces, removes pasted controls, bounds queries, and forwa
   assert.equal(picker.render(80).join("\n").includes(CURSOR_MARKER), true);
   focusable.focused = false;
   picker.handleInput("\u001b[200~foo \u0007\u009dbar\u009c\u001b[201~");
-  const rendered = picker.render(80).join("\n");
+  // Check the bytes the terminal receives: the TUI resolves the BEL-framed software cursor first.
+  const rendered = resolveFakeCursors(picker.render(80));
   assert.match(rendered, /bar foo/);
   assert.equal(rendered.includes("\u0007"), false);
   assert.equal(rendered.includes("\u009d"), false);
@@ -291,7 +292,7 @@ test("restores selection after broadening and carries query through scope and co
   });
 
   const carried = createPicker(records, { initialQuery: "alpha" });
-  assert.match(stripVTControlCharacters(carried.picker.render(80).join("\n")), /Search: .*alpha/);
+  assert.match(visibleText(carried.picker.render(80)), /Search: .*alpha/);
   carried.picker.handleInput("\t");
   carried.picker.handleInput("enter");
   assert.deepEqual(carried.result(), {
@@ -332,7 +333,7 @@ test("sanitizing recalled text steps by code point so astral characters survive 
 test("bidi overrides pasted into the search query are removed before matching", () => {
   const { picker } = createPicker([saved("one", "current", "/work/project", "alpha")]);
   picker.handleInput(`${RLO}alpha`);
-  const rendered = stripVTControlCharacters(picker.render(80).join("\n"));
+  const rendered = visibleText(picker.render(80));
   assert.equal(rendered.includes(RLO), false);
   assert.match(rendered, /alpha/);
 });
@@ -342,13 +343,13 @@ test("an unterminated introducer never truncates a preview or the searchable tex
   // the picker row and the fuzzy filter, and the code-point filter already made that tail inert.
   const text = `Here is the plan:${DCS} step one, step two, and the important secret detail.`;
   const { picker } = createPicker([saved("one", "current", "/work/project", text)]);
-  const rendered = stripVTControlCharacters(picker.render(200).join("\n"));
+  const rendered = visibleText(picker.render(200));
   assert.match(rendered, /important secret detail/u);
 
   const filtered = createPicker([saved("one", "current", "/work/project", text)], {
     initialQuery: "secret detail",
   });
-  assert.match(stripVTControlCharacters(filtered.picker.render(200).join("\n")), /1 match/u);
+  assert.match(visibleText(filtered.picker.render(200)), /1 match/u);
   for (const introducer of [DCS, OSC, PM, APC, SOS]) {
     assert.equal(
       sanitizeTerminalText(`release-2.1${introducer}-hotfix`),
@@ -362,6 +363,6 @@ test("an unterminated introducer never truncates a preview or the searchable tex
 test("previews are sanitized before truncation so the budget buys visible characters", () => {
   const text = `${`${ESCAPE}[1;32m`.repeat(15)}REAL MESSAGE CONTENT`;
   const { picker } = createPicker([saved("one", "current", "/work/project", text)]);
-  const rendered = stripVTControlCharacters(picker.render(200).join("\n"));
+  const rendered = visibleText(picker.render(200));
   assert.match(rendered, /REAL MESSAGE CONTENT/u);
 });

@@ -68,8 +68,10 @@ export function rowKey(row: Pick<SessionRow, "id" | "path">): string {
 }
 
 /** Renderer output only: inputs must be plain BEFORE entering native components.
- * Keep just native software-cursor inverse/reset and the IME position marker,
- * never arbitrary SGR, OSC, erase or cursor-motion instructions. */
+ * Keep just the native software cursor (Pi 1.0.4-1.1.x inverse/reset SGR, or
+ * the zero-width fake-cursor markers the TUI resolves since Pi 1.2.0) and the
+ * IME position marker, never arbitrary SGR, OSC, erase or cursor-motion
+ * instructions. */
 export function safeLines(lines: string[], width: number): string[] {
   const columns = Math.max(1, width);
   const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -77,8 +79,8 @@ export function safeLines(lines: string[], width: number): string[] {
     .flatMap((line) => line.split("\n"))
     .map((line) => {
       const safe = line
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: exact renderer-owned SGR and public IME marker allowlist
-        .split(/(\x1b\[(?:0|7|27)m|\x1b_pi:c\x07)/u)
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: exact renderer-owned SGR, fake-cursor and IME marker allowlist
+        .split(/(\x1b\[(?:0|7|27)m|\x1b_pi:(?:c|fc|\/fc)\x07)/u)
         .map((part, i) => {
           if (i % 2) return part;
           // A terminal cannot display a two-column glyph in one column. Substitute
@@ -132,20 +134,25 @@ class SafeComponent implements Component, Focusable {
   }
 }
 
-/** Never mount a native custom dialog. In Pi 1.0.4 native completion pops the
- * top overlay (possibly foreign), or restores an old main-editor draft.
- * Complete the public factory synchronously to acquire its public TUI, then
- * use only manually owned OverlayHandles. No host fields are read or patched. */
+/** Never mount a native custom dialog. Pi 1.0.4-1.2.x native completion pops
+ * the top overlay (possibly foreign); an inline dialog restores an old
+ * main-editor draft. Complete the public factory synchronously to acquire its
+ * public TUI, then use only manually owned OverlayHandles. No host fields are
+ * read or patched. */
 async function surface(owner: Owner<ExtensionContext>): Promise<Surface> {
   return owner.wait(
     owner.ctx.ui.custom<Surface>(
       (tui, theme, keys, done) => {
-        // Native done() pops the current top overlay even before it mounts its
-        // component. Supply a synchronous, noncapturing sentinel so this cannot
-        // pop a pre-existing foreign overlay. No asynchronous gap is permitted.
+        // Before Pi 1.3.0, native done() pops the current top overlay even
+        // before it mounts its component. Supply a synchronous, noncapturing
+        // sentinel so this cannot pop a pre-existing foreign overlay. Later
+        // hosts remove only the dialog's own, still unmounted, overlay and leave
+        // the sentinel, so remove it by its own handle (a no-op once popped).
+        // No asynchronous gap is permitted.
         const sentinel = { render: () => [], invalidate() {} };
-        tui.showOverlay(sentinel, { nonCapturing: true });
+        const handle = tui.showOverlay(sentinel, { nonCapturing: true });
         done({ tui, theme, keys });
+        handle.hide();
         return sentinel;
       },
       { overlay: true },
@@ -395,7 +402,7 @@ class ReviewEditor implements Component, Focusable {
       width,
     );
     const rows = Math.max(1, this.surface.tui.terminal.rows);
-    // Pi 1.0.4's public Editor renders at most max(5, floor(rows*.3))
+    // Pi 1.0.4-1.4.0's public Editor renders at most max(5, floor(rows*.3))
     // content rows and two scroll borders. Reserve that whole viewport, one
     // title row and all essential controls; never slice native render output.
     const viewport = Math.max(5, Math.floor(rows * 0.3)) + 2;

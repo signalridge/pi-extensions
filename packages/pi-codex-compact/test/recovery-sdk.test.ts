@@ -116,6 +116,7 @@ async function fixture() {
   let authHook = async () => {};
   let requestTimeoutMs = DEFAULT_CODEX_COMPACT_SETTINGS.requestTimeoutMs;
   let allowCanonicalHistory = true;
+  let layeredFallback = true;
   let mutateRecoveryWire = false;
   let authCount = 0;
   let confirmations = 0;
@@ -187,7 +188,7 @@ async function fixture() {
       kind: "missing",
       path: join(directory, "extension-settings.json"),
       document: {},
-      settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory, requestTimeoutMs },
+      settings: { ...DEFAULT_CODEX_COMPACT_SETTINGS, allowCanonicalHistory, requestTimeoutMs, layeredFallback },
     }),
     reload: async () => extensionSettings.get(),
     update: async () => {
@@ -356,6 +357,9 @@ async function fixture() {
     confirmationCommand,
     denyPersistentCanonical: () => {
       allowCanonicalHistory = false;
+    },
+    strictCancellation: () => {
+      layeredFallback = false;
     },
     mutateRecoveryWire: () => {
       mutateRecoveryWire = true;
@@ -606,6 +610,8 @@ test("SDK recovery rejects wire-only declaration mutation using the frozen ordin
 test("actual SDK full oversized → explicit prefix accepted → fresh reopen/fork/exact wire → later full compaction", async () => {
   const f = await fixture();
   try {
+    // Recovery export is the explicit path once strict full compaction cancels.
+    f.strictCancellation();
     f.oversized(true);
     const sourceFile = f.source.getSessionFile();
     assert.ok(sourceFile);

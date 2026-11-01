@@ -20,7 +20,6 @@ import { test } from "vitest";
 import { consumeLspConfigNotice, DEFAULT_SERVER_CONFIGS, loadConfig, loadRuntime } from "../src/adapters.js";
 import { commandExists, commandPathValue, mergeEnvironment, resolveCommandPath } from "../src/command.js";
 import { collectSupportedFiles, directoryUri, resolveSupportedFile } from "../src/files.js";
-import { resolveSpawnCommand } from "../src/lsp-client.js";
 import lsp from "../src/pi-lsp.js";
 import { selectDiagnosticRoutes, selectFixRoute } from "../src/routes.js";
 import { runDiagnostics, runFix } from "../src/runner.js";
@@ -28,19 +27,19 @@ import { applyTextEdits, collectWorkspaceEdits, hasOverlappingTextEdits, positio
 import type { LspServerAdapter } from "../src/types.js";
 import { createMockContext, createMockPi } from "./support.js";
 
-test("lsp registers diagnostics/fix tools, command, and status hooks", () => {
+test("lsp registers diagnostics, fix, navigation and rename tools, command, and status hooks", () => {
   const mock = createMockPi();
   lsp(mock.pi);
 
   assert.deepEqual(
     mock.tools.map((tool) => tool.name),
-    ["lsp_diagnostics", "lsp_fix"],
+    ["lsp_diagnostics", "lsp_fix", "lsp_definition", "lsp_references", "lsp_hover", "lsp_symbols", "lsp_rename"],
   );
   assert.ok(mock.commands.has("lsp"));
   assert.deepEqual([...mock.events.keys()].sort(), ["session_shutdown", "session_start"]);
 });
 
-test("Docker diagnostics matrix covers every built-in server and production setting", () => {
+test("Docker diagnostics matrix covers every built-in diagnostics server and production setting", () => {
   const matrixPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "docker/matrix.json");
   const matrix = JSON.parse(readFileSync(matrixPath, "utf8")) as {
     profiles: Array<{
@@ -55,11 +54,16 @@ test("Docker diagnostics matrix covers every built-in server and production sett
       };
     }>;
   };
-  assert.deepEqual(
-    matrix.profiles.map(({ name }) => name).sort(),
-    DEFAULT_SERVER_CONFIGS.map(({ name }) => name).sort(),
+  // The matrix measures diagnostics; navigation-only defaults have no profile.
+  const diagnosticsDefaults = DEFAULT_SERVER_CONFIGS.filter(
+    ({ operations }) => !operations || operations.includes("diagnostics"),
   );
-  for (const config of DEFAULT_SERVER_CONFIGS) {
+  assert.deepEqual(
+    DEFAULT_SERVER_CONFIGS.filter((config) => !diagnosticsDefaults.includes(config)).map(({ name }) => name),
+    ["typescript-language-server"],
+  );
+  assert.deepEqual(matrix.profiles.map(({ name }) => name).sort(), diagnosticsDefaults.map(({ name }) => name).sort());
+  for (const config of diagnosticsDefaults) {
     const profile = matrix.profiles.find(({ name }) => name === config.name);
     assert.ok(profile, `missing Docker profile for ${config.name}`);
     const linuxCommand = config.name === "elixir-ls" ? ["language_server.sh"] : config.command;
@@ -355,17 +359,6 @@ test("command helpers honor server environments and platform wrappers", () => {
   const resolvedShim = resolveCommandPath("language-server", windowsBin, "win32", windowsBin);
   assert.ok(resolvedShim);
   assert.equal(resolvedShim, commandShim);
-  assert.deepEqual(
-    resolveSpawnCommand({ command: resolvedShim, args: ["--stdio"] }, "win32", "C:\\Windows\\System32\\cmd.exe"),
-    {
-      command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", commandShim, "--stdio"],
-    },
-  );
-  assert.deepEqual(resolveSpawnCommand({ command: "language_server.sh", args: [] }, "linux"), {
-    command: "language_server.sh",
-    args: [],
-  });
   const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-command-"));
   const executable = path.join(root, "tool");
   writeFileSync(executable, "#!/bin/sh\nexit 0\n");

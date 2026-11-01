@@ -235,15 +235,21 @@ export class WorkflowTurnArming {
   }
 
   consume(event: BeforeAgentStartEvent, ctx: ExtensionContext): void {
+    // Pi 1.2+ also announces idle custom-message runs; only a user prompt can
+    // carry the armed input, and earlier hosts never reached here for them.
+    if (event.messageType === "custom") return;
     const pending = this.pending;
     const ambiguous = this.ambiguous;
     this.pending = undefined; // one-use, also for mismatched/consumed prompts
     this.current = undefined;
     try {
+      // Pi 1.2+ (which reports messageType) counts the session busy while its
+      // own run prepares and queues concurrent sends into it. Earlier hosts were
+      // still idle here, so a busy session meant another run had started.
       if (
         ambiguous ||
         !pending?.content ||
-        !ctx.isIdle() ||
+        (event.messageType === undefined && !ctx.isIdle()) ||
         event.prompt !== pending.text ||
         inputKey("", event.images) !== pending.images ||
         ctx.sessionManager.getSessionId() !== pending.sessionId ||

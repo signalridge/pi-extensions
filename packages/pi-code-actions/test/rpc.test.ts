@@ -52,6 +52,22 @@ test("RPC insertion confirms replacement without reading the client draft; cance
   };
   await handler("", ctx as never);
   assert.match(notices.at(-1) ?? "", /requires TUI/);
+  // Copy must reject before Pi's terminal writer: OSC52 on server stderr
+  // cannot copy into this RPC client's clipboard.
+  const originalWrite = process.stderr.write;
+  let writes = 0;
+  process.stderr.write = (() => {
+    writes++;
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    await handler("last copy 1", ctx as never);
+    assert.match(notices.at(-1) ?? "", /Clipboard copying is unavailable outside TUI mode/);
+    assert.ok(!notices.some((message) => message === "Copied to clipboard."));
+    assert.equal(writes, 0);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
   await handler("last insert 1", ctx as never);
   assert.equal(inserted, "client draft");
   assert.equal(replacements, 0);

@@ -658,3 +658,32 @@ test("store construction failures are content-free and keep the command availabl
   assert.doesNotMatch(message ?? "", /private\/user/);
   assert.ok(mock.commands.has("analytics"));
 });
+
+test("an idle custom-message run is recorded as extension-triggered", async () => {
+  const store = new FakeStore();
+  const mock = createMockPi();
+  createAnalyticsExtension({ createStore: () => store })(mock.pi);
+  const started = lifecycleContext();
+  await emit(mock, "session_start", { reason: "startup" }, started.ctx);
+  // Pi 1.2+ announces a run started by pi.sendMessage(..., { triggerTurn: true }) here too.
+  const custom = { messageType: "custom", message: { customType: "wake" }, systemPromptOptions: { skills: [] } };
+  for (const [event, payload] of [
+    ["before_agent_start", custom],
+    ["agent_start", {}],
+    ["turn_start", {}],
+    ["message_end", { message: { role: "assistant", stopReason: "stop" } }],
+    ["agent_settled", {}],
+    ["input", { text: "follow up", source: "interactive" }],
+    ["before_agent_start", { messageType: "user", prompt: "follow up", systemPromptOptions: { skills: [] } }],
+    ["agent_start", {}],
+    ["turn_start", {}],
+    ["message_end", { message: { role: "assistant", stopReason: "stop" } }],
+    ["agent_settled", {}],
+  ] as const) {
+    await emit(mock, event, payload, started.ctx);
+  }
+  assert.deepEqual(
+    store.runs.map(({ triggerSource }) => triggerSource),
+    ["extension", "interactive"],
+  );
+});

@@ -1,4 +1,4 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { type ChildProcessWithoutNullStreams, type SpawnOptions, spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { StringDecoder } from "node:string_decoder";
@@ -12,13 +12,54 @@ export function resolveSpawnCommand(
   command: ServerCommand,
   platform: NodeJS.Platform = process.platform,
   comSpec = process.env.ComSpec,
-): ServerCommand {
+): ServerCommand & Pick<SpawnOptions, "windowsVerbatimArguments"> {
   if (platform !== "win32" || !/\.(?:bat|cmd)$/i.test(command.command)) return command;
+  const shellCommand = [escapeCmd(command.command), ...command.args.map(quoteCmdArgument)].join(" ");
   return {
     command: comSpec?.trim() || "cmd.exe",
-    args: ["/d", "/s", "/c", command.command, ...command.args],
+    // /s removes the outer quotes. Node must not quote this command line again.
+    args: ["/d", "/s", "/c", `"${shellCommand}"`],
+    windowsVerbatimArguments: true,
   };
 }
+
+function escapeCmd(value: string) {
+  return value.replace(/([()\][%!^"`<>&|;, *?])/g, "^$1");
+}
+
+function quoteCmdArgument(value: string) {
+  // Quote pairs encode a literal quote without unbalancing cmd's quote state
+  // when a batch launcher forwards %*. Double preceding and trailing backslashes
+  // for Windows argv parsing, then escape the initial cmd parsing pass once.
+  let quoted = '"';
+  let backslashes = 0;
+  for (const character of value) {
+    if (character === "\\") {
+      backslashes++;
+      continue;
+    }
+    quoted += "\\".repeat(character === '"' ? backslashes * 2 : backslashes);
+    quoted += character === '"' ? '""' : character;
+    backslashes = 0;
+  }
+  return escapeCmd(`${quoted}${"\\".repeat(backslashes * 2)}"`);
+}
+
+// Every CodeActionKind in LSP 3.17. Servers such as Biome advertise
+// resolveProvider only to clients that accept literal CodeAction objects.
+const CODE_ACTION_KINDS = [
+  "",
+  "quickfix",
+  "refactor",
+  "refactor.extract",
+  "refactor.inline",
+  "refactor.rewrite",
+  "source",
+  "source.organizeImports",
+  "source.fixAll",
+];
+// SymbolKind 1 (File) through 26 (TypeParameter); servers otherwise assume 1-18 only.
+const SYMBOL_KINDS = Array.from({ length: 26 }, (_, index) => index + 1);
 
 // Quiet period (ms) after each publish before treating push diagnostics as settled.
 const PUBLISHED_DIAGNOSTICS_SETTLE_MS = 800;
@@ -120,6 +161,7 @@ export class LspClient {
       cwd: this.#cwd,
       env: environment,
       stdio: "pipe",
+      windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
     });
     let completeCleanup!: (error?: Error) => void;
     const done = new Promise<Error | undefined>((resolve) => {
@@ -229,14 +271,26 @@ export class LspClient {
           // capabilities must be advertised statically.
           codeAction: {
             dynamicRegistration: false,
+            codeActionLiteralSupport: { codeActionKind: { valueSet: CODE_ACTION_KINDS } },
             resolveSupport: { properties: ["edit"] },
           },
+          definition: { dynamicRegistration: false, linkSupport: true },
           diagnostic: { dynamicRegistration: false, relatedDocumentSupport: true },
+          documentSymbol: {
+            dynamicRegistration: false,
+            hierarchicalDocumentSymbolSupport: true,
+            symbolKind: { valueSet: SYMBOL_KINDS },
+          },
+          hover: { dynamicRegistration: false, contentFormat: ["markdown", "plaintext"] },
           publishDiagnostics: {},
+          references: { dynamicRegistration: false },
+          rename: { dynamicRegistration: false, prepareSupport: false },
           synchronization: { didSave: true },
         },
         workspace: {
           configuration: true,
+          symbol: { dynamicRegistration: false, symbolKind: { valueSet: SYMBOL_KINDS } },
+          // No resourceOperations: file creates, renames and deletes are not applied.
           workspaceEdit: { documentChanges: true },
           workspaceFolders: true,
         },
@@ -248,6 +302,17 @@ export class LspClient {
     if (this.#adapter.initialization) {
       this.notify("workspace/didChangeConfiguration", { settings: this.#adapter.initialization });
     }
+  }
+
+  /** Whether `initialize` advertised a provider, for example `definitionProvider`. */
+  hasCapability(provider: string) {
+    const value = this.#serverCapabilities[provider];
+    return value !== undefined && value !== null && value !== false;
+  }
+
+  /** Send one request and return its unvalidated result; callers validate the shape. */
+  async requestResult(method: string, params: unknown): Promise<unknown> {
+    return (await this.request(method, params)).result;
   }
 
   didOpen(uri: string, text: string, languageId: string) {

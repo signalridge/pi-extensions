@@ -13,4 +13,4 @@ the package source and its changelog.
 The following packages receive the most substantial local maintenance and
 therefore keep package-local behavior notes: `pi-subagents`, `pi-workflows`,
 `pi-goal`, `pi-statusline`, `pi-input-history`, `pi-input-prefix`,
-`pi-welcome`, `pi-herdr-state`, and `pi-gpt-fast`.
+`pi-welcome`, and `pi-gpt-fast`.
