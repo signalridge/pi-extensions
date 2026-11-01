@@ -58,6 +58,13 @@ describe.skipIf(VERSION !== "1.4.0" || process.platform === "win32")(
           {
             name: "probes",
             factory: (pi) => {
+              pi.registerVirtualModel({
+                provider: "background-router",
+                id: "small",
+                name: "Offline small router",
+                contextWindow: 8000,
+                route: () => ({ model: faux.getModel(), thinkingLevel: "off" }),
+              });
               pi.on("before_agent_start", (event) => {
                 prompts.push(event.messageType === "custom" ? `custom:${event.message.customType}` : event.prompt);
               });
@@ -124,6 +131,42 @@ describe.skipIf(VERSION !== "1.4.0" || process.platform === "win32")(
         notify: "turn",
       });
     const release = (name: string) => writeFileSync(join(cwd, name), "");
+
+    it.each([
+      { input: 20_000, repair: "none", wakes: true },
+      { input: 250_000, repair: "none", wakes: false },
+      { input: 250_000, repair: "shorten", wakes: true },
+      { input: 250_000, repair: "omit", wakes: true },
+    ])("SDK physical-window process wake and persisted repair: %j", async ({ input, repair, wakes }) => {
+      const ctx = session.extensionRunner.createToolContext("routed", undefined);
+      const router = ctx.modelRegistry.find("background-router", "small");
+      if (!router) throw new Error("Missing router fixture");
+      await session.setModel(router);
+      const call = job("routed");
+      const tool = session.getToolDefinition("bash_background");
+      if (!tool) throw new Error("Missing background tool fixture");
+      await tool.execute("routed", call.arguments, undefined, undefined, ctx);
+      const manager = session.sessionManager;
+      const user = manager.appendMessage({ role: "user", content: "original long input", timestamp: Date.now() });
+      const assistant = manager.appendMessage({
+        ...fauxAssistantMessage("answer"),
+        provider: faux.getModel().provider,
+        model: faux.getModel().id,
+        usage: { ...fauxAssistantMessage("").usage, input, totalTokens: input },
+      });
+      if (repair !== "none")
+        manager.appendContextEdit(
+          repair === "omit" ? assistant : user,
+          repair === "omit" ? null : { content: "short" },
+        );
+      faux.setResponses([fauxAssistantMessage("received")]);
+      release("routed");
+      await vi.waitFor(() => expect(events()).toHaveLength(1), { timeout: 5000 });
+      if (wakes) await vi.waitFor(() => expect(faux.state.callCount).toBe(1));
+      else expect(faux.state.callCount).toBe(0);
+      await vi.waitFor(() => expect(session.isIdle).toBe(true));
+      expect(overflowNotices()).toHaveLength(wakes ? 0 : 1);
+    });
 
     it("records exits without re-running an overflowed parent, notices once, and wakes again after compaction", async () => {
       // An earlier turn gives compaction something to summarize once it is allowed.

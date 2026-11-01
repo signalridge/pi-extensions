@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
+import { formatLocations } from "../src/lsp-results.js";
 import { displayPosition, resolvePosition } from "../src/positions.js";
-import { findInvalidTextEditRange, flattenWorkspaceEdit } from "../src/text-edits.js";
+import {
+  applyTextEdits,
+  findInvalidTextEditRange,
+  flattenWorkspaceEdit,
+  offsetAt,
+  positionAt,
+} from "../src/text-edits.js";
 
 const text = "package main\n\nfunc width(id int) int { return id + width(id) }\n";
 
@@ -99,6 +106,32 @@ test("edit ranges must exist in the snapshot they will be applied to", () => {
   assert.equal(findInvalidTextEditRange(source, [edit(1, 1, 0, 1)]), "2:2-1:2");
   assert.equal(findInvalidTextEditRange(`${source}\n`, [edit(2, 0)]), undefined);
 });
+
+for (const newline of ["\n", "\r\n", "\r"]) {
+  test(`navigation, edits and context agree for newline ${JSON.stringify(newline)}`, () => {
+    const source = `const x=1;${newline}const y=x;${newline}😀`;
+    assert.deepEqual(resolvePosition(source, { line: 2, symbol: "x" }, "a.ts"), { line: 1, character: 8 });
+    const edit = { range: { start: { line: 1, character: 8 }, end: { line: 1, character: 9 } }, newText: "longer" };
+    assert.equal(findInvalidTextEditRange(source, [edit]), undefined);
+    assert.equal(applyTextEdits(source, [edit]), source.replace("y=x", "y=longer"));
+    assert.equal(offsetAt(source, edit.range.start), 10 + newline.length + 8);
+    assert.deepEqual(positionAt(source, 10), { line: 0, character: 10 });
+    if (newline === "\r\n") assert.deepEqual(positionAt(source, 11), { line: 0, character: 10 });
+    assert.deepEqual(positionAt(source, 10 + newline.length), { line: 1, character: 0 });
+    assert.deepEqual(positionAt(source, source.length), { line: 2, character: 2 });
+    assert.equal(offsetAt(source, { line: 3, character: 0 }), source.length);
+    assert.equal(
+      findInvalidTextEditRange(source, [
+        { ...edit, range: { start: { line: 0, character: 11 }, end: { line: 1, character: 0 } } },
+      ]),
+      "1:12-2:1",
+    );
+    const uri = "file:///work/a.ts";
+    assert.deepEqual(formatLocations("/work", [{ uri, range: edit.range }], { uri, text: source }), [
+      "a.ts:2:9: const y=x;",
+    ]);
+  });
+}
 
 test("workspace edits are validated, grouped by URI, and resource operations reported", () => {
   const edit = {

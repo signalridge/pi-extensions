@@ -67,15 +67,17 @@ tool result:
 - A file whose resolved path or content is already in the system prompt is
   skipped. So are directories at or below a `node_modules` segment, paths whose
   real location is outside the working directory (a symlink cannot reach out),
-  and calls issued by another tool rather than the model.
+  and calls issued by another tool rather than the model. Candidate context files
+  are checked on their real paths before reading, including dependency-tree exclusions.
 - Each file is capped at 16 KiB, truncated with a note naming the file. One
   turn delivers at most 32 KiB; files over that budget are named in a short
   note and load with the next file operation below them in a later turn.
 - Nothing is delivered unless the project is trusted (`ctx.isProjectTrusted()`):
   nested files in an untrusted checkout are a prompt-injection vector. Pi's own
   context loading is unchanged.
-- A full `read` or a `write` of a context file counts as delivering it; a
-  partial read or an edit does not.
+- A full, untruncated `read` or a `write` of a context file counts as delivering
+  it; a partial read, an automatically truncated read or an edit does not. Such
+  reads leave the file eligible for bounded delivery on a later operation below it.
 
 Each delivery is recorded as a `pi-agent-guidance:subdirectory-context` custom
 session entry, which is not sent to the model. Whether a file was delivered is

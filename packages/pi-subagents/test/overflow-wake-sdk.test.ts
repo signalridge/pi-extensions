@@ -44,6 +44,7 @@ describe("overflow-aware waking on the real offline Pi SDK", () => {
     const loader = new DefaultResourceLoader({ cwd: root, agentDir, noExtensions: true, noContextFiles: true, noThemes: true, noPromptTemplates: true, extensionFactories: [
       { name: "overflow-subagents", factory: pi => subagentsExtension(pi) },
       { name: "probes", factory: pi => {
+        pi.registerVirtualModel({ provider: "overflow-router", id: "small", name: "Offline small router", contextWindow: 8000, route: () => ({ model: main.getModel(), thinkingLevel: "off" }) });
         pi.on("before_agent_start", event => { runs.push(event.messageType); });
         pi.on("session_compact", () => compactionHook());
         // Stands in for a compaction owner that cancels Pi's overflow recovery, then
@@ -111,6 +112,35 @@ describe("overflow-aware waking on the real offline Pi SDK", () => {
     // The run after compaction carries the held result it kept and the new one that woke it.
     for (const marker of ["SECOND_RESULT", "THIRD_RESULT"]) expect(JSON.stringify(woken?.messages)).toContain(marker);
     expect(overflowNotices()).toHaveLength(1);
+  });
+
+  it.each([
+    { input: 20_000, repair: "none", wakes: true },
+    { input: 250_000, repair: "none", wakes: false },
+    { input: 250_000, repair: "shorten", wakes: true },
+    { input: 250_000, repair: "omit", wakes: true },
+  ])("SDK physical-window wake and persisted repair: %j", async ({ input, repair, wakes }) => {
+    const selected = ctx.modelRegistry.find("overflow-router", "small");
+    expect(selected).toBeDefined();
+    await session.setModel(selected!);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    child.setResponses([async () => { entered.resolve(); await release.promise; return fauxAssistantMessage("ROUTED_RESULT"); }]);
+    main.setResponses([fauxAssistantMessage("received")]);
+    try {
+      await spawn({ prompt: "routed child" });
+      await entered.promise;
+      const manager = session.sessionManager;
+      const user = manager.appendMessage({ role: "user", content: "original long input", timestamp: Date.now() });
+      const assistant = manager.appendMessage({ ...fauxAssistantMessage("answer"), provider: main.getModel().provider, model: main.getModel().id, usage: { ...fauxAssistantMessage("").usage, input, totalTokens: input } });
+      if (repair !== "none") manager.appendContextEdit(repair === "omit" ? assistant : user, repair === "omit" ? null : { content: "short" });
+      release.resolve();
+      await vi.waitFor(() => expect(notices()).toHaveLength(1));
+      if (wakes) await vi.waitFor(() => expect(main.state.callCount).toBe(1));
+      else expect(main.state.callCount).toBe(0);
+      await vi.waitFor(() => expect(session.isIdle).toBe(true));
+      expect(overflowNotices()).toHaveLength(wakes ? 0 : 1);
+    } finally { release.resolve(); }
   });
 
   it("holds a question wake while overflowed and wakes for it after compaction", async () => {

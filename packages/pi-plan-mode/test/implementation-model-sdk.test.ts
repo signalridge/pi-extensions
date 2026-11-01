@@ -12,7 +12,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import planMode from "../src/plan-mode.js";
 import type { PlanModeSettings } from "../src/settings.js";
 
@@ -156,6 +156,7 @@ async function fixture(
     session,
     manager,
     registry,
+    runtime,
     command,
     state,
     sent,
@@ -272,7 +273,7 @@ test("a model or thinking level chosen during implementation is the user's to ke
         // The target branch still records the handoff; only the live model shows it was superseded.
         assert.ok(handoffEntry);
         await f.session.navigateTree(handoffEntry);
-        assert.ok(f.state()?.modelHandoff);
+        assert.equal(f.state()?.modelHandoff, undefined, "tree reconciliation retires an identity-mismatched handoff");
       }
       const after = f.current();
       await f.command("exit");
@@ -355,7 +356,7 @@ const gatedSwitches = [
 ] as const;
 
 for (const [phase, order] of gatedSwitches) {
-  test(`${order}-loaded model_select gate: branch navigation invalidates ${phase} before thinking mutation or compensation`, async () => {
+  test(`${order}-loaded model_select gate: navigation is vetoed until ${phase} settles`, async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => {
       release = resolve;
@@ -390,15 +391,15 @@ for (const [phase, order] of gatedSwitches) {
       armed = true;
       const switching = f.command(phase === "apply" ? "implement" : "exit");
       await entered;
-      await f.session.navigateTree(destination);
-      assert.equal(f.current().thinking, "minimal");
-      const target = f.current();
+      assert.equal((await f.session.navigateTree(destination)).cancelled, true);
+      assert.notEqual(JSON.stringify(f.state()), destinationState);
       release();
       await switching;
-      assert.deepEqual(f.current(), target);
+      assert.equal(f.sent.length, sent + (phase === "apply" ? 1 : 0));
+      assert.equal((await f.session.navigateTree(destination)).cancelled, false);
+      assert.equal(f.current().thinking, "minimal");
       assert.equal(JSON.stringify(f.state()), destinationState);
       assert.equal(f.state()?.modelHandoff, undefined);
-      assert.equal(f.sent.length, sent);
     } finally {
       release();
       await f.close();
@@ -645,6 +646,339 @@ test("a thinking-only handoff retires on a different manual model even with unch
     await f.close();
   }
 });
+
+for (const phase of ["apply", "restore"] as const) {
+  test(`deferred native checkAuth vetoes tree/new/resume/fork during physical ${phase}; retry works`, async () => {
+    const f = await fixture(configured);
+    const held = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    try {
+      const destination = f.manager.appendMessage({ role: "user", content: "off branch", timestamp: Date.now() });
+      await f.planReady();
+      if (phase === "restore") await f.command("implement");
+      const before = f.manager.getLeafId();
+      const original = f.runtime.checkAuth.bind(f.runtime);
+      const auth = vi.spyOn(f.runtime, "checkAuth").mockImplementationOnce(async (provider) => {
+        entered.resolve();
+        await held.promise;
+        return original(provider);
+      });
+      const switching = f.command(phase === "apply" ? "implement" : "exit");
+      await entered.promise;
+      assert.equal((await f.session.navigateTree(destination)).cancelled, true);
+      assert.equal(f.manager.getLeafId() === destination, false);
+      for (const reason of ["new", "resume"] as const) {
+        const gate = await f.session.extensionRunner.emit({ type: "session_before_switch", reason });
+        assert.equal(gate?.cancel, true);
+      }
+      assert.equal(
+        (await f.session.extensionRunner.emit({ type: "session_before_fork", entryId: destination }))?.cancel,
+        true,
+      );
+      assert.ok(f.notifications.some(({ message }) => /model.*in progress.*retry/i.test(message)));
+      held.resolve();
+      await switching;
+      auth.mockRestore();
+      assert.notEqual(f.manager.getLeafId(), before);
+      assert.equal((await f.session.navigateTree(destination)).cancelled, false);
+      assert.ok(!f.manager.getBranch().some((entry) => entry.type === "model_change" && entry.modelId === "builder"));
+    } finally {
+      held.resolve();
+      await f.close();
+    }
+  });
+}
+
+for (const phase of ["apply", "restore"] as const) {
+  test(`admitted tree navigation rejects inverse-order physical ${phase} before checkAuth; idle retry works`, async () => {
+    const held = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    let armed = false;
+    const f = await fixture(configured, {
+      afterPlan: (pi) =>
+        pi.on("session_before_tree", async () => {
+          if (!armed) return;
+          armed = false;
+          entered.resolve();
+          await held.promise;
+        }),
+    });
+    let navigating: ReturnType<typeof f.session.navigateTree> | undefined;
+    try {
+      const destination = f.manager.appendCustomEntry("destination", {});
+      await f.planReady();
+      if (phase === "restore") await f.command("implement");
+      const source = f.manager.getLeafId();
+      assert.ok(source);
+      const before = f.current();
+      const handoff = f.state()?.modelHandoff;
+      const auth = vi.spyOn(f.runtime, "checkAuth");
+      armed = true;
+      navigating = f.session.navigateTree(destination);
+      await entered.promise;
+      assert.equal(f.session.extensionRunner.createCommandContext().isIdle(), false);
+      await f.command(phase === "apply" ? "implement" : "exit");
+      assert.equal(auth.mock.calls.length, 0, "busy navigation must reject BEFORE entering native setModel");
+      assert.deepEqual(f.current(), before);
+      if (phase === "restore")
+        assert.deepEqual(f.state()?.modelHandoff, handoff, "busy restore retains ownership for retry");
+      else assert.equal(f.state()?.awaitingAction, true, "busy apply keeps the ready plan");
+      held.resolve();
+      assert.equal((await navigating).cancelled, false);
+      const branch = f.manager.getBranch();
+      const boundary = branch.findIndex((entry) => entry.id === destination);
+      assert.ok(boundary >= 0);
+      assert.ok(
+        !branch
+          .slice(boundary + 1)
+          .some((entry) => entry.type === "model_change" || entry.type === "thinking_level_change"),
+      );
+      assert.equal((await f.session.navigateTree(source)).cancelled, false);
+      await f.command(phase === "apply" ? "implement" : "exit");
+      assert.ok(auth.mock.calls.length > 0);
+      assert.deepEqual(
+        f.current(),
+        phase === "apply" ? { model: "builder", thinking: "low" } : { model: "planner", thinking: "high" },
+      );
+      auth.mockRestore();
+    } finally {
+      held.resolve();
+      await navigating;
+      await f.close();
+    }
+  });
+}
+
+test("a delayed historical model_select cannot retire a newer persisted handoff", async () => {
+  const held = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const observed = Promise.withResolvers<void>();
+  let armed = true;
+  const f = await fixture(configured, {
+    beforePlan: (pi) =>
+      pi.on("model_select", async (event) => {
+        if (armed && event.model.id === "reviewer") {
+          armed = false;
+          entered.resolve();
+          await held.promise;
+        }
+      }),
+    afterPlan: (pi) =>
+      pi.on("model_select", (event) => {
+        if (event.model.id === "reviewer") observed.resolve();
+      }),
+  });
+  try {
+    const reviewer = f.registry.find(PROVIDER, "reviewer");
+    const planning = f.registry.find(PROVIDER, "planner");
+    assert.ok(reviewer && planning);
+    const historical = f.session.setModel(reviewer);
+    await entered.promise;
+    await f.session.setModel(planning);
+    f.session.setThinkingLevel("high");
+    await f.planReady();
+    await f.command("implement");
+    assert.ok(f.state()?.modelHandoff);
+    held.resolve();
+    await historical;
+    await observed.promise;
+    assert.ok(f.state()?.modelHandoff);
+    await f.session.reload();
+    await f.command("exit");
+    assert.deepEqual(f.current(), { model: "planner", thinking: "high" });
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
+for (const reload of [false, true]) {
+  test(`thinking-only ancestor handoff does not restore planner thinking onto reviewer (reload=${reload})`, async () => {
+    const f = await fixture({ implementationThinkingLevel: "low" });
+    try {
+      await f.planReady();
+      await f.command("implement");
+      const leaf = f.manager.getLeafId();
+      assert.ok(leaf);
+      const reviewer = f.registry.find(PROVIDER, "reviewer");
+      assert.ok(reviewer);
+      f.session.settingsManager.setModelThinkingLevel(PROVIDER, "reviewer", "low");
+      await f.session.setModel(reviewer);
+      await f.session.navigateTree(leaf);
+      if (reload) await f.session.reload();
+      await f.command("exit");
+      assert.deepEqual(f.current(), { model: "reviewer", thinking: "low" });
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("reentrant reload never waits on its own model callback and retains the physical navigation gate", async () => {
+  let f: Awaited<ReturnType<typeof fixture>>;
+  let destination = "";
+  let armed = true;
+  let vetoed = false;
+  f = await fixture(configured, {
+    beforePlan: (pi) =>
+      pi.on("model_select", async (event) => {
+        if (!armed || event.model.id !== "builder") return;
+        armed = false;
+        await f.session.reload();
+        vetoed = (await f.session.navigateTree(destination)).cancelled;
+      }),
+  });
+  try {
+    destination = f.manager.appendMessage({ role: "user", content: "destination", timestamp: Date.now() });
+    await f.planReady();
+    await f.command("implement");
+    assert.equal(vetoed, true);
+    assert.equal(f.state()?.modelHandoff, undefined, "retired command cannot publish ownership after reload");
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.session.navigateTree(destination)).cancelled, false);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const reload of [false, true]) {
+  test(`native away-and-back selections retire a handoff before delayed callbacks (reload=${reload})`, async () => {
+    const held = Promise.withResolvers<void>();
+    const awayEntered = Promise.withResolvers<void>();
+    const backEntered = Promise.withResolvers<void>();
+    let armed = false;
+    const f = await fixture(configured, {
+      beforePlan: (pi) =>
+        pi.on("model_select", async (event) => {
+          if (!armed) return;
+          if (event.model.id === "reviewer") awayEntered.resolve();
+          else if (event.model.id === "builder") backEntered.resolve();
+          else return;
+          await held.promise;
+        }),
+    });
+    try {
+      await f.planReady();
+      await f.command("implement");
+      const reviewer = f.registry.find(PROVIDER, "reviewer");
+      const implementation = f.registry.find(PROVIDER, "builder");
+      assert.ok(reviewer && implementation);
+      f.session.settingsManager.setModelThinkingLevel(PROVIDER, "reviewer", "low");
+      f.session.settingsManager.setModelThinkingLevel(PROVIDER, "builder", "low");
+      armed = true;
+      const away = f.session.setModel(reviewer);
+      await awayEntered.promise;
+      const back = f.session.setModel(implementation);
+      await backEntered.promise;
+      if (reload) await f.session.reload();
+      await f.command("exit");
+      assert.equal(f.state()?.modelHandoff, undefined);
+      assert.deepEqual(f.current(), { model: "builder", thinking: "low" });
+      held.resolve();
+      await Promise.all([away, back]);
+      assert.deepEqual(f.current(), { model: "builder", thinking: "low" });
+    } finally {
+      held.resolve();
+      await f.close();
+    }
+  });
+}
+
+test("normal thinking-only ownership survives reload and restores only its own model's level", async () => {
+  const f = await fixture({ implementationThinkingLevel: "low" });
+  try {
+    await f.planReady();
+    await f.command("implement");
+    assert.deepEqual(f.state()?.modelHandoff, {
+      thinkingModel: planner,
+      previousThinkingLevel: "high",
+      appliedThinkingLevel: "low",
+    });
+    await f.session.reload();
+    await f.command("exit");
+    assert.deepEqual(f.current(), { model: "planner", thinking: "high" });
+  } finally {
+    await f.close();
+  }
+});
+
+test("a delayed historical thinking callback cannot retire a newer thinking-only handoff", async () => {
+  const held = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  const observed = Promise.withResolvers<void>();
+  let armed = true;
+  const f = await fixture(
+    { implementationThinkingLevel: "low" },
+    {
+      beforePlan: (pi) =>
+        pi.on("thinking_level_select", async (event) => {
+          if (armed && event.level === "minimal") {
+            armed = false;
+            entered.resolve();
+            await held.promise;
+          }
+        }),
+      afterPlan: (pi) =>
+        pi.on("thinking_level_select", (event) => {
+          if (event.level === "minimal") observed.resolve();
+        }),
+    },
+  );
+  try {
+    f.session.setThinkingLevel("minimal");
+    await entered.promise;
+    f.session.setThinkingLevel("high");
+    await f.planReady();
+    await f.command("implement");
+    held.resolve();
+    await observed.promise;
+    assert.ok(f.state()?.modelHandoff);
+    await f.command("exit");
+    assert.deepEqual(f.current(), { model: "planner", thinking: "high" });
+  } finally {
+    held.resolve();
+    await f.close();
+  }
+});
+
+for (const selection of ["thinking", "model"] as const) {
+  test(`legacy resumed model handoff relinquishes unprovable thinking and audits future ordinary ${selection} selections`, async () => {
+    const first = await fixture(configured);
+    let resumed: Awaited<ReturnType<typeof fixture>> | undefined;
+    try {
+      await first.planReady();
+      await first.command("implement");
+      await first.runHandoff();
+      const legacy = { ...first.state() };
+      delete legacy.modelHandoffBoundary;
+      first.manager.appendCustomEntry("plan-mode-state", legacy);
+      const sessionFile = first.manager.getSessionFile();
+      assert.ok(sessionFile);
+      await first.close(true);
+      resumed = await fixture(configured, { cwd: first.cwd, sessionFile });
+      assert.deepEqual(resumed.current(), { model: "builder", thinking: "low" });
+      assert.deepEqual(resumed.state()?.modelHandoff, { appliedModel: builder, previousModel: planner });
+      assert.equal(typeof resumed.state()?.modelHandoffBoundary, "string");
+      if (selection === "thinking") {
+        resumed.session.setThinkingLevel("minimal");
+        resumed.session.setThinkingLevel("low");
+      } else {
+        const reviewer = resumed.registry.find(PROVIDER, "reviewer");
+        const builderModel = resumed.registry.find(PROVIDER, "builder");
+        assert.ok(reviewer && builderModel);
+        resumed.session.settingsManager.setModelThinkingLevel(PROVIDER, "reviewer", "low");
+        resumed.session.settingsManager.setModelThinkingLevel(PROVIDER, "builder", "low");
+        await resumed.session.setModel(reviewer);
+        await resumed.session.setModel(builderModel);
+      }
+      await resumed.command("exit");
+      assert.deepEqual(resumed.current(), { model: selection === "thinking" ? "planner" : "builder", thinking: "low" });
+    } finally {
+      await resumed?.close(true);
+      rmSync(first.cwd, { recursive: true, force: true });
+    }
+  });
+}
 
 test("a resumed implementation stays on its model and /plan exit still restores the planning model", async () => {
   const first = await fixture(configured);

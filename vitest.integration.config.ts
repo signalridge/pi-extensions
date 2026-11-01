@@ -7,6 +7,7 @@ export default defineConfig({
       "scripts/editor-composition.test.ts",
       "scripts/status-navigation.test.ts",
       "scripts/goal-compaction-composition.test.ts",
+      "scripts/goal-rules-composition.test.ts",
     ],
     setupFiles: ["packages/pi-input-history/test/vitest.setup.ts"],
   },

@@ -1,4 +1,4 @@
-import { type LiteralSecret, type SecretPattern, type SecretSource, SOURCE_ORDER } from "./patterns.js";
+import { type LiteralSecret, type SecretPattern, type SecretSource, SOURCE_ORDER, safeLabel } from "./patterns.js";
 import {
   buildPlaceholder,
   hmacDigest,
@@ -50,7 +50,9 @@ export class SecretRegistry {
   constructor(options: SecretRegistryOptions) {
     this.#key = options.key;
     this.#digest = options.digest ?? hmacDigest;
-    this.#literals = options.literals.filter((literal) => literal.value.length >= MIN_SECRET_LENGTH);
+    this.#literals = options.literals
+      .filter((literal) => literal.value.length >= MIN_SECRET_LENGTH)
+      .map((literal) => ({ ...literal, label: safeLabel(literal.label, literal.value) }));
     this.#patterns = options.patterns;
     // Register configured values up front, in order, so their labels never depend on scan order.
     for (const literal of this.#literals) this.#placeholderFor(literal.value, literal.label, literal.source);
@@ -63,16 +65,15 @@ export class SecretRegistry {
     return counts;
   }
 
+  /** Learn validated pattern values without rewriting text or issuing merged-span placeholders. */
+  discover(text: string): void {
+    if (text.length >= MIN_SECRET_LENGTH) this.#patternCandidates(text, this.#reserved(text));
+  }
+
   /** Replace every secret occurrence in `text` with its placeholder. */
   obfuscate(text: string): TextResult {
     if (text.length < MIN_SECRET_LENGTH) return { text, count: 0 };
-    // Snapshot verified issued spans before discovery: they must not become
-    // new pattern secrets (for example a placeholder in a URL password field).
-    const reserved: ReservedSpan[] = text.includes("$$")
-      ? [...text.matchAll(PLACEHOLDER_PATTERN)]
-          .filter((match) => this.#valueByPlaceholder.has(match[0]))
-          .map((match) => [match.index, match.index + match[0].length] as const)
-      : [];
+    const reserved = this.#reserved(text);
     const spans = this.#select(this.#candidates(text, reserved), reserved);
     if (spans.length === 0) return { text, count: 0 };
     let out = "";
@@ -102,6 +103,7 @@ export class SecretRegistry {
   #placeholderFor(value: string, label: string, source: SecretSource | undefined): string {
     const existing = this.#placeholderByValue.get(value);
     if (existing !== undefined) return existing;
+    label = safeLabel(label, value);
     let attempt = 0;
     let placeholder = buildPlaceholder(this.#digest, this.#key, label, value, attempt);
     while (this.#valueByPlaceholder.has(placeholder)) {
@@ -116,7 +118,17 @@ export class SecretRegistry {
     return placeholder;
   }
 
-  #candidates(text: string, reserved: readonly ReservedSpan[]): Candidate[] {
+  // Snapshot verified issued spans before discovery: they must not become
+  // new pattern secrets (for example a placeholder in a URL password field).
+  #reserved(text: string): ReservedSpan[] {
+    return text.includes("$$")
+      ? [...text.matchAll(PLACEHOLDER_PATTERN)]
+          .filter((match) => this.#valueByPlaceholder.has(match[0]))
+          .map((match) => [match.index, match.index + match[0].length] as const)
+      : [];
+  }
+
+  #patternCandidates(text: string, reserved: readonly ReservedSpan[]): Candidate[] {
     const candidates: Candidate[] = [];
     let lower: string | undefined;
     const lowercase = (): string => {
@@ -142,15 +154,23 @@ export class SecretRegistry {
         const value = text.slice(start, end);
         let learned = this.#learned.get(value);
         if (!learned) {
-          learned = { label: pattern.label, source: pattern.source, rank: this.#literals.length + index };
+          learned = {
+            label: safeLabel(pattern.label, value),
+            source: pattern.source,
+            rank: this.#literals.length + index,
+          };
           this.#learned.set(value, learned);
-          this.#placeholderFor(value, pattern.label, pattern.source);
+          this.#placeholderFor(value, learned.label, learned.source);
         }
         candidates.push({ start, end, ...learned });
       }
     });
-    // Learn contextual captures before literal scanning, so even an earlier bare
-    // occurrence in this text (and later messages in this request) is protected.
+    return candidates;
+  }
+
+  #candidates(text: string, reserved: readonly ReservedSpan[]): Candidate[] {
+    // Standalone obfuscation also learns contextual captures before literal scanning.
+    const candidates = this.#patternCandidates(text, reserved);
     const literals = [
       ...this.#literals.map((literal, rank) => ({ ...literal, rank })),
       ...[...this.#learned].map(([value, metadata]) => ({ value, ...metadata })),

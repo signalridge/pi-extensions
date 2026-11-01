@@ -329,7 +329,9 @@ export function writeFreshFix(
     const bytes = Buffer.from(text, "utf8");
     let offset = 0;
     while (offset < bytes.length) {
-      offset += writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      const written = writeSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (written <= 0) throw new Error(`Unable to make progress writing ${file}.`);
+      offset += written;
     }
     ftruncateSync(fd, bytes.length);
   } finally {

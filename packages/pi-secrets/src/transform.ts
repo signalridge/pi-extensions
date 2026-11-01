@@ -115,7 +115,16 @@ export function mapMessage(message: AgentMessage, map: TextMap): AgentMessage {
     case "bashExecution": {
       const command = map(message.command);
       const output = map(message.output);
-      return command === message.command && output === message.output ? message : { ...message, command, output };
+      // Pi appends this path when converting truncated ! output to provider text.
+      const fullOutputPath = message.fullOutputPath === undefined ? undefined : map(message.fullOutputPath);
+      return command === message.command && output === message.output && fullOutputPath === message.fullOutputPath
+        ? message
+        : {
+            ...message,
+            command,
+            output,
+            ...(fullOutputPath === undefined ? {} : { fullOutputPath }),
+          };
     }
     case "branchSummary":
     case "compactionSummary": {

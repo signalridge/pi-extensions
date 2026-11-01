@@ -406,11 +406,17 @@ and the edit is validated as a whole before anything is written:
 - every edited file must be a regular, valid UTF-8 file inside the workspace root whose extension
   routes to the same server; edits for other files, non-file URIs, or ranges that do not exist in the
   file reject the entire rename;
+- multiple target paths with the same device/inode (including hardlinks) reject the rename before writing;
 - file operations (create, rename, or delete) are not applied and reject the rename;
   pi-lsp does not advertise `resourceOperations`, so conforming servers do not send them;
-- with `apply: true`, pi-lsp holds Pi's file-mutation queue for every edited file, acquired in one
-  global order, then rechecks every file's workspace containment, identity, and bytes before writing
-  any of them. A change detected in one file leaves all files untouched.
+- with `apply: true`, pi-lsp explicitly preflights every target's workspace containment, identity,
+  and bytes before requesting any write queue. Corruption detected in that preflight leaves every
+  file untouched. It then acquires **only one native file-mutation queue at a time**, in captured
+  canonical-path order, rechecks freshness, identity and cancellation inside the admitted callback,
+  writes that target, and releases its queue before requesting the next. Native queues resolve keys
+  asynchronously; never nesting them prevents a retargeted sibling from self-waiting on a held key.
+  The all-file preflight is **not atomic multi-lock admission**: a later cooperating writer can change
+  a sibling after preflight, causing a partial rename. No rollback is claimed.
 
 Before starting a server, pi-lsp inventories supported files using each candidate server's discovery
 and skip-directory policy (sorted traversal, at most 10,000 supported paths overall, plus
@@ -421,8 +427,14 @@ Touched files must still match their baseline before pi-lsp reads their bytes an
 The requested file also retains its original bytes. The queued write checks then compare every
 touched file's identity and bytes again. Same-length external saves are detected through timestamps,
 not size alone. This relies on filesystem metadata fidelity; it is not a lock or atomic compare-and-swap.
-An external writer can still race the final check, and a failure while writing (after every check
-passed) names the files already updated.
+An external writer can still race the final check or native queue-key resolution; this does not
+provide atomic protection against arbitrary same-user filesystem syscalls. A failure after preflight
+names files already fully updated; a failure while writing also names the current
+**possibly partially modified target** separately,
+even when a descriptor short-write, ENOSPC, or truncate error contains no path. No rollback is claimed.
+
+Positions, ranges, previews and source context use UTF-16 columns with LF, CRLF and lone CR line
+endings. Edits preserve all newline bytes outside the replaced ranges.
 
 ## Cancellation and shutdown
 

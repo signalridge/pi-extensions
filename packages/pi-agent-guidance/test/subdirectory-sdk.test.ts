@@ -12,7 +12,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import guidance from "../agent-guidance.js";
-import { SUBDIRECTORY_ENTRY } from "../subdirectory-context.js";
+import { MAX_FILE_BYTES, MAX_TURN_BYTES, SUBDIRECTORY_ENTRY } from "../subdirectory-context.js";
 
 interface Fixture {
   cwd: string;
@@ -201,6 +201,42 @@ test("tree navigation and compaction redeliver what the model can no longer see;
       expect.stringContaining("src shared guidance"),
       expect.stringContaining("src codex guidance"),
     ]);
+  });
+});
+
+test("a >2000-line, <16KiB auto-truncated read remains eligible for subsequent bounded guidance delivery", async () => {
+  await fixture(async ({ cwd, faux, start }) => {
+    const finalRule = "IMPORTANT_FINAL_RULE";
+    const guidanceText = `${"x\n".repeat(2000)}${finalRule}\n`;
+    expect(Buffer.byteLength(guidanceText)).toBeLessThan(MAX_FILE_BYTES);
+    writeFileSync(join(cwd, "src", "AGENTS.md"), guidanceText);
+    const session = await start();
+    const seen: TranscriptContext[] = [];
+    readThenAnswer(faux, "read", { path: "src/AGENTS.md" }, seen);
+    await session.prompt("Read the guidance file without explicit offset or limit.");
+    const first = lastToolResultText(session);
+    expect(first[0]).not.toContain(finalRule);
+    expect(first[0]).toContain("Use offset=2001 to continue.");
+    const readResult = [...session.messages].reverse().find((message) => message.role === "toolResult");
+    expect(readResult?.role === "toolResult" && readResult.details).toMatchObject({
+      truncation: { truncated: true, truncatedBy: "lines", outputLines: 2000 },
+    });
+    expect(deliveries(session)).toEqual([[join(cwd, "src", "CODEX.md")]]);
+
+    readThenAnswer(faux, "read", { path: "src/other.ts" }, seen);
+    await session.prompt("Read a source file below the guidance.");
+    const second = lastToolResultText(session);
+    expect(second.slice(1)).toEqual([
+      `Context file ${join(cwd, "src", "AGENTS.md")} applies to files below ${join(cwd, "src")}:\n\n${guidanceText}`,
+    ]);
+    expect(Buffer.byteLength(second.slice(1).join(""))).toBeLessThanOrEqual(MAX_TURN_BYTES);
+    expect(JSON.stringify(seen.at(-1)?.messages)).toContain(finalRule);
+    expect(deliveries(session)).toEqual([[join(cwd, "src", "CODEX.md")], [join(cwd, "src", "AGENTS.md")]]);
+
+    readThenAnswer(faux, "read", { path: "src/other.ts" }, seen);
+    await session.prompt("Read again after complete guidance delivery.");
+    expect(lastToolResultText(session)).toEqual(["export const other = 2;\n"]);
+    expect(deliveries(session)).toHaveLength(2);
   });
 });
 

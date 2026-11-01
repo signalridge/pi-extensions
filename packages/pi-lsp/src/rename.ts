@@ -9,7 +9,6 @@ import {
   assertFixWorkspace,
   assertFreshFile,
   captureWorkspace,
-  type FileMutationQueue,
   type FixSnapshot,
   type FixWorkspace,
   fileMutationQueue,
@@ -165,6 +164,7 @@ function planWorkspaceEdit(
     );
   }
   const planned = new Map<string, PlannedFile>();
+  const identities = new Set<string>();
   for (const { uri, edits } of files) {
     let filePath: string;
     try {
@@ -199,6 +199,10 @@ function planWorkspaceEdit(
     const snapshot = real === target.real ? target.snapshot : snapshotFile(resolved);
     assertBaseline();
     assertFreshFile(adapter, root, workspace, resolved, snapshot, "rename");
+    const identity = `${snapshot.dev}:${snapshot.ino}`;
+    if (identities.has(identity))
+      throw new Error(`${adapter.name} edited ${relativePath} through the same file identity as another target.`);
+    identities.add(identity);
     const text = snapshot.bytes.toString("utf8");
     if (!Buffer.from(text, "utf8").equals(snapshot.bytes)) throw new Error(`${relativePath} is not valid UTF-8.`);
     const invalid = findInvalidTextEditRange(text, edits);
@@ -224,10 +228,7 @@ function planWorkspaceEdit(
   return [...planned.values()].sort((left, right) => left.relativePath.localeCompare(right.relativePath));
 }
 
-/**
- * Hold Pi's mutation queue for every file, acquired in one global order so two
- * multi-file writers cannot deadlock, and verify all files before writing any.
- */
+/** Preflight every target, then serialize one complete checked write at a time. */
 async function writePlannedFiles(
   adapter: LspServerAdapter,
   root: string,
@@ -235,28 +236,38 @@ async function writePlannedFiles(
   files: PlannedFile[],
   signal: AbortSignal | undefined,
 ) {
-  const write = async () => {
-    throwIfAborted(signal, adapter);
-    for (const plan of files) assertFreshFile(adapter, root, workspace, plan.path, plan.snapshot, "rename");
-    const updated: string[] = [];
-    for (const plan of files) {
-      try {
-        writeFreshFix(adapter, root, workspace, plan.path, plan.snapshot, plan.newText, "rename");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`${message} Files already updated by this rename: ${updated.join(", ") || "none"}.`);
-      }
-      updated.push(plan.relativePath);
-    }
-  };
   const queue = fileMutationQueue();
-  const keys = files.map((plan) => plan.real).sort();
-  return queue ? withQueues(queue, keys, write) : write();
-}
-
-function withQueues(queue: FileMutationQueue, files: string[], run: () => Promise<void>): Promise<void> {
-  const [first, ...rest] = files;
-  return first === undefined ? run() : queue(first, () => withQueues(queue, rest, run));
+  const ordered = [...files].sort((left, right) => (left.real < right.real ? -1 : left.real > right.real ? 1 : 0));
+  const admit = (plan: PlannedFile) => {
+    throwIfAborted(signal, adapter);
+    assertFreshFile(adapter, root, workspace, plan.path, plan.snapshot, "rename");
+    if (realpathSync(plan.path) !== plan.real || realpathSync(plan.real) !== plan.real)
+      throw staleFixError(plan.path, "rename");
+  };
+  // Not atomic multi-lock admission: later cooperating writes can invalidate a
+  // sibling after this preflight. Never hold one native queue while requesting
+  // another: the host asynchronously resolves keys, which can alias meanwhile.
+  for (const plan of ordered) admit(plan);
+  const updated: string[] = [];
+  for (const plan of ordered) {
+    let writing = false;
+    const write = async () => {
+      admit(plan);
+      writing = true;
+      writeFreshFix(adapter, root, workspace, plan.path, plan.snapshot, plan.newText, "rename");
+    };
+    try {
+      // Await accepted callbacks even on abort; session drain must own them.
+      if (queue) await queue(plan.real, write);
+      else await write();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `${message} ${writing ? `Possibly partially modified target: ${plan.relativePath}. ` : ""}Files already updated by this rename: ${updated.join(", ") || "none"}.`,
+      );
+    }
+    updated.push(plan.relativePath);
+  }
 }
 
 function snapshotFile(file: string) {

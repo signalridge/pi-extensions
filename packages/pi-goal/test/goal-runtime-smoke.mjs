@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, InMemoryCredentialStore, Type } from "@earendil-works/pi-ai";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import {
   createAgentSession,
@@ -57,7 +57,7 @@ async function createHarness(
 
   try {
     const credentials = new InMemoryCredentialStore();
-    const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null });
+    const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false });
     const modelRegistry = new ModelRegistry(modelRuntime);
     const faux = createFauxCore({
       api: `pi-goal-faux-${crypto.randomUUID()}`,
@@ -173,14 +173,7 @@ async function createHarness(
 }
 
 function completionResponse(context) {
-  const system = context.systemPrompt ?? context.messages.find((message) => message.role === "system")?.content;
-  const systemText =
-    typeof system === "string"
-      ? system
-      : (system ?? [])
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
+  const systemText = getCurrentSystemPrompt(context.messages);
   const goalId = /<goal_id>\s*([^<\s]+)\s*<\/goal_id>/.exec(systemText)?.[1];
   assert.ok(goalId, "expected goal id in continuation system prompt");
   return fauxAssistantMessage(

@@ -24,6 +24,7 @@ import {
 } from "./implementation-retention.js";
 import { PLAN_HANDOFF_IDENTITY_ENTRY, PlanInputOwnership } from "./input-ownership.js";
 import { invalidPlanMessage, latestAssistantText, parseProposedPlan } from "./message-transform.js";
+import { modelMutationPending } from "./model-mutation.js";
 import { createPlanActionController } from "./plan-action-controller.js";
 import { createPlanExportController } from "./plan-export-controller.js";
 import {
@@ -289,6 +290,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     getArgumentCompletions: completePlanArguments,
     handler: async (args, ctx) => {
       if (!stateIsCurrent(ctx)) return;
+      reconcileModelHandoff(ctx);
       latestCommandContext = ctx;
       const prompt = args.trim();
       const command = prompt.toLowerCase();
@@ -434,6 +436,20 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     updateUi(ctx);
   });
 
+  function guardModelMutation(_event: unknown, ctx: ExtensionContext) {
+    if (!modelMutationPending(ctx)) return;
+    // Never await a mutation here: setModel awaits model_select handlers,
+    // which may themselves request navigation or session replacement.
+    ctx.ui.notify(
+      "Plan model change is in progress; retry navigation or session replacement after it finishes.",
+      "warning",
+    );
+    return { cancel: true };
+  }
+  pi.on("session_before_tree", guardModelMutation);
+  pi.on("session_before_switch", guardModelMutation);
+  pi.on("session_before_fork", guardModelMutation);
+
   pi.on("session_tree", (_event, ctx) => {
     // This is the committed boundary: getBranch() now belongs to the target.
     // Pi has already restored any loadout declared by the target's canonical
@@ -465,7 +481,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   });
 
   pi.on("thinking_level_select", (event, ctx) => {
-    if (!stateIsCurrent(ctx)) return;
+    if (menuController.signal.aborted || !stateIsCurrent(ctx)) return;
     const owned = ownedThinkingChanges.findIndex(
       (change) =>
         change.previousLevel === event.previousLevel && (settingOwnedThinking || change.level === event.level),
@@ -475,11 +491,8 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       return;
     }
     implementationModels.thinkingSelected();
-    const handoff = state.modelHandoff;
-    if (!state.enabled && handoff?.appliedThinkingLevel && event.level !== handoff.appliedThinkingLevel) {
-      const { previousThinkingLevel: _previous, appliedThinkingLevel: _applied, ...remaining } = handoff;
-      state = { ...state, modelHandoff: remaining.appliedModel ? remaining : undefined };
-      persistState(ctx);
+    if (state.modelHandoff) {
+      reconcileModelHandoff(ctx);
       return;
     }
     if (!state.enabled || !state.appliedThinkingLevel) return;
@@ -495,20 +508,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
   });
 
   pi.on("model_select", (event, ctx) => {
+    if (menuController.signal.aborted) return;
     implementationModels.modelSelected(event.model);
     if (!stateIsCurrent(ctx)) return;
-    const handoff = state.modelHandoff;
-    if (!handoff) return;
-    const appliedModel = handoff.appliedModel;
-    if (
-      appliedModel
-        ? sameModel(event.model, appliedModel)
-        : event.previousModel && sameModel(event.model, event.previousModel)
-    )
-      return;
-    // Selecting another model takes ownership; ending the handoff must not undo it.
-    state = { ...state, modelHandoff: undefined };
-    persistState(ctx);
+    reconcileModelHandoff(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -779,6 +782,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   function exitPlanMode(ctx: ExtensionContext) {
     if (!stateIsCurrent(ctx)) return;
+    if (state.modelHandoff && rejectBusyModelRestore(ctx)) return;
     inputOwnership.commitHandoffs(ctx, workflowGeneration);
     advanceWorkflow();
     const wasEnabled = state.enabled;
@@ -812,6 +816,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       enter();
       return;
     }
+    if (rejectBusyModelRestore(ctx)) return;
     const sessionGeneration = menuGeneration;
     const planWorkflowGeneration = workflowGeneration;
     state = { ...state, modelHandoff: undefined };
@@ -820,6 +825,12 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       if (!restored || sessionGeneration !== menuGeneration || planWorkflowGeneration !== workflowGeneration) return;
       if (stateIsCurrent(ctx)) enter();
     });
+  }
+
+  function rejectBusyModelRestore(ctx: ExtensionContext) {
+    if (ctx.isIdle()) return false;
+    ctx.ui.notify("Planning model restoration deferred: session operation is busy; retry when idle.", "warning");
+    return true;
   }
 
   async function finishModelHandoff(ctx: ExtensionContext, handoff: ImplementationModelHandoff) {
@@ -834,6 +845,15 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     try {
       const outcome = await implementationModels.restore(ctx, handoff, isCurrent);
       if (!isCurrent() || outcome.kind === "obsolete") return false;
+      if (outcome.kind === "busy") {
+        // No physical mutation started. Keep the restore handoff for an idle
+        // retry, including when a synchronous callback made the host busy.
+        state = { ...state, modelHandoff: handoff };
+        persistState(ctx);
+        updateUi(ctx);
+        ctx.ui.notify(outcome.message, "warning");
+        return false;
+      }
       if (outcome.kind === "unavailable") ctx.ui.notify(outcome.message, "warning");
       else if (outcome.kind === "restored") {
         if (outcome.message) ctx.ui.notify(outcome.message, "info");
@@ -882,7 +902,11 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
         return false;
       }
       if (result.handoff) {
-        state = { ...state, modelHandoff: result.handoff };
+        state = {
+          ...state,
+          modelHandoff: result.handoff,
+          modelHandoffBoundary: ctx.sessionManager.getBranch().at(-1)?.id,
+        };
         persistState(ctx);
         updateUi(ctx);
         ctx.ui.notify(describeImplementationHandoff(result.handoff), "info");
@@ -1057,6 +1081,14 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     const modelTarget = implementationModels.resolve(ctx, settings);
     if (modelTarget.kind === "unavailable") {
       ctx.ui.notify(`${modelTarget.message} Implementation was not started; the plan remains available.`, "warning");
+      return;
+    }
+
+    if (modelTarget.kind === "target" && !ctx.isIdle()) {
+      ctx.ui.notify(
+        "Implementation model switch deferred: session operation is busy; retry when idle. The plan remains available.",
+        "warning",
+      );
       return;
     }
 
@@ -1378,9 +1410,53 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     }
   }
 
+  function reconcileModelHandoff(ctx: ExtensionContext) {
+    let handoff = state.modelHandoff;
+    if (!handoff) return;
+    const branch = ctx.sessionManager.getBranch();
+    const boundary = state.modelHandoffBoundary
+      ? branch.findIndex((entry) => entry.id === state.modelHandoffBoundary)
+      : -1;
+    // Older handoffs have no provable native publication boundary. Do not
+    // infer thinking provenance from timestamps or callback arrival. Retain
+    // only model ownership, and anchor all future selection auditing now.
+    if (boundary < 0) {
+      const {
+        previousThinkingLevel: _previous,
+        appliedThinkingLevel: _applied,
+        thinkingModel: _model,
+        ...remaining
+      } = handoff;
+      handoff = remaining.appliedModel ? remaining : undefined;
+      state = {
+        ...state,
+        modelHandoff: handoff,
+        modelHandoffBoundary: branch.at(-1)?.id,
+      };
+      persistState(ctx);
+      if (!handoff) return;
+    }
+    const later = boundary >= 0 ? branch.slice(boundary + 1) : [];
+    const model = handoff.appliedModel ?? handoff.thinkingModel;
+    if (!model || !ctx.model || !sameModel(ctx.model, model) || later.some((entry) => entry.type === "model_change")) {
+      state = { ...state, modelHandoff: undefined, modelHandoffBoundary: undefined };
+      persistState(ctx);
+    } else if (handoff.appliedThinkingLevel && later.some((entry) => entry.type === "thinking_level_change")) {
+      const {
+        previousThinkingLevel: _previous,
+        appliedThinkingLevel: _applied,
+        thinkingModel: _model,
+        ...remaining
+      } = handoff;
+      state = { ...state, modelHandoff: remaining.appliedModel ? remaining : undefined };
+      persistState(ctx);
+    }
+  }
+
   function restoreState(ctx: ExtensionContext) {
     state = restorePlanModeState(ctx.sessionManager.getBranch(), STATE_ENTRY_TYPE);
     stateOrigin = captureStateOrigin(ctx);
+    reconcileModelHandoff(ctx);
   }
 
   function updateUi(ctx: ExtensionContext) {

@@ -181,6 +181,49 @@ describe("pattern-detected secrets", () => {
     expect(labelsIn(configured.obfuscate(value).text)).toEqual(["CONFIGURED"]);
   });
 
+  it("sanitizes the first pattern label before retaining it or merging overlapping matches", () => {
+    const secret = "ULTRASECRETPASSWORD";
+    const tail = `${secret.slice(-8)}TAIL`;
+    const secrets = new SecretRegistry({
+      key: "key",
+      literals: [],
+      patterns: [
+        { label: secret, source: "configPattern", regex: compilePattern(secret) },
+        { label: "LATER_SAFE_LABEL", source: "configPattern", regex: compilePattern(secret) },
+        { label: "TAIL", source: "configPattern", regex: compilePattern(tail) },
+      ],
+    });
+    // Discovery must not issue a derived overlap placeholder or count replacements.
+    expect(secrets.discover(`${secret}TAIL`)).toBeUndefined();
+    expect(secrets.counts().configPattern).toBe(2);
+    for (const text of [secret, `${secret}TAIL`, `again ${secret}`]) {
+      const masked = secrets.obfuscate(text);
+      expect(masked.count).toBe(1);
+      expect(masked.text).not.toContain(secret);
+      expect(labelsIn(masked.text)).toEqual(["SECRET"]);
+      expect(secrets.restore(masked.text)).toEqual({ text, count: 1 });
+      expect(secrets.obfuscate(masked.text)).toEqual({ text: masked.text, count: 0 });
+      expect(secrets.counts().configPattern).toBe(2);
+    }
+  });
+
+  it("keeps an existing safe first label when a later pattern name reveals the same value", () => {
+    const secret = "ULTRASECRETPASSWORD";
+    const secrets = new SecretRegistry({
+      key: "key",
+      literals: [],
+      patterns: [
+        { label: "FIRST_SAFE", source: "configPattern", regex: compilePattern(secret) },
+        { label: secret, source: "configPattern", regex: compilePattern(secret) },
+      ],
+    });
+    secrets.discover(secret);
+    const masked = secrets.obfuscate(secret);
+    expect(labelsIn(masked.text)).toEqual(["FIRST_SAFE"]);
+    expect(secrets.restore(masked.text)).toEqual({ text: secret, count: 1 });
+    expect(secrets.counts().configPattern).toBe(1);
+  });
+
   it("give configured literals the label when a literal and a pattern match the same value", () => {
     const secrets = new SecretRegistry({
       key: "key-a",

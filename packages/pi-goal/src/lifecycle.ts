@@ -680,7 +680,8 @@ export function registerGoalLifecycle(
       if (ticket) {
         runtime.pendingInputWake = ticket;
         runtime.beginAgentRun(null, undefined);
-        return { systemPrompt: `${event.systemPrompt}\n\n${buildGoalSystemPrompt(ticket.resumedGoal)}` };
+        event.systemPromptOptions.sections.pi_goal = buildGoalSystemPrompt(ticket.resumedGoal);
+        return;
       }
     }
     if (!ownedPromptBoundary && ownedPromptGoalId === undefined && acceptedDirectInput?.realInput) {
@@ -755,9 +756,7 @@ export function registerGoalLifecycle(
       runtime.updateStatus(ctx, runtime.activeGoal);
     }
 
-    return {
-      systemPrompt: `${event.systemPrompt}\n\n${buildGoalSystemPrompt(runtime.activeGoal)}`,
-    };
+    event.systemPromptOptions.sections.pi_goal = buildGoalSystemPrompt(runtime.activeGoal);
   });
 
   pi.on("agent_start", (_event, _ctx) => {

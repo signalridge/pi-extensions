@@ -10,6 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import type {
@@ -113,6 +114,37 @@ export function directoriesBetween(cwd: string, target: string): string[] {
   return kept.map((_, index) => path.join(cwd, ...kept.slice(0, index + 1)));
 }
 
+/** Candidate containment must be established before stat/read follows a symlink. */
+function readCandidate(filePath: string, cwd: string): ContextFile | undefined {
+  try {
+    const realCwd = realpathSync(cwd);
+    const realFile = realpathSync(filePath);
+    const relative = path.relative(realCwd, realFile);
+    if (
+      relative === ".." ||
+      relative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relative) ||
+      relative.split(path.sep).includes("node_modules")
+    ) {
+      return undefined;
+    }
+    // Read the validated real path, retaining the candidate name for delivery and
+    // resolved-path/content deduplication (including valid in-tree symlinks).
+    const file = readContextFile(realFile);
+    return file ? { ...file, path: filePath } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Pi omits details on ordinary complete reads; malformed truncation is not proof of completeness. */
+function readIsComplete(details: unknown): boolean {
+  if (details === undefined) return true;
+  if (!isRecord(details)) return false;
+  const truncation = details.truncation;
+  return truncation === undefined || (isRecord(truncation) && truncation.truncated === false);
+}
+
 function render(file: ContextFile): string {
   const bytes = Buffer.from(file.content, "utf8");
   let content = file.content;
@@ -143,8 +175,9 @@ export function createSubdirectoryContext(pi: ExtensionAPI, config: Config, agen
     const names = provider ? getCandidateFiles(ctx.model?.id, provider, config) : [];
     const known = loaded ?? legacyContextFiles(getDirectories(ctx.cwd, agentDir));
     const files: ContextFile[] = [];
+    const read = (filePath: string) => readCandidate(filePath, ctx.cwd);
     for (const dir of directories) {
-      for (const file of [coreContextFile(dir), ...names.map((name) => readContextFile(path.join(dir, name)))]) {
+      for (const file of [coreContextFile(dir, read), ...names.map((name) => read(path.join(dir, name)))]) {
         if (file && shouldLoad(file, [...known, ...files])) files.push(file);
       }
     }
@@ -172,7 +205,10 @@ export function createSubdirectoryContext(pi: ExtensionAPI, config: Config, agen
       // A full read or a write already shows the model the operated-on file.
       const showsTarget =
         event.toolName === "write" ||
-        (event.toolName === "read" && event.input.offset === undefined && event.input.limit === undefined);
+        (event.toolName === "read" &&
+          event.input.offset === undefined &&
+          event.input.limit === undefined &&
+          readIsComplete(event.details));
       const record: DeliveredFile[] = [];
       const blocks: Content = [];
       const deferred: string[] = [];

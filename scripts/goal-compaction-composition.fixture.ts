@@ -190,6 +190,7 @@ async function fakeLoader(factories: ExtensionFactory[], directory: string) {
         return runtime.sendMessage(message, options);
       }) as ExtensionAPI["sendMessage"],
       getSettings: () => runtime.getSettings(),
+      getThinkingLevel: () => runtime.getThinkingLevel(),
       events,
     } as unknown as ExtensionAPI;
     await factory(api);
@@ -230,6 +231,7 @@ async function exercise(control: Control, drift?: Drift) {
   const directory = mkdtempSync(join(sandbox, "fixture-"));
   const realGoal = control === "goal" || control === "goal-fold";
   const boundedFold = control === "goal-fold";
+  const syntheticGoalOverlay = realGoal && drift !== undefined;
   const remoteCheckpointCounts: number[] = [];
   const source = SessionManager.inMemory(directory);
   let target = false;
@@ -457,6 +459,18 @@ async function exercise(control: Control, drift?: Drift) {
     [
       observer,
       ...(realGoal ? [(pi: ExtensionAPI) => goal(pi, { settingsPath: goalSettings })] : []),
+      ...(syntheticGoalOverlay
+        ? [
+            (pi: ExtensionAPI) => {
+              // R12 makes real Goal guidance canonical. Only drift controls need
+              // a divergent prompt: read the live getter AFTER Goal has updated
+              // structured options, then force a solely synthetic local overlay.
+              pi.on("before_agent_start", (event) =>
+                target ? { systemPrompt: event.systemPrompt + append } : undefined,
+              );
+            },
+          ]
+        : []),
       compactWithObservationControl,
     ],
     directory,
@@ -578,6 +592,23 @@ async function exercise(control: Control, drift?: Drift) {
     const targetRequests = requests.filter((request) => request.target);
     assert.equal(preparations.length, 1);
     assert.equal(preparations[0].reason, "threshold", "must be native automatic, never manual compact");
+    const prep = preparations[0];
+    const forced = syntheticGoalOverlay || (!realGoal && control !== "ordinary");
+    if (forced) {
+      assert.notEqual(prep.canonical, prep.effective, "drift/force controls require actual divergent prompt views");
+      assert.equal(prep.effective, prep.canonical + append, "only the synthetic overlay is request-local");
+      assert.ok(!prep.canonical.includes(append));
+    } else {
+      assert.equal(prep.canonical, prep.effective, "structured Goal guidance is canonical, not a forced prompt");
+    }
+    if (realGoal) {
+      assert.equal(prep.activeGoal?.goal?.id, goalId);
+      assert.equal(prep.activeGoal?.goal?.status, "active");
+      assert.equal(prep.activeGoal?.goal?.iteration, 9);
+      assert.equal(prep.activeGoal?.pendingAction, undefined);
+      assert.ok(prep.canonical.includes("<pi_goal>\nActive /goal:") && prep.canonical.includes(goalId));
+      assert.ok(prep.effective.includes("<pi_goal>\nActive /goal:") && prep.effective.includes(goalId));
+    }
     assert.deepEqual(errors, []);
     assert.equal(source.getSessionFile(), undefined);
     const ordinary = targetRequests.filter((request) => request.kind === "ordinary");
@@ -616,10 +647,16 @@ async function exercise(control: Control, drift?: Drift) {
       assert.notDeepEqual(after.replacementHistory.at(-1), before?.replacementHistory.at(-1));
       assert.ok(projectCheckpointContext(source.buildSessionContext().messages, after, "full"));
       assert.deepEqual(outcomes, [{ hasResult: true, aborted: false }]);
-      const prep = preparations[0];
+      assert.ok(ordinary.every((request) => request.packet.instructions === prep.effective));
+      for (const request of [...remote, ...ordinary]) {
+        assert.deepEqual(
+          request.packet.tools,
+          ordinary[0].packet.tools,
+          "compaction leaves the real loadout unchanged",
+        );
+      }
       for (const request of remote) {
         assert.equal(request.packet.instructions, prep.canonical);
-        assert.deepEqual(request.packet.tools, remote[0].packet.tools);
       }
       const remoteInput = remote.flatMap((request) => request.packet.input);
       assert.ok(JSON.stringify(remote[0].packet.input).includes("MEANINGFUL_SYNTHETIC_PREFIX"));
@@ -656,26 +693,35 @@ async function exercise(control: Control, drift?: Drift) {
           finalOpaque,
         );
       }
-      if (control !== "ordinary") {
-        assert.notEqual(prep.canonical, prep.effective);
-        assert.ok(ordinary.every((request) => request.packet.instructions === prep.effective));
-        assert.ok(!JSON.stringify(after).includes(realGoal ? goalId : append));
-      }
-      if (realGoal) {
-        assert.equal(prep.activeGoal?.goal?.id, goalId);
-        assert.equal(prep.activeGoal?.goal?.status, "active");
-        assert.equal(prep.activeGoal?.goal?.iteration, 9);
-        assert.equal(prep.activeGoal?.pendingAction, undefined);
-        assert.ok(prep.effective.includes("Active /goal:") && prep.effective.includes(goalId));
-        assert.ok(!prep.canonical.includes(goalId));
-        assert.ok(ordinary.every((request) => request.packet.tools?.some((tool) => tool.name === "goal_complete")));
+      if (forced) assert.ok(!JSON.stringify(after).includes(append), "synthetic overlay never enters the checkpoint");
+    }
+    if (realGoal) {
+      assert.ok(ordinary.every((request) => request.packet.tools?.some((tool) => tool.name === "goal_complete")));
+      assert.deepEqual(completions, [true]);
+      assert.equal(goalState(source)?.goal, null);
+      assert.equal(session.isIdle, true);
+      assert.deepEqual(actions, [], "actual goal_complete terminates without synthetic suppression or self-queueing");
+      if (!drift) {
+        // Completion terminates the tool batch, so canonical history can still
+        // contain the active section. A real next input prepares the new baseline
+        // and must remove that guidance from both canonical and provider views.
+        settings.applyOverrides({ compaction: { enabled: false } });
+        const requestCount = requests.length;
+        await session.prompt("Verify the post-completion baseline.");
+        const baseline = requests.slice(requestCount);
+        assert.equal(baseline.length, 1, "only the explicit baseline input starts another turn");
+        assert.equal(baseline[0].kind, "ordinary");
+        const canonical = getCurrentSystemPrompt(source.buildSessionContext().messages);
+        assert.equal(baseline[0].packet.instructions, canonical);
+        assert.ok(!canonical.includes("<pi_goal>") && !canonical.includes(goalId));
+        assert.deepEqual(baseline[0].packet.tools, ordinary[0].packet.tools);
         assert.deepEqual(completions, [true]);
         assert.equal(goalState(source)?.goal, null);
-        assert.ok(!getCurrentSystemPrompt(source.buildSessionContext().messages).includes(goalId));
         assert.equal(session.isIdle, true);
-        assert.deepEqual(actions, [], "actual goal_complete terminates without synthetic suppression or self-queueing");
+        assert.deepEqual(actions, [], "baseline preparation never self-queues a Goal turn");
       }
     }
+    assert.deepEqual(errors, []);
     assert.deepEqual(denied, { fetch: 0, websocket: 0, socket: 0, http: 0 });
   } finally {
     // A native rebind clears Goal's completion status timer without private APIs.

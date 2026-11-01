@@ -54,7 +54,10 @@ as `token_expiry_seconds`, hashes and UUIDs stay readable. Generic bearer tokens
 and high-entropy strings are not detected; add a configured pattern for a format
 you use. A false positive only costs readability, because the round trip is
 lossless. Discovered values are retained for literal matching for the registry's lifetime, so a
-later bare occurrence is protected even without the original contextual setting name.
+bare occurrence is protected even without the original contextual setting name.
+Discovery covers all provider-bound conversation strings before any are rewritten,
+so context found later in a request also protects earlier bare occurrences on that
+first request.
 Values shorter than 8 characters are never obfuscated.
 
 ## Placeholders

@@ -1,5 +1,7 @@
+import { sep } from "node:path";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
+import { normalizeToolPath } from "../src/glob.js";
 import { DELIVERY_ENTRY, deliveryRecord, isDue, parseDeliveryRecord, readLedger } from "../src/ledger.js";
 import { describeCall, matchesCondition, matchesGlobs } from "../src/match.js";
 import { renderBlock, renderReminder, renderSection } from "../src/render.js";
@@ -41,6 +43,22 @@ describe("describeCall", () => {
       paths: ["/work/outside.ts"],
     });
   });
+});
+
+it("normalizes file URLs without trimming valid path bytes and rejects malformed URLs", () => {
+  expect(normalizeToolPath(cwd, "file:///work/project/src/space%20%E9%9B%AA.ts")).toBe("src/space 雪.ts");
+  expect(normalizeToolPath(cwd, "file:///work/outside.ts")).toBe("/work/outside.ts");
+  expect(normalizeToolPath(cwd, " src/a.ts ")).toBe(" src/a.ts ");
+  expect(normalizeToolPath(cwd, "file:///work/project/src/%20space%20%E9%9B%AA.ts%20")).toBe("src/ space 雪.ts ");
+  if (sep === "/") {
+    expect(normalizeToolPath(cwd, "file:src/a.ts")).toBe("file:src/a.ts");
+    expect(normalizeToolPath(cwd, "file:/src/a.ts")).toBe("file:/src/a.ts");
+    expect(normalizeToolPath(cwd, "FILE://src/a.ts")).toBe("FILE:/src/a.ts");
+    expect(normalizeToolPath(cwd, "FILE:///work/project/src/a.ts")).toBe("FILE:/work/project/src/a.ts");
+  }
+  if (sep === "/") expect(normalizeToolPath(cwd, "file:///work/project/src/a%5Cb.ts")).toBe("src/a\\b.ts");
+  for (const value of ["file://remote/work/project/src/a.ts", "file:///src/%ZZ", "file:///src/a%2Fb.ts"])
+    expect(normalizeToolPath(cwd, value)).toBeUndefined();
 });
 
 describe("matching", () => {

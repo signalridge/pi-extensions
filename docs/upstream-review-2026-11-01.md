@@ -154,7 +154,7 @@ text, avoiding a false failure at a clock boundary.
 
 `bun run check` passes on Pi 1.4.0 across 33 packages (31 extensions, two
 libraries): configuration, boundary, shared-range, version and Changeset checks;
-lint, TypeScript and tests for every package (484 test files); integration,
+lint, TypeScript and tests for every package (492 test files); integration,
 release and configuration tests; loader smoke that activates each of the 31
 extension tarballs independently, the Subagents/Workflows pair, and the 23
 stable extensions together; tarball validation; and secret scanning. Each new or

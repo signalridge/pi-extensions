@@ -28,6 +28,7 @@ import {
   parseCheckpointDetails,
 } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";
+import { readLastDiagnostic } from "../src/diagnostics.js";
 import type { JsonObject } from "../src/protocol.js";
 import { createCodexCompactSettingsRuntime } from "../src/settings.js";
 import { createMockContext } from "./support.js";
@@ -319,6 +320,7 @@ test("SDK remote failure → layered checkpoint → exact replay → resume → 
     const first = await session.compact();
     const remote = compactionDetails(first);
     assert.equal(remote.version, CHECKPOINT_VERSION);
+    assert.equal((await readLastDiagnostic(manager.getSessionId())).at(-1)?.outcome, "prepared");
 
     await session.prompt(
       `[PI_CODEX_REMOTE_CHECKPOINT:genuine-user-content] NEWER_CANARY ${"Newer conversation content. ".repeat(100)}`,
@@ -331,6 +333,7 @@ test("SDK remote failure → layered checkpoint → exact replay → resume → 
     assert.deepEqual(f.kindsSince(start), ["remote", "summary"]);
     const layered = compactionDetails(second);
     assert.equal(layered.version, LAYERED_CHECKPOINT_VERSION);
+    assert.equal((await readLastDiagnostic(manager.getSessionId())).at(-1)?.outcome, "layered");
     assert.deepEqual(layered.replacementHistory, [
       ...remote.replacementHistory,
       layeredSummaryItem("LAYERED_SUMMARY_CANARY"),
@@ -489,6 +492,9 @@ for (const boundary of ["layered-notify", "layered-status", "remote-status"] as 
       }
       await assert.rejects(session.compact(), /cancel/i);
       assert.equal(mutations, 1, "cleanup and notification callbacks must not loop on invalidation");
+      const diagnostics = await readLastDiagnostic(manager.getSessionId());
+      assert.equal(diagnostics.at(-1)?.outcome, "cancelled");
+      assert.ok(!diagnostics.some((row) => row.outcome === "prepared" || row.outcome === "layered"));
       assert.deepEqual(f.kindsSince(start), boundary === "remote-status" ? ["remote"] : ["remote", "summary"]);
       assert.deepEqual(manager.getEntries(), before, "no checkpoint or changed loadout snapshot is persisted");
       assert.equal(compactionIdFor(manager.getBranch(), remote), compactionIdFor(before, remote));

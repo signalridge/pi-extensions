@@ -29,7 +29,7 @@ import {
   priorLayeredSummary,
   projectCheckpointContext,
 } from "./checkpoint.js";
-import { createDiagnosticTrace, diagnosticSummary, readLastDiagnostic } from "./diagnostics.js";
+import { createDiagnosticTrace, diagnosticSummary, readLastDiagnostic, type TimeoutScope } from "./diagnostics.js";
 import {
   type CompactionCancellationCode,
   type CompactionFailure,
@@ -527,6 +527,7 @@ async function compactRemotely(
         isCurrent: () => boolean;
       }
     | undefined;
+  let success: { outcome: "prepared" | "layered"; error?: CompactionFailureCode; scope?: TimeoutScope } | undefined;
   let prepared: SessionBeforeCompactResult | undefined;
   let preparedIsCurrent: (() => boolean) | undefined;
   try {
@@ -673,7 +674,7 @@ async function compactRemotely(
     if (performance.now() >= deadline) throw compactionError("remote_timeout");
     // Synchronous fingerprinting/retention may outlast timer delivery too.
     if (performance.now() >= deadline) throw compactionError("remote_timeout");
-    diagnostics.finish("prepared");
+    success = { outcome: "prepared" };
     preparedIsCurrent = requestIsCurrent;
     prepared = {
       compaction: {
@@ -751,7 +752,7 @@ async function compactRemotely(
       if (!isCurrent()) return cancelInvalidatedPreparation();
       if (result.ok && details && layered.isCurrent() && performance.now() < deadline) {
         diagnostics.usage(result.usage, false);
-        diagnostics.finish("layered", failure.code, timeoutScope);
+        success = { outcome: "layered", error: failure.code, scope: timeoutScope };
         notifyLayered(ctx, settings, failure, diagnosticSummary(diagnostics.snapshot()));
         preparedIsCurrent = layered.isCurrent;
         prepared = {
@@ -787,16 +788,22 @@ async function compactRemotely(
       return undefined;
     }
   } finally {
-    diagnostics.finish("cancelled");
     if (!ownerSignal.aborted && ctx.mode === "tui" && ctx.hasUI && ctx.sessionManager.getSessionId() === sessionId) {
       setCompactionStatus(ctx, undefined);
     }
+    if (!prepared) diagnostics.finish("cancelled");
   }
   // UI notification and status cleanup are external callbacks and can re-enter
   // the SDK. Fence the prepared result AFTER both; no further notification or
   // cleanup callback may reopen this within-handler publication gap.
   // Later compaction handlers still need the host's unavailable append-time fence.
-  if (prepared && (!preparedIsCurrent?.() || performance.now() >= deadline)) return { cancel: true };
+  if (prepared && (!preparedIsCurrent?.() || performance.now() >= deadline)) {
+    diagnostics.finish("cancelled");
+    return { cancel: true };
+  }
+  // finish only updates owned memory and queues persistence; it does not await
+  // I/O or invoke UI callbacks, so it cannot reopen the accepted result fence.
+  if (success) diagnostics.finish(success.outcome, success.error, success.scope);
   return prepared;
 }
 

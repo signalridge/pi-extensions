@@ -48,6 +48,98 @@ describe.skipIf(VERSION !== "1.4.0")("goal continuation after a context overflow
     rmSync(cwd, { recursive: true, force: true });
   });
 
+  it.each([
+    { input: 20_000, repair: "none", continues: true },
+    { input: 250_000, repair: "none", continues: false },
+    { input: 250_000, repair: "shorten", continues: true },
+    { input: 250_000, repair: "omit", continues: true },
+  ])("SDK Goal continuation uses physical usage and persisted repair: %j", async ({ input, repair, continues }) => {
+    const settingsPath = join(agentDir, "goal.json");
+    writeFileSync(settingsPath, JSON.stringify({ toolVisibility: "always" }));
+    runtime.registerVirtualModel({
+      provider: "goal-router",
+      id: "small",
+      name: "Offline small router",
+      contextWindow: 8000,
+      route: () => ({ model: faux.getModel(), thinkingLevel: "off" }),
+    });
+    const registry = new ModelRegistry(runtime);
+    const manager = SessionManager.inMemory(cwd);
+    const user = manager.appendMessage({ role: "user", content: "original long input", timestamp: Date.now() });
+    const response = {
+      ...fauxAssistantMessage("answer"),
+      provider: faux.getModel().provider,
+      model: faux.getModel().id,
+      usage: { ...fauxAssistantMessage("").usage, input, totalTokens: input },
+    };
+    const assistant = manager.appendMessage(response);
+    if (repair !== "none")
+      manager.appendContextEdit(repair === "omit" ? assistant : user, repair === "omit" ? null : { content: "short" });
+    const now = Date.now();
+    manager.appendCustomEntry("goal-state", {
+      goal: {
+        id: "current",
+        status: "active",
+        text: "finish current",
+        startedAt: now,
+        updatedAt: now,
+        iteration: 1,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        baselineTokens: 0,
+        automaticModelTurns: 0,
+        toolFreeRepeatCount: 0,
+      },
+    });
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      noExtensions: true,
+      noSkills: true,
+      noContextFiles: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      extensionFactories: [{ name: "goal", factory: (pi) => goal(pi, { settingsPath }) }],
+    });
+    await loader.reload();
+    const { session } = await createAgentSession({
+      cwd,
+      agentDir,
+      modelRuntime: runtime,
+      modelRegistry: registry,
+      model: registry.find("goal-router", "small"),
+      settingsManager,
+      resourceLoader: loader,
+      sessionManager: manager,
+      tools: ["goal_complete", "goal_blocked", "goal_wait"],
+    });
+    try {
+      await session.bindExtensions({ mode: "print" });
+      faux.setResponses([
+        fauxAssistantMessage(
+          fauxToolCall("goal_complete", { goal_id: "current", summary: "Verified repaired context." }),
+          { stopReason: "toolUse" },
+        ),
+      ]);
+      // Replay the final-response/settled public boundaries against the real SDK
+      // branch; the continuation is then delivered by Pi's actual native queue.
+      await session.extensionRunner.emit({ type: "agent_end", messages: [response] });
+      await session.extensionRunner.emit({ type: "agent_settled", messages: [response] });
+      if (continues) await vi.waitFor(() => expect(faux.state.callCount).toBe(1));
+      else expect(faux.state.callCount).toBe(0);
+      await vi.waitFor(() => expect(session.isIdle).toBe(true));
+      const state = manager
+        .getBranch()
+        .filter((entry) => entry.type === "custom" && entry.customType === "goal-state")
+        .at(-1)?.data as GoalStateEntryData;
+      expect(state.goal?.status ?? null).toBe(continues ? null : "blocked");
+    } finally {
+      session.dispose();
+    }
+  });
+
   it("blocks once with compaction advice, starts no continuation, and continues after compaction and resume", async () => {
     const settingsPath = join(agentDir, "goal.json");
     writeFileSync(settingsPath, JSON.stringify({ toolVisibility: "always" }));

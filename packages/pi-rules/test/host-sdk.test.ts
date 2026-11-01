@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   type AssistantMessage,
   fauxAssistantMessage,
@@ -12,6 +13,7 @@ import {
 import {
   createAgentSession,
   DefaultResourceLoader,
+  type ExtensionAPI,
   ModelRegistry,
   ModelRuntime,
   SessionManager,
@@ -29,7 +31,10 @@ afterEach(async () => {
 });
 
 /** A real Pi 1.4 session with this extension, a faux provider and rule files under `project/` and `agent/`. */
-async function fixture(files: Record<string, string>, options: { trusted?: boolean } = {}) {
+async function fixture(
+  files: Record<string, string>,
+  options: { trusted?: boolean; probe?: (pi: ExtensionAPI) => void } = {},
+) {
   expect(VERSION).toBe("1.4.0");
   const root = mkdtempSync(join(tmpdir(), "pi-rules-sdk-"));
   const cwd = join(root, "project");
@@ -73,7 +78,7 @@ async function fixture(files: Record<string, string>, options: { trusted?: boole
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [rules],
+    extensionFactories: [rules, ...(options.probe ? [options.probe] : [])],
   });
   await loader.reload();
   expect(loader.getExtensions().errors).toEqual([]);
@@ -288,6 +293,129 @@ describe("real Pi 1.4 SDK session", () => {
     expect(deliveries(f)).toHaveLength(2);
     expect([...readLedger(f.session.sessionManager.getBranch()).deliveries.values()]).toEqual(Array(65).fill(1));
     expect(f.errors).toEqual([]);
+  });
+
+  it.each(["reload", "tree"])(
+    "cancelled queued reminders do not consume once, including across %s",
+    async (recovery) => {
+      const queued = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let armed = true;
+      const f = await fixture(
+        {
+          "agent/rules/cancel.md": "---\ncondition: CANCEL_ME\nscope: tool:bash\n---\nCANCEL_RULE_BODY",
+        },
+        {
+          probe: (pi) =>
+            pi.on("tool_call", async (event) => {
+              if (armed && event.toolName === "bash") {
+                armed = false;
+                queued.resolve();
+                await release.promise;
+              }
+            }),
+        },
+      );
+      const before = f.session.sessionManager.appendMessage({
+        role: "user",
+        content: "before cancellation",
+        timestamp: Date.now(),
+      });
+      f.faux.setResponses([f.tool("bash", { command: "printf CANCEL_ME" }), f.text("should not run")]);
+      const prompting = f.session.prompt("first");
+      await queued.promise;
+      f.session.clearQueue();
+      const aborting = f.session.abort();
+      release.resolve();
+      await Promise.all([prompting, aborting]);
+      expect(deliveries(f)).toHaveLength(0);
+      expect(
+        f.session.messages.some((message) => message.role === "custom" && message.customType === REMINDER_MESSAGE),
+      ).toBe(false);
+      if (recovery === "reload") await f.session.reload();
+      else expect((await f.session.navigateTree(before)).cancelled).toBe(false);
+      f.faux.setResponses([f.tool("bash", { command: "printf CANCEL_ME" }), f.text("done")]);
+      await f.session.prompt("retry");
+      expect(deliveries(f)).toHaveLength(1);
+      expect(occurrences(f.seen.at(-1), "CANCEL_RULE_BODY")).toBe(1);
+    },
+  );
+
+  it("file URLs match native write targets, including escaped space/unicode and block scope", async () => {
+    const f = await fixture({
+      "agent/rules/no-write.md":
+        "---\ncondition: BLOCK_ME\nscope: tool:write(src/**/*.ts)\nenforce: block\n---\nDo not write BLOCK_ME.",
+    });
+    const inside = pathToFileURL(join(f.cwd, "src", "space 雪.ts")).href;
+    const outside = pathToFileURL(join(f.cwd, "outside.ts")).href;
+    const whitespace = pathToFileURL(join(f.cwd, "src", " space 雪.ts ")).href;
+    f.faux.setResponses([
+      f.tool("write", { path: inside, content: "BLOCK_ME" }),
+      f.tool("write", { path: outside, content: "BLOCK_ME" }),
+      f.tool("write", { path: whitespace, content: "BLOCK_ME" }),
+      f.tool("write", { path: whitespace, content: "allowed" }),
+      f.text("done"),
+    ]);
+    await f.session.prompt("write");
+    // Trailing filename whitespace is significant: "*.ts" does not match "*.ts ".
+    expect(toolResults(f, "write").map((result) => result.isError)).toEqual([true, false, false, false]);
+    expect(readFileSync(join(f.cwd, "src", " space 雪.ts "), "utf8")).toBe("allowed");
+    expect(existsSync(join(f.cwd, "src", "space 雪.ts"))).toBe(false);
+    expect(existsSync(join(f.cwd, "outside.ts"))).toBe(true);
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "literal file: and uppercase FILE:// paths match the actual native write target",
+    async () => {
+      const f = await fixture({
+        "agent/rules/no-literal-write.md":
+          "---\ncondition: BLOCK_ME\nscope: tool:write(file:src/**/*.ts), tool:write(FILE:/**/*.ts), tool:write(file:/src/**/*.ts)\nenforce: block\n---\nDo not write BLOCK_ME.",
+      });
+      const paths = ["file:src/a.ts", "FILE://src/a.ts", "file:/src/space 雪.ts", " file:src/space 雪.ts "];
+      f.faux.setResponses([
+        ...paths.map((path) => f.tool("write", { path, content: "BLOCK_ME" })),
+        ...paths.map((path) => f.tool("write", { path, content: "allowed" })),
+        f.text("done"),
+      ]);
+      await f.session.prompt("write literal paths");
+      expect(toolResults(f, "write").map((result) => result.isError)).toEqual([
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      for (const path of paths) expect(readFileSync(join(f.cwd, path), "utf8")).toBe("allowed");
+      expect(f.errors).toEqual([]);
+    },
+  );
+
+  it("inactive read_rule offers index-less glob files and repeated block references without widening tools", async () => {
+    const f = await fixture({
+      "agent/rules/glob.md": "---\nglobs: src/**/*.tsx\n---\nGLOB_BODY",
+      "agent/rules/block.md": "---\ncondition: BLOCK_ME\nscope: tool:write\nenforce: block\n---\nBLOCK_BODY",
+      "project/src/App.tsx": "export {};",
+    });
+    f.session.setActiveToolsByName(["read", "write"]);
+    f.faux.setResponses([
+      f.tool("read", { path: "src/App.tsx" }),
+      f.tool("write", { path: "x", content: "BLOCK_ME" }),
+      f.tool("write", { path: "x", content: "BLOCK_ME" }),
+      f.text("done"),
+    ]);
+    await f.session.prompt("read then write");
+    const offers = f.session.messages.filter(
+      (message) => message.role === "custom" && message.customType === REMINDER_MESSAGE,
+    );
+    expect(JSON.stringify(offers)).toContain("/rules/glob.md");
+    expect(JSON.stringify(offers)).not.toContain("Read it with read_rule");
+    const repeated = toolResults(f, "write")[1];
+    expect(repeated && resultText(repeated)).toContain("/rules/block.md");
+    expect(repeated && resultText(repeated)).not.toContain("read_rule");
+    expect(f.session.getActiveToolNames()).toEqual(["read", "write"]);
   });
 
   it("offers a glob rule by name when a tool touches a matching file", async () => {

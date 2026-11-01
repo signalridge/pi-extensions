@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import {
   type ExtensionContext,
   SessionManager,
   type ToolResultEvent,
+  truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import type { Config } from "../selection.js";
 import {
@@ -148,6 +150,55 @@ test("disabled, untrusted, failed, nested, unrelated and outside calls deliver a
   expect(harness().tool("edit", { path: "@pkg/a.ts" })).toHaveLength(1);
 });
 
+test("candidate symlinks outside cwd or into dependencies are rejected BEFORE content reads", () => {
+  const outside = join(root, "outside.md");
+  const dependency = join(cwd, "node_modules", "dep", "instructions.md");
+  mkdirSync(join(cwd, "node_modules", "dep"), { recursive: true });
+  writeFileSync(outside, "PRIVATE_OUTSIDE_MARKER");
+  writeFileSync(dependency, "DEPENDENCY_MARKER");
+  symlinkSync(outside, join(cwd, "pkg", "AGENTS.override.md"));
+  symlinkSync(dependency, join(cwd, "pkg", "CODEX.md"));
+  write("pkg/AGENTS.md", "safe fallback guidance");
+  const subject = harness({
+    config: { providers: { openai: ["CODEX.md", "../../outside.md", "../node_modules/dep/instructions.md"] } },
+  });
+  const reads = spyOn(fs, "readFileSync");
+  try {
+    const blocks = subject.tool("read", { path: "pkg/a.ts" });
+    expect(blocks.map((text) => text.split("\n\n")[1])).toEqual(["safe fallback guidance"]);
+    const readPaths = reads.mock.calls.map(([file]) => String(file));
+    expect(readPaths).toEqual([fs.realpathSync(join(cwd, "pkg", "AGENTS.md"))]);
+    for (const rejected of [
+      outside,
+      dependency,
+      join(cwd, "pkg", "AGENTS.override.md"),
+      join(cwd, "pkg", "CODEX.md"),
+      join(cwd, "pkg", "../../outside.md"),
+    ]) {
+      expect(readPaths).not.toContain(fs.realpathSync(rejected));
+    }
+    expect(deliveredFiles(subject.manager.buildContextEntries()).size).toBe(1);
+  } finally {
+    reads.mockRestore();
+  }
+});
+
+test("valid in-tree candidate symlinks retain path and content deduplication", () => {
+  write("shared-guide.md", "shared internal guidance");
+  symlinkSync(join(cwd, "shared-guide.md"), join(cwd, "pkg", "AGENTS.md"));
+  symlinkSync(join(cwd, "shared-guide.md"), join(cwd, "pkg", "CODEX.md"));
+  write("pkg/lib/AGENTS.md", "shared internal guidance");
+  const subject = harness();
+  expect(subject.tool("read", { path: "pkg/lib/a.ts" })).toEqual([
+    `Context file ${join(cwd, "pkg", "AGENTS.md")} applies to files below ${join(cwd, "pkg")}:\n\nshared internal guidance`,
+  ]);
+  expect(subject.tool("read", { path: "pkg/lib/a.ts" })).toEqual([]);
+  const loaded = harness();
+  loaded.subdirectories.observe([{ path: join(cwd, "shared-guide.md"), content: "older host snapshot" }]);
+  // The alias is deduplicated by realpath, even when the loaded content differs.
+  expect(loaded.tool("read", { path: "pkg/a.ts" })).toEqual([]);
+});
+
 test("reading a context file records it without echoing it; partial reads and edits do not", () => {
   write("pkg/AGENTS.md", "pkg agents");
   write("pkg/CODEX.md", "pkg codex");
@@ -157,9 +208,39 @@ test("reading a context file records it without echoing it; partial reads and ed
   const partial = harness();
   expect(partial.tool("read", { path: "pkg/AGENTS.md", offset: 2 })).toHaveLength(1);
   expect(partial.tool("read", { path: "pkg/a.ts" }).map((text) => text.split("\n\n")[1])).toEqual(["pkg agents"]);
+  const limited = harness();
+  expect(limited.tool("read", { path: "pkg/AGENTS.md", limit: 1 })).toHaveLength(1);
+  expect(limited.tool("read", { path: "pkg/a.ts" }).map((text) => text.split("\n\n")[1])).toEqual(["pkg agents"]);
+  const written = harness();
+  expect(written.tool("write", { path: "pkg/AGENTS.md" })).toHaveLength(1);
+  expect(written.tool("read", { path: "pkg/a.ts" })).toEqual([]);
   const edited = harness();
   expect(edited.tool("edit", { path: "pkg/AGENTS.md" })).toHaveLength(1);
   expect(edited.tool("read", { path: "pkg/a.ts" }).map((text) => text.split("\n\n")[1])).toEqual(["pkg agents"]);
+});
+
+test("only an actually untruncated read counts as full delivery, with validated truncation details", () => {
+  write("pkg/AGENTS.md", "pkg agents");
+  const incompleteDetails: unknown[] = [
+    { truncation: truncateHead("x\n".repeat(2001)) },
+    { truncation: truncateHead("x".repeat(60 * 1024)) },
+    { truncation: null },
+    { truncation: {} },
+    { truncation: { truncated: "false" } },
+    "invalid details",
+  ];
+  for (const details of incompleteDetails) {
+    const subject = harness();
+    expect(subject.tool("read", { path: "pkg/AGENTS.md" }, { details })).toEqual([]);
+    expect(deliveredFiles(subject.manager.buildContextEntries()).size).toBe(0);
+    expect(subject.tool("read", { path: "pkg/a.ts" }).map((text) => text.split("\n\n")[1])).toEqual(["pkg agents"]);
+  }
+  for (const details of [undefined, {}, { truncation: truncateHead("pkg agents") }]) {
+    const subject = harness();
+    expect(subject.tool("read", { path: "pkg/AGENTS.md" }, { details })).toEqual([]);
+    expect(deliveredFiles(subject.manager.buildContextEntries()).size).toBe(1);
+    expect(subject.tool("read", { path: "pkg/a.ts" })).toEqual([]);
+  }
 });
 
 test("changed content and a context edit of the carrying result are redelivered", () => {

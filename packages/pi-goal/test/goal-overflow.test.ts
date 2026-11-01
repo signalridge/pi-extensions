@@ -11,6 +11,8 @@ function usage(input: number) {
 // A provider that accepts an over-window request and still answers: Pi recognizes it from usage.
 const silentOverflow = {
   role: "assistant",
+  provider: "physical",
+  model: "large",
   stopReason: "stop",
   content: [{ type: "text", text: "partial" }],
   usage: usage(250_000),
@@ -20,7 +22,11 @@ async function overflowedGoal() {
   const branch: Array<Record<string, unknown>> = [];
   const f = await startGoalForTest({
     sessionManager: { getBranch: () => branch, getEntries: () => branch },
-    model: { contextWindow: 200_000 },
+    model: { contextWindow: 8_000 },
+    modelRegistry: {
+      find: (provider: string, model: string) =>
+        provider === "physical" && model === "large" ? { contextWindow: 200_000 } : undefined,
+    },
   });
   branch.push({ type: "message", id: "overflowed", message: silentOverflow });
   branch.push({

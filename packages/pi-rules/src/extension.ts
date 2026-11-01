@@ -9,6 +9,7 @@ import { Type } from "typebox";
 import { loadRules, type RuleSet, SOURCE_LABELS } from "./discovery.js";
 import { DELIVERY_ENTRY, type DeliveryChannel, deliveryRecords, isDue, type Ledger, readLedger } from "./ledger.js";
 import { type CallSubject, describeCall, matchesCondition, matchesGlobs } from "./match.js";
+import { PendingDeliveries } from "./pending-deliveries.js";
 import { READ_RULE_TOOL, renderBlock, renderReminder, renderSection } from "./render.js";
 import { report, ruleDetail, ruleRows, summary } from "./report.js";
 import type { Rule } from "./rule.js";
@@ -30,6 +31,12 @@ export function registerRules(pi: ExtensionAPI, options: RulesExtensionOptions =
   let loaded: RuleSet | undefined;
   // Matches since this runtime loaded its rules; deliveries come from the branch instead.
   const matches = new Map<string, number>();
+  const pending = new PendingDeliveries();
+  let readRuleHidden = false;
+  const readable = () =>
+    !readRuleHidden &&
+    pi.getActiveTools().includes(READ_RULE_TOOL) &&
+    pi.getAllTools().some((tool) => tool.name === READ_RULE_TOOL && tool.exposure !== "hidden");
 
   const load = (ctx: ExtensionContext): RuleSet => {
     loaded = loadRules({
@@ -57,20 +64,31 @@ export function registerRules(pi: ExtensionAPI, options: RulesExtensionOptions =
   };
 
   pi.on("session_start", (_event, ctx) => {
+    pending.clear();
+    readRuleHidden = false;
     const set = load(ctx);
     if (ctx.hasUI && set.diagnostics.some((diagnostic) => diagnostic.level !== "info"))
       ctx.ui.notify(`${summary(set)}. Run /rules for details.`, "warning");
   });
 
+  pi.on("session_tree", () => pending.clear());
+  pi.on("agent_settled", () => pending.clear());
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role !== "custom" || event.message.customType !== REMINDER_MESSAGE) return;
+    const admitted = pending.admit(event.message, ctx);
+    if (admitted) record(admitted.via, admitted.rules);
+  });
+
   pi.on("session_shutdown", () => {
+    pending.clear();
     loaded = undefined;
     matches.clear();
   });
 
   pi.on("before_agent_start", (event, ctx) => {
     const prompt = event.systemPromptOptions;
-    const readable = prompt.selectedTools.includes(READ_RULE_TOOL) && !prompt.hiddenTools.includes(READ_RULE_TOOL);
-    const section = renderSection(current(ctx).rules, readable);
+    readRuleHidden = prompt.hiddenTools.includes(READ_RULE_TOOL);
+    const section = renderSection(current(ctx).rules, prompt.selectedTools.includes(READ_RULE_TOOL) && !readRuleHidden);
     if (section) prompt.sections[SECTION_NAME] = section;
   });
 
@@ -84,7 +102,7 @@ export function registerRules(pi: ExtensionAPI, options: RulesExtensionOptions =
     for (const rule of [...matched, ...touched]) matches.set(rule.name, (matches.get(rule.name) ?? 0) + 1);
 
     const ledger = ledgerOf(ctx);
-    const due = (rule: Rule) => isDue(rule, ledger);
+    const due = (rule: Rule) => isDue(rule, ledger) && !pending.has(rule.name, ctx);
     const blockers = matched.filter((rule) => rule.mode === "block");
     const reminders = matched.filter((rule) => rule.mode === "remind" && due(rule));
     const offers = touched.filter(due);
@@ -94,23 +112,21 @@ export function registerRules(pi: ExtensionAPI, options: RulesExtensionOptions =
       record("block", [...quoted, ...reminders, ...offers]);
       return {
         block: true,
-        reason: renderBlock(blockers, new Set(quoted.map((rule) => rule.name)), reminders, offers, label),
+        reason: renderBlock(blockers, new Set(quoted.map((rule) => rule.name)), reminders, offers, label, readable()),
       };
     }
     if (reminders.length === 0 && offers.length === 0) return undefined;
-    record(reminders.length > 0 ? "reminder" : "offer", [...reminders, ...offers]);
-    pi.sendMessage(
-      {
-        customType: REMINDER_MESSAGE,
-        content: renderReminder(reminders, offers, label),
-        display: false,
-        details: {
-          rules: [...reminders, ...offers].map((rule) => rule.name),
-          tool: call.tool,
-        },
-      },
-      { deliverAs: "steer" },
-    );
+    const content = renderReminder(reminders, offers, label, readable());
+    const claim = pending.queue(ctx, reminders.length > 0 ? "reminder" : "offer", [...reminders, ...offers], content);
+    try {
+      pi.sendMessage(
+        { customType: REMINDER_MESSAGE, content, display: false, details: claim.details },
+        { deliverAs: "steer" },
+      );
+    } catch (error) {
+      claim.cancel();
+      throw error;
+    }
     return undefined;
   });
 

@@ -363,10 +363,12 @@ describe("goal_wait lifecycle", () => {
       const fixture = restoreWait(original);
       await fixture.mock.events.get("input")?.[0]?.({ source, text: "Review passed" }, fixture.ctx);
       assert.equal(requireLastGoal(fixture.mock).status, "paused");
-      const result = (await deliverPrompt(fixture, "Review passed")) as { systemPrompt?: string };
+      const result = (await deliverPrompt(fixture, "Review passed")) as {
+        systemPromptOptions: { sections: { pi_goal: string } };
+      };
       assert.equal(requireLastGoal(fixture.mock).status, "active");
       assert.equal(requireLastGoal(fixture.mock).wait, undefined);
-      assert.match(result.systemPrompt ?? "", /finish after review/);
+      assert.match(result.systemPromptOptions.sections.pi_goal, /finish after review/);
       await vi.advanceTimersByTimeAsync(60_000);
       assert.equal(fixture.mock.sentUserMessages.length, 0);
     });
@@ -469,9 +471,11 @@ describe("goal_wait lifecycle", () => {
   test("accepted input still wakes after another handler transforms its text", async () => {
     const fixture = await waitingGoal();
     await fixture.mock.events.get("input")?.[0]?.({ source: "interactive", text: "/template review" }, fixture.ctx);
-    const result = (await deliverPrompt(fixture, "Expanded review result")) as { systemPrompt?: string };
+    const result = (await deliverPrompt(fixture, "Expanded review result")) as {
+      systemPromptOptions: { sections: { pi_goal: string } };
+    };
     assert.equal(requireLastGoal(fixture.mock).status, "active");
-    assert.match(result.systemPrompt ?? "", /finish after review/);
+    assert.match(result.systemPromptOptions.sections.pi_goal, /finish after review/);
   });
 
   test("a rejected prompt does not consume the wait before a later accepted input", async () => {
@@ -747,7 +751,7 @@ describe("goal_wait lifecycle", () => {
     const initial = (await mock.events.get("before_agent_start")?.[0]?.(
       { prompt: initialPrompt, systemPrompt: "base" },
       ctx,
-    )) as { systemPrompt: string };
+    )) as { systemPromptOptions: { sections: { pi_goal: string } } };
     await mock.events.get("input")?.[0]?.({ source: "interactive", text: "ready", streamingBehavior: "followUp" }, ctx);
     await requireGoalTool(mock, "goal_wait").execute(
       "wait",
@@ -777,7 +781,7 @@ describe("goal_wait lifecycle", () => {
         `Goal runtime binding update: real input resumed the waiting goal. This current goal_id supersedes the earlier binding.\n\n<goal_id>\n${resumedId}\n</goal_id>\nThis goal_id is only the goal_complete tool stale-turn guard, not part of the objective. If and only if the goal is fully complete, pass this exact goal_id to goal_complete with the completion summary.`,
       );
     }
-    assert.match(initial.systemPrompt, /later Goal runtime binding update/);
+    assert.match(initial.systemPromptOptions.sections.pi_goal, /later Goal runtime binding update/);
     assert.equal(messages.length, 1, "context update must not mutate the original message list");
     const complete = requireGoalTool(mock, "goal_complete");
     const stale = await complete.execute(

@@ -988,7 +988,7 @@ export async function runAgent(
   const parentModel = parentPolicySnapshot ? parentPolicySnapshot.model : ctx.model;
   // The spawning session's level, read once. A tier inherits only a level it
   // can clamp; the untiered fallback below also passes the parent's "off".
-  const liveParentThinking = parentPolicySnapshot || options.parentThinking ? undefined : options.pi.getThinkingLevel?.();
+  const liveParentThinking = parentPolicySnapshot || options.parentThinking ? undefined : ctx.thinkingLevel ?? options.pi.getThinkingLevel?.();
   const parentThinking = parentPolicySnapshot
     ? parentPolicySnapshot.thinking
     : options.parentThinking ?? (() => {

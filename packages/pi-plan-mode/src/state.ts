@@ -43,6 +43,8 @@ export interface PlanModeState {
   manualThinkingLevel?: PlanModeFixedThinkingLevel;
   /** Present only after an implementation handoff switched model or thinking; never while planning. */
   modelHandoff?: ImplementationModelHandoff;
+  /** Native entry boundary after the handoff's own model/thinking selections. */
+  modelHandoffBoundary?: string;
 }
 
 type SessionEntry = {
@@ -91,6 +93,10 @@ export function restorePlanModeState(entries: unknown[], stateEntryType: string)
     appliedThinkingLevel: enabled ? fixedThinkingLevel(entry.data.appliedThinkingLevel) : undefined,
     manualThinkingLevel: enabled ? fixedThinkingLevel(entry.data.manualThinkingLevel) : undefined,
     modelHandoff: enabled ? undefined : normalizeModelHandoff(entry.data.modelHandoff),
+    modelHandoffBoundary:
+      !enabled && typeof entry.data.modelHandoffBoundary === "string" && entry.data.modelHandoffBoundary.length <= 128
+        ? entry.data.modelHandoffBoundary
+        : undefined,
   };
 }
 
@@ -98,12 +104,16 @@ function normalizeModelHandoff(value: unknown): ImplementationModelHandoff | und
   if (!isRecord(value)) return undefined;
   const appliedModel = modelReference(value.appliedModel);
   const previousModel = appliedModel ? modelReference(value.previousModel) : undefined;
-  const appliedThinkingLevel = fixedThinkingLevel(value.appliedThinkingLevel);
+  const thinkingModel = modelReference(value.thinkingModel);
+  const appliedThinkingLevel =
+    appliedModel || thinkingModel ? fixedThinkingLevel(value.appliedThinkingLevel) : undefined;
   const previousThinkingLevel = appliedThinkingLevel ? fixedThinkingLevel(value.previousThinkingLevel) : undefined;
   const handoff: ImplementationModelHandoff = {
     ...(appliedModel ? { appliedModel } : {}),
     ...(previousModel ? { previousModel } : {}),
-    ...(appliedThinkingLevel && previousThinkingLevel ? { appliedThinkingLevel, previousThinkingLevel } : {}),
+    ...(appliedThinkingLevel && previousThinkingLevel
+      ? { appliedThinkingLevel, previousThinkingLevel, ...(thinkingModel ? { thinkingModel } : {}) }
+      : {}),
   };
   return Object.keys(handoff).length > 0 ? handoff : undefined;
 }

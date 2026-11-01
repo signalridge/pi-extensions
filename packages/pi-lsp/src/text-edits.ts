@@ -1,36 +1,18 @@
+import { textLines } from "./lines.js";
 import type { LspPosition, LspRange, LspTextEdit, WorkspaceEdit } from "./types.js";
 
 export function positionAt(text: string, offset: number): LspPosition {
   const boundedOffset = Math.max(0, Math.min(offset, text.length));
-  let line = 0;
-  let lineStart = 0;
-
-  for (let index = 0; index < boundedOffset; index += 1) {
-    if (text[index] === "\n") {
-      line += 1;
-      lineStart = index + 1;
-    }
-  }
-
-  return { line, character: boundedOffset - lineStart };
+  const lines = textLines(text);
+  let line = lines.length - 1;
+  while (line > 0 && (lines[line]?.start ?? 0) > boundedOffset) line--;
+  const bounds = lines[line];
+  return { line, character: bounds ? Math.min(boundedOffset, bounds.end) - bounds.start : 0 };
 }
 
 export function offsetAt(text: string, position: LspPosition) {
-  let line = 0;
-  let lineStart = 0;
-
-  for (let index = 0; index < text.length && line < position.line; index += 1) {
-    if (text[index] === "\n") {
-      line += 1;
-      lineStart = index + 1;
-    }
-  }
-
-  if (line < position.line) return text.length;
-
-  let lineEnd = text.indexOf("\n", lineStart);
-  if (lineEnd < 0) lineEnd = text.length;
-  return Math.min(lineStart + position.character, lineEnd);
+  const bounds = textLines(text)[Math.max(0, position.line)];
+  return bounds ? Math.min(bounds.start + Math.max(0, position.character), bounds.end) : text.length;
 }
 
 export function applyTextEdits(text: string, edits: LspTextEdit[]) {
@@ -87,11 +69,14 @@ function textEditRangesConflict(left: { start: number; end: number }, right: { s
  * clamps such ranges silently, so multi-file writes check them first.
  */
 export function findInvalidTextEditRange(text: string, edits: LspTextEdit[]) {
-  const lineLengths = text.split("\n").map((line) => line.length);
-  const valid = (position: LspPosition) =>
-    position.line < lineLengths.length
-      ? position.character <= (lineLengths[position.line] ?? 0)
-      : position.line === lineLengths.length && position.character === 0;
+  const lines = textLines(text);
+  const valid = (position: LspPosition) => {
+    if (!isPosition(position)) return false;
+    const bounds = lines[position.line];
+    return bounds
+      ? position.character <= bounds.end - bounds.start
+      : position.line === lines.length && position.character === 0;
+  };
   for (const edit of edits) {
     const { start, end } = edit.range;
     if (!valid(start) || !valid(end) || offsetAt(text, start) > offsetAt(text, end)) {

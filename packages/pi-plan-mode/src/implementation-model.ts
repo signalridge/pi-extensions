@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { mutateModel } from "./model-mutation.js";
 import {
   configuredImplementationModel,
   configuredImplementationThinkingLevel,
@@ -15,6 +16,8 @@ export interface ImplementationModelHandoff {
   appliedModel?: PlanModeModelReference;
   previousThinkingLevel?: PlanModeFixedThinkingLevel;
   appliedThinkingLevel?: PlanModeFixedThinkingLevel;
+  /** Model identity scopes thinking ownership; unlike appliedModel it owns no switch. */
+  thinkingModel?: PlanModeModelReference;
 }
 
 export type ImplementationModelTarget =
@@ -34,6 +37,7 @@ export type ImplementationModelSwitch =
 export type PlanningModelRestore =
   | { kind: "restored"; message?: string; warning?: string }
   | { kind: "kept" }
+  | { kind: "busy"; message: string }
   | { kind: "obsolete" }
   | { kind: "unavailable"; message: string };
 
@@ -173,14 +177,16 @@ export function createImplementationModelCoordinator({ pi, setThinkingLevel }: I
       isCurrent: () => boolean,
     ): Promise<ImplementationModelSwitch> {
       if (!isCurrent()) return { kind: "obsolete" };
+      if (!ctx.isIdle()) return { kind: "failed", message: "session operation is busy; retry when idle" };
       const pending = selection;
       const previousModel = ctx.model ? modelReference(ctx.model) : undefined;
       const previousThinkingLevel = thinkingLevel();
-      if (target.model) {
-        const label = formatModel(target.model);
+      const targetModel = target.model;
+      if (targetModel) {
+        const label = formatModel(targetModel);
         let switched: boolean;
         try {
-          switched = await pi.setModel(target.model);
+          switched = await mutateModel(ctx, () => pi.setModel(targetModel));
         } catch (error: unknown) {
           if (!isCurrent()) return { kind: "obsolete" };
           return { kind: "failed", message: `${label}: ${errorDetail(error)}` };
@@ -202,7 +208,13 @@ export function createImplementationModelCoordinator({ pi, setThinkingLevel }: I
         ...(ambiguous ? { warning: ambiguousThinkingWarning("implementation thinking application") } : {}),
         handoff: {
           ...(appliedModel ? { appliedModel, ...(previousModel ? { previousModel } : {}) } : {}),
-          ...(!ambiguous ? { previousThinkingLevel, appliedThinkingLevel } : {}),
+          ...(!ambiguous
+            ? {
+                previousThinkingLevel,
+                appliedThinkingLevel,
+                ...(!appliedModel && previousModel ? { thinkingModel: previousModel } : {}),
+              }
+            : {}),
         },
       };
     },
@@ -219,7 +231,17 @@ export function createImplementationModelCoordinator({ pi, setThinkingLevel }: I
       isCurrent: () => boolean,
     ): Promise<PlanningModelRestore> {
       if (!isCurrent()) return { kind: "obsolete" };
+      if (!ctx.isIdle())
+        return {
+          kind: "busy",
+          message: "Planning model restoration deferred: session operation is busy; retry when idle.",
+        };
       const pending = selection;
+      if (
+        !handoff.appliedModel &&
+        (!handoff.thinkingModel || !ctx.model || !sameModel(ctx.model, handoff.thinkingModel))
+      )
+        return { kind: "kept" };
       const levelBefore = thinkingLevel();
       const desiredThinkingLevel =
         handoff.appliedThinkingLevel !== undefined && levelBefore === handoff.appliedThinkingLevel
@@ -241,7 +263,7 @@ export function createImplementationModelCoordinator({ pi, setThinkingLevel }: I
           }
           let restored: boolean;
           try {
-            restored = await pi.setModel(planning);
+            restored = await mutateModel(ctx, () => pi.setModel(planning));
           } catch (error: unknown) {
             if (!isCurrent()) return { kind: "obsolete" };
             return {

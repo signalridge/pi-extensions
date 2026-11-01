@@ -105,6 +105,10 @@ the text being replaced), the `content` of a `write`, the `command` of `bash`
 and `powershell`. `bash` and `powershell` calls have no path, so a path glob on
 them is an error, and a rule with `globs` never matches them.
 
+Path matching mirrors Pi's exact lowercase `file://` recognition and decodes those URLs before
+matching. Other spellings, such as `file:src/a.ts` or uppercase `FILE://`, remain literal paths,
+not decoded URLs. Filename whitespace and escaped space/Unicode bytes remain significant.
+
 Some oh-my-pi scope tokens name streams Pi cannot check before a call runs. They
 produce a warning and are dropped, which only ever narrows where a rule fires:
 `text` and `thinking` (assistant prose, see [Not supported](#not-supported)) and
@@ -146,12 +150,17 @@ timestamps, so it is byte-identical on every run and Pi never appends a section
 patch; the provider's prompt cache keeps its prefix. Editing a rule file changes
 the section after `/reload`, which costs one cache miss. Enforced and glob rules are not in the prompt
 until they match. When `read_rule` is not an active tool, the index lists each
-rule's file path instead.
+rule's file path instead. Glob offers—including description-less rules absent from the index—and
+repeated block references likewise provide the rule-file path when `read_rule` is inactive or hidden.
+The extension never widens the selected tool whitelist.
 
 ## Repeat policy and persistence
 
-A rule counts as delivered when pi-rules sends its text or offer (a reminder, a
-block message, a glob offer) or the model reads it with `read_rule`. Each
+A queued reminder or glob offer counts as delivered only when its own authenticated custom message
+is admitted at Pi's native `message_start` boundary, not when it is queued. Pending matches are
+deduplicated in memory; cancellation, settlement, branch changes and runtime retirement release
+undelivered claims so a later match can offer them again. Copied message details cannot confer a
+receipt. Block messages and successful `read_rule` calls retain their immediate delivery behavior. Each
 delivery appends a `pi-rules:delivered` custom entry to the current session
 branch with `pi.appendEntry`; these entries never reach the model. Repeat state
 is recomputed from the current branch whenever a rule matches:

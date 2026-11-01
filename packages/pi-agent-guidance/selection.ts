@@ -103,9 +103,9 @@ export function resolvedPath(filePath: string): string {
 }
 
 /** The file Pi Core selects for one directory, including its unreadable/non-file skips. */
-export function coreContextFile(dir: string): ContextFile | undefined {
+export function coreContextFile(dir: string, read = readContextFile): ContextFile | undefined {
   for (const name of CORE_CONTEXT_FILES) {
-    const file = readContextFile(path.join(dir, name));
+    const file = read(path.join(dir, name));
     if (file) return file;
   }
   return undefined;

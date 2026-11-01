@@ -127,11 +127,6 @@ export function createAnalyticsExtension(
     });
 
     pi.on("before_agent_start", async (event, ctx) => {
-      // Pi 1.2+ also announces runs started by an idle custom message (for example
-      // a subagent completion). No input preceded them, so they must not consume
-      // the user's pending trigger or explicit skill; turn_start records them as
-      // extension-triggered, exactly as on hosts that never announced them here.
-      if (event.messageType === "custom") return;
       const generation = sessionGeneration;
       const tracker = skillTracker;
       const activeCollector = collector;
@@ -141,6 +136,9 @@ export function createAnalyticsExtension(
       if (generation !== sessionGeneration || tracker !== skillTracker || activeCollector !== collector) {
         return;
       }
+      // Custom runs need the live discovery map too, but must not consume an
+      // explicit user skill or trigger. turn_start attributes them to extensions.
+      if (event.messageType === "custom") return;
       const explicit = tracker.consumeExplicitSkill();
       dispatchedModel = undefined;
       assistant = undefined;
@@ -280,8 +278,12 @@ export function createAnalyticsExtension(
       dispatchedModel = undefined;
       assistant = undefined;
       pendingAttemptWithoutRun = false;
-      pendingTriggerSource = "unknown";
-      skillTracker?.clearPending();
+      // An extension-started cycle did not consume pending user preflight.
+      // Settlement must not erase that input before its own run can begin.
+      if (run?.triggerSource !== "extension") {
+        pendingTriggerSource = "unknown";
+        skillTracker?.clearPending();
+      }
       if (run) await persistRun(run, ctx, generation, owner.signal);
     });
 

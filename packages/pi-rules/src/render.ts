@@ -60,13 +60,18 @@ function ruleBlock(rule: Rule): string {
   return `<rule name="${rule.name}">\n${rule.body}\n</rule>`;
 }
 
-function offerLine(rule: Rule, call: CallLabel): string {
+function offerLine(rule: Rule, call: CallLabel, readRuleAvailable: boolean): string {
   const about = rule.description ? `: ${oneLine(rule.description)}` : "";
-  return `The rule "${rule.name}" applies to ${call.path ?? "this file"} (files: ${globList(rule)})${about}. Read it with ${READ_RULE_TOOL} before changing the file.`;
+  return `The rule "${rule.name}" applies to ${call.path ?? "this file"} (files: ${globList(rule)})${about}. ${readRuleAvailable ? `Read it with ${READ_RULE_TOOL}` : `Read its rule file ${JSON.stringify(rule.path)}`} before changing the file.`;
 }
 
 /** Hidden steering text for `remind` matches and glob offers; the call itself was not stopped by pi-rules. */
-export function renderReminder(reminders: readonly Rule[], offers: readonly Rule[], call: CallLabel): string {
+export function renderReminder(
+  reminders: readonly Rule[],
+  offers: readonly Rule[],
+  call: CallLabel,
+  readRuleAvailable = true,
+): string {
   const parts: string[] = [];
   const pathAttribute = call.path ? ` path="${attribute(call.path)}"` : "";
   for (const rule of reminders)
@@ -74,7 +79,9 @@ export function renderReminder(reminders: readonly Rule[], offers: readonly Rule
       `<rule-reminder rule="${rule.name}" tool="${attribute(call.tool)}"${pathAttribute}>\nThe arguments of your ${callText(call)} matched this project or user rule. pi-rules did not stop the call. Check what you wrote against the rule: fix a real violation in your next steps, and leave anything the rule allows.\n\n${rule.body}\n</rule-reminder>`,
     );
   for (const rule of offers)
-    parts.push(`<rule-offer rule="${rule.name}"${pathAttribute}>\n${offerLine(rule, call)}\n</rule-offer>`);
+    parts.push(
+      `<rule-offer rule="${rule.name}"${pathAttribute}>\n${offerLine(rule, call, readRuleAvailable)}\n</rule-offer>`,
+    );
   return parts.join("\n\n");
 }
 
@@ -89,6 +96,7 @@ export function renderBlock(
   reminders: readonly Rule[],
   offers: readonly Rule[],
   call: CallLabel,
+  readRuleAvailable = true,
 ): string {
   const names = blockers.map((rule) => `"${rule.name}"`).join(", ");
   const parts = [
@@ -98,9 +106,9 @@ export function renderBlock(
     parts.push(
       quoted.has(rule.name)
         ? ruleBlock(rule)
-        : `Rule "${rule.name}" was quoted earlier on this branch; ${READ_RULE_TOOL} shows it again.`,
+        : `Rule "${rule.name}" was quoted earlier on this branch; ${readRuleAvailable ? `${READ_RULE_TOOL} shows it again` : `read its rule file ${JSON.stringify(rule.path)} to see it again`}.`,
     );
   for (const rule of reminders) parts.push(`This call also matched the rule "${rule.name}":\n${ruleBlock(rule)}`);
-  for (const rule of offers) parts.push(offerLine(rule, call));
+  for (const rule of offers) parts.push(offerLine(rule, call, readRuleAvailable));
   return parts.join("\n\n");
 }

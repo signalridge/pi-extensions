@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import { basename, isAbsolute, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** A compiled file glob. Matching is the same on every host: no platform glob API is involved. */
 export interface Glob {
@@ -75,14 +76,23 @@ export function compileGlob(pattern: string): Glob {
 
 /** Normalize a tool `path` argument to a cwd-relative POSIX path (absolute when outside cwd). */
 export function normalizeToolPath(cwd: string, raw: string): string | undefined {
-  let value = raw.trim();
+  let value = raw;
   if (value.startsWith("@")) value = value.slice(1);
   if (!value) return undefined;
+  // Pi decodes only the exact lowercase file:// prefix. Other file: spellings
+  // are literal paths (including file:src/a.ts and FILE:// on POSIX).
+  if (value.startsWith("file://")) {
+    try {
+      value = fileURLToPath(value);
+    } catch {
+      return undefined;
+    }
+  }
   if (value === "~" || value.startsWith("~/")) value = homedir() + value.slice(1);
   const absolute = resolve(cwd, value);
   const inside = relative(cwd, absolute);
   const chosen = inside && !inside.startsWith("..") && !isAbsolute(inside) ? inside : absolute;
-  return chosen.replaceAll("\\", "/");
+  return sep === "\\" ? chosen.replaceAll("\\", "/") : chosen;
 }
 
 /** Split on commas outside quotes, (), [] and {}; used for scope tokens and comma-separated globs. */

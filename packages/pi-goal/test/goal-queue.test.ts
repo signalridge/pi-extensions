@@ -485,7 +485,13 @@ test("pending prioritize preserves Pi-owned retry turns", async () => {
   );
 
   const retryStart = await beforeStart?.({ prompt: "automatic provider retry", systemPrompt: "base" }, harness.ctx);
-  assert.match(String((retryStart as { systemPrompt?: string } | undefined)?.systemPrompt), /recovering goal/);
+  assert.match(
+    String(
+      (retryStart as { systemPromptOptions: { sections: { pi_goal: string } } } | undefined)?.systemPromptOptions
+        .sections.pi_goal,
+    ),
+    /recovering goal/,
+  );
   const completed = await completionTool(harness.mock).execute(
     "retry-completion",
     { goal_id: recovering.id, summary: "Recovering goal completed and verified." },

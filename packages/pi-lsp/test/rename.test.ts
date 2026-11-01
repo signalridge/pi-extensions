@@ -8,6 +8,7 @@ import { test, vi } from "vitest";
 import { LspClient } from "../src/lsp-client.js";
 import { runRename } from "../src/rename.js";
 import { selectOperationRoute } from "../src/routes.js";
+import * as runner from "../src/runner.js";
 import type { LspServerAdapter } from "../src/types.js";
 import { messages, navigationAdapter, text } from "./navigation-fixture.js";
 
@@ -226,14 +227,19 @@ const greetEdits = (main: string, other: string) => ({
   },
 });
 
-test("rename verifies every file under Pi's mutation queue before writing any of them", async () => {
+test("rename reports completed siblings when a cooperating writer invalidates a later queued target", async () => {
   const { root, main, other } = workspace();
   const gated = gatedRename(root, greetEdits);
   let releaseQueue!: () => void;
   const held = new Promise<void>((resolve) => {
     releaseQueue = resolve;
   });
-  // A cooperating writer (the native edit tool) holds other.go while the rename computes.
+  const queued = Promise.withResolvers<void>();
+  vi.spyOn(runner, "fileMutationQueue").mockReturnValue((file, run) => {
+    if (file.endsWith("other.go")) queued.resolve();
+    return withFileMutationQueue(file, run);
+  });
+  // A cooperating writer holds other.go while the rename computes.
   const writer = withFileMutationQueue(other, async () => {
     await held;
     writeFileSync(other, `${OTHER}// saved by another tool\n`);
@@ -242,16 +248,16 @@ test("rename verifies every file under Pi's mutation queue before writing any of
     const running = rename(root, gated.adapter, { apply: true });
     await gated.entered;
     gated.release();
-    // Planning snapshots other.go synchronously once the request settles; the
-    // rename then waits on the queue the writer holds.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The all-file preflight saw intact bytes, but main.go is released before
+    // waiting on other.go. This is intentionally not atomic multi-lock admission.
+    await queued.promise;
     releaseQueue();
     await writer;
     await assert.rejects(
       running,
-      /File changed while computing LSP rename edits; left unchanged: .*other\.go\. Retry the rename\./,
+      /File changed while computing LSP rename edits; left unchanged: .*other\.go\. Retry the rename\. Files already updated by this rename: main\.go/,
     );
-    assert.equal(readFileSync(main, "utf8"), MAIN, "a stale sibling must not leave a partial rename");
+    assert.equal(readFileSync(main, "utf8"), MAIN.replaceAll("greet", "welcome"));
     assert.equal(readFileSync(other, "utf8"), `${OTHER}// saved by another tool\n`);
   } finally {
     releaseQueue();

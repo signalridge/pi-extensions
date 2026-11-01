@@ -1,4 +1,4 @@
-import type { ContextWithSystemEvent } from "@earendil-works/pi-coding-agent";
+import { type ContextWithSystemEvent, convertToLlm } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { mapJsonStrings, mapMessages, mapStringsInPlace } from "../src/transform.js";
 
@@ -165,6 +165,57 @@ describe("mapMessages", () => {
     expect(bash).toMatchObject({ command: "export X=[S]", output: "[S]" });
     expect(branch?.summary).toBe("branch [S]");
     expect(compaction?.summary).toBe("compacted [S]");
+  });
+
+  it("protects fullOutputPath before Pi appends it to truncated ! output", () => {
+    const input = deepFreeze<Messages>([
+      {
+        role: "bashExecution",
+        command: "echo hello",
+        output: "hello",
+        exitCode: 0,
+        cancelled: false,
+        truncated: true,
+        fullOutputPath: `/tmp/${SECRET}/pi-bash-demo.log`,
+        timestamp: 0,
+      },
+    ]);
+    const snapshot = structuredClone(input);
+    // Establish that the actual host conversion would expose the path.
+    expect(JSON.stringify(convertToLlm(input))).toContain(SECRET);
+    const mapped = mapMessages(input, mask);
+    expect(mapped.changed).toBe(true);
+    const providerText = JSON.stringify(convertToLlm(mapped.messages));
+    expect(providerText).toContain("Full output: /tmp/[S]/pi-bash-demo.log");
+    expect(providerText).not.toContain(SECRET);
+    expect(input).toEqual(snapshot);
+  });
+
+  it("keeps bash message identity and optional path presence when unchanged", () => {
+    const base = {
+      role: "bashExecution" as const,
+      command: "echo hello",
+      output: "hello",
+      exitCode: 0,
+      cancelled: false,
+      truncated: false,
+      timestamp: 0,
+    };
+    const input = deepFreeze<Messages>([
+      base,
+      { ...base, fullOutputPath: "/tmp/safe.log" },
+      { ...base, fullOutputPath: undefined },
+    ]);
+    const result = mapMessages(input, mask);
+    expect(result.changed).toBe(false);
+    expect(result.messages[0]).toBe(input[0]);
+    expect(result.messages[1]).toBe(input[1]);
+    expect(result.messages[2]).toBe(input[2]);
+    expect(Object.hasOwn(result.messages[0] ?? {}, "fullOutputPath")).toBe(false);
+    expect(Object.hasOwn(result.messages[2] ?? {}, "fullOutputPath")).toBe(true);
+    const changed = mapMessages([{ ...base, command: SECRET }], mask).messages[0];
+    expect(changed).toMatchObject({ command: "[S]" });
+    expect(Object.hasOwn(changed ?? {}, "fullOutputPath")).toBe(false);
   });
 
   it("reports no change and keeps identities when nothing matches", () => {

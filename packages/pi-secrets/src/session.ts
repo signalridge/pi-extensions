@@ -87,6 +87,13 @@ export function createSecretsSession(input: SecretsSessionInput): SecretsSession
 
 /** Obfuscate one provider-bound transcript; `messages` is never mutated. */
 export function obfuscateRequest(session: SecretsSession, messages: RequestMessages) {
+  // Use exactly the rewrite surface, excluding system/opaque strings. Discover
+  // across the whole request first: a later contextual capture protects earlier
+  // bare occurrences on the first request as well as every subsequent replay.
+  mapMessages(messages, (text) => {
+    session.registry.discover(text);
+    return text;
+  });
   let replacements = 0;
   const result = mapMessages(messages, (text) => {
     const obfuscated = session.registry.obfuscate(text);

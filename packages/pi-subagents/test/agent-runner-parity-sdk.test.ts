@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
 import { type AgentSession, type ExtensionAPI, type ExtensionContext, ModelRegistry, ModelRuntime, SessionManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
@@ -9,7 +9,7 @@ import { type RunOptions, runAgent, setDefaultModel } from "../src/agent-runner.
 import { setAgentTiersSettings } from "../src/agent-tiers.js";
 import { registerAgents } from "../src/agent-types.js";
 import subagentsExtension from "../src/index.js";
-import { AGENT_DEFINITION_GENERATION_OVERRIDE, INTERNAL_AGENT_CONFIG_OVERRIDE, INTERNAL_RESOLVED_ISOLATED } from "../src/internal-run.js";
+import { AGENT_DEFINITION_GENERATION_OVERRIDE, INTERNAL_AGENT_CONFIG_OVERRIDE, INTERNAL_PARENT_POLICY_SNAPSHOT, INTERNAL_RESOLVED_ISOLATED } from "../src/internal-run.js";
 import { setScopeModelsEnabled } from "../src/model-scope.js";
 import { shutdownAndDisposeSession } from "../src/session-lifecycle.js";
 import type { AgentConfig, AgentRecordSnapshot } from "../src/types.js";
@@ -35,7 +35,7 @@ describe("runner isolation and final no-tier scope (faux SDK)", () => {
     mkdirSync(agentDir);
     previousAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = agentDir;
-    faux = fauxProvider({ provider: "parity-faux", models: [{ id: "allowed" }, { id: "outside" }] });
+    faux = fauxProvider({ provider: "parity-faux", models: [{ id: "allowed", reasoning: true }, { id: "outside", reasoning: true }] });
     const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false });
     runtime.registerNativeProvider(faux.provider);
     await runtime.refresh({ allowNetwork: false });
@@ -192,6 +192,47 @@ describe("runner isolation and final no-tier scope (faux SDK)", () => {
       await manager.getRecordMutable(parentId)?.promise;
       await manager.dispose();
     }
+  });
+
+  it.each(["high", "off"] as const)("nested SDK Agent tool inherits coordinator %s rather than root off", async level => {
+    setScopeModelsEnabled(false);
+    writeFileSync(join(cwd, ".pi", "agents", "worker.md"), "---\ntools: none\nextensions: false\nskills: false\npersist_session: false\noutput_transcript: false\n---\nworker");
+    const base: AgentConfig = { name: "coordinator", description: "fixture", builtinToolNames: [], extensions: false, skills: false, systemPrompt: "fixture", promptMode: "replace" };
+    registerAgents(new Map([
+      ["coordinator", { ...base, allowedSubagents: ["worker"], ...(level === "high" ? { agentTier: "coordinator" } : {}) }],
+      ["worker", { ...base, name: "worker" }],
+    ]));
+    setAgentTiersSettings({ profiles: { coordinator: { model: "inherit", thinking: "high" } } });
+    const manager = new AgentManager();
+    manager.setRememberAgents(false);
+    manager.setSupervisorQuestions(false);
+    const rootPi = { ...pi, getThinkingLevel: () => "off" } as ExtensionAPI;
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("Agent", { subagent_type: "worker", description: "worker", prompt: "go" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("worker done"),
+      fauxAssistantMessage("coordinator done"),
+    ]);
+    try {
+      const { record } = await manager.spawnAndWait(rootPi, { ...ctx, thinkingLevel: "off" }, "coordinator", "go", { description: "coordinator" });
+      expect(record.status).toBe("completed");
+      const worker = manager.listAgentsMutable().find(item => item.type === "worker");
+      expect(worker?.status).toBe("completed");
+      expect(worker?.session?.thinkingLevel).toBe(level);
+      expect(manager.getRecordMutable(record.id)?.session?.thinkingLevel).toBe(level);
+    } finally { await manager.dispose(); }
+  });
+
+  it.each(["snapshot", "parent-option", "tier", "option", "agent"] as const)("real SDK thinking precedence remains authoritative: %s", async source => {
+    setScopeModelsEnabled(false);
+    config(source === "agent" ? { thinking: "low" } : {});
+    setAgentTiersSettings({ profiles: { selected: { model: "inherit", thinking: "low" } } });
+    const options: Partial<RunOptions> = source === "snapshot" ? {
+      [INTERNAL_PARENT_POLICY_SNAPSHOT]: Object.freeze({ model: ctx.model, thinking: "medium" }), parentThinking: "low",
+    } : source === "parent-option" ? { parentThinking: "medium" }
+      : source === "tier" ? { agentTier: "selected", thinkingLevel: "high", [INTERNAL_PARENT_POLICY_SNAPSHOT]: Object.freeze({ model: ctx.model, thinking: "medium" }) }
+        : source === "option" ? { thinkingLevel: "low", [INTERNAL_PARENT_POLICY_SNAPSHOT]: Object.freeze({ model: ctx.model, thinking: "medium" }) } : {};
+    const result = await run(options, { ...ctx, thinkingLevel: "high" });
+    expect(result.session.thinkingLevel).toBe(source === "snapshot" || source === "parent-option" ? "medium" : "low");
   });
 
   it("ordinary admission cannot forge resolved isolation with an external symbol", async () => {

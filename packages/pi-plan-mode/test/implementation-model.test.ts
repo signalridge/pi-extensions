@@ -74,11 +74,15 @@ test("a persisted model handoff is restored only outside Plan mode and only with
       appliedThinkingLevel: "low",
       previousThinkingLevel: "high",
     }),
-    {
-      appliedThinkingLevel: "low",
-      previousThinkingLevel: "high",
-    },
+    undefined,
   );
+  const thinkingOnly = {
+    thinkingModel: handoff.previousModel,
+    appliedThinkingLevel: "low",
+    previousThinkingLevel: "high",
+  };
+  assert.deepEqual(restore(false, thinkingOnly), thinkingOnly);
+  assert.equal(restore(false, { ...thinkingOnly, thinkingModel: { provider: "", id: "x" } }), undefined);
   assert.equal(restore(false, { appliedModel: { provider: "", id: "x" } }), undefined);
   assert.equal(restore(false, "builder"), undefined);
 });

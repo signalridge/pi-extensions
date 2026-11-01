@@ -104,6 +104,7 @@ export interface StatusContext {
   abort?: () => void;
   sessionManager?: unknown;
   model?: { contextWindow?: number };
+  modelRegistry?: { find(provider: string, model: string): { contextWindow?: number } | undefined };
 }
 
 export const STATUS_KEY = "goal";

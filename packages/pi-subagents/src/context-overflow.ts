@@ -7,23 +7,35 @@
 import { isContextOverflow } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-export type OverflowContext = Pick<ExtensionContext, "sessionManager" | "model" | "hasUI" | "ui">;
+type EpisodeContext = Pick<ExtensionContext, "sessionManager"> & {
+  modelRegistry?: { find(provider: string, model: string): { contextWindow?: number } | undefined };
+};
+export type OverflowContext = EpisodeContext & Pick<ExtensionContext, "hasUI" | "ui">;
 
 /**
  * The first overflowed response of the current episode: the latest meaningful response on the
  * branch overflowed and neither compaction nor a successful response followed. Aborted and
  * transient error responses say nothing about the context size and are skipped.
  */
-export function overflowEpisode(ctx: Pick<ExtensionContext, "sessionManager" | "model">): string | undefined {
+export function overflowEpisode(ctx: EpisodeContext): string | undefined {
   try {
     const branch = ctx.sessionManager.getBranch();
-    const contextWindow = ctx.model?.contextWindow;
+    const projection = ctx.sessionManager.buildSessionProjection?.();
+    const projected = projection ? new Set(projection.entries.filter(entry => entry.messages.some(message => message.role === "assistant")).map(entry => entry.sourceEntry.id)) : undefined;
+    let contextEdited = false;
     let episode: string | undefined;
     for (let index = branch.length - 1; index >= 0; index--) {
       const entry = branch[index];
       if (entry.type === "compaction") break;
+      if (entry.type === "context_edit") { contextEdited = true; continue; }
       if (entry.type !== "message" || entry.message.role !== "assistant" || entry.message.stopReason === "aborted") continue;
-      if (!isContextOverflow(entry.message, contextWindow)) {
+      const explicit = entry.message.stopReason === "error" && isContextOverflow(entry.message);
+      if (entry.message.stopReason === "error" && !explicit) continue;
+      // Pi can omit a failed recovery attempt before a cancelled compaction.
+      // That alone does not repair its oversized input; invalidate usage only.
+      if (!explicit && projected && !projected.has(entry.id)) break;
+      const contextWindow = ctx.modelRegistry?.find(entry.message.provider, entry.message.model)?.contextWindow;
+      if (!explicit && (contextEdited || !isContextOverflow(entry.message, contextWindow))) {
         if (entry.message.stopReason === "error") continue;
         break;
       }

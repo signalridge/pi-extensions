@@ -1,3 +1,7 @@
+import { splitLines } from "./lines.js";
+
+export { splitLines } from "./lines.js";
+
 import type { LspPosition } from "./types.js";
 
 /**
@@ -54,10 +58,6 @@ export function resolvePosition(text: string, input: PositionInput, label: strin
 /** Format a 0-based LSP position as the 1-based `line:column` used in tool text. */
 export function displayPosition(position: LspPosition) {
   return `${position.line + 1}:${position.character + 1}`;
-}
-
-export function splitLines(text: string) {
-  return text.split("\n").map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
 }
 
 /**
