@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.11.0
+### Minor Changes
+
+- da9ed0f: Add a layered fallback for remote compaction failures over an active opaque checkpoint. When an authorized Remote V2 request fails with a remote or history-size reason (HTTP, timeout, transport, provider, context-window, segmentation, attempt-budget, invalid-response or local-construction failure) and the effective checkpoint is valid and compatible, the extension no longer cancels. It keeps that opaque checkpoint exactly and asks Pi's public `generateSummaryWithUsage` for one readable summary of only the history this compaction drops after it, using the same provider, model, resolved credentials, abort signal and remaining stage/total deadline. The result is a version 2 checkpoint: the previous replacement history followed by one delimited summary message, with a new ID, marker and kept-message fingerprints. It replays Pi's kept messages verbatim, merges rather than stacks on a later failure, and is absorbed by the next successful remote fold. Releases 1.10 and earlier treat version 2 as malformed and cancel rather than compact over it.
+  
+  The layered request reuses the complete remote live-state fence before streaming, on every physical fetch attempt (including provider-internal retries), after summary completion, and before constructing and returning the prepared checkpoint. Branch, model, tools/loadout, provider or authentication drift observed within this handler cancels without replacing the opaque checkpoint. Pi does not expose a final append-time fence after later compaction handlers run; handlers that mutate this state must load before this extension, as documented in its compatibility limits. Canonical preparation preserves genuine marker-shaped user requests; only compaction-summary messages and fingerprint-proven covered version 1 lineage are excluded.
+  
+  If the summary also fails, times out, is aborted or is empty, compaction cancels as before, and the notice now says which path ran and why. Malformed or incompatible checkpoints, missing consent, credential failures, the local loadout/payload guards, live-state divergence, branch/model changes and caller cancellation still cancel. Diagnostics record a `layered_summary` stage and a `layered` outcome. The new `layeredFallback` setting (default `true`, also in the `/codex-compact` settings menu) restores cancel-only behavior when set to `false`.
+
+### Patch Changes
+
+- da9ed0f: Accept a remote compaction whose single item is repeated in the completed response with its keys in a different order. Duplicate detection now compares items with keys sorted at every depth, so a valid compaction no longer fails as "2 distinct compaction items". Adapted from narumiruna/pi-extensions `6b89b6ab`.
+- da9ed0f: Document Pi 1.4.0 as the tested host. The packages were requalified against Pi 1.4.0; host behavior statements that still hold now name the range they were verified on.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.10.0
 ### Minor Changes
 

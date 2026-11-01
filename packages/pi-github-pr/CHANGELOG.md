@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.8
+### Patch Changes
+
+- da9ed0f: Develop and test against Pi 1.4.0. The package's SDK and rendering tests now run on the new baseline host, including the 1.2 run-start and 1.3 dialog-stack changes; no runtime behavior changed.
+
 ## 1.2.7
 ### Patch Changes
 

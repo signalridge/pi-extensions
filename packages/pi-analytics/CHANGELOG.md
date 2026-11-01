@@ -1,5 +1,18 @@
 # @signalridge/pi-analytics
 
+## 1.4.1
+### Patch Changes
+
+- da9ed0f: Record runs started by an idle custom message (for example a subagent completion notice) as extension-triggered again. Pi 1.2 and later announce those runs through `before_agent_start`, which labelled them `unknown` and could consume a pending user trigger.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.4.0
 ### Minor Changes
 

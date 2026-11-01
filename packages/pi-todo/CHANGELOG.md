@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2
+### Patch Changes
+
+- da9ed0f: Document Pi 1.4.0 as the tested host for the native checklist UI.
+
 ## 1.4.1
 ### Patch Changes
 

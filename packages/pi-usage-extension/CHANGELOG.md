@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- da9ed0f: Add a This Month period to `/usage`, between Last Week and Last 30 Days, covering the calendar month to date in the table, graphs, insights and exports. The month starts at 00:00 on the local 1st, computed from the civil calendar so month length and DST changes never shift it (a midnight skipped by DST on the 1st starts the month at that day's first instant). Adapted from tmustier/pi-extensions `3de53e29`.
+
+### Patch Changes
+
+- da9ed0f: Document Pi 1.4.0 as the tested host. The packages were requalified against Pi 1.4.0; host behavior statements that still hold now name the range they were verified on.
+- da9ed0f: Read usage from the session directory Pi actually uses. `/usage` previously always scanned `<agentDir>/sessions`, missing sessions stored through `--session-dir`, `PI_CODING_AGENT_SESSION_DIR` or the `sessionDir` setting; it now follows the active session's directory as Pi resolved it. Windows working directories (`C:\Users\name\...`, including other machines' homes) collapse to `~` project labels like POSIX homes, and other drive paths drop the drive letter. Adapted from tmustier/pi-extensions `cf65f962`, `e38e1cf3` and `91a28802`.
+
 ## 1.2.7
 ### Patch Changes
 

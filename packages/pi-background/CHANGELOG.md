@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.0
+### Minor Changes
+
+- da9ed0f: Remove the cooperative launch review for the retired `@signalridge/pi-approvals` extension. `bash_background` and command-starting `monitor` no longer look for a human approval service or advertise an approval adapter, and the package no longer depends on `@signalridge/pi-approval-core`. Launch inputs are still revalidated against the registered schema and frozen before dispatch. Permission extensions that gate `bash` must keep covering `bash_background` and `monitor` explicitly.
+
+### Patch Changes
+
+- da9ed0f: Stop process events from waking a session whose context overflowed the model window. While the latest response on the branch is a context overflow with no compaction after it, `notify: "turn"` events are added to the conversation as context without starting a turn, and one warning per overflow episode asks to run `/compact` (or `/codex-compact` when installed) or start a new session. A compaction or a later successful response restores normal wakes. Previously each wake resent the same over-window context and failed again. The package now declares `@earendil-works/pi-ai` as a host peer dependency.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+
 ## 1.6.1
 ### Patch Changes
 

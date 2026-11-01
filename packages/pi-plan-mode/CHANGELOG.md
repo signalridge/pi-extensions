@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.0
+### Minor Changes
+
+- da9ed0f: Add opt-in `implementationModel` (`provider/model-id`, resolved through Pi's model registry) and `implementationThinkingLevel` settings. Implementing a plan in the current session switches to that model and thinking level before the implementation request is sent; `/plan exit`, clearing the active implementation, or starting a new plan restores the planning model and thinking level, but only while the session still shows what the handoff applied, so a manual model choice is kept and a manual thinking choice relinquishes the handoff's thinking ownership. The handoff is recorded in the session and survives resume. Apply and restore retain selection ownership through async model selection and final handoff publication, in addition to lifecycle checks. Intervening manual model selections retire the pending switch, even when the user chooses away and back. Thinking provenance is conservative: any unowned thinking change before the expected model is observed is ambiguous, including genuine automatic model-default transitions, because the public thinking event has no source. Apply or restore warns and preserves the current thinking instead of forcing the configured implementation or prior planning level. A safe model-only handoff can proceed, but ambiguous thinking is never recorded as extension-owned or later restored from that handoff. Public branch entries detect changes even when earlier thinking-event handlers delay observation; explicit owned thinking setters are excluded. Manual thinking changes after expected model observation invalidate the operation, including away-and-back choices. Obsolete switches do not mutate, persist a handoff, or compensate into another branch or selection. A thinking-only handoff also retires when a different model is manually selected, even if its effective thinking level stays unchanged. An unknown model, missing credentials, or a refused switch leaves the plan ready on the planning model with a warning instead of implementing on another model.
+
+### Patch Changes
+
+- da9ed0f: Avoid nested native rename queues across asynchronous key resolution; preflight all targets, then recheck and write one queued target at a time with accurate partial-progress reporting. Reject model handoff mutations when a public session operation is already busy, preserve retry ownership, and conservatively migrate legacy handoffs without a native publication boundary. Match Pi's exact lowercase `file://` recognition while keeping other spellings literal.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.4.6
 ### Patch Changes
 

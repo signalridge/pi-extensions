@@ -1,5 +1,19 @@
 # @signalridge/pi-goal
 
+## 1.5.1
+### Patch Changes
+
+- da9ed0f: Do not count runs started by an idle custom message, such as a subagent completion notice, as manual goal runs. Pi 1.2 and later announce those runs through `before_agent_start`; goal input accounting now treats only user prompts as prompt boundaries, as on earlier hosts.
+- da9ed0f: Block a goal with actionable advice when its context overflows the model window. An overflow that Pi's compact-and-retry did not recover now says the context exceeds the model's window and to run `/compact` (or `/codex-compact` when installed) or start a new session, then `/goal resume`, instead of a generic retries-exhausted message. A response that silently exceeds the window (usage above the context window, no error) blocks the same way instead of starting another continuation into the same request. A due `goal_wait` stays paused while the context is overflowed, with one warning, and wakes after a compaction.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.5.0
 ### Minor Changes
 
