@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-analytics",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Local-first, content-free usage analytics for Pi models, skills, tools, and reliability.",
   "type": "module",
   "license": "MIT",
@@ -37,7 +37,7 @@
   },
   "dependencies": {
     "@narumitw/pi-tui-kit": "^0.54.0",
-    "@signalridge/pi-ui": "^1.4.0"
+    "@signalridge/pi-ui": "^1.4.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

@@ -1,5 +1,24 @@
 # @signalridge/pi-lsp
 
+## 1.3.0
+### Minor Changes
+
+- da9ed0f: Add code navigation and semantic rename. `lsp_definition`, `lsp_references`, `lsp_hover` and `lsp_symbols` (file symbols, or workspace symbols with `query`) take a file plus a 1-based line and an identifier on it (or a UTF-16 column) and return workspace-relative, bounded output. `lsp_rename` previews every edit by default and writes only with `apply: true`, validating all edited files and holding Pi's file-mutation queue for each before writing any; file operations are rejected. Each operation runs on the first routed server whose `initialize` result advertises its provider, and fails naming the provider when none does. A new per-server `operations` setting restricts which tools a server is routed for; the built-in catalog adds `typescript-language-server --stdio` for TS/JS navigation and keeps Biome as the only TS/JS diagnostics and fix server.
+  
+  Rename captures bounded pre-request identity/size/timestamp baselines for supported workspace paths, rejects stale or unbaselined returned targets before writing, and only reads touched secondary file contents after metadata validation. Same-length saves during server computation are detected; newly created targets fail closed. Identifier boundaries inspect Unicode code points and continuation marks while keeping UTF-16 offsets.
+  
+  Advertise `codeActionLiteralSupport` with the full code-action kind set so servers such as Biome expose resolvable fix-all and organize-imports actions (adapted from narumiruna/pi-extensions `246a2cb9` and `cda5d36e`). On Windows, prefer `.exe`, `.cmd` and `.bat` launchers over npm's extensionless shim and pass batch-launcher arguments to `cmd.exe` as one quoted command line (adapted from `90bafa06`).
+
+### Patch Changes
+
+- da9ed0f: Avoid nested native rename queues across asynchronous key resolution; preflight all targets, then recheck and write one queued target at a time with accurate partial-progress reporting. Reject model handoff mutations when a public session operation is already busy, preserve retry ownership, and conservatively migrate legacy handoffs without a native publication boundary. Match Pi's exact lowercase `file://` recognition while keeping other spellings literal.
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+
 ## 1.2.8
 ### Patch Changes
 

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.11.1
+### Patch Changes
+
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- da9ed0f: Restore workflow keyword and standing `/effort high|ultra` authorization on Pi 1.2 and later. Those hosts report the session as busy while its own run starts, so the hidden guidance that authorizes the `workflow` tool was silently dropped for every idle prompt. The idle check now applies only on hosts that do not identify the starting run, and runs started by a custom message never consume an armed prompt.
+- da9ed0f: Stop settled workflow results from waking a session whose context overflowed the model window. While the latest response on the branch is a context overflow with no compaction after it, results are still delivered and acknowledged as context but no wake is sent, and one warning per overflow episode asks to run `/compact` (or `/codex-compact` when installed) or start a new session. A compaction or a later successful response restores normal wakes. Previously each wake resent the same over-window context and failed again. The package now declares `@earendil-works/pi-ai` as a host peer dependency.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.11.0
 ### Minor Changes
 

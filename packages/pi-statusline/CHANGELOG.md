@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.4
+### Patch Changes
+
+- da9ed0f: Develop and test against Pi 1.4.0. The package's SDK and rendering tests now run on the new baseline host, including the 1.2 run-start and 1.3 dialog-stack changes; no runtime behavior changed.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.5.3
 ### Patch Changes
 

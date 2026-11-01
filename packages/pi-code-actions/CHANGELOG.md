@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.8
+### Patch Changes
+
+- da9ed0f: Copy snippets through Pi's own `copyToClipboard` instead of spawning clipboard utilities. `/code copy` now works in remote sessions (OSC 52, including `PI_CLIPBOARD_OSC52=1`), Termux and WSL, keeps Linux clipboard ownership after the copy, and reports Pi's failure reason. A copy pending when the session changes is no longer awaited or reported.
+- da9ed0f: Settle a code-actions dialog that the host disposes without closing it. Pi 1.4 resets extension UI on `/reload` by disposing open dialogs; the pending picker or run-output pane is now resolved as cancelled instead of leaving its owner, and session retirement, waiting forever. Host-driven disposal settles locally without splicing Pi's dialog stack during reset, so adjacent foreign dialogs are disposed too; explicit completion still closes synchronously to preserve draft/navigation ordering. Clipboard copying is TUI-only; RPC reports unavailable instead of claiming an OSC52 server-side write reached the client.
+
 ## 1.2.7
 ### Patch Changes
 

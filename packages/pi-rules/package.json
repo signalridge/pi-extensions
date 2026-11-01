@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-rules",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Project and user rule files for Pi: always-on guidance, an on-demand rule index, and rules enforced on tool calls.",
   "type": "module",
   "license": "MIT",

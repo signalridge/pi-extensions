@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.8
+### Patch Changes
+
+- da9ed0f: Suggest `brew install` only on macOS when `bat`, `delta` or `glow` is missing, and name only the missing packages. Other systems are pointed to the README, which now covers Debian and Ubuntu installing `bat` as `batcat`. Adapted from tmustier/pi-extensions `ec06085e`.
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.2.7
 ### Patch Changes
 

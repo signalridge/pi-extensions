@@ -1,5 +1,0 @@
----
-"@signalridge/pi-btw": minor
----
-
-Add an opt-in `advisor` tool that lets the main model ask a stronger reviewer model for a second opinion without the user leaving the main thread. Name the reviewer with `"advisorModel": "provider/model-id"` in `pi-btw.json`; without it the tool is never registered. It is registered only in sessions with an attached client (TUI or RPC), so print/JSON runs and managed subagent children never see it. Each call sends the reviewer the optional question plus the current branch's bounded text transcript (the `/btw --with-parent` serialization, about 40,000 characters, without parent `context` hook redactions) under its own provider session ID, with no tools. Virtual reviewers, credential-resolved endpoint overrides and a reviewer equal to the current session model are refused without a request; every failure or cancellation is an error result. The answer is capped at 12,000 characters and reports the reviewer and its token usage. Design adapted from juicesharp/rpiv-mono `rpiv-advisor` at `46dbdfd` (MIT).

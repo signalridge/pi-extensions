@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.3.0
+### Minor Changes
+
+- da9ed0f: Add opt-in desktop notifications. With `PI_TAB_STATUS_NOTIFY=1`, an interactive session raises one notification when a run settles (aborted runs stay silent) and once each time the tab enters the stalled `blocked` state. The escape sequence is chosen per terminal (OSC 99 for kitty, OSC 9 for iTerm2, OSC 777 otherwise), can be forced with `osc777`, `osc9` or `osc99`, and is wrapped for tmux passthrough. Text is limited to the project label and a fixed outcome, with control characters, bidi overrides and `;` removed. Non-TUI sessions, including subagent children, never notify. Notifications are off by default.
+
+### Patch Changes
+
+- da9ed0f: Show a run you abort as cancelled rather than finished. The tab returns to its bare project title instead of `review`/🚧 (or `blocked` when the abort surfaced as an error), and no desktop notification is raised. The host's `aborted` flag on `agent_settled` (Pi 1.1+) decides; older hosts fall back to the run's last stop reason.
+
 ## 1.2.7
 ### Patch Changes
 

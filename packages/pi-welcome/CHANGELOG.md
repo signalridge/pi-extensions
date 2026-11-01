@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.10
+### Patch Changes
+
+- da9ed0f: Document Pi 1.4.0 as the tested host. The packages were requalified against Pi 1.4.0; host behavior statements that still hold now name the range they were verified on.
+
 ## 1.3.9
 ### Patch Changes
 

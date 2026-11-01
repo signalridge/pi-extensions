@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.17.0
+### Minor Changes
+
+- da9ed0f: Requalify on Pi 1.4.0 and port upstream fixes.
+  
+  - Fix: on Pi 1.2 and later, a message typed while a subagent-question wake was starting aborted the wake and left the message unanswered (TUI: returned to the editor; SDK/RPC: recorded but never answered, or stuck in the follow-up queue). Only idle input now invalidates the wake, and queued steering joins the request as an ordinary turn.
+  - Fix: with `scopeModels` enabled, subagent spawns refused models that Pi 1.4's own `enabledModels` scope admits, such as provider-qualified partials (`anthropic/sonnet`) and IDs offered by several providers.
+  - Fix: untiered subagents inherit the parent session's thinking level, including `off`, instead of Pi's default.
+  - Fix: `get_subagent_result` answers from the latest saved record on the branch after the live record is cleaned up or lost to a reload; foreground resumes save their outcome.
+  - Fix: append-mode agents no longer receive the parent's skill list, cwd and extension sections a second time, and a `skills: false` agent no longer sees the parent's skills.
+  - Fix: agent files accept Claude Code tool names (`Read`, `Glob`, `MultiEdit`, …) and the `disallowedTools` key.
+  - Fix: the exploration guideline names Explore only when it can be spawned.
+  - Fix: a FIFO or other non-regular file named like a memory, skill or agent file is skipped instead of hanging Pi.
+  - Removed: cooperation with the retired `@signalridge/pi-approvals` service (reviewed child edit/write/bash and adapter-required blocking) and the `@signalridge/pi-approval-core` dependency. `ask_tools` timing, Plan policy, project trust and child tool admission are unchanged.
+  
+  Upstream: tintinweb/pi-subagents `4fe1877f`, `00de0cd9`, `15464f3b`, `5c81f518`, `f42173ff`; nicobailon/pi-subagents `b09eb5e8`.
+
+### Patch Changes
+
+- da9ed0f: - Reject rename hardlink aliases and retargeted queue identities before writes; support all LSP newline styles and identify possibly partially modified targets on write failure.
+  - Fence pending physical Plan model mutations at cancellable navigation/replacement gates, reconcile handoffs by native selection chronology, and scope thinking-only restoration to its originating model.
+  - Compose Goal guidance through an owned structured prompt section. Resolve overflow usage against physical response models and invalidate stale size evidence after persisted context edits in each independent continuation helper.
+  - Persist queued Rules reminders/offers only at authenticated native admission, match file URL paths, and provide usable rule-file references when read_rule is unavailable.
+  - Inherit nested workers' thinking from their immediate spawning session while preserving explicit policy precedence.
+  - Refresh skill discovery for custom Analytics runs without consuming pending user attribution, and finalize successful Codex diagnostics only after UI cleanup and the final owned result fence.
+- da9ed0f: Stop background completions from re-running a parent whose context overflowed the model window. While the latest meaningful response on the branch is a context overflow with no compaction after it, completion notices are added to the conversation without starting a turn, parent-question wakes wait, and one warning per overflow episode asks to run `/compact` (or `/codex-compact` when installed) or start a new session. A compaction or a later successful response restores normal waking; held questions wake after the compaction controller releases, even when a downstream async compaction handler delays release. Idle-gated recovery is session-owned, cancellable, and bounded to 30 seconds without model polling. Transient errors and aborts do not prove recovery. A question cancelled during preparation never discards real queued steering or follow-up input. Previously every completion started another request that resent the same over-window context and failed again. `get_subagent_result` now tells the model that a running or queued agent will notify it on completion, not to poll, and to use `wait: true` only when blocked on the result. Pending clarification questions are injected through `context_with_system`, so Pi's mid-conversation system messages stay in place and the cached prompt prefix survives while questions are pending (as in nicobailon/pi-subagents `f45abdb9`).
+- Updated dependencies [da9ed0f]
+  - @signalridge/pi-ui@1.4.1
+
 ## 1.16.0
 ### Minor Changes
 
