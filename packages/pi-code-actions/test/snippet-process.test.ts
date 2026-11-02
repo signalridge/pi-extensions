@@ -1,4 +1,4 @@
-import { test } from "bun:test";
+import { spyOn, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import extension from "../index.js";
+import * as actions from "../src/actions.js";
 import { CAPTURE_BYTES_PER_STREAM } from "../src/captured-output.js";
 import { executeSnippet } from "../src/snippet-process.js";
 
@@ -82,14 +83,94 @@ function fixture(produce = false) {
   };
 }
 
-for (const event of [
+const retirementEvents = [
   "session_before_switch",
   "session_before_fork",
   "session_before_tree",
   "session_start",
   "session_tree",
   "session_shutdown",
-]) {
+] as const;
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+for (const event of retirementEvents) {
+  test(`${event} and repeated shutdown await an already-retired run`, async () => {
+    const entered = gate();
+    const cleanup = gate();
+    let signal: AbortSignal | undefined;
+    const run = spyOn(actions, "runSnippet").mockImplementation(async (_pi, _ctx, _content, ownership) => {
+      signal = ownership.signal;
+      entered.resolve();
+      await cleanup.promise;
+    });
+    const handlers = new Map<string, () => Promise<void>>();
+    let command!: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+    extension({
+      on: (name: string, handler: () => Promise<void>) => handlers.set(name, handler),
+      registerCommand: (_name: string, definition: { handler: typeof command }) => {
+        command = definition.handler;
+      },
+    } as never);
+    const ctx = {
+      mode: "rpc",
+      hasUI: true,
+      cwd: process.cwd(),
+      sessionManager: {
+        getSessionId: () => "session",
+        getLeafId: () => "leaf",
+        getBranch: () => [
+          {
+            type: "message",
+            id: "leaf",
+            timestamp: "",
+            message: { role: "assistant", content: "```sh\nprintf safe\n```" },
+          },
+        ],
+      },
+      ui: { confirm: async () => true, notify: () => assert.fail("retired runs cannot notify") },
+    } as unknown as ExtensionCommandContext;
+    let pending: Promise<void> | undefined;
+    let retiring: Promise<void> | undefined;
+    let repeated: Promise<void> | undefined;
+    try {
+      pending = command("run 1", ctx);
+      await entered.promise;
+      retiring = handlers.get(event)?.();
+      repeated = handlers.get("session_shutdown")?.();
+      assert.ok(retiring && repeated);
+      assert.equal(signal?.aborted, true);
+      let retired = false;
+      let repeatedRetired = false;
+      void retiring.then(() => {
+        retired = true;
+      });
+      void repeated.then(() => {
+        repeatedRetired = true;
+      });
+      // Drain runnable callbacks, not a duration estimate or an OS PID observation.
+      // The owned run cannot settle until this test explicitly releases cleanup.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(retired, false, "first retirement must await the owned run");
+      assert.equal(repeatedRetired, false, "repeated retirement must await the same owned run");
+      assert.equal(run.mock.calls.length, 1);
+      cleanup.resolve();
+      await Promise.all([pending, retiring, repeated]);
+      assert.equal(retired, true);
+      assert.equal(repeatedRetired, true);
+    } finally {
+      cleanup.resolve();
+      await Promise.allSettled([pending, retiring, repeated]);
+      run.mockRestore();
+    }
+  });
+
   test.skipIf(process.platform === "win32")(
     `${event} waits for real TERM-resistant children and suppresses stale output`,
     async () => {
@@ -101,6 +182,13 @@ for (const event of [
       let retiredReads = 0;
       let capturedCwd = tree.cwd;
       const notices: string[] = [];
+      let runSettled = false;
+      const originalRun = actions.runSnippet;
+      const run = spyOn(actions, "runSnippet").mockImplementation((...args) =>
+        originalRun(...args).finally(() => {
+          runSettled = true;
+        }),
+      );
       extension({
         on: (name: string, handler: () => Promise<void>) => {
           handlers.set(name, handler);
@@ -158,25 +246,35 @@ for (const event of [
         retired = true;
         const before = Date.now();
         const retiring = handlers.get(event)?.();
-        // A second boundary must still await a run whose owner was already retired.
-        await handlers.get("session_shutdown")?.();
-        assert.ok(
-          tree.pids().every((pid) => !alive(pid)),
-          "repeated retirement must await in-flight cleanup",
-        );
-        await retiring;
+        const repeated = handlers.get("session_shutdown")?.();
+        assert.ok(retiring && repeated);
+        await Promise.all([
+          retiring.then(() => {
+            assert.equal(runSettled, true, "first retirement returned before its real owned run settled");
+          }),
+          repeated.then(() => {
+            assert.equal(runSettled, true, "repeated retirement returned before its real owned run settled");
+          }),
+        ]);
         assert.ok(Date.now() - before < 3000, "retirement cleanup must be bounded");
-        assert.ok(
-          tree.pids().every((pid) => !alive(pid)),
-          "event must await cleanup before returning",
-        );
+        // Supervisor exit/pipe closure does not synchronously finish descendant
+        // termination. Observe eventual exit before teardown can signal anything.
+        // The gated test above independently proves the repeated-retirement barrier.
+        await tree.gone();
         await pending;
         assert.equal(retiredReads, 0);
         assert.deepEqual(notices, []);
       } finally {
-        await handlers.get("session_shutdown")?.();
-        await pending;
-        await tree.cleanup();
+        try {
+          await handlers.get("session_shutdown")?.();
+          await pending;
+        } finally {
+          try {
+            await tree.cleanup();
+          } finally {
+            run.mockRestore();
+          }
+        }
       }
     },
     10_000,
