@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.3
+### Patch Changes
+
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+- 3096585: Avoid repeatedly serializing unchanged native history with bounded, value-validated canonical fingerprint memoization. Validate array identity explicitly and exclude native raw JSON and boxed primitives even when their prototypes or descriptors look like plain data. Reuse exact canonical disk-line digests without weakening fresh ownership, ancestry, header, file-identity or durability verification.
+- 3096585: Reject fractional or unsafe revision arguments before native integer coercion can turn them into a valid optimistic-concurrency revision. Preserve exact integer-string conversion, runtime graph/revision checks and persisted snapshot schemas.
+
 ## 1.4.2
 ### Patch Changes
 

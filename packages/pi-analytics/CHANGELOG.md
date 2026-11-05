@@ -1,5 +1,21 @@
 # @signalridge/pi-analytics
 
+## 1.5.0
+### Minor Changes
+
+- 3096585: Collect optional bounded native reported-model metadata without inferring missing reports or changing usage accounting. Add requested/reported model-pair aggregates and an adaptive read-only response review with a bounded preview, explicit hidden count, and searchable details in the existing TUI/RPC dashboard.
+- 3096585: Qualify the shared TUI Kit 0.69 release against Pi 1.5, synchronizing all consumer ranges. Forward native viewport capture through border adapters and declare it for custom selectors so configured paging reaches the focused list while overlays retain priority.
+  
+  Settle bordered custom interactions locally on dispose-only host teardown without invoking a stale host completion callback. Preserve consumer-owned cancellation, session fences, draft handling, and accepted-work draining; dispose wrapped components exactly once.
+
+### Patch Changes
+
+- 3096585: Settle Analytics loading when the host disposes its custom UI, while draining the accepted local query and preserving the replacement editor and data-clear consent.
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.4.1
 ### Patch Changes
 

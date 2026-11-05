@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0
+### Minor Changes
+
+- 3096585: Qualify the shared TUI Kit 0.69 release against Pi 1.5, synchronizing all consumer ranges. Forward native viewport capture through border adapters and declare it for custom selectors so configured paging reaches the focused list while overlays retain priority.
+  
+  Settle bordered custom interactions locally on dispose-only host teardown without invoking a stale host completion callback. Preserve consumer-owned cancellation, session fences, draft handling, and accepted-work draining; dispose wrapped components exactly once.
+
+### Patch Changes
+
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+
 ## 1.4.1
 ### Patch Changes
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.9
+### Patch Changes
+
+- 3096585: Render Welcome key hints from the host's live bindings, report the inline snippet picker as a native blocking question, and cancel history search below five terminal rows without accepting hidden results or changing the draft.
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+
 ## 1.2.8
 ### Patch Changes
 
