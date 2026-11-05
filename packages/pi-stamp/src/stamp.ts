@@ -1,9 +1,24 @@
-import type { EntryRenderer, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type Component, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { DEFAULT_STAMP_SETTINGS, formatMessageStampLabel, formatStampLabel, type StampSettings } from "./format.js";
+import type { EntryRenderer, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+import {
+  buildCostOriginLookup,
+  COST_ORIGIN_ENTRY_TYPE,
+  type CostOriginAnnotation,
+  type CostOriginLookup,
+  isStampEntryId,
+} from "./cost-origin.js";
+import {
+  DEFAULT_STAMP_SETTINGS,
+  formatMessageStampLabel,
+  formatStampLabel,
+  type StampSettings,
+  stampFormatEnvironmentEpoch,
+} from "./format.js";
 import { showStampMenu } from "./menu.js";
 import {
   type AssistantMetadataData,
+  type AssistantStampCostOrigin,
+  captureAssistantCostOrigin,
   captureAssistantMetadata,
   formatAssistantMetadataLines,
   formatToolStampLabel,
@@ -12,6 +27,7 @@ import {
   sanitizeTerminalText,
   type ToolStampOutcome,
 } from "./metadata.js";
+import { StampRenderCache, type StampRenderSnapshot, stampRenderSnapshot } from "./render-cache.js";
 import { createStampSettingsRuntime, type StampSettingsRuntime } from "./settings.js";
 
 export const STAMP_ENTRY_TYPE = "pi-stamp";
@@ -162,72 +178,146 @@ export function isToolStampData(value: unknown): value is ToolStampDataV1 {
   );
 }
 
-export function createStampEntryRenderer(getSettings: () => Readonly<StampSettings>): EntryRenderer<StampEntryData> {
+export function createStampEntryRenderer(
+  getSettings: () => Readonly<StampSettings>,
+  costOrigin?: CostOriginLookup,
+  cache = new StampRenderCache(),
+): EntryRenderer<StampEntryData> {
   return (entry, options, theme) => {
     if (isToolStampData(entry.data)) {
       if (!getSettings().toolStamps) return undefined;
-      const data = entry.data;
-      return dynamicRightAlignedText(() => {
+    } else if (!isMessageStampData(entry.data)) return undefined;
+    const key = Symbol("stamp");
+    return {
+      render(width) {
+        if (width < 1) return [];
+        const data = entry.data;
         const settings = getSettings();
-        if (!settings.toolStamps) return [];
-        const label = formatToolStampLabel(data.toolName, data.completedAt - data.startedAt, data.outcome);
-        return label ? [theme.fg("dim", label)] : [];
-      });
-    }
-    if (!isMessageStampData(entry.data)) return undefined;
-    const data = entry.data;
-    return dynamicRightAlignedText(() => {
-      const settings = getSettings();
-      const label = formatMessageStampLabel(
-        {
-          timestamp: data.timestamp,
-          ...(data.version === 1 ? {} : { previousTimestamp: data.previousTimestamp }),
-          ...(data.version === 3 || data.version === 4
-            ? {
-                completedAt: data.completedAt,
-                firstContentAt: data.firstContentAt,
-              }
-            : {}),
-        },
-        settings,
-      );
-      if (!label) return [];
-      const metadataLines =
-        data.version === 4
-          ? formatAssistantMetadataLines(data.metadata, settings.assistantMetadata, options.expanded)
-          : [];
-      return [label, ...metadataLines].map((line) => theme.fg("dim", line));
-    });
+        // Attribution is live, not part of a cached whole render. In particular,
+        // currentCostOrigin must qualify the native leaf/session/generation BEFORE
+        // a previously known label can be selected, even on unchanged repaints.
+        const cost =
+          isRecord(data) && data.version === 4 && isRecord(data.metadata) && isRecord(data.metadata.usage)
+            ? data.metadata.usage.estimatedCost
+            : undefined;
+        const resolvedOrigin = typeof cost === "number" ? costOrigin?.(entry.id, cost) : undefined;
+        const origin =
+          resolvedOrigin === "provider" || resolvedOrigin === "estimated" || resolvedOrigin === "unknown"
+            ? resolvedOrigin
+            : undefined;
+        let snapshot: StampRenderSnapshot | undefined;
+        try {
+          snapshot = stampRenderSnapshot(data, [
+            entry.id,
+            settings.hourCycle,
+            settings.showSeconds,
+            settings.dateContext,
+            settings.locale,
+            settings.timeZone,
+            settings.responseTiming,
+            settings.assistantMetadata,
+            settings.toolStamps,
+            options.expanded,
+            origin,
+            stampFormatEnvironmentEpoch(settings),
+          ]);
+        } catch {
+          // An unavailable OS default must not freeze a previous successful label.
+        }
+        const lines = cache.lines(key, snapshot, () => {
+          if (isToolStampData(data)) {
+            if (!settings.toolStamps) return [];
+            const label = formatToolStampLabel(data.toolName, data.completedAt - data.startedAt, data.outcome);
+            return label ? [label] : [];
+          }
+          if (!isMessageStampData(data)) return [];
+          const label = formatMessageStampLabel(
+            {
+              timestamp: data.timestamp,
+              ...(data.version === 1 ? {} : { previousTimestamp: data.previousTimestamp }),
+              ...(data.version === 3 || data.version === 4
+                ? { completedAt: data.completedAt, firstContentAt: data.firstContentAt }
+                : {}),
+            },
+            settings,
+          );
+          if (!label) return undefined;
+          return [
+            label,
+            ...(data.version === 4
+              ? formatAssistantMetadataLines(metadataView(data, origin), settings.assistantMetadata, options.expanded)
+              : []),
+          ];
+        });
+        if (lines.length === 0) return [];
+        // Public Theme.fg wraps text in ANSI foreground codes. Resolve those codes
+        // live even for the SAME theme object, without retaining coloured rows.
+        // The transient marker is removed before anything reaches the terminal.
+        const [prefix = "", suffix = ""] = theme.fg("dim", "\u0000").split("\u0000");
+        return cache
+          .rows(key, lines, width, { prefix, suffix })
+          .map((row) => `${row.padding}${prefix}${row.text}${suffix}`);
+      },
+      invalidate() {
+        cache.delete(key);
+      },
+    };
   };
 }
 
 export const renderStampEntry = createStampEntryRenderer(() => DEFAULT_STAMP_SETTINGS);
 
-function dynamicRightAlignedText(getLines: () => readonly string[]): Component {
-  return {
-    render(width) {
-      if (width < 1) return [];
-      return getLines().flatMap((text) =>
-        wrapTextWithAnsi(text, width).map((line) => {
-          const leftPadding = " ".repeat(Math.max(0, width - visibleWidth(line)));
-          return `${leftPadding}${line}`;
-        }),
-      );
-    },
-    invalidate() {},
-  };
-}
-
 export default function stampExtension(pi: ExtensionAPI, options: StampExtensionOptions = {}): void {
   const settingsRuntime = options.settingsRuntime ?? createStampSettingsRuntime();
   const now = options.now ?? Date.now;
-  pi.registerEntryRenderer(
-    STAMP_ENTRY_TYPE,
-    createStampEntryRenderer(() => settingsRuntime.get().settings),
-  );
-
   let generation = 0;
+  let renderCache = new StampRenderCache();
+  const retireRenderCache = () => {
+    renderCache.clear(true);
+    renderCache = new StampRenderCache();
+  };
+  let costOrigins: CostOriginLookup = () => undefined;
+  let costOriginsLeaf: string | null | undefined;
+  let costOriginSession: ExtensionContext["sessionManager"] | undefined;
+  let activeSessionId: string | undefined;
   let sessionController = new AbortController();
+  const currentCostOrigin: CostOriginLookup = (id, cost) => {
+    const owner = generation;
+    const manager = costOriginSession;
+    if (!manager || sessionController.signal.aborted) return undefined;
+    try {
+      const sessionId = manager.getSessionId();
+      const leaf = manager.getLeafId();
+      if (sessionId !== activeSessionId) return undefined;
+      if (leaf !== costOriginsLeaf) {
+        const branch = manager.getBranch();
+        const lookup = costOriginLookupFromBranch(branch);
+        if (
+          (branch.at(-1)?.id ?? null) !== leaf ||
+          manager.getLeafId() !== leaf ||
+          manager.getSessionId() !== sessionId ||
+          manager !== costOriginSession ||
+          owner !== generation ||
+          sessionController.signal.aborted
+        )
+          return undefined;
+        costOrigins = lookup;
+        costOriginsLeaf = leaf;
+      }
+      if (owner !== generation || manager !== costOriginSession || sessionController.signal.aborted) return undefined;
+      return costOrigins(id, cost);
+    } catch {
+      return undefined;
+    }
+  };
+  pi.registerEntryRenderer<StampEntryData>(STAMP_ENTRY_TYPE, (entry, renderOptions, theme) => {
+    const renderGeneration = generation;
+    return createStampEntryRenderer(
+      () => settingsRuntime.get().settings,
+      (id, cost) => (renderGeneration === generation ? currentCostOrigin(id, cost) : undefined),
+      renderCache,
+    )(entry, renderOptions, theme);
+  });
   let tuiSessionActive = false;
   let acceptingTurnEvents = true;
   let lastStampTimestamp: number | undefined;
@@ -271,6 +361,7 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     timestamp: number,
     timing: FinalizedAssistantTiming | undefined,
     message: unknown,
+    ctx: ExtensionContext,
   ): void => {
     const matchingTiming = timing?.timestamp === timestamp ? timing : undefined;
     const metadata =
@@ -290,8 +381,58 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
         metadata,
       };
       if (isMessageStampData(stamp)) {
+        const owner = generation;
+        const origin = captureAssistantCostOrigin(message);
+        // appendEntry is synchronous and returns void. Prove a single exact child
+        // was appended to the native branch; timestamps are not identities.
+        const before = optionalBranchSnapshot(ctx);
         pi.appendEntry<AssistantMessageStampDataV4>(STAMP_ENTRY_TYPE, stamp);
-        lastStampTimestamp = timestamp;
+        if (owner === generation) lastStampTimestamp = timestamp;
+        try {
+          if (
+            origin === undefined ||
+            !before ||
+            owner !== generation ||
+            sessionController.signal.aborted ||
+            ctx.signal?.aborted ||
+            ctx.sessionManager.getSessionId() !== activeSessionId
+          )
+            return;
+          const after = optionalBranchSnapshot(ctx);
+          const entry = after?.entries.at(-1);
+          if (
+            !after ||
+            !entry ||
+            after.entries.length !== before.entries.length + 1 ||
+            !before.entries.every((ancestor, index) => ancestor.id === after.entries[index]?.id) ||
+            entry.parentId !== before.leaf ||
+            before.entries.some((ancestor) => ancestor.id === entry.id) ||
+            !isStampEntryId(entry.id) ||
+            entry.type !== "custom" ||
+            entry.customType !== STAMP_ENTRY_TYPE ||
+            JSON.stringify(entry.data) !== JSON.stringify(stamp) ||
+            before.sessionId !== after.sessionId ||
+            after.sessionId !== activeSessionId ||
+            ctx.sessionManager.getLeafId() !== entry.id ||
+            ctx.signal?.aborted ||
+            sessionController.signal.aborted ||
+            owner !== generation
+          )
+            return;
+          const cost = stamp.metadata.usage?.estimatedCost;
+          if (cost === undefined) return;
+          pi.appendEntry<CostOriginAnnotation>(COST_ORIGIN_ENTRY_TYPE, {
+            version: 1,
+            stampEntryId: entry.id,
+            cost,
+            origin,
+          });
+          if (owner === generation && !sessionController.signal.aborted) {
+            costOriginsLeaf = undefined;
+          }
+        } catch {
+          // Optional attribution must never invalidate a successfully persisted v4 stamp.
+        }
         return;
       }
     }
@@ -361,13 +502,19 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     sessionController = new AbortController();
     const controller = sessionController;
     const currentGeneration = ++generation;
+    retireRenderCache();
     pendingUserStamps.length = 0;
     activeAssistantTiming = undefined;
     finalizedAssistantTiming = undefined;
     activeToolTimings.clear();
     tuiSessionActive = ctx.mode === "tui";
     acceptingTurnEvents = true;
-    lastStampTimestamp = lastStampTimestampFromBranch(ctx.sessionManager.getBranch());
+    costOrigins = () => undefined;
+    costOriginsLeaf = undefined;
+    costOriginSession = ctx.sessionManager;
+    activeSessionId = ctx.sessionManager.getSessionId();
+    const branch = ctx.sessionManager.getBranch();
+    lastStampTimestamp = lastStampTimestampFromBranch(branch);
     try {
       const state = await settingsRuntime.reload(controller.signal);
       if (controller.signal.aborted || currentGeneration !== generation || controller !== sessionController) {
@@ -390,12 +537,18 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     sessionController.abort(new Error("pi-stamp branch replaced"));
     sessionController = new AbortController();
     generation += 1;
+    retireRenderCache();
     pendingUserStamps.length = 0;
     activeAssistantTiming = undefined;
     finalizedAssistantTiming = undefined;
     activeToolTimings.clear();
     acceptingTurnEvents = false;
-    lastStampTimestamp = lastStampTimestampFromBranch(ctx.sessionManager.getBranch());
+    costOrigins = () => undefined;
+    costOriginsLeaf = undefined;
+    costOriginSession = ctx.sessionManager;
+    activeSessionId = ctx.sessionManager.getSessionId();
+    const branch = ctx.sessionManager.getBranch();
+    lastStampTimestamp = lastStampTimestampFromBranch(branch);
   });
 
   pi.on("turn_start", () => {
@@ -493,13 +646,13 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     activeAssistantTiming = undefined;
   });
 
-  pi.on("turn_end", (event) => {
+  pi.on("turn_end", (event, ctx) => {
     if (!acceptingTurnEvents) return;
     const timing = finalizedAssistantTiming;
     activeAssistantTiming = undefined;
     finalizedAssistantTiming = undefined;
     if (tuiSessionActive && event.message.role === "assistant") {
-      appendAssistantStamp(event.message.timestamp, timing, event.message);
+      appendAssistantStamp(event.message.timestamp, timing, event.message, ctx);
     }
     flushToolStamps(event.toolResults);
   });
@@ -514,6 +667,11 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
   pi.on("session_shutdown", async () => {
     sessionController.abort(new Error("pi-stamp session shut down"));
     generation += 1;
+    retireRenderCache();
+    costOrigins = () => undefined;
+    costOriginsLeaf = undefined;
+    costOriginSession = undefined;
+    activeSessionId = undefined;
     flushPendingUsers();
     pendingUserStamps.length = 0;
     activeAssistantTiming = undefined;
@@ -523,6 +681,36 @@ export default function stampExtension(pi: ExtensionAPI, options: StampExtension
     lastStampTimestamp = undefined;
     await settingsRuntime.flush();
   });
+}
+
+function metadataView(stamp: AssistantMessageStampDataV4, origin?: AssistantStampCostOrigin): AssistantMetadataData {
+  if (origin !== "provider" && origin !== "estimated" && origin !== "unknown") return stamp.metadata;
+  return { ...stamp.metadata, usage: { ...stamp.metadata.usage, costOrigin: origin } };
+}
+
+export function costOriginLookupFromBranch(entries: readonly unknown[]): CostOriginLookup {
+  return buildCostOriginLookup(entries, (entry) => {
+    if (
+      !isRecord(entry) ||
+      entry.type !== "custom" ||
+      entry.customType !== STAMP_ENTRY_TYPE ||
+      !isMessageStampData(entry.data) ||
+      entry.data.version !== 4
+    )
+      return undefined;
+    return entry.data.metadata.usage?.estimatedCost;
+  });
+}
+
+function optionalBranchSnapshot(ctx: ExtensionContext) {
+  try {
+    const leaf = ctx.sessionManager.getLeafId();
+    const entries = ctx.sessionManager.getBranch();
+    if ((entries.at(-1)?.id ?? null) !== leaf) return undefined;
+    return { leaf, entries, sessionId: ctx.sessionManager.getSessionId() };
+  } catch {
+    return undefined;
+  }
 }
 
 function lastStampTimestampFromBranch(entries: readonly unknown[]): number | undefined {

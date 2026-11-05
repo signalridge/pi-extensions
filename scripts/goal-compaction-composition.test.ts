@@ -135,7 +135,7 @@ for (const failure of ["missing host", "inconsistent host", "dependency lookup",
           writeFileSync(
             join(host, peer, "package.json"),
             JSON.stringify({
-              version: failure === "inconsistent host" && index === 0 ? "1.0.4" : "1.4.0",
+              version: failure === "inconsistent host" && index === 0 ? "1.0.4" : "1.5.0",
             }),
           );
         }

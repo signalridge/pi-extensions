@@ -38,7 +38,13 @@ export const ParamsSchema = Type.Object(
       Type.Literal("clear"),
     ]),
     baseRevision: Type.Optional(
-      Type.Integer({ minimum: 0, description: "REQUIRED for every mutation; current revision from list" }),
+      // Integer coercion truncates fractions before transition() can reject them.
+      Type.Number({
+        minimum: 0,
+        maximum: Number.MAX_SAFE_INTEGER,
+        multipleOf: 1,
+        description: "REQUIRED for every mutation; current revision from list",
+      }),
     ),
     title: Type.Optional(Fields.title),
     description: Fields.description,

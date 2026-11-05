@@ -4,6 +4,7 @@ export const MAX_LINE_COUNT_BYTES = 256 * 1024;
 export const LINE_COUNT_BATCH_SIZE = 8;
 export const LINE_COUNT_BATCH_DELAY_MS = 30;
 export const SCAN_BATCH_SIZE = 4;
+export const METADATA_CONCURRENCY = 4;
 export const SCAN_BATCH_DELAY_MS = 25;
 export const SAFE_MODE_ENTRY_THRESHOLD = 200;
 

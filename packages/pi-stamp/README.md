@@ -15,8 +15,8 @@ Formatter caching and environment refresh are adapted from narumiruna/pi-extensi
 - Shows each message's recorded creation time on a dim, right-aligned transcript row.
 - Supports 12/24-hour clocks, optional seconds, automatic date context, locales, and time zones.
 - Optionally shows assistant response duration and detailed first-content/total timing.
-- Optionally shows reported assistant model, API/provider, stop reason, token usage, and estimated
-  cost without querying a provider.
+- Optionally shows reported assistant model, API/provider, stop reason, token usage, and cost
+  origin without querying a provider.
 - Keeps response IDs and bounded diagnostic summaries behind explicit metadata opt-in plus Pi's
   transcript-expansion control; never includes raw diagnostics or opaque signatures.
 - Optionally records tool duration and success/error after the complete tool block, paired strictly
@@ -175,7 +175,7 @@ assistant stamp is finalized. A compact stamp can look like:
 
 ```text
 14:32:08 · 3.2s
-claude-sonnet-4-6 · 842 tok · est $0.018
+claude-sonnet-4-6 · 842 tok · estimated $0.018
 ```
 
 When Pi reports a response model different from the requested model, compact mode keeps both:
@@ -186,7 +186,7 @@ requested-alias → provider-response-model · 842 tok
 
 Expanded mode adds labeled rows for API, provider, requested model, provider-reported response model,
 stop reason, and each individually reported input/output/reasoning/cache-read/cache-write/total token
-or estimated-cost field. Missing values stay absent; `pi-stamp` never derives a token total, response
+or cost field. Missing values stay absent; `pi-stamp` never derives a token total, response
 model, cost, or diagnostic message.
 
 Pi's transcript expansion action (`app.tools.expand`, `Ctrl+O` by default) is the explicit debug view.
@@ -197,8 +197,26 @@ never copies diagnostic messages, stacks, details, raw payloads, message content
 and retained text is bounded before persistence.
 
 Provider support varies. Every optional field is shown only when present and valid on that finalized
-assistant message. The cost label says `est` because Pi's message value is an estimate based on the
-provider/model usage data available to Pi; the extension performs no price lookup.
+assistant message. For a valid nonnegative finite total, Pi's optional
+`usage.cost.totalFromProvider` flag determines the cost label: `true` becomes `provider`, `false`
+becomes `estimated`, and an absent or invalid flag becomes `unknown`. Zero is a valid total.
+Missing or invalid totals establish no origin. The extension performs no price lookup or
+requested-model/tier repricing. Historical version-4 snapshots keep their public `estimatedCost`
+field and exact usage shape unchanged; that legacy name alone does not establish attribution.
+Origin is recorded separately in optional `pi-stamp:cost-origin:v1` custom entries referencing the
+exact native version-4 stamp entry ID and matching numeric cost. The renderer overlays validated
+origin only in a view copy, never in persisted version-4 metadata or stored messages. Missing,
+malformed, conflicting, duplicate, or off-branch annotations cannot establish attribution; without a
+valid annotation the cost displays `unknown`. Lookup state retains at most 4,096 source references
+and 4,096 annotation references per branch; exceeding either bound leaves origin unknown. No history
+is rewritten. Older readers ignore the separate annotation and still render all version-4 timestamp,
+timing, and provenance fields (including their historical cost label).
+
+The optional annotation is appended only when the public session branch and leaf prove the exact
+new stamp identity in the current session generation. If that identity cannot be established, a turn
+is cancelled, or the annotation write fails, the successfully recorded version-4 stamp remains valid
+and origin stays unknown. Annotation lookup is rebuilt from the active branch on start and tree
+navigation and retired on replacement and shutdown.
 
 ## Tool timing
 
@@ -259,6 +277,7 @@ packages/pi-stamp/
 │   ├── index.ts       # Thin Pi package entrypoint
 │   ├── format.ts      # Date, clock, and response-elapsed formatting/settings types
 │   ├── metadata.ts    # Bounded metadata capture, validation, and compact/expanded labels
+│   ├── cost-origin.ts # Optional exact-reference cost-origin annotations
 │   ├── menu.ts        # /stamp presentation menu
 │   ├── settings.ts    # Validation and atomic user settings
 │   └── stamp.ts       # Entry compatibility, rendering, and lifecycle ownership

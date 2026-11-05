@@ -36,9 +36,10 @@ import {
   SettingsList,
   Spacer,
   Text,
+  type TUI,
 } from "@earendil-works/pi-tui";
 import { parseOwnedConversationOpenRequest, replyChannel, WORKFLOW_UI_CHANNELS } from "@signalridge/pi-subagents-protocol";
-import { wrapCustomUi } from "@signalridge/pi-ui";
+import { borderedComponent, wrapCustomUi } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import {
@@ -67,6 +68,7 @@ import {
   type SpawnOptions,
 } from "./agent-manager.js";
 import { AGENT_RECORD_ENTRY_TYPE, findSavedAgentRecord, type SavedAgentRecord } from "./agent-record-entry.js";
+import { captureAgentReopenMetadata } from "./agent-reopen.js";
 import {
   getAgentConversation,
   getDefaultMaxTokens,
@@ -137,7 +139,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
-import { AGENT_DEFINITION_GENERATION_OVERRIDE } from "./internal-run.js";
+import { AGENT_DEFINITION_GENERATION_OVERRIDE, assertNoPublicReopen } from "./internal-run.js";
 import {
   resolveAgentInvocationConfig,
   resolveJoinMode,
@@ -219,7 +221,7 @@ import {
   type Theme,
 } from "./ui/agent-display.js";
 import { createMentionProvider, mentionRoster } from "./ui/agent-mention.js";
-import { getConversationOverlayOptions } from "./ui/conversation-viewer.js";
+import { getConversationOverlayOptions, getConversationViewerMode } from "./ui/conversation-viewer.js";
 import { type AgentSelection, captureAgentSelection, FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import {
   safeTerminalText,
@@ -1009,6 +1011,7 @@ function activateRootRuntime(
    * gone, and other extensions reconstruct history from it.
    */
   function persistAgentRecord(record: AgentRecord): void {
+    const reopen = manager.getRememberAgents() ? captureAgentReopenMetadata(record) : undefined;
     pi.appendEntry(AGENT_RECORD_ENTRY_TYPE, {
       id: record.id,
       type: record.type,
@@ -1019,6 +1022,7 @@ function activateRootRuntime(
       startedAt: record.startedAt,
       completedAt: record.completedAt,
       compactionCount: record.compactionCount,
+      ...(reopen ? { reopen } : {}),
       ...(record.outputFile ? { outputFile: record.outputFile } : {}),
       ...(record.lifetimeUsage.input + record.lifetimeUsage.output > 0
         ? { tokens: record.lifetimeUsage.input + record.lifetimeUsage.output }
@@ -1171,6 +1175,7 @@ function activateRootRuntime(
     prompt: string,
     options: any,
   ) => {
+    assertNoPublicReopen(options);
     const safeOptions = { ...(options ?? {}) };
     delete safeOptions.parentAgentId;
     delete safeOptions.depth;
@@ -1409,6 +1414,7 @@ function activateRootRuntime(
     );
     manager.clearCompleted(true);
     for (const tombstone of recovered) persistRecoveredManaged(tombstone);
+    manager.restoreSavedAgents(ctx);
     if (ownsRpcRegistry && !rpcHandle) {
       rpcHandle = registerRpcHandlers({
         events: pi.events,
@@ -1545,6 +1551,7 @@ function activateRootRuntime(
     );
     manager.clearCompleted(true);
     for (const tombstone of recovered) persistRecoveredManaged(tombstone);
+    manager.restoreSavedAgents(ctx);
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
     bindFleetUi();
   });
@@ -1974,9 +1981,8 @@ function activateRootRuntime(
    * Start a top-level agent for a mention, with the same activity tracker,
    * transcript, and FleetView wiring an Agent-tool background run gets.
    *
-   * `reclaim` and `resumeSessionFile` are the reopen path and are deliberately
-   * not reachable from any caller-supplied surface: both values always come
-   * from a resumable entry this extension wrote itself.
+   * Saved continuation passes only an agent ID. The manager looks up and
+   * validates its branch-owned receipt; no caller may issue a session path.
    */
   function spawnMention(
     ctxRef: ExtensionContext,
@@ -1984,8 +1990,12 @@ function activateRootRuntime(
     prompt: string,
     opts: {
       description: string;
-      reclaimHandle?: string;
-      resumeSessionFile?: string;
+      resumeId?: string;
+      isBackground?: boolean;
+      signal?: AbortSignal;
+      tier?: string;
+      maxTurns?: number;
+      toolCallId?: string;
     },
   ): string {
     const config = getAgentConfig(type);
@@ -2002,18 +2012,15 @@ function activateRootRuntime(
     let id = "";
     const spawnOptions: SpawnOptions = {
       description: opts.description,
-      maxTurns: normalizeMaxTurns(resolved.maxTurns ?? getDefaultMaxTurns()),
-      isolated: resolved.isolated,
+      maxTurns: normalizeMaxTurns(resolved.maxTurns ?? opts.maxTurns ?? getDefaultMaxTurns()),
+      // Cold admission derives restrictions from its receipt/current definition,
+      // not synthetic per-call defaults (public transitions are unsupported).
+      ...(opts.resumeId ? {} : { isolated: resolved.isolated, isolation: resolved.isolation }),
       inheritContext: resolved.inheritContext,
-      isolation: resolved.isolation,
-      isBackground: true,
+      isBackground: opts.isBackground ?? true,
+      signal: opts.signal,
+      agentTier: opts.tier,
       rootSessionId: ctxRef.sessionManager.getSessionId(),
-      ...(opts.reclaimHandle === undefined
-        ? {}
-        : { reclaimHandle: opts.reclaimHandle }),
-      ...(opts.resumeSessionFile === undefined
-        ? {}
-        : { resumeSessionFile: opts.resumeSessionFile }),
       invocation: {
         maxTurns: normalizeMaxTurns(resolved.maxTurns),
         isolated: resolved.isolated,
@@ -2027,6 +2034,7 @@ function activateRootRuntime(
         id = newId;
         agentActivity.set(id, state);
         const record = manager.getRecordMutable(id);
+        if (record) record.toolCallId = opts.toolCallId;
         // A reopened conversation keeps writing the transcript it already has:
         // `ensureOutputFile` creates one only when absent, and streaming starts
         // after the turns already on disk instead of truncating them.
@@ -2036,7 +2044,7 @@ function activateRootRuntime(
             id,
             ctxRef.sessionManager.getSessionId(),
           );
-          if (opts.resumeSessionFile) ensureOutputFile(record.outputFile);
+          if (opts.resumeId) ensureOutputFile(record.outputFile);
           else writeInitialEntry(record.outputFile, id, prompt, ctxRef.cwd);
         }
         fleet.ensureTimer();
@@ -2050,7 +2058,7 @@ function activateRootRuntime(
           // A reopened session already holds every prior turn. Start the stream
           // after them so the transcript gains this run's turns instead of a
           // second copy of the whole conversation.
-          const startIndex = opts.resumeSessionFile
+          const startIndex = opts.resumeId
             ? session.state.messages.length
             : undefined;
           record.outputCleanup = streamToOutputFile(
@@ -2064,11 +2072,25 @@ function activateRootRuntime(
       },
     };
     try {
-      return manager.spawn(pi, ctxRef, type, prompt, spawnOptions);
+      const id = opts.resumeId
+        ? manager.reopen(pi, ctxRef, opts.resumeId, prompt, spawnOptions)
+        : manager.spawn(pi, ctxRef, type, prompt, spawnOptions);
+      void manager.getRecordMutable(id)?.promise?.finally(() => tracker.retire()).catch(() => {});
+      return id;
     } catch (error) {
       tracker.retire();
       throw error;
     }
+  }
+
+  /** Append only this admission's native turns, for both foreground and mention resumes. */
+  function attachOrdinaryResumeTranscript(ctx: ExtensionContext, record: AgentRecord): void {
+    if (!record.session || record.owner || record.parentAgentId ||
+      !(getAgentConfig(record.type)?.outputTranscript ?? getOutputTranscriptDefault())) return;
+    record.outputCleanup?.();
+    record.outputFile = createOutputFilePath(ctx.cwd, record.id, ctx.sessionManager.getSessionId());
+    ensureOutputFile(record.outputFile);
+    record.outputCleanup = streamToOutputFile(record.session, record.outputFile, record.id, ctx.cwd, record.session.messages.length);
   }
 
   // ---- Join mode configuration ----
@@ -2350,7 +2372,10 @@ function activateRootRuntime(
               ...callbacks,
               onBudgetResolved: tracker.onBudgetResolved,
               onStarted: () => {
-                if (tracker.isCurrent()) agentActivity.set(record.id, state);
+                if (tracker.isCurrent()) {
+                  agentActivity.set(record.id, state);
+                  attachOrdinaryResumeTranscript(ctx, record);
+                }
               },
             },
           );
@@ -2380,28 +2405,21 @@ function activateRootRuntime(
         }
         return { action: "handled" };
       }
-      // A live record with no session never got far enough to continue, so it
-      // falls through to the start-fresh path below.
+      ctx.ui.notify(`Could not resume ${target} — it has no usable child session. Start a new Agent explicitly.`, "warning");
+      return { action: "handled" };
     }
 
-    // Evicted, but its conversation is still on disk: reopen it. An ordinary
-    // spawn carrying a session file, so the new record picks up the fleet row,
-    // transcript, and completion notification unchanged — and `reclaimHandle`
-    // hands it back the name the entry was holding.
+    // Evicted, but its branch-owned receipt still authorizes continuation.
+    // Reopen under the original agent ID and handle, after manager validation.
     if (resolved?.kind === "resumable") {
       const entry = resolved.entry;
       const target = `@${entry.handle}`;
 
-      // Checked here rather than left to SessionManager.open: that runs inside
-      // runAgent, whose rejection lands on the record as an agent error. A
-      // `/new` in another pi window or a manual delete makes the conversation
-      // unrecoverable, so drop the entry — a handle that can only ever fail is
-      // worse than none — and say so rather than quietly sending this message
-      // to an unrelated agent.
+      // Keep the receipt even when its file is gone: dropping it would make a
+      // repeated mention silently start a different conversation under this name.
       if (!existsSync(entry.sessionFile)) {
-        manager.dropResumable(entry.handle);
         ctx.ui.notify(
-          `Could not resume ${target} — its session is gone.`,
+          `Could not resume ${target} — its session is gone. Restore its original session file or explicitly start a new Agent.`,
           "warning",
         );
         return { action: "handled" };
@@ -2428,15 +2446,9 @@ function activateRootRuntime(
       try {
         spawnMention(ctx, dispatch.type, mention.message, {
           description: entry.description,
-          reclaimHandle: entry.handle,
-          resumeSessionFile: entry.sessionFile,
+          resumeId: entry.id,
         });
-        // The entry deliberately stays. `resolveMention` prefers the live
-        // record holding this same handle, so it cannot shadow the resume — and
-        // if this run dies before establishing its own session, the original
-        // transcript is still the right thing for the next mention to reopen.
-        // Once the resumed record is evicted it overwrites this entry in place,
-        // keyed by the same handle, so nothing accumulates.
+        // Live lookup takes precedence until eviction refreshes this same ID's receipt.
         ctx.ui.notify(`Resuming ${target}`, "info");
       } catch (err) {
         ctx.ui.notify(
@@ -2943,11 +2955,38 @@ Terse command-style prompts produce shallow, generic work.
     // ---- Execute ----
 
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+      assertNoPublicReopen(params);
       // Ensure we have UI context for the FleetView list
       seatFleet(ctx);
 
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
+
+      if (params.resume && !manager.getRecordMutable(params.resume)) {
+        for (const key of ["isolated", "isolation"] as const) {
+          if (params[key] !== undefined) throw new Error(`Cold resume does not support per-call ${key}; omit ${key} to preserve the original restrictions, or start a fresh Agent.`);
+        }
+        if (params.supervisor_questions === "parent") {
+          throw new Error('supervisor_questions: "parent" requires a fresh non-isolated background Agent. Set run_in_background: true, omit schedule/resume, and enable Supervisor questions. Foreground calls cannot answer while blocked.');
+        }
+        if (params.supervisor_questions !== undefined) throw new Error('Resume preserves the child question mode; omit supervisor_questions and use run_in_background: true for a parent-mode child.');
+        if (params.schedule) return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
+        if (params.inherit_context === true) throw new Error(INHERIT_CONTEXT_UNAVAILABLE);
+        signal?.throwIfAborted();
+        const entry = manager.getResumable(params.resume);
+        if (!entry || entry.id !== params.resume) return textResult(`No ordinary saved agent on this branch: "${params.resume}". Use its workflow owner's recovery controls for managed agents, or start a new Agent.`);
+        const background = params.run_in_background ?? getAgentConfig(entry.type)?.runInBackground ?? false;
+        const id = spawnMention(ctx, entry.type, params.prompt, {
+          description: entry.description, resumeId: entry.id, isBackground: background,
+          signal: background ? undefined : signal, tier: params.tier, maxTurns: params.max_turns, toolCallId,
+        });
+        const record = manager.getRecordMutable(id)!;
+        const details = () => buildDetails({ displayName: getDisplayName(entry.type), description: entry.description, subagentType: entry.type }, record);
+        if (background) return textResult(`Agent "${id}" continued in background${record.status === "queued" ? " (queued)" : ""}.`,
+          { ...details(), status: record.status === "queued" ? "queued" : "background" });
+        await record.promise;
+        return textResult(record.status === "error" ? `Agent failed: ${record.error}${partialOutputSuffix(record)}` : record.result?.trim() || "No output.", details());
+      }
 
       const rawType = params.subagent_type as SubagentType;
       // Single decision point for dispatch (#183): unknown, disabled and
@@ -3171,7 +3210,7 @@ Terse command-style prompts produce shallow, generic work.
       // Resume existing agent
       if (params.resume) {
         const existing = manager.getRecordMutable(params.resume);
-        if (!existing || existing.parentAgentId) {
+        if (!existing || existing.parentAgentId || existing.owner || existing.detached) {
           return textResult(
             `Agent not found: "${params.resume}". It may have been cleaned up.`,
           );
@@ -3289,7 +3328,10 @@ Terse command-style prompts produce shallow, generic work.
             maxTurns: params.max_turns,
             onBudgetResolved: tracker.onBudgetResolved,
             onStarted: () => {
-              if (tracker.isCurrent()) agentActivity.set(existing.id, state);
+              if (tracker.isCurrent()) {
+                agentActivity.set(existing.id, state);
+                attachOrdinaryResumeTranscript(ctx, existing);
+              }
             },
           });
         } finally {
@@ -3890,6 +3932,8 @@ Terse command-style prompts produce shallow, generic work.
     // Agent runs entry includes every retained top-level record, not just active agents.
     const agents = manager.listAgentsMutable().filter((a) => !a.parentAgentId);
     if (agents.length > 0) options.push(summarizeAgentRuns(agents));
+    const retainedWorkflows = fleet.retainedWorkflowGroups();
+    if (retainedWorkflows.length) options.push(`Retained workflow children (${retainedWorkflows.length})`);
 
     // Agent types list
     if (allNames.length > 0) {
@@ -3933,6 +3977,17 @@ Terse command-style prompts produce shallow, generic work.
     if (choice.startsWith("Agent runs (")) {
       await showAgentRuns(ctx);
       if (isCurrent()) await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Retained workflow children (")) {
+      if (ctx.mode !== "tui" || !ctx.hasUI) return;
+      const group = await selectItem(ctx.ui, "Retained workflow children", retainedWorkflows,
+        item => `Workflow ${sanitizeDisplayText(item.runId)} · ${item.records.length} retained children`);
+      if (!group || !isCurrent()) return;
+      const action = await ctx.ui.select("Workflow child access", ["Open workflow inspector", "Inspect retained children"]);
+      if (!action || !isCurrent()) return;
+      seatFleet(ctx);
+      // Owner admission precedes its dialog completion. Do not open another
+      // menu over it; /workflows remains the authoritative workflow navigator.
+      await fleet.openRetainedWorkflow(group.runId, action === "Open workflow inspector");
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
       if (isCurrent()) await showAgentsMenu(ctx);
@@ -4124,18 +4179,20 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     seatFleet(ctx);
-    const mode = fleet.conversationMode();
-    // Fullscreen owns its entire native viewport; an extra shared border would
-    // clip its controls. Floating conversations retain the normal treatment.
-    const viewerUi = mode === "fullscreen" ? ctx.ui : wrapCustomUi(ctx.ui);
-    await viewerUi.custom<undefined>(
+    // Resolve the public host mode at construction, not from Fleet's optional
+    // widget: owned-only/disabled Fleet has no mounted TUI to borrow.
+    let host: TUI | undefined;
+    await ctx.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
         if (!selection.current()) { done(undefined); return { render: () => [], invalidate: () => {} }; }
-        return fleet.conversation(selection, tui, theme, keybindings, done, message => ctx.ui.notify(message, "info"), mode);
+        host = tui;
+        const mode = getConversationViewerMode(tui);
+        const viewer = fleet.conversation(selection, tui, theme, keybindings, done, message => ctx.ui.notify(message, "info"), mode);
+        return mode === "fullscreen" ? viewer : borderedComponent(viewer, text => theme.fg("borderAccent", text));
       },
       {
         overlay: true,
-        overlayOptions: getConversationOverlayOptions({ mode: mode === "fullscreen" ? "fullscreen" : undefined }),
+        overlayOptions: () => getConversationOverlayOptions(host),
       },
     );
   }
@@ -4757,8 +4814,7 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 ---
 description: <one-line description shown in UI>
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
-thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
+tier: <optional existing tier key from the catalogue below. Omit for the configured default policy; never write model: or thinking:>
 max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
 prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
 extensions: <true (inherit all MCP/extension tools), false (none), or comma-separated names. Default: true>
@@ -4774,6 +4830,8 @@ isolation: <"worktree" to run in isolated git worktree. Omit for normal>
 
 <system prompt body — instructions for the agent>
 \`\`\`
+
+${buildAgentTierListText()}
 
 Guidelines for choosing settings:
 - For read-only tasks (review, analysis): tools: read, bash, grep, find, ls
@@ -4889,33 +4947,49 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       tools = customTools;
     }
 
-    // 4. Model
-    const modelChoice = await ctx.ui.select("Model", [
-      "inherit (parent model)",
-      "haiku",
-      "sonnet",
-      "opus",
-      "custom...",
+    // 4–5. One model catalogue: reference an existing tier, or explicitly
+    // approve adding a new named pair. Never write retired frontmatter pins.
+    const catalogue = getAgentTiersSettings();
+    const catalogueIdentity = JSON.stringify(catalogue);
+    const keys = listAgentTierKeys(catalogue).filter(key => !catalogue.blockedProfiles?.includes(key));
+    const policyChoice = await ctx.ui.select("Model policy", [
+      "Use default policy (omit tier)", ...keys.map(key => `Tier: ${key}`), "Choose model and thinking...",
     ]);
-    if (!modelChoice) return;
-
-    let model: string | undefined;
-    if (modelChoice === "haiku") model = "anthropic/claude-haiku-4-5";
-    else if (modelChoice === "sonnet") model = "anthropic/claude-sonnet-4-6";
-    else if (modelChoice === "opus") model = "anthropic/claude-opus-4-6";
-    else if (modelChoice === "custom...") {
-      model = (await ctx.ui.input("Model (provider/modelId)")) || undefined;
+    if (!policyChoice) return;
+    let tier: string | undefined;
+    let newProfile: AgentTierProfile | undefined;
+    if (policyChoice.startsWith("Tier: ")) {
+      tier = keys.find(key => policyChoice === `Tier: ${key}`);
+      if (!tier) return;
+    } else if (policyChoice === "Choose model and thinking...") {
+      const model = await pickModelReference(ctx, "Model", undefined);
+      if (model === undefined) return;
+      const levels = offerableTierThinking(model, ctx.modelRegistry);
+      const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS.filter(level => level === "off" || levels.includes(level))]);
+      if (!thinkingChoice) return;
+      if (thinkingChoice === "off") {
+        ctx.ui.notify('Explicit thinking "off" cannot be represented by the current shared tier schema. Nothing was saved or translated to inherit. This requires a separate tier/protocol product decision; choose a supported tier policy to save an agent today.', "warning");
+        return;
+      }
+      if (!levels.includes(thinkingChoice as TierThinking)) return;
+      const thinking = thinkingChoice as TierThinking;
+      const matching = keys.filter(key => catalogue.profiles?.[key]?.model === model && catalogue.profiles[key].thinking === thinking);
+      if (matching.length > 0) {
+        const chosen = await ctx.ui.select("Use matching tier", matching);
+        if (!chosen) return;
+        tier = matching.includes(chosen) ? chosen : undefined;
+        if (!tier) return;
+      } else {
+        const key = (await ctx.ui.input("New tier name (one word, no spaces)"))?.trim();
+        if (!key) return;
+        if (!isValidAgentTierKey(key) || catalogue.profiles?.[key] || catalogue.blockedProfiles?.includes(key)) {
+          ctx.ui.notify("Choose a new valid tier name. Existing or blocked tiers are never edited by this wizard.", "warning");
+          return;
+        }
+        tier = key;
+        newProfile = { model, thinking, description: `Policy for ${name}` };
+      }
     }
-
-    // 5. Thinking
-    // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", [
-      "inherit",
-      ...THINKING_LEVELS,
-    ]);
-    if (!thinkingChoice) return;
-
-    const thinking = thinkingChoice === "inherit" ? undefined : thinkingChoice;
 
     // 6. System prompt
     const systemPrompt = await ctx.ui.editor("System prompt", "");
@@ -4924,8 +4998,7 @@ Do not wrap the response in a markdown code fence. Return only the file contents
     const content = buildNewAgentFile({
       description,
       tools,
-      model,
-      thinking,
+      tier,
       systemPrompt,
     });
 
@@ -4943,6 +5016,25 @@ Do not wrap the response in a markdown code fence. Return only the file contents
       if (!overwrite) return;
     }
 
+    if (JSON.stringify(getAgentTiersSettings()) !== catalogueIdentity) {
+      ctx.ui.notify("Tier catalogue changed while this wizard was open. Retry with the current policy; nothing was saved.", "warning");
+      return;
+    }
+    if (newProfile && tier) {
+      const approved = await ctx.ui.confirm("Add model tier?",
+        `Add a new shared tier "${tier}" to this project's .pi/subagents.json? Model: ${newProfile.model}; thinking: ${newProfile.thinking}. The agent will reference it by name. Existing tiers are unchanged. Personal agents need this tier configured in each project where they run.`);
+      if (!approved) return;
+      if (JSON.stringify(getAgentTiersSettings()) !== catalogueIdentity) {
+        ctx.ui.notify("Tier catalogue changed before approval completed. Retry; nothing was saved.", "warning");
+        return;
+      }
+      const proposed = upsertAgentTierProfile(getAgentTiersConfiguredSettings(), tier, newProfile);
+      const saved = saveAndEmitChanged({ ...snapshotSettings(), agentTiers: proposed }, `Tier "${tier}" created.`,
+        (event, payload) => pi.events.emit(event, payload), sessionCwd);
+      ctx.ui.notify(saved.message, saved.level);
+      if (saved.level !== "info") return; // Never leave a file referencing an unpersisted tier.
+      setAgentTiersSettings(proposed);
+    }
     try {
       if (existing === undefined) await atomicCreateFile(targetPath, content);
       else await atomicReplaceFile(targetPath, content, existing);

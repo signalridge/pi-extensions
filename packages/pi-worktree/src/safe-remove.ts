@@ -323,7 +323,11 @@ export async function removeWorktreeSafely(
         signal?.throwIfAborted();
         await removeSnapshot(tombstonePath, snapshot, beforeDeleteEntry);
       } catch (error: unknown) {
-        if (!tombstonePath && !metadataRemoved) {
+        if (!tombstonePath && !metadataRemoved && error instanceof WorktreeRecoveryError) {
+          // Mutation output overflow cannot prove whether Git committed the move.
+          // Filesystem presence alone cannot authorize another mutation as rollback.
+          moveOutcomeUnknown = true;
+        } else if (!tombstonePath && !metadataRemoved) {
           try {
             const outcome = await classifyMoveOutcome(path, quarantinePath);
             if (outcome === "moved") moved = true;

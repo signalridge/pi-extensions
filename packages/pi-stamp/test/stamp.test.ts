@@ -272,7 +272,7 @@ test("entry renderer composes opt-in assistant metadata, explicit debug details,
   assert.ok(compact);
   assert.deepEqual(
     compact.render(80).map((line) => line.trim()),
-    ["00:01:02", "test-model → actual-model · 2 tok · est $0"],
+    ["00:01:02", "test-model → actual-model · 2 tok · unknown $0"],
   );
 
   settings = { ...settings, assistantMetadata: "expanded", responseTiming: "duration" };
@@ -283,7 +283,7 @@ test("entry renderer composes opt-in assistant metadata, explicit debug details,
     [
       "00:01:02 · 3.2s",
       "api anthropic-messages · provider anthropic · requested test-model · response actual-model · stop stop",
-      "tokens in 1 · out 1 · cache read 0 · cache write 0 · total 2 · est cost $0",
+      "tokens in 1 · out 1 · cache read 0 · cache write 0 · total 2 · unknown cost $0",
       "debug · response id response-1",
       "debug · diagnostics 1",
       "debug · retry · HTTPError · code 429",

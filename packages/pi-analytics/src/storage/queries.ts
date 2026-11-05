@@ -51,7 +51,17 @@ export interface ReliabilityStats {
   categories: Record<ProviderErrorCategory, number>;
 }
 
+export interface ModelPairCount {
+  /** Concrete requested identity from the finalized assistant, not the selected router. */
+  provider?: string;
+  model?: string;
+  /** No reported provider is inferred from this model string. */
+  responseModel?: string;
+  count: number;
+}
+
 export interface ResponseStats {
+  modelPairs: ModelPairCount[];
   count: number;
   llmCalls: number;
   average: number;
@@ -96,6 +106,7 @@ export async function querySnapshot(
   signal?: AbortSignal,
 ): Promise<AnalyticsSnapshot> {
   const generationCounts: number[] = [];
+  const modelPairs = new Map<string, ModelPairCount>();
   const seenRunIds = new Set<string>();
   const skills = new Map<string, SkillStats>();
   const tools = new Map<string, ToolStats & { totalDurationMs: number }>();
@@ -169,6 +180,11 @@ export async function querySnapshot(
       terminal += error.terminal ? 1 : 0;
     }
     for (const generation of run.generations) {
+      const { provider, model, responseModel } = generation;
+      const key = JSON.stringify([provider ?? null, model ?? null, responseModel ?? null]);
+      const pair = modelPairs.get(key);
+      if (pair) pair.count += 1;
+      else modelPairs.set(key, { provider, model, responseModel, count: 1 });
       for (const response of generation.responses) {
         if (response.status === 429) http429 += 1;
         if (response.status >= 500 && response.status < 600) http5xx += 1;
@@ -176,7 +192,12 @@ export async function querySnapshot(
     }
   }
 
-  const responses = responseStatistics(generationCounts);
+  const responses = responseStatistics(
+    generationCounts,
+    [...modelPairs.entries()]
+      .sort(([leftKey, left], [rightKey, right]) => right.count - left.count || leftKey.localeCompare(rightKey))
+      .map(([, pair]) => pair),
+  );
   return {
     overview: {
       responseCycles: responses.count,
@@ -206,7 +227,7 @@ export async function querySnapshot(
   };
 }
 
-function responseStatistics(generationCounts: number[]): ResponseStats {
+function responseStatistics(generationCounts: number[], modelPairs: ModelPairCount[]): ResponseStats {
   const sorted = [...generationCounts].sort((left, right) => left - right);
   const count = sorted.length;
   const llmCalls = sum(sorted);
@@ -219,6 +240,7 @@ function responseStatistics(generationCounts: number[]): ResponseStats {
         ? (sorted[Math.floor(count / 2)] ?? 0)
         : ((sorted[count / 2 - 1] ?? 0) + (sorted[count / 2] ?? 0)) / 2;
   return {
+    modelPairs,
     count,
     llmCalls,
     average: count > 0 ? llmCalls / count : 0,

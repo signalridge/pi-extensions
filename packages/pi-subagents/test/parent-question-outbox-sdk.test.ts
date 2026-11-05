@@ -475,6 +475,9 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     expect(await recovered).toMatchObject({ status: "unanswered" });
   });
 
+  // Pi 1.5 evaluates both PNG and JPEG encodings for every resize. Allow the two
+  // real 4096px normalizations to finish; all ownership/acknowledgement deadlines
+  // and assertions below remain unchanged.
   it.each(["refused", "steer"] as const)("keeps a copied ambiguous frame question-inert after default AUTO 4096 PNG normalization (first copy %s)", async firstCopy => {
     expect(session.settingsManager.getImageAutoResize()).toBe(true);
     const image = pngImage(4096);
@@ -571,7 +574,7 @@ describe("question outbox on native SDK INPUT and preparation", () => {
     }
     expect(await next).toMatchObject({ status: "unanswered" });
     expect(await later).toMatchObject({ status: "unanswered" });
-  });
+  }, 30_000);
 
   it.each(["handled", "throw"])("uses native %s semantics for input-scoped own readiness without releasing another preparing prompt", async outcome => {
     const mentionGate = barrier();

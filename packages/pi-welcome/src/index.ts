@@ -27,6 +27,7 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
+  type KeybindingHints,
   keyText,
   loadProjectContextFiles,
   SettingsManager,
@@ -75,7 +76,7 @@ const MAX_NAMES = 8;
 interface WelcomeData {
   rows: [string, string][];
   /**
-   * Key hints, most useful first. Kept as separate items rather than one joined
+   * Legacy key hints (new entries store only facts). Kept as separate items rather than one joined
    * string so a narrow card can drop the trailing ones instead of wrapping a
    * separator onto a line of its own. Optional because an entry written before
    * this field existed replays without any.
@@ -173,28 +174,25 @@ function capitalizeKey(key: string): string {
 /**
  * The key hints Pi's own header would have shown, as plain text.
  *
- * Read from the live keybindings rather than hard-coded, so a rebound key is
- * still described correctly. Deliberately not built with pi's `keyHint()`: that
- * colors through pi's own theme singleton, while this card renders with the
- * theme handed to its entry renderer, and the two would disagree after a theme
- * change. The whole line is dimmed by the renderer instead of highlighting
- * individual keys.
+ * Renderers pass the host-injected formatter so remapped and unbound keys
+ * reflect the host, even when the extension resolves a separate SDK copy.
+ * The no-argument form remains available for existing callers. Use plain
+ * `keyText`, not styled `keyHint`, so the card's supplied theme owns styling.
  */
-export function collectHints(): string[] {
+export function collectHints(hints: Pick<KeybindingHints, "keyText"> = { keyText }): string[] {
   try {
     // Ordered most useful first: a narrow card keeps the head of this list.
     return [
-      [capitalizeKey(keyText("app.interrupt")), "interrupt"],
+      [capitalizeKey(hints.keyText("app.interrupt")), "interrupt"],
       ["/", "commands"],
       ["!", "bash"],
-      [capitalizeKey(keyText("app.clear")), "clear"],
-      [capitalizeKey(keyText("app.tools.expand")), "expand tools"],
+      [capitalizeKey(hints.keyText("app.clear")), "clear"],
+      [capitalizeKey(hints.keyText("app.tools.expand")), "expand tools"],
     ]
       .filter(([key]) => key && key.length > 0)
       .map(([key, description]) => `${key} ${description}`);
   } catch {
-    // Keybindings are a TUI singleton; if it is not up yet, a card without a
-    // hint line is better than no card.
+    // If the formatter is unavailable, omit hints rather than invent bindings.
     return [];
   }
 }
@@ -331,8 +329,7 @@ function collect(pi: ExtensionAPI, ctx: ExtensionContext): WelcomeData {
     }
   }
 
-  const hints = collectHints();
-  return hints.length > 0 ? { rows, hints } : { rows };
+  return { rows }; // Keybindings are live presentation, not persisted workspace facts.
 }
 
 // ─── Card Component ────────────────────────────────────────────────────────────
@@ -390,6 +387,7 @@ export class WelcomeCard implements Component {
   constructor(
     data: WelcomeData,
     private readonly theme: Theme,
+    private readonly keybindings?: Pick<KeybindingHints, "keyText">,
   ) {
     this.rows = data.rows.map(([label, value]) => [sanitizeCardText(label), sanitizeCardText(value)]);
     // The entry is replayed from a session file on disk, which an older build
@@ -408,10 +406,10 @@ export class WelcomeCard implements Component {
     return text + " ".repeat(safeWidth - renderedWidth);
   }
 
-  private renderCompact(width: number): string[] {
+  private renderCompact(width: number, hints: readonly string[]): string[] {
     const t = this.theme;
     const lines = [
-      t.fg("muted", this.hints.length > 0 ? (this.hints[0] ?? "ready") : "ready"),
+      t.fg("muted", hints.length > 0 ? (hints[0] ?? "ready") : "ready"),
       ...this.rows.map(([label, value]) =>
         label === GAP[0] && value === GAP[1] ? "" : `${t.fg("dim", `${label}:`)} ${t.fg("text", value)}`,
       ),
@@ -421,7 +419,8 @@ export class WelcomeCard implements Component {
 
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
-    if (safeWidth < MIN_WIDTH) return this.renderCompact(safeWidth);
+    const hints = this.keybindings ? collectHints(this.keybindings).map(sanitizeCardText) : this.hints;
+    if (safeWidth < MIN_WIDTH) return this.renderCompact(safeWidth, hints);
 
     const t = this.theme;
     const border = (text: string) => t.fg("borderAccent", text);
@@ -442,7 +441,7 @@ export class WelcomeCard implements Component {
       blank(),
     );
 
-    const hintLine = fitHints(this.hints, Math.max(1, inner - PAD * 2));
+    const hintLine = fitHints(hints, Math.max(1, inner - PAD * 2));
     if (hintLine) {
       // The whole line is dimmed rather than highlighting each key: this is
       // orientation, not a control the user is meant to look at.
@@ -498,10 +497,12 @@ function withLiveInventory(data: WelcomeData, pi: ExtensionAPI, ctx: ExtensionCo
 
 export default function (pi: ExtensionAPI) {
   let currentContext: ExtensionContext | undefined;
-  pi.registerEntryRenderer<WelcomeData>(ENTRY_TYPE, (entry, _options, theme) => {
+  pi.registerEntryRenderer<WelcomeData>(ENTRY_TYPE, (entry, options, theme) => {
     const data = entry.data;
     if (!data?.rows?.length) return undefined;
-    return new WelcomeCard(currentContext ? withLiveInventory(data, pi, currentContext) : data, theme);
+    const live = currentContext ? withLiveInventory(data, pi, currentContext) : data;
+    // Ignore legacy persisted hints on replay; never rewrite the stored entry.
+    return new WelcomeCard(live, theme, options);
   });
 
   pi.on("session_start", async (_event, ctx) => {

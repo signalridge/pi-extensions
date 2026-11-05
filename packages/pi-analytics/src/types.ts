@@ -27,6 +27,8 @@ export interface GenerationRecord {
   ordinal: number;
   provider?: string;
   model?: string;
+  /** Explicit AssistantMessage.responseModel, absent when not reported or invalid. */
+  responseModel?: string;
   thinkingLevel?: string;
   startedAtMs: number;
   finishedAtMs?: number;

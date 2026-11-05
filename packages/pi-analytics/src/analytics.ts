@@ -219,6 +219,7 @@ export function createAnalyticsExtension(
         stopReason: event.message.stopReason,
         errorMessage: event.message.errorMessage,
         model: dispatchedModel,
+        responseModel: event.message.responseModel,
       });
     });
 

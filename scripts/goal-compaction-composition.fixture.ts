@@ -3,13 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import {
-  getCurrentSystemPrompt,
-  InMemoryCredentialStore,
-  type Model,
-  type Provider,
-  Type,
-} from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, InMemoryCredentialStore, type Model, type Provider } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
   buildSessionProjection,
@@ -25,6 +19,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { test, vi } from "vitest";
 import { parseCheckpointDetails, projectCheckpointContext } from "../packages/pi-codex-compact/src/checkpoint.js";
 import { createCodexCompactExtension } from "../packages/pi-codex-compact/src/codex-compact.js";

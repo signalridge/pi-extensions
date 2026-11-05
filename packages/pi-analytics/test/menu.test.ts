@@ -65,6 +65,7 @@ const snapshot: AnalyticsSnapshot = {
     },
   },
   responses: {
+    modelPairs: [],
     count: 83,
     llmCalls: 192,
     average: 2.31,

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { type Tool, Type } from "@earendil-works/pi-ai";
+import type { Tool } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { test } from "vitest";
 import { type SystemPromptViews, ToolStateTracker } from "../src/tool-state.js";
 

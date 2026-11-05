@@ -14,6 +14,10 @@ await runMenu(withBorderedCustomUi(ctx), menu, options);
 
 The adapter adds the standard Pi top and bottom border rules to custom components that do not already render them. The outer rule uses the theme's `borderAccent` color (purple in the Signalridge themes). Existing bordered components are detected and are not double-framed. Keyboard input, focus, invalidation, disposal, overlay options, and RPC behavior are forwarded unchanged. On mouse-capable Pi versions, pointer events are forwarded with coordinates adjusted for added border rows; those rules are not content hit targets. Existing borders retain their original mouse geometry and handlers retain their capture/focus results.
 
+On Pi 1.5, the border wrapper forwards the live `capturesViewportInput` property. Selectors that handle paging should declare it; arbitrary viewers and text inputs are not opted in automatically. Native search and focused overlays retain host priority.
+
+`wrapCustomUi()` also settles its own promise with `undefined` when the host disposes a component without completing `custom()`. It never calls the host completion callback during teardown, and ignores late completion so an obsolete draft cannot be restored. Disposal is idempotent. Consumers remain responsible for owner signals (including during async creation), session fences, and draining accepted work through `waitForPending()` before returning. This does not settle the host's internal prompt-event span or detect a reset before a factory has returned a component.
+
 Use `borderedComponent()` when a package owns the custom factory directly. Persistent widgets, footers, and deliberately full-screen views are not dialogs and should not be wrapped automatically.
 
 ## Safe display copies

@@ -67,6 +67,20 @@ export class WorkflowError extends Error {
   }
 }
 
+/**
+ * Host-only proof that effective managed-request validation rejected before any
+ * attempt rotation or remote allocation. Never infer this from a code/message,
+ * or attach it to an error received after submitting a spawn.
+ */
+export class AllocationFreeDispatchError extends WorkflowError {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, {
+      recoverable: false,
+      details: cause,
+    });
+  }
+}
+
 // Transported VM throws must not acquire provider/abort classification merely
 // because IPC reconstructed them in the host Error realm. Keep provenance and
 // helper-computed text outside user data (including non-Error object throws).

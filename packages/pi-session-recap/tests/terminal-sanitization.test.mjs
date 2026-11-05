@@ -143,6 +143,7 @@ test("a model recap cannot drive the terminal through the recap widget", async (
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
     },
     sessionManager: {
+      getSessionId: () => "recap-test",
       getBranch: () => branch,
       buildContextEntries: () => branch,
     },

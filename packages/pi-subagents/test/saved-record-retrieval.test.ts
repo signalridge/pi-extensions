@@ -96,7 +96,7 @@ async function activate(branch: Entry[]) {
 async function finishedAgent(branch: Entry[], run: Partial<RunResult> = {}, resumed?: Awaited<ReturnType<typeof resumeAgent>>): Promise<string> {
   vi.mocked(runAgent).mockResolvedValue({
     responseText: "THE-FULL-RESULT",
-    session: { dispose: vi.fn() } as any,
+    session: { dispose: vi.fn(), messages: [], state: { messages: [] }, subscribe: vi.fn(() => vi.fn()) } as unknown as RunResult["session"],
     aborted: false,
     steered: false,
     ...run,

@@ -8,6 +8,7 @@ import {
   PROTOCOL_CAPABILITIES,
   PROTOCOL_VERSION,
   routingPolicyFingerprint,
+  WORKFLOW_UI_CHANNELS,
 } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it, vi } from "vitest";
 import { WORKFLOW_ARMED_DIRECTIVE } from "../src/arming.js";
@@ -62,6 +63,11 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
   const commands: string[] = [];
   const commandDefinitions = new Map<string, unknown>();
   const widgetUpdates: Array<string[] | undefined> = [];
+  const widgetRegistrations: Array<{
+    key: string;
+    content: Parameters<ExtensionContext["ui"]["setWidget"]>[1];
+    options: Parameters<ExtensionContext["ui"]["setWidget"]>[2];
+  }> = [];
   const entries: unknown[] = [...branch];
   bus.on("subagents:rpc:context", (raw) => {
     const request = raw as { requestId: string };
@@ -112,11 +118,16 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
     mode: "print" as "print" | "rpc" | "tui",
     ui: {
       setStatus: vi.fn(),
-      setWidget: (_key: string, content: Parameters<ExtensionContext["ui"]["setWidget"]>[1]) => {
+      setWidget: (
+        key: string,
+        content: Parameters<ExtensionContext["ui"]["setWidget"]>[1],
+        options?: Parameters<ExtensionContext["ui"]["setWidget"]>[2],
+      ) => {
+        widgetRegistrations.push({ key, content, options });
         if (typeof content === "function") {
           const component = content(
             { terminal: { rows: 24, columns: 80 }, requestRender() {} } as never,
-            { fg: (_token: string, text: string) => text } as never,
+            { fg: (_token: string, text: string) => text, bold: (text: string) => text } as never,
           );
           widgetUpdates.push(component.render(80));
         } else widgetUpdates.push(content);
@@ -148,6 +159,7 @@ function createPi(child: boolean, appendFailures = 0, branch: unknown[] = [], pr
     commandDefinitions,
     entries,
     widgetUpdates,
+    widgetRegistrations,
     routing,
     pi,
     ctx,
@@ -434,6 +446,79 @@ describe("workflow status lifecycle", () => {
     } finally {
       await f.lifecycle.get("session_shutdown")?.({}, f.ctx);
       await pending;
+    }
+  });
+});
+
+describe("owned workflow overview lifecycle", () => {
+  it("keeps periodic projection/footer updates without children, expires terminal rows, and fences old factories", async () => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    const run = {
+      runId: "overview",
+      status: "paused",
+      startedAt: now - 3000,
+      updatedAt: now,
+      meta: { name: "childless", description: "test" },
+      callStatus: {},
+      callResults: {},
+      agentIds: {},
+    };
+    const list = vi
+      .spyOn(WorkflowEngine.prototype, "list")
+      .mockImplementation(() => [{ runId: run.runId, status: run.status }] as never);
+    const get = vi.spyOn(WorkflowEngine.prototype, "getRun").mockImplementation(() => run as never);
+    const header = vi
+      .spyOn(WorkflowEngine.prototype, "getInspectionHeader")
+      .mockReturnValue({ restored: true } as never);
+    const f = createPi(false);
+    f.ctx.mode = "tui";
+    f.ctx.hasUI = true;
+    const updates: Array<{ runs: Array<{ elapsedMs: number; status: string }> }> = [];
+    f.bus.on(WORKFLOW_UI_CHANNELS.changed, (raw) => updates.push(raw as (typeof updates)[number]));
+    piWorkflows(f.pi as never);
+    try {
+      await f.lifecycle.get("session_start")?.({}, f.ctx);
+      expect(f.widgetUpdates.at(-1)?.join("\n")).toContain("childless · paused");
+      expect(f.widgetUpdates.at(-1)?.join("\n")).toContain("0/0 in flight");
+      expect(f.widgetUpdates.at(-1)?.join("\n")).toContain("restored");
+      const old = f.widgetRegistrations.find((item) => typeof item.content === "function")?.content;
+      if (typeof old !== "function") throw new Error("Overview factory missing");
+      const mounted = old(
+        { terminal: { rows: 24 }, requestRender() {} } as never,
+        { fg: (_color: string, text: string) => text, bold: (text: string) => text } as never,
+      );
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(updates.at(-1)?.runs[0].elapsedMs).toBe(5000);
+      expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · A0 P1");
+      await f.lifecycle.get("session_tree")?.({}, f.ctx);
+      expect(mounted.render(120)).toEqual([]);
+      run.status = "stopping";
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(updates.at(-1)?.runs[0].status).toBe("stopping");
+      expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · A1 P0");
+      run.status = "completed";
+      run.updatedAt = Date.now();
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(f.widgetUpdates.at(-1)?.join("\n")).toContain("childless · completed");
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(f.widgetUpdates.at(-1)).toBeUndefined();
+      expect(updates.at(-1)?.runs[0].status).toBe("completed"); // History remains observable.
+      expect(f.ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-workflows", "Workflows · C1 F0 S0");
+      const count = f.widgetUpdates.length;
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(f.widgetUpdates).toHaveLength(count); // No terminal relinger or polling loop.
+      expect(
+        f.widgetRegistrations
+          .filter((item) => typeof item.content === "function")
+          .every((item) => item.options?.placement === "belowEditor"),
+      ).toBe(true);
+    } finally {
+      await f.lifecycle.get("session_shutdown")?.({}, f.ctx);
+      list.mockRestore();
+      get.mockRestore();
+      header.mockRestore();
+      vi.useRealTimers();
     }
   });
 });
@@ -913,6 +998,11 @@ return { local: [cwd, process.cwd()], nested: await workflow(${JSON.stringify(ch
       expect((await pending).details.status).toBe("completed");
       await fixture.lifecycle.get("session_shutdown")?.({}, fixture.ctx);
       expect(fixture.widgetUpdates.at(-1)).toBeUndefined();
+      const registrations = fixture.widgetRegistrations.filter(({ content }) => typeof content === "function");
+      expect(registrations.length).toBeGreaterThan(0);
+      expect(
+        registrations.every(({ key, options }) => key === "pi-workflows" && options?.placement === "belowEditor"),
+      ).toBe(true);
       const updates = fixture.widgetUpdates.length;
       await Promise.resolve();
       expect(fixture.widgetUpdates).toHaveLength(updates);

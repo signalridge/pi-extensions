@@ -3,6 +3,7 @@ import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { MenuDefinition } from "@narumitw/pi-tui-kit";
 import { runConfirmation, runMenu, runTask } from "@narumitw/pi-tui-kit";
 import { withBorderedCustomUi } from "@signalridge/pi-ui";
+import { responsePairItems, responsePreviewLines, responseReviewContent } from "./response-screen.js";
 import type { ClearAnalyticsResult } from "./storage/files.js";
 import type { AnalyticsSnapshot, SkillStats, TimeRange, TimeRangeId, ToolStats } from "./storage/queries.js";
 import { resolveTimeRange } from "./storage/queries.js";
@@ -93,9 +94,31 @@ export function createAnalyticsMenu(
         hint: "back",
       }),
       responses: ({ state }) => ({
-        kind: "detail",
+        kind: "browse",
         title: `Response cycles · ${RANGE_LABELS[state.rangeId]}`,
-        lines: responseLines(state.result),
+        lines:
+          state.result.kind === "ready"
+            ? responsePreviewLines(state.result.snapshot.responses)
+            : [state.result.message],
+        items:
+          state.result.kind === "ready"
+            ? [
+                {
+                  id: "statistics",
+                  label: "Response statistics",
+                  description: "Average, median, P95, maximum and distribution",
+                  detailDocument: {
+                    content: responseReviewContent(state.result.snapshot.responses),
+                    format: { kind: "text" },
+                  },
+                },
+                ...responsePairItems(state.result.snapshot.responses.modelPairs),
+              ]
+            : [],
+        // Numeric browse limits remain height-adaptive; cap the initial preview
+        // at one statistics row plus six pairs, even on a tall terminal.
+        viewportSize: 7,
+        enableDetailSearch: true,
         hint: "back",
       }),
       privacy: ({ state }) => ({
@@ -185,7 +208,7 @@ export async function showAnalyticsMenu(
     runConfirmation,
     isCurrent: options.isCurrent,
   });
-  const loading = await runTask(ctx, {
+  const loading = await runTask(withBorderedCustomUi(ctx), {
     label: "Loading local analytics…",
     signal: options.signal,
     isCurrent: options.isCurrent,
@@ -337,31 +360,12 @@ function reliabilityLines(result: AnalyticsLoadResult): string[] {
   ];
 }
 
-function responseLines(result: AnalyticsLoadResult): string[] {
-  if (result.kind === "unavailable") return [result.message];
-  const value = result.snapshot.responses;
-  return [
-    metric("Cycles", value.count),
-    metric("LLM calls", value.llmCalls),
-    metric("Average", formatDecimal(value.average)),
-    metric("Median", formatDecimal(value.median)),
-    metric("P95", value.p95),
-    metric("Maximum", value.maximum),
-    "",
-    "Calls per response",
-    metric("1 call", value.distribution.one),
-    metric("2–3 calls", value.distribution.twoToThree),
-    metric("4–6 calls", value.distribution.fourToSix),
-    metric("7+ calls", value.distribution.sevenPlus),
-  ];
-}
-
 function privacyLines(state: AnalyticsMenuState): string[] {
   return [
     "Local analytics files:",
     safeDisplayText(state.path),
     "",
-    "Stored: timestamps, extension-generated record IDs, model/provider IDs, thinking level, tool and skill names, durations, counts, HTTP statuses, and classified errors.",
+    "Stored: timestamps, extension-generated record IDs, requested and explicitly reported model IDs, provider IDs, thinking level, tool and skill names, durations, counts, HTTP statuses, and classified errors.",
     "Not stored: prompts, responses, thinking, tool arguments/results, raw errors, headers, cwd/file paths, session identity, or credentials.",
     "",
     "No database server, cloud connection, or other remote telemetry is used.",

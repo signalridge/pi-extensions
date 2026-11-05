@@ -1,16 +1,20 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Fingerprints } from "./fingerprint.js";
 import { type Durability, fingerprint, isState, Persistence, VOLATILE } from "./persistence.js";
 import { copy, empty, type Snapshot, STATE_TYPE, transition, validateSnapshot } from "./state.js";
 
-function authority(branch: readonly SessionEntry[]): string {
-  return fingerprint([...branch].reverse().find(isState) ?? null);
+function authority(branch: readonly SessionEntry[], hash = fingerprint): string {
+  return hash([...branch].reverse().find(isState) ?? null);
 }
-export function recover(branch: readonly SessionEntry[]): { snapshot: Snapshot; invalid: number; record?: string } {
+export function recover(
+  branch: readonly SessionEntry[],
+  hash = fingerprint,
+): { snapshot: Snapshot; invalid: number; record?: string } {
   let invalid = 0;
   for (const entry of [...branch].reverse()) {
     if (entry.type !== "custom" || entry.customType !== STATE_TYPE) continue;
     try {
-      return { snapshot: validateSnapshot(entry.data), invalid, record: fingerprint(entry) };
+      return { snapshot: validateSnapshot(entry.data), invalid, record: hash(entry) };
     } catch {
       invalid++;
     }
@@ -35,7 +39,8 @@ export class TodoStore {
   private owner?: Ownership;
   private generation = 0;
   private committing = false;
-  private readonly persistence = new Persistence();
+  private readonly hashes = new Fingerprints();
+  private readonly persistence = new Persistence(this.hashes);
   private storage?: Durability;
   private unavailable?: string;
   constructor(private readonly pi: Pick<ExtensionAPI, "appendEntry">) {}
@@ -55,8 +60,11 @@ export class TodoStore {
   private quarantine(message: string) {
     this.unavailable = message;
     this.generation++;
+    this.persistence.retire();
   }
   reconcile(ctx: ExtensionContext): number {
+    // A continuing native prefix may reuse values, never an abandoned owner.
+    if (!this.owner || !this.matches(this.owner, ctx)) this.persistence.retire();
     this.generation++;
     this.owner = undefined;
     try {
@@ -72,7 +80,10 @@ export class TodoStore {
         );
         return 0;
       }
-      const recovered = recover(branch.filter((entry) => !isState(entry) || this.persistence.includes(storage, entry)));
+      const recovered = recover(
+        branch.filter((entry) => !isState(entry) || this.persistence.includes(storage, entry)),
+        this.hashes.hash,
+      );
       this.snapshot = recovered.snapshot;
       this.snapshotRecord = recovered.record;
       this.storage = storage;
@@ -87,6 +98,7 @@ export class TodoStore {
   retire() {
     this.generation++;
     this.owner = undefined;
+    this.persistence.retire();
   }
   private captureNative(ctx: ExtensionContext): Ownership {
     const branch = ctx.sessionManager.getBranch();
@@ -94,8 +106,8 @@ export class TodoStore {
       manager: ctx.sessionManager,
       session: ctx.sessionManager.getSessionId(),
       file: ctx.sessionManager.getSessionFile(),
-      prefix: branch.map(fingerprint),
-      authority: authority(branch),
+      prefix: branch.map(this.hashes.hash),
+      authority: authority(branch, this.hashes.hash),
       generation: this.generation,
     };
   }
@@ -107,8 +119,8 @@ export class TodoStore {
         owner.manager === ctx.sessionManager &&
         owner.session === ctx.sessionManager.getSessionId() &&
         owner.file === ctx.sessionManager.getSessionFile() &&
-        owner.prefix.every((hash, index) => branch[index] && fingerprint(branch[index]) === hash) &&
-        (!checkAuthority || owner.authority === authority(branch))
+        owner.prefix.every((hash, index) => branch[index] && this.hashes.hash(branch[index]) === hash) &&
+        (!checkAuthority || owner.authority === authority(branch, this.hashes.hash))
       );
     } catch {
       return false;
@@ -116,8 +128,10 @@ export class TodoStore {
   }
   assert(ctx: ExtensionContext, lease?: Ownership) {
     if (this.unavailable) throw new Error(this.unavailable);
-    if (!this.owner || !this.matches(this.owner, ctx) || (lease && !this.matches(lease, ctx)))
+    if (!this.owner || !this.matches(this.owner, ctx) || (lease && !this.matches(lease, ctx))) {
+      this.persistence.retire();
       throw new Error("Todo ownership changed; reopen /todo or retry on the current branch.");
+    }
   }
   lease(ctx: ExtensionContext): Ownership {
     this.assert(ctx);
@@ -189,7 +203,7 @@ export class TodoStore {
       }
       if (
         !this.matches(origin, ctx, false) ||
-        authority(ctx.sessionManager.getBranch()) !== fingerprint(latest ?? null)
+        authority(ctx.sessionManager.getBranch(), this.hashes.hash) !== this.hashes.hash(latest ?? null)
       ) {
         this.quarantine("Todo ownership changed during durability verification; reconcile the native session.");
         throw new Error(this.unavailable);
@@ -209,7 +223,7 @@ export class TodoStore {
       }
       // A native exception AFTER a complete verified write is a committed operation.
       this.snapshot = next;
-      this.snapshotRecord = latest ? fingerprint(latest) : undefined;
+      this.snapshotRecord = latest ? this.hashes.hash(latest) : undefined;
       this.storage = verified;
       this.owner = this.captureNative(ctx);
       return copy(next);

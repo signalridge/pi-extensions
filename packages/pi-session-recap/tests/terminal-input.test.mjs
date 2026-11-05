@@ -76,7 +76,7 @@ function harness(t, mode = "tui") {
       find: () => model,
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
     },
-    sessionManager: { getBranch: () => branch, buildContextEntries: () => branch },
+    sessionManager: { getSessionId: () => "recap-test", getBranch: () => branch, buildContextEntries: () => branch },
     ui: {
       onTerminalInput(handler) {
         subscriptions++;

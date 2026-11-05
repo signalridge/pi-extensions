@@ -13,6 +13,7 @@ export async function ownedCustom<T>(
   ctx: ExtensionCommandContext,
   ownership: ActionOwnership,
   factory: (tui: TUI, theme: Theme, keys: KeybindingsManager, done: (value: T) => void) => DisposableComponent,
+  options?: Pick<NonNullable<Parameters<ExtensionCommandContext["ui"]["custom"]>[1]>, "blocked">,
 ): Promise<T | undefined> {
   if (!ownership.isCurrent() || ownership.signal.aborted || ctx.mode !== "tui" || !ctx.hasUI) return undefined;
   let closed = false;
@@ -78,7 +79,7 @@ export async function ownedCustom<T>(
           dispose();
         },
       };
-    });
+    }, options);
     const result = await Promise.race([dialog, retired]);
     return ownership.isCurrent() && !ownership.signal.aborted ? result : undefined;
   } finally {

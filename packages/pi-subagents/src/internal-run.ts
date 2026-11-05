@@ -5,6 +5,7 @@
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { AgentReopenRoute } from "./reopen-route.js";
 import type { AgentConfig, ThinkingLevel } from "./types.js";
 
 /**
@@ -47,6 +48,20 @@ export const INTERNAL_RESOLVED_ISOLATED = Symbol("pi-subagents.internal-resolved
 /** Branch-local frontmatter only; never accepts another run/config capability. */
 export type ResumeBudgetPolicy = Pick<AgentConfig, "maxTurns">;
 export const INTERNAL_RESUME_BUDGET_POLICY = Symbol("pi-subagents.internal-resume-budget-policy");
+
+/** Manager-issued catalog proof, rechecked by the real runner before any replay. */
+export const INTERNAL_REOPEN_ROUTE = Symbol("pi-subagents.internal-reopen-route");
+export interface InternalReopenRouteProof { readonly route: AgentReopenRoute; }
+
+/** Reject string-keyed reopen capabilities at every public admission boundary. */
+export function assertNoPublicReopen(value: unknown): void {
+  if (typeof value !== "object" || value === null) return;
+  for (const key of ["resumeSessionFile", "reclaimHandle", "resume_session_file", "reclaim_handle"]) {
+    if (Reflect.has(value, key)) {
+      throw new Error(`Unsupported internal capability "${key}". Resume an ordinary agent by its agent ID instead; session file paths are never accepted.`);
+    }
+  }
+}
 
 /** The only no-tool policy currently issued by the package. */
 export const AGENT_DEFINITION_GENERATION_OVERRIDE: InternalAgentConfigOverride = Object.freeze({

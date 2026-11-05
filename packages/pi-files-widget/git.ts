@@ -40,7 +40,7 @@ function getGitPathPrefix(cwd: string): string {
 }
 
 /** Convert a repo-root-relative path to a cwd-relative one; null if outside cwd. */
-function stripPathPrefix(filePath: string, prefix: string): string | null {
+export function stripPathPrefix(filePath: string, prefix: string): string | null {
   if (!prefix) return filePath;
   if (filePath.startsWith(prefix)) return filePath.slice(prefix.length);
   return null;
@@ -121,7 +121,7 @@ export function getGitBranch(cwd: string): string {
   }
 }
 
-function parseNumstatZ(output: string): Map<string, DiffStats> {
+export function parseNumstatZ(output: string): Map<string, DiffStats> {
   const stats = new Map<string, DiffStats>();
   const entries = output.split("\0");
   for (let i = 0; i < entries.length; i++) {

@@ -71,6 +71,21 @@ test("the card carries the key hints pi's own header would have shown", () => {
   assert.equal(fitHints(hints, 4), undefined);
 });
 
+test("the same card reads injected bindings on every render, including unbinding", () => {
+  let binding = "ctrl+j";
+  const card = new WelcomeCard({ rows: [["Directory", "original workspace"]], hints: ["obsolete hint"] }, theme, {
+    keyText: (id) => (id === "app.interrupt" ? binding : ""),
+  });
+  assert.match(card.render(80).join("\n"), /Ctrl\+J interrupt/u);
+  binding = "ctrl+b";
+  assert.match(card.render(19).join("\n"), /Ctrl\+B interrupt/u);
+  assert.doesNotMatch(card.render(80).join("\n"), /Ctrl\+J|obsolete/u);
+  binding = "";
+  assert.doesNotMatch(card.render(80).join("\n"), /interrupt|obsolete/u);
+  assert.match(card.render(80).join("\n"), /original workspace/u);
+  assert.match(card.render(19).join("\n"), /\/ commands/u);
+});
+
 test("hostile workspace facts are neutralized before they reach the terminal", () => {
   // A directory name may contain any byte but `/` and NUL, and a git refname may
   // carry a bidi override, so both arrive as attacker-controlled text in a clone.
@@ -103,8 +118,8 @@ test("hostile workspace facts are neutralized before they reach the terminal", (
 
   // The facts themselves must still be readable once the controls are gone.
   const wide = new WelcomeCard({ rows }, theme).render(80).join("\n");
-  // Hints are stored in the same entry and replayed on resume, so they get the
-  // same scrubbing on the way out.
+  // Legacy hints remain supported by direct card callers and get the same
+  // scrubbing on the way out (the entry renderer uses live hints instead).
   const poisonedHints = new WelcomeCard({ rows: [["Directory", "~/p"]], hints: ["Ctrl+C\u001b[2J interrupt"] }, theme)
     .render(80)
     .join("\n");

@@ -9,6 +9,7 @@ import type {
   SimpleStreamOptions,
   UserMessage,
 } from "@earendil-works/pi-ai";
+import { projectSideMessages, type TextProjection } from "./secrets-projection.js";
 import { sanitizeSingleLine } from "./text.js";
 
 export const BTW_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -108,7 +109,9 @@ export interface CompleteSideThreadTurnOptions {
   signal?: AbortSignal;
   completeSimple: CompleteSimpleFunction;
   /** Called immediately before the provider request; false cancels a stale session. */
-  prepareContext?: () => string | false;
+  prepareContext?: (project?: TextProjection) => string | false;
+  /** Optional Secrets capability, discovered immediately before this request. */
+  createProjection?: () => TextProjection | undefined;
   /** Revalidate after provider settlement without rereading parent history. */
   isCurrent?: () => boolean;
 }
@@ -127,6 +130,7 @@ export async function completeSideThreadTurn({
   signal,
   completeSimple,
   prepareContext,
+  createProjection,
   isCurrent = () => true,
 }: CompleteSideThreadTurnOptions): Promise<CompleteSideThreadTurnResult> {
   if (signal?.aborted || !isCurrent()) return { kind: "aborted" };
@@ -135,13 +139,19 @@ export async function completeSideThreadTurn({
     if (!canSendSideThreadToModel(thread, requestModel)) {
       return { kind: "error", message: sideThreadDestinationError(thread) };
     }
-    const parentContext = prepareContext?.() ?? "";
-    if (parentContext === false) return { kind: "aborted" };
+    const project = createProjection?.();
+    // Discover the full side transcript first, so it can protect parent truncation edges too.
+    if (project) projectSideMessages(buildSideThreadMessages(thread, question), project);
+    const parentContext = prepareContext?.(project) ?? "";
+    if (parentContext === false || signal?.aborted || !isCurrent()) return { kind: "aborted" };
     if (parentContext) bindSideThreadToModel(thread, requestModel);
     thread.id ??= randomUUID();
+    const messages = buildSideThreadMessages(thread, question, parentContext);
+    const projected = project ? projectSideMessages(messages, project) : messages;
+    if (signal?.aborted || !isCurrent()) return { kind: "aborted" };
     const response = await completeSimple(
       requestModel,
-      { systemPrompt: SYSTEM_PROMPT, messages: buildSideThreadMessages(thread, question, parentContext) },
+      { systemPrompt: SYSTEM_PROMPT, messages: projected },
       { ...buildStreamOptions(auth, thinkingLevel, signal), sessionId: thread.id },
     );
     if (signal?.aborted || !isCurrent() || response?.stopReason === "aborted") return { kind: "aborted" };

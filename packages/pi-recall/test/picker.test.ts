@@ -87,6 +87,7 @@ test("defaults to Current cwd and cycles scope forward and backward with visible
     saved("two", "other", "/work/project", "two"),
     saved("three", "elsewhere", "/other", "three"),
   ]);
+  assert.equal(picker.capturesViewportInput, true);
   assert.match(picker.render(80).join("\n"), /Scope: Current cwd \(2\).*Tab change scope/);
   picker.handleInput("\t");
   assert.match(picker.render(80).join("\n"), /Scope: All \(3\)/);

@@ -1326,6 +1326,7 @@ describe("AgentManager — resumable index (rememberAgents)", () => {
     record.completedAt = Date.now() - 11 * 60_000; // older than the 10-minute cutoff
 
     manager.clearCompleted();
+    await vi.waitFor(() => expect(manager.listResumable()).toHaveLength(1));
 
     const entries = manager.listResumable();
     expect(entries.length).toBe(1);
@@ -1371,7 +1372,7 @@ describe("AgentManager — resumable index (rememberAgents)", () => {
     const record = manager.getRecordMutable(id)!;
     record.completedAt = Date.now() - 11 * 60_000;
     manager.clearCompleted();
-    expect(manager.listResumable().length).toBe(1);
+    await vi.waitFor(() => expect(manager.listResumable().length).toBe(1));
 
     manager.setRememberAgents(false);
     expect(manager.listResumable().length).toBe(0);
@@ -1403,7 +1404,7 @@ describe("AgentManager — resumable index (rememberAgents)", () => {
     const record = manager.getRecordMutable(id)!;
     record.completedAt = Date.now() - 11 * 60_000;
     manager.clearCompleted();
-    expect(manager.listResumable().length).toBe(1);
+    await vi.waitFor(() => expect(manager.listResumable().length).toBe(1));
 
     expect(manager.dropResumable(id)).toBe(true);
     expect(manager.listResumable().length).toBe(0);

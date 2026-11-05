@@ -16,7 +16,7 @@ initTheme("dark", false);
 test.each(["select", "cancel", "retire"])(
   "installed Pi custom host %s restores its draft before any owner open",
   async (exit) => {
-    assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+    assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
     vi.useFakeTimers();
     const controller = new AbortController();
     const editor = {
@@ -46,8 +46,8 @@ test.each(["select", "cancel", "retire"])(
       editorContainer,
       ui,
       keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
-      // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
-      ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
+      // 1.0.4 mounts directly; 1.5.0 owns a dialog stack and terminal-status reporter.
+      ...(VERSION === "1.5.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
     }) as { showExtensionCustom: ExtensionContext["ui"]["custom"] };
     const context = createMockContext({
       mode: "tui",
@@ -90,6 +90,7 @@ test.each(["select", "cancel", "retire"])(
       const inspector = editorContainer.children[0];
       assert.ok(inspector && inspector !== editor);
       assert.equal(focus, inspector);
+      assert.equal(inspector.capturesViewportInput, true);
       if (exit === "retire") controller.abort();
       else inspector.handleInput?.(exit === "select" ? "\r" : "\x1b");
       // Native close restores before any promise continuation, not after dispatch.

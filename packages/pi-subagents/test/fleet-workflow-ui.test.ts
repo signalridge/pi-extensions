@@ -1,4 +1,4 @@
-import { type Component, visibleWidth } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import type { EventBus, WorkflowUiRunSummary } from "@signalridge/pi-subagents-protocol";
 import { replyChannel, WORKFLOW_UI_CHANNELS } from "@signalridge/pi-subagents-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -94,7 +94,58 @@ describe("Fleet workflow metadata peer", () => {
   });
 });
 
-describe("Fleet authoritative workflow rows", () => {
+describe("independent Fleet and explicit workflow child access", () => {
+  it("retires managed-child-only repaint ticks while preserving ordinary agent activity and retained access", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const session = { subscribe: () => () => {}, messages: [] };
+    const managed = {
+      id: "retained-child", type: "Explore", description: "completed workflow child", status: "completed", session,
+      startedAt: 1, completedAt: Date.now(), toolUses: 0,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 }, compactionCount: 0,
+      owner: { extension: "pi-workflows", runId: "retained-run", nodeId: "call-1", attemptId: "attempt-1" },
+    } as AgentRecord;
+    const records = [managed];
+    const listAgentsMutable = vi.fn(() => records);
+    const fleet = new FleetList({ listAgentsMutable } as unknown as AgentManager, new Map());
+    disposals.push(() => fleet.dispose());
+    const requestRender = vi.fn();
+    const tui = { terminal: { rows: 24, columns: 120 }, requestRender };
+    const setWidget = vi.fn<FleetUICtx["setWidget"]>((_, factory) => { factory?.(tui as never, theme); });
+    fleet.setUICtx({ setWidget, getEditorText: () => "", onTerminalInput: () => () => {}, custom: vi.fn(), notify: vi.fn() });
+
+    // A managed spawn may arm the timer, but its first tick must retire it.
+    fleet.ensureTimer();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(200);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(setWidget).not.toHaveBeenCalled();
+    expect(requestRender).not.toHaveBeenCalled();
+    const idleReads = listAgentsMutable.mock.calls.length;
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(listAgentsMutable).toHaveBeenCalledTimes(idleReads);
+    expect(fleet.retainedWorkflowGroups()[0].records).toEqual([managed]);
+
+    const ordinary = { ...managed, id: "ordinary", owner: undefined, status: "running", completedAt: undefined } as AgentRecord;
+    records.push(ordinary);
+    fleet.update();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(200);
+    expect(requestRender).toHaveBeenCalled();
+    ordinary.status = "completed";
+    ordinary.completedAt = Date.now();
+    fleet.onAgentFinished(ordinary.id);
+    vi.advanceTimersByTime(4200);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(setWidget).toHaveBeenLastCalledWith("fleet", undefined);
+    const finalRenders = requestRender.mock.calls.length;
+    const finalReads = listAgentsMutable.mock.calls.length;
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(requestRender).toHaveBeenCalledTimes(finalRenders);
+    expect(listAgentsMutable).toHaveBeenCalledTimes(finalReads);
+    expect(fleet.retainedWorkflowGroups()[0].records).toEqual([managed]);
+  });
+
   it("never infers workflow status from running children; failed peer open offers an explicit bounded child-only fallback", async () => {
     const bus = new Bus(); const session = { subscribe: () => () => {}, messages: [] };
     const records = Array.from({ length: 30 }, (_, index) => ({ id: String(index), type: "Explore", description: `child ${index}`, status: "running", session,
@@ -110,55 +161,56 @@ describe("Fleet authoritative workflow rows", () => {
     fleet.setUICtx(ui);
     const peer = new WorkflowUiClient(bus, () => true, () => fleet.update()); disposals.push(() => peer.dispose()); fleet.setWorkflowClient(peer);
     publish(bus, [run({ status: "failed" })]);
-    expect(widget!.render(200).join("\n")).toContain("Named workflow · failed");
-    expect(widget!.render(200).join("\n")).not.toContain("Named workflow · running");
+    expect(widget).toBeUndefined(); // No overview or flattened owned-agent duplicate.
+    expect(fleet.handleKey("\x1b[B")).toBeUndefined();
     bus.on(WORKFLOW_UI_CHANNELS.open, raw => bus.emit(replyChannel(WORKFLOW_UI_CHANNELS.open, (raw as { requestId: string }).requestId), { success: false, error: "Unsupported" }));
-    fleet.handleKey("\x1b[B"); fleet.handleKey("\x1b[B"); fleet.handleKey("\r");
+    const opening = fleet.openRetainedWorkflow("run");
     await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("retained children only"), "warning");
     expect(overlay!.render(80).join("\n")).toContain("30 retained children");
     expect(overlay!.render(80).length).toBeLessThanOrEqual(Math.floor(24 * 0.7));
+    fleet.dispose(); await opening;
   });
 
-  it("renders zero-child authority, preserves run selection after inspector, yields dialog keys and expires terminal rows", async () => {
+  it("never mounts zero-child workflow summaries or takes their arrows, regardless of status or Fleet setting", () => {
     vi.useFakeTimers(); const bus = new Bus();
     const manager = { listAgentsMutable: () => [] } as unknown as AgentManager;
     const fleet = new FleetList(manager, new Map()); disposals.push(() => fleet.dispose());
-    let widget: { render(width: number): string[] } | undefined;
-    let focus: unknown = { getText: () => "", setText: () => {} };
-    const tui = { terminal: { rows: 24, columns: 120 }, getFocusedComponent: () => focus, requestRender: vi.fn() };
-    const custom = vi.fn(); const notify = vi.fn();
-    const ui: FleetUICtx = { setWidget: (_, factory) => { widget = factory?.(tui as never, theme); }, getEditorText: () => "", onTerminalInput: () => () => {}, custom, notify };
-    fleet.setUICtx(ui);
+    const setWidget = vi.fn(); const custom = vi.fn();
+    fleet.setUICtx({ setWidget, getEditorText: () => "", onTerminalInput: () => () => {}, custom, notify: vi.fn() });
+    const peer = new WorkflowUiClient(bus, () => true, () => fleet.update()); disposals.push(() => peer.dispose());
+    fleet.setWorkflowClient(peer);
+    for (const enabled of [true, false]) {
+      fleet.setEnabled(enabled);
+      for (const status of ["completed", "failed", "stopped", "stopping", "paused", "interrupted", "running"] as const) {
+        publish(bus, [run({ status, callCount: 0, runningCalls: 0, completedCalls: 0 })]);
+        expect(fleet.retainedWorkflowGroups()).toEqual([]);
+        for (const key of ["\x1b[B", "\x1b[D", "\r"]) expect(fleet.handleKey(key)).toBeUndefined();
+      }
+    }
+    vi.advanceTimersByTime(4201);
+    expect(setWidget).not.toHaveBeenCalled(); expect(custom).not.toHaveBeenCalled();
+  });
+
+  it("delegates an explicit retained group to the owner even with Fleet disabled, then yields all dialog keys", async () => {
+    vi.useFakeTimers(); const bus = new Bus();
+    const record = { id: "child", startedAt: 1, owner: { extension: "pi-workflows", runId: "run" } } as AgentRecord;
+    const fleet = new FleetList({ listAgentsMutable: () => [record] } as unknown as AgentManager, new Map());
+    disposals.push(() => fleet.dispose());
+    const custom = vi.fn(); const setWidget = vi.fn();
+    fleet.setUICtx({ setWidget, getEditorText: () => "", onTerminalInput: () => () => {}, custom, notify: vi.fn() });
     const peer = new WorkflowUiClient(bus, () => true, () => fleet.update()); disposals.push(() => peer.dispose());
     fleet.setWorkflowClient(peer); publish(bus);
-    expect(widget!.render(180).join("\n")).toContain("▸ Named workflow · running · validate · 1/3 running · 1 done · 0 failed");
-    expect(widget!.render(180).join("\n")).not.toContain("● Named workflow");
-    expect(widget!.render(180).join("\n")).toContain("3s · 50 tokens");
-    for (const status of ["completed", "failed", "paused", "running"] as const) {
-      publish(bus, [run({ status })]);
-      const lines = widget!.render(180);
-      expect(lines.find(line => line.includes("Named workflow"))).toContain("▸ Named workflow");
-      expect(lines.at(-1)).toBe("");
-      expect(lines.at(-2)?.trim()).not.toBe("");
-    }
-    for (const rows of [0, 4, 8, 24]) { tui.terminal.rows = rows; expect(widget!.render(120).length).toBeLessThanOrEqual(Math.floor(rows / 2)); }
-    for (const width of [0, 1, 12, 80]) expect(widget!.render(width).every(line => visibleWidth(line) <= width)).toBe(true);
     const opened = vi.fn((raw: unknown) => {
       const request = raw as { requestId: string; runId: string; surfaceId: string };
-      expect(request.runId).toBe("run"); expect(request.surfaceId).toBe("surface");
+      expect(request).toMatchObject({ runId: "run", surfaceId: "surface" });
       bus.emit(replyChannel(WORKFLOW_UI_CHANNELS.open, request.requestId), { success: true, data: { accepted: true } });
-      queueMicrotask(() => { focus = { render: () => [] }; });
     });
     bus.on(WORKFLOW_UI_CHANNELS.open, opened);
-    fleet.handleKey("\x1b[B"); fleet.handleKey("\x1b[B"); fleet.handleKey("\r"); await Promise.resolve(); await Promise.resolve();
+    fleet.setEnabled(false);
+    await fleet.openRetainedWorkflow("run");
     vi.advanceTimersByTime(1);
     for (const key of ["\x1b[B", "\r", "\x02", "\x1b"]) expect(fleet.handleKey(key)).toBeUndefined();
-    expect(custom).not.toHaveBeenCalled();
-    focus = { getText: () => "", setText: () => {} };
-    expect(widget!.render(120).join("\n")).toContain("Named workflow");
-    publish(bus, [run({ status: "completed" })]); vi.advanceTimersByTime(4201);
-    expect(widget).toBeUndefined();
-    expect(opened).toHaveBeenCalledOnce();
+    expect(opened).toHaveBeenCalledOnce(); expect(custom).not.toHaveBeenCalled(); expect(setWidget).not.toHaveBeenCalled();
   });
 });

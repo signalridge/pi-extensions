@@ -243,18 +243,20 @@ describe("manager foreground handoff", () => {
     await waiter;
   });
 
-  it("excludes bare spawn, background, queued, nested, reopened, internal and resumed paths", async () => {
+  it("excludes bare spawn, background, queued, nested, internal and resumed paths and rejects injected reopen paths", async () => {
     const bare = manager.spawn(pi, ctx, "Explore", "bare", { description: "bare", isBackground: false });
     const bg = manager.spawn(pi, ctx, "Explore", "bg", { description: "bg", isBackground: true });
     const queued = manager.spawn(pi, ctx, "Explore", "queued", { description: "queued", isBackground: true });
     const nested = await foreground({ parentAgentId: bare, depth: 2 });
-    const reopened = await foreground({ resumeSessionFile: "/tmp/old.jsonl" });
+    await expect(manager.spawnAndWait(pi, ctx, "Explore", "work", {
+      description: "work", resumeSessionFile: "/tmp/old.jsonl",
+    } as Parameters<AgentManager["spawnAndWait"]>[4])).rejects.toThrow(/internal capability/);
     let internalId = "";
     const internalWait = manager.spawnAndWaitInternal(pi, ctx, "Explore", "generate", { description: "generate" }, AGENT_DEFINITION_GENERATION_OVERRIDE, id => { internalId = id; });
     await Promise.resolve();
-    for (const id of [bare, bg, queued, nested.id, reopened.id, internalId]) expect(manager.canHandoff(id)).toBe(false);
+    for (const id of [bare, bg, queued, nested.id, internalId]) expect(manager.canHandoff(id)).toBe(false);
     for (const run of runs) complete(run);
-    await Promise.all([nested.waiter, reopened.waiter, internalWait, manager.getRecordMutable(bare)!.promise]);
+    await Promise.all([nested.waiter, internalWait, manager.getRecordMutable(bare)!.promise]);
     const resumeGate = deferred<Awaited<ReturnType<typeof resumeAgent>>>();
     vi.mocked(resumeAgent).mockReturnValue(resumeGate.promise);
     const resumed = manager.resume(bare, "again");

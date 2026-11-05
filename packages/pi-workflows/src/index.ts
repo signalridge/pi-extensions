@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { defineTool } from "@earendil-works/pi-coding-agent";
-import { Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { Type } from "@sinclair/typebox";
 import { DEFAULT_TRIGGER_WORD, hasTriggerWord, WORKFLOW_ARMING_MESSAGE_TYPE, WorkflowTurnArming } from "./arming.js";
@@ -26,8 +26,9 @@ import {
   WORKFLOW_STRENGTHS,
   type WorkflowStrengthTable,
 } from "./strengths.js";
-import { liveWidgetLines, showWorkflowNavigator } from "./ui.js";
+import { showWorkflowNavigator } from "./ui.js";
 import { buildWorkflowUiSnapshot, openOwnedConversation, WorkflowUiBridge, type WorkflowUiSurface } from "./ui-bus.js";
+import { overviewRuns, workflowOverviewLines } from "./ui-overview.js";
 import {
   loadProjectWorkflowSettings,
   loadWorkflowSettings,
@@ -509,11 +510,12 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       .map((summary) => workflowEngine.getRun(String(summary.runId)))
       .filter((run): run is NonNullable<typeof run> => run !== undefined);
     if (statusSource?.()) tui.setStatus("pi-workflows", workflowStatusSummary(runs));
-    const hasActive = runs.some((run) => !["completed", "failed", "stopped"].includes(run.status));
+    const hasProgress = overviewRuns(runs).length > 0;
     const surfaceId = workflowUiSurfaceId;
+    const snapshot = buildWorkflowUiSnapshot(workflowEngine, surfaceId);
     tui.setWidget(
       "pi-workflows",
-      hasActive
+      hasProgress
         ? (host, theme) => ({
             render(width) {
               if (
@@ -521,29 +523,33 @@ export default function piWorkflows(pi: ExtensionAPI): void {
                 engine !== workflowEngine ||
                 workflowEngine.isDisposed() ||
                 workflowUiSurfaceId !== surfaceId ||
+                !ownsDeliveryBranch() ||
                 !Number.isFinite(width) ||
                 width < 1
               )
                 return [];
               const height = Number.isFinite(host.terminal.rows) ? Math.max(0, host.terminal.rows) : 24;
-              const rowBudget = Math.max(1, Math.min(12, Math.floor(height / 4)));
-              return liveWidgetLines(
+              const rowBudget = Math.max(0, Math.min(12, Math.floor(height / 4)));
+              return workflowOverviewLines(
                 runs,
+                snapshot.runs,
+                theme,
+                width,
+                rowBudget,
                 workflowSettings.progressMode,
                 workflowSettings.maxAgentsShown,
-                rowBudget,
-              ).map((line, index) =>
-                truncateToWidth(theme.fg(index === 0 ? "accent" : "muted", line), Math.floor(width)),
               );
             },
             invalidate() {},
           })
         : undefined,
+      { placement: "belowEditor" },
     );
+    // Publication/footer cadence is independent of passive row visibility.
     workflowUiBridge?.publish();
-    if (hasActive && !widgetTimer) {
+    if (hasProgress && !widgetTimer) {
       widgetTimer = setInterval(refreshWidget, 2_000);
-    } else if (!hasActive && widgetTimer) {
+    } else if (!hasProgress && widgetTimer) {
       clearInterval(widgetTimer);
       widgetTimer = undefined;
     }
@@ -765,9 +771,6 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     // re-run every finished call untabled.
     workflowEngine.strengths = () => workflowSettings.strengths;
     workflowEngine.loadSavedWorkflow = resolveNestedWorkflow;
-    // Command/tool registrations persist across session replacement, but the
-    // widget belongs to the newly restored engine and must be refreshed too.
-    refreshWidget();
     if (surfaceRegistered) return;
     surfaceRegistered = true;
 
@@ -2008,7 +2011,7 @@ export default function piWorkflows(pi: ExtensionAPI): void {
       return;
     }
     engine = recoveredEngine;
-    widgetUi = ctx.mode === "tui" ? ctx.ui : undefined;
+    widgetUi = ctx.mode === "tui" && ctx.hasUI ? ctx.ui : undefined;
     registerSurface();
 
     // Public API methods target the current session: generation + branch
@@ -2017,7 +2020,9 @@ export default function piWorkflows(pi: ExtensionAPI): void {
     deliveryBranchAnchor = journalBranchAnchor;
     registerStatusActions();
     workflowUiBridge ??= new WorkflowUiBridge(pi.events, workflowUiSurface);
-    workflowUiBridge.publish();
+    // Bind the presentation only after its session/branch source is installed.
+    refreshWidget();
+    if (!widgetUi) workflowUiBridge.publish();
     inputPreparing = false;
     compacting = false;
     navigating = false;

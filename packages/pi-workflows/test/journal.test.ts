@@ -9,6 +9,7 @@
  *  - buildResumeJournal reconstructs the runtime's cache map
  */
 
+import { parseManagedTerminalSnapshot } from "@signalridge/pi-subagents-protocol";
 import { describe, expect, it } from "vitest";
 import {
   applyRecoveryEvent,
@@ -353,6 +354,77 @@ describe("workflow journal replay (schema v4)", () => {
     expect(run?.callResults["0"]?.tier).toBe("low");
     expect(run?.callStatus["0"]).toBe("completed");
     expect(run?.finalResult).toEqual({ report: "done" });
+  });
+
+  it.each([257, 2_000])(
+    "restores an exact %i-character managed transcript pointer with terminal ownership",
+    (length) => {
+      const runId = "pointer-boundary";
+      const attemptId = `${runId}/0/attempt-1`;
+      const owner = { extension: "pi-workflows", runId, nodeId: "0", attemptId };
+      const outputFile = `/transcripts/${"x".repeat(length - 13)}`;
+      const result = {
+        status: "failed",
+        attemptId,
+        agentId: "child",
+        outputFile,
+        tokenCount: 0,
+        compactionCount: 2,
+        updatedAt: 3,
+      };
+      const entries = [
+        runCreated(runId),
+        transition(runId, "running", 2),
+        callAttempt(runId, "0", 2),
+        callResult(runId, "0", 3, { result, attemptId, owner, callHash: undefined }),
+        transition(runId, "completed", 4),
+      ];
+      const accepted: unknown[] = [];
+      const diagnostics: string[] = [];
+      const restored = replayJournal(entries, {
+        onInvalid: (message) => diagnostics.push(message),
+        onAccepted: (event) => accepted.push(event),
+      }).get(runId);
+      expect(diagnostics).toEqual([]);
+      expect(restored?.status).toBe("completed");
+      expect(restored?.callStatus["0"]).toBe("failed");
+      expect(restored?.attemptIds["0"]).toBe(attemptId);
+      expect(restored?.agentIds["0"]).toBe("child");
+      expect(restored?.callResults["0"]).toEqual({ ...result, tier: "low" });
+      expect(accepted).toContainEqual(expect.objectContaining({ kind: "call_result", owner }));
+      expect(buildResumeJournal(entries).size).toBe(0);
+    },
+  );
+
+  it.each(["x".repeat(2_001), "", " \t\n ", 42, null, {}])(
+    "rejects a persisted transcript pointer rejected by the managed protocol: %j",
+    (outputFile) => {
+      expect(() =>
+        parseManagedTerminalSnapshot({ status: "failed", outputFile, compactionCount: 0, completedAt: 1 }),
+      ).toThrow();
+      const diagnostics: string[] = [];
+      const runs = replayJournal(
+        [
+          runCreated("invalid-pointer"),
+          callResult("invalid-pointer", "0", 3, {
+            result: { status: "failed", outputFile, tokenCount: 0, compactionCount: 0, updatedAt: 3 },
+          }),
+        ],
+        { onInvalid: (message) => diagnostics.push(message) },
+      );
+      expect(runs.has("invalid-pointer")).toBe(false);
+      expect(diagnostics).toHaveLength(1);
+    },
+  );
+
+  it("keeps the journal's generic identity bound independent of transcript pointers", () => {
+    const runs = replayJournal([
+      runCreated("long-agent-id"),
+      callResult("long-agent-id", "0", 3, {
+        result: { status: "failed", agentId: "x".repeat(257), compactionCount: 0, updatedAt: 3 },
+      }),
+    ]);
+    expect(runs.has("long-agent-id")).toBe(false);
   });
 
   it("rejects an unknown run reference", () => {

@@ -12,7 +12,7 @@ describe("owned Node execution frames (disposable process, external deadline)", 
     expect(stderr).toBe("");
     expect(stdout).toContain("PASS controls");
   }, 15000);
-  it.each([
+  const modes = [
     "sync",
     "async",
     "parallel",
@@ -56,17 +56,24 @@ describe("owned Node execution frames (disposable process, external deadline)", 
     "nestedAbort",
     "parentLagHealthy",
     "parentLagStall",
-  ])(
-    "bounds %s without blocking the Pi parent or leaking its child",
-    async (mode) => {
-      const { stdout, stderr } = await execute(
-        "node",
-        ["--unhandled-rejections=strict", "--import", fixture("node-typescript.mjs"), fixture("vm-owned.ts"), mode],
-        { timeout: 12000 },
-      );
-      expect(stderr).toBe("");
-      expect(stdout).toContain(`PASS ${mode}`);
-    },
-    15000,
-  );
+  ];
+  for (const mode of modes) {
+    // Capacity cases exercise 8,300 sequential callbacks and 16,600 IPC roundtrips.
+    // Only their outer hang guards budget that transport work; in-fixture
+    // liveness, ownership, cancellation and cleanup deadlines stay unchanged.
+    const capacity = mode === "retainedContextCapacity" || mode === "scopeRecycling";
+    it(
+      `bounds ${mode} without blocking the Pi parent or leaking its child`,
+      async () => {
+        const { stdout, stderr } = await execute(
+          "node",
+          ["--unhandled-rejections=strict", "--import", fixture("node-typescript.mjs"), fixture("vm-owned.ts"), mode],
+          { timeout: capacity ? 30_000 : 12_000 },
+        );
+        expect(stderr).toBe("");
+        expect(stdout).toContain(`PASS ${mode}`);
+      },
+      capacity ? 35_000 : 15_000,
+    );
+  }
 });

@@ -146,7 +146,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
 
         if (!isCurrent()) {
           browser.dispose();
-          return browser;
+          return { ...browser, capturesViewportInput: true };
         }
         closeActiveInteraction?.();
         closeActiveInteraction = dispose;
@@ -156,6 +156,7 @@ export default function editorExtension(pi: ExtensionAPI): void {
         }, POLL_INTERVAL_MS);
 
         return {
+          capturesViewportInput: true,
           render: (w) => (isCurrent() ? (browser?.render(w) ?? []) : []),
           handleInput: (data) => {
             if (!isCurrent()) return;

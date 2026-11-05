@@ -42,6 +42,7 @@ function makeContext(branch, api, widgets) {
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
     },
     sessionManager: {
+      getSessionId: () => "recap-test",
       getBranch: () => branch,
       buildSessionProjection: () => buildSessionProjection(branch),
     },

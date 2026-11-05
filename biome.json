@@ -6,6 +6,7 @@
       "packages/**/*.js",
       "packages/**/*.mjs",
       "scripts/**/*.mjs",
+      "scripts/**/*.cjs",
       "scripts/**/*.ts",
       "vitest.integration.config.ts",
       "!packages/pi-subagents/**",

@@ -73,6 +73,7 @@ describe("pre-dispatch soft budget gates through real helper IPC", () => {
   it.each(["run", "phase"])("checks %s budget before every empty/schema/execution retry", async (scope) => {
     for (const kind of ["empty", "schema", "failure"]) {
       const retrySpend = vi.fn();
+      const agentEnd = vi.fn();
       const run = vi.fn(async (_prompt: string, options?: AgentRunOptions) => {
         options?.onUsage?.({ ...UNIT });
         if (kind === "failure")
@@ -90,12 +91,22 @@ describe("pre-dispatch soft budget gates through real helper IPC", () => {
           tokenBudget: scope === "run" ? 1 : null,
           agent: { run },
           onRetrySpend: retrySpend,
+          onAgentEnd: agentEnd,
         },
       );
       expect(run).toHaveBeenCalledTimes(1);
       expect(result.result).toEqual({ code: EXHAUSTED, spent: 1 });
       expect(result.tokenUsage?.total).toBe(1);
       expect(retrySpend).toHaveBeenCalledExactlyOnceWith(1);
+      expect(agentEnd).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          result: null,
+          tokens: 1,
+          tokenUsage: UNIT,
+          errorCode: EXHAUSTED,
+          recoverable: false,
+        }),
+      );
     }
   });
 

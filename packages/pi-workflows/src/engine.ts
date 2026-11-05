@@ -20,7 +20,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { ManagedSpawnResponse } from "@signalridge/pi-subagents-protocol";
 import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
-import { describeWorkflowError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import {
+  AllocationFreeDispatchError,
+  describeWorkflowError,
+  WorkflowError,
+  WorkflowErrorCode,
+  wrapError,
+} from "./errors.js";
 import { type WorkflowInspection, type WorkflowInspectionHeader, WorkflowPresentation } from "./inspection.js";
 import {
   applyRecoveryEvent,
@@ -46,6 +52,7 @@ import {
   type DispatchTask,
   type ManagedProtocolCheck,
   type ManagedSpawnClient,
+  prepareManagedSpawnRequest,
   type WorkflowEventBus,
 } from "./rpc-client.js";
 import {
@@ -179,6 +186,8 @@ interface ManagedCallFacts {
   executionGeneration: number;
   attemptId: string;
   agentId: string;
+  /** Exact-owner terminal admission, not merely a queued/running identity. */
+  settled?: boolean;
   tokenCount?: number;
   outputFile?: string;
   compactionCount: number;
@@ -788,6 +797,7 @@ export class WorkflowEngine {
       facts.agentId !== agentId
     )
       return;
+    facts.settled = true;
     facts.tokenCount = terminal.tokenCount;
     facts.outputFile = terminal.outputFile;
     facts.compactionCount = Math.max(facts.compactionCount, terminal.compactionCount);
@@ -1564,6 +1574,12 @@ export class WorkflowEngine {
         onAgentEnd: (event) => {
           if (!isPresentationCurrent()) return;
           const nodeId = event.id.startsWith(`${runId}:`) ? event.id.slice(runId.length + 1) : undefined;
+          // A completed child is not a successful logical call until runtime
+          // validation accepts it. Exhausted schema/repair failures must settle
+          // the current journal attempt too, not just its volatile presentation.
+          if (nodeId !== undefined && event.error !== undefined)
+            this.finalizeLogicalCallFailure(state, nodeId, event.error);
+          if (!isPresentationCurrent()) return;
           const persisted = nodeId === undefined ? undefined : state.run.callResults[nodeId];
           const persistedTokens =
             nodeId !== undefined && persisted?.attemptId === state.run.attemptIds[nodeId]
@@ -1712,7 +1728,6 @@ export class WorkflowEngine {
     const spawnNodeId = `call-${nodeId}`;
     const base = state.generations.get(nodeId) ?? 0;
     const generation = base + (runOptions.attempt ?? 1);
-    state.generations.set(nodeId, generation);
     const spawnAttemptId = `attempt-${generation}`;
     const attemptId = `${runId}/${nodeId}/attempt-${generation}`;
 
@@ -1725,13 +1740,6 @@ export class WorkflowEngine {
         { recoverable: false },
       );
     }
-    // This dispatch is authoritative for the current script revision. Do not
-    // carry an identity from the previous script: deleting `tier` must clear
-    // the recorded one instead of silently preserving the old route.
-    const tierIdentity: CallTierIdentity = tier === undefined ? {} : { tier };
-    state.callTiers.set(nodeId, tierIdentity);
-    run.callTiers[nodeId] = tierIdentity;
-    state.managedCallFacts.delete(nodeId);
     const task: DispatchTask = {
       subagent_type: type,
       prompt,
@@ -1742,6 +1750,25 @@ export class WorkflowEngine {
       ...(runOptions.excludeTools === undefined ? {} : { excludeTools: runOptions.excludeTools }),
       ...(runOptions.isolation === undefined ? {} : { isolation: runOptions.isolation }),
     };
+
+    // Validate the complete effective wire request (schema/repair text included)
+    // before any attempt fact or submitted lease. A deterministic caller error
+    // owns no remote allocation; cleanup must not mask its original diagnostic.
+    try {
+      prepareManagedSpawnRequest(task, runId, spawnNodeId, spawnAttemptId);
+    } catch (error: unknown) {
+      // This proof is minted only on the allocation-free side of dispatch;
+      // errors from client.spawn below remain conservatively chargeable.
+      throw new AllocationFreeDispatchError(error);
+    }
+    state.generations.set(nodeId, generation);
+    // This dispatch is authoritative for the current script revision. Do not
+    // carry an identity from the previous script: deleting `tier` must clear
+    // the recorded one instead of silently preserving the old route.
+    const tierIdentity: CallTierIdentity = tier === undefined ? {} : { tier };
+    state.callTiers.set(nodeId, tierIdentity);
+    run.callTiers[nodeId] = tierIdentity;
+    state.managedCallFacts.delete(nodeId);
 
     // Journal the attempt rotation only for top-level calls. A nested frame is
     // represented by its parent workflow_result replay boundary instead of
@@ -2233,6 +2260,33 @@ export class WorkflowEngine {
     state.run.callTiers[nodeId] = result.tier === undefined ? {} : { tier: result.tier };
     state.run.callStatus[nodeId] = "completed";
     state.run.updatedAt = Date.now();
+  }
+
+  private finalizeLogicalCallFailure(state: ScriptRunState, nodeId: string, error: string): void {
+    const run = state.run;
+    const facts = state.managedCallFacts.get(nodeId);
+    // No guesses about unknown remote admissions, stale attempts, nested calls,
+    // or failures already committed by dispatch's lifecycle terminal path.
+    if (
+      run.callStatus[nodeId] !== "running" ||
+      !facts?.settled ||
+      facts.executionGeneration !== state.executionGeneration ||
+      facts.attemptId !== run.attemptIds[nodeId]
+    )
+      return;
+    const result = resultFromLifecycle(
+      "failed",
+      facts.agentId,
+      undefined,
+      error,
+      facts.compactionCount,
+      facts.tokenCount,
+      state.callTiers.get(nodeId)?.tier,
+    );
+    result.attemptId = facts.attemptId;
+    if (facts.outputFile !== undefined) result.outputFile = facts.outputFile;
+    // No call hash/store delta: invalid output can never enter the replay cache.
+    this.commitCallTerminal(run.runId, nodeId, result);
   }
 
   private commitCallTerminal(runId: string, nodeId: string, result: CallResult, required = false): void {

@@ -612,6 +612,7 @@ for (const firstKind of ["diagnostics", "fix"] as const) {
     `runner retains ${firstKind} leases across calls after %s until confirmed close`,
     async (failure) => {
       const server = adapter("silent-initialize");
+      server.env = { PI_LSP_TEST_READY: path.join(root, "silent.ready") };
       const labels: Array<string | undefined> = [];
       const ctx = { ui: { setStatus: (_key: string, label: string | undefined) => labels.push(label) } };
       let blockedChild: ChildProcess | undefined;
@@ -625,10 +626,26 @@ for (const firstKind of ["diagnostics", "fix"] as const) {
         this.emit("error", error);
         return false;
       });
-      const invoke = (kind: "diagnostics" | "fix", target = server, directory = root) =>
-        kind === "diagnostics"
-          ? runDiagnostics(target, { root: directory, paths: ["main.go"] }, 150, undefined, ctx, "shared-status")
-          : runFix(target, { root: directory, path: "main.go" }, 150, undefined, ctx, "shared-status");
+      let expectedReady: string | undefined;
+      const start = LspClient.prototype.start;
+      vi.spyOn(LspClient.prototype, "start").mockImplementation(async function (this: LspClient) {
+        const ready = expectedReady;
+        if (ready) rmSync(ready, { force: true });
+        await start.call(this);
+        if (ready) await waitForFile(path.relative(root, ready));
+      });
+      const invoke = async (kind: "diagnostics" | "fix", target = server, directory = root) => {
+        // Stable per-adapter readiness paths preserve effective-environment lease
+        // identity, including aliases and calls blocked before actual spawning.
+        expectedReady = target.env?.PI_LSP_TEST_READY;
+        try {
+          return await (kind === "diagnostics"
+            ? runDiagnostics(target, { root: directory, paths: ["main.go"] }, 150, undefined, ctx, "shared-status")
+            : runFix(target, { root: directory, path: "main.go" }, 150, undefined, ctx, "shared-status"));
+        } finally {
+          expectedReady = undefined;
+        }
+      };
       const started = Date.now();
       await assert.rejects(invoke(firstKind), /timed out: initialize/, "preserve the request error");
       assert.ok(Date.now() - started < 2000, "unconfirmed cleanup must be bounded");
@@ -648,7 +665,9 @@ for (const firstKind of ["diagnostics", "fix"] as const) {
 
       // A different actual adapter on the same root is independent, even when
       // callers use the same status key. Same adapter on another root is too.
-      await invoke(otherKind, adapter("clean"));
+      const clean = adapter("clean");
+      clean.env = { PI_LSP_TEST_READY: path.join(root, "clean.ready") };
+      await invoke(otherKind, clean);
       assert.equal(pids().length, 2);
       assertGone(pids()[1]);
       const otherRoot = path.join(root, "other-root");

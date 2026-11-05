@@ -25,7 +25,7 @@ const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 for (const deadline of ["poll", "expiry", "debounce", "in-flight", "print", "rpc"] as const) {
   test(`installed SDK retires GitHub ${deadline} ownership without shutdown`, async () => {
-    assert.equal(VERSION, "1.4.0");
+    assert.equal(VERSION, "1.5.0");
     const cwd = mkdtempSync(join(tmpdir(), "github-dispose-"));
     const agentDir = join(cwd, "agent");
     mkdirSync(agentDir);

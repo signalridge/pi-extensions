@@ -21,20 +21,24 @@ import {
   isManagedAgentTier,
   parseManagedSpawnRequest,
 } from "@signalridge/pi-subagents-protocol";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { AGENT_RECORD_ENTRY_TYPE, findSavedAgentRecord, savedResumableAgents } from "./agent-record-entry.js";
+import { type AgentReopenMetadata, acquireAgentSessionLease, CHILD_IDENTITY_ENTRY_TYPE, captureAgentReopenMetadata, validateAgentReopen } from "./agent-reopen.js";
+import { resolveAgentRunModel, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import {
   type AgentTierResolutionSnapshot,
   getAgentTiersSettings,
   resolveAgentTier,
 } from "./agent-tiers.js";
-import { getAgentConfig } from "./agent-types.js";
+import { getAgentConfig, resolveSpawnType } from "./agent-types.js";
 import {
   assertNoRawInheritance,
   assertSafeChildSession,
 } from "./context-boundary.js";
 import {
+  assertNoPublicReopen,
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
+  INTERNAL_REOPEN_ROUTE,
   INTERNAL_RESOLVED_ISOLATED,
   INTERNAL_RESUME_BUDGET_POLICY,
   type InternalAgentConfigOverride,
@@ -48,6 +52,9 @@ import {
   parentModelSessionOptions,
 } from "./model-runtime-bridge.js";
 import type { ParentQuestionHandler } from "./parent-questions.js";
+import { captureProjectTrust, isProjectResource } from "./project-trust.js";
+import { captureQuestionOrigin } from "./question-origin.js";
+import { assertReopenRoute, captureReopenRoute } from "./reopen-route.js";
 import { selectResumeTurnPolicy } from "./run-budget-policy.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import type { TierThinking } from "./settings.js";
@@ -63,6 +70,7 @@ import type {
 } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import {
+  assertReusableWorktree,
   cleanupWorktree,
   cleanupWorktreeAsync,
   createWorktree,
@@ -251,6 +259,7 @@ function snapshotAgentRecord(record: AgentRecord): AgentRecordSnapshot {
   Reflect.deleteProperty(snapshot, "outputCleanup");
 
   Reflect.deleteProperty(snapshot, "promise");
+  Reflect.deleteProperty(snapshot, "reopen");
   return Object.freeze(snapshot);
 }
 
@@ -345,6 +354,7 @@ interface SpawnArgs {
   options: SpawnOptions;
   internalOverride?: InternalAgentConfigOverride;
   parentQuestion?: ParentQuestionHandler;
+  coldResume?: ResumableAgentEntry;
 }
 
 export type ManagedSpawnRequest = ProtocolManagedSpawnRequest;
@@ -1001,20 +1011,6 @@ export interface SpawnOptions {
   configCwd?: string;
   /** Root session id, inherited by nested launches so transcripts stay grouped. */
   rootSessionId?: string;
-  /**
-   * Reuse an existing mention handle instead of allocating a fresh one. Set when
-   * a resumable entry is reopened, so `@handle` keeps addressing the same
-   * conversation across the eviction. Bypasses the uniqueness search on purpose:
-   * the handle is already spoken for by the entry being reopened.
-   */
-  reclaimHandle?: string;
-  /**
-   * Reopen the conversation in this session file rather than starting a new
-   * one. Like `reclaimHandle`, an internal capability: the value always comes
-   * from a resumable entry this extension wrote, never from a tool argument or
-   * an RPC payload — a forged path would let a spawn read an unrelated session.
-   */
-  resumeSessionFile?: string;
 }
 
 /** Internal managed-spawn policy; model/thinking resolution is finalized by runAgent. */
@@ -1158,6 +1154,14 @@ export class AgentManager {
    * Distinct from ManagedSpawnTombstone (managed-spawn idempotency).
    */
   private readonly resumable = new Map<string, ResumableAgentEntry>();
+  /** Native-file leases outlive terminal status until provider and teardown settlement. */
+  private readonly sessionLeases = new Map<string, () => void>();
+  private readonly reopenOrigins = new WeakMap<AgentRecord, {
+    pi: ExtensionAPI; ctx: ExtensionContext; current: ReturnType<typeof captureQuestionOrigin>; epoch: number;
+  }>();
+  private reopenEpoch = 0;
+  private receiptPublicationClosed = false;
+  private readonly retiringHandles = new Map<string, string>();
   /** Whether evicted records are indexed at all (settings: rememberAgents). */
   private rememberAgents = true;
   /** Whether spawned agents get `contact_supervisor` (settings). */
@@ -1306,6 +1310,47 @@ export class AgentManager {
     } catch {
       // A broken child shutdown handler must not prevent sibling teardown.
     }
+  }
+
+  /** Advance only a proven ordinary receipt after native shutdown has stopped writing. */
+  private refreshReopenAfterTeardown(record: AgentRecord, session: AgentSession, expected?: AgentReopenMetadata): boolean {
+    const origin = this.reopenOrigins.get(record);
+    if (this.receiptPublicationClosed || !origin || origin.epoch !== this.reopenEpoch || !origin.current(origin.ctx) ||
+      (this.agents.has(record.id) && this.agents.get(record.id) !== record)) return false;
+    try {
+      const reopen = captureAgentReopenMetadata({ ...record, session });
+      if (!reopen || !record.sessionFile) return false;
+      const entry: ResumableAgentEntry = { id: record.id, type: record.type, description: record.description,
+        handle: reopen.handle, sessionFile: record.sessionFile, completedAt: record.completedAt ?? Date.now(), reopen };
+      // This retains the original route and native identity; a refused route or
+      // opaque startup injection cannot be turned into new replay consent.
+      assertReopenRoute(reopen.route, session.model);
+      validateAgentReopen(entry, origin.ctx);
+      if (expected) {
+        const branch = origin.ctx.sessionManager.getBranch();
+        const saved = savedResumableAgents(branch, origin.ctx.sessionManager.getSessionId()).find(item => item.id === record.id);
+        if (JSON.stringify(saved?.reopen) !== JSON.stringify(expected)) return false;
+        const previous = findSavedAgentRecord(branch, record.id);
+        if (!previous) return false;
+        origin.pi.appendEntry(AGENT_RECORD_ENTRY_TYPE, { ...previous, reopen });
+      }
+      record.reopen = reopen;
+      return true;
+    } catch {
+      // A failed proof/persistence keeps the original receipt, never guessed consent.
+      return false;
+    }
+  }
+
+  private releaseSessionLeaseAfterSettlement(record: AgentRecord): void {
+    const release = this.sessionLeases.get(record.id);
+    if (!release) return;
+    const pending = [record.promise, this.recordSessionTeardowns.get(record.id)].filter(value => value !== undefined);
+    void Promise.allSettled(pending).then(() => {
+      if (this.sessionLeases.get(record.id) !== release) return;
+      this.sessionLeases.delete(record.id);
+      release();
+    });
   }
 
   private releasePoolSlot(id: string): void {
@@ -1468,6 +1513,12 @@ export class AgentManager {
       // permanently unavailable journal degrades to a warning, never a failed run.
       this.scheduleManagedPersistenceRetry(tombstone);
     }
+  }
+
+  private finishOutput(record: AgentRecord): void {
+    const cleanup = record.outputCleanup;
+    record.outputCleanup = undefined;
+    try { cleanup?.(); } catch { /* Transcript errors cannot orphan resume ownership. */ }
   }
 
   private notifyComplete(record: AgentRecord): void {
@@ -1748,7 +1799,79 @@ export class AgentManager {
   ): string {
     // Public/legacy spawns never receive an owner capability. The internal
     // managed path passes owner separately after validating its request.
+    assertNoPublicReopen(options);
     return this.spawnInternal(pi, ctx, type, prompt, options);
+  }
+
+  /** Rebuild the bounded index exclusively from the active parent's branch. */
+  restoreSavedAgents(ctx: ExtensionContext): void {
+    this.resumable.clear();
+    if (!this.rememberAgents || this.disposed) return;
+    const entries = savedResumableAgents(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId());
+    for (const entry of entries) {
+      // Ambiguous handle/name receipts never select one conversation by accident.
+      if (entries.some(other => other.id !== entry.id &&
+        (other.handle.toLowerCase() === entry.handle.toLowerCase() || other.id === entry.handle || other.handle === entry.id))) continue;
+      this.resumable.set(entry.handle, entry);
+    }
+  }
+
+  /** Continue a package-issued ordinary identity, never an arbitrary session path. */
+  reopen(pi: ExtensionAPI, ctx: ExtensionContext, name: string, prompt: string, options: SpawnOptions): string {
+    assertNoPublicReopen(options);
+    for (const key of ["isolated", "isolation"] as const) {
+      if (options[key] !== undefined) throw new Error(`Cold resume does not support per-call ${key}; omit ${key} to preserve the original restrictions, or start a fresh Agent.`);
+    }
+    if (!this.rememberAgents) throw new Error("Remember agents is disabled. Enable it before continuing saved agents.");
+    const entry = this.getResumable(name);
+    if (!entry) throw new Error(`No ordinary saved agent on this branch: "${name}". Use the owning workflow's recovery controls for managed agents, or start a new Agent.`);
+    if (this.agents.has(entry.id) || this.recordSessionTeardowns.has(entry.id)) {
+      throw new Error("This agent is live or still settling; wait for its existing instance instead of reopening it.");
+    }
+    for (const live of this.agents.values()) {
+      if (live.handle?.toLowerCase() === entry.handle.toLowerCase()) throw new Error("Saved agent handle collides with a retained agent. Start a new Agent.");
+    }
+    const branchEntry = savedResumableAgents(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId())
+      .find(candidate => candidate.id === entry.id);
+    if (!branchEntry || branchEntry.type !== entry.type || branchEntry.handle !== entry.handle ||
+      JSON.stringify(branchEntry.reopen) !== JSON.stringify(entry.reopen)) throw new Error("Saved agent receipt is stale or belongs to another branch. Return to its latest owning branch or start a new Agent.");
+    if (options.parentAgentId !== undefined || options.depth !== undefined || options.configCwd !== undefined) {
+      throw new Error("Cold continuation is available only to ordinary top-level agents.");
+    }
+    const dispatch = resolveSpawnType(entry.type);
+    if (!dispatch.ok || dispatch.fellBackFrom !== undefined || dispatch.type !== entry.type) {
+      throw new Error(`The original agent type "${entry.type}" is no longer available. Restore/enable its trusted definition or start a new Agent.`);
+    }
+    const config = getAgentConfig(entry.type);
+    const trust = captureProjectTrust(ctx);
+    if (!trust.trusted && (config?.source === "project" || (config?.sourcePath && isProjectResource(config.sourcePath, trust.cwd)))) {
+      throw new Error(`The current agent definition "${entry.type}" is not trusted. Restore project trust or start a new trusted Agent.`);
+    }
+    if (config?.persistSession === false) throw new Error("The current agent definition disables session persistence; saved continuation is refused.");
+    assertReopenRoute(entry.reopen?.route, resolveAgentRunModel(ctx, config, options));
+    validateAgentReopen(entry, ctx);
+    const policy = resolveAgentInvocationConfig(config, {});
+    if (entry.reopen?.isolation === "worktree") {
+      if (!isWorktreeIsolationEnabled()) throw new Error("Worktree isolation is disabled; restore the original isolation policy before continuing this agent.");
+      assertReusableWorktree(entry.reopen.worktree!);
+    } else if (policy.isolation === "worktree") {
+      throw new Error("The current definition requires isolation but the saved agent has no isolated checkout. Start a new isolated Agent; continuation never creates a replacement checkout.");
+    }
+    const release = acquireAgentSessionLease(entry.sessionFile);
+    this.sessionLeases.set(entry.id, release);
+    try {
+      return this.spawnInternal(pi, ctx, entry.type, prompt, {
+        ...options, description: entry.description, rootSessionId: ctx.sessionManager.getSessionId(),
+        cwd: entry.reopen!.cwd, isolation: entry.reopen!.isolation,
+        isolated: entry.reopen!.isolated || policy.isolated, inheritContext: policy.inheritContext,
+        supervisorQuestions: entry.reopen!.supervisorQuestions && this.supervisorQuestions && options.supervisorQuestions !== false,
+        excludeTools: [...new Set([...(entry.reopen!.excludeTools ?? []), ...(options.excludeTools ?? [])])],
+      }, undefined, entry.id, undefined, entry);
+    } catch (error) {
+      if (this.sessionLeases.get(entry.id) === release) this.sessionLeases.delete(entry.id);
+      release();
+      throw error;
+    }
   }
 
   private spawnInternal(
@@ -1760,6 +1883,7 @@ export class AgentManager {
     owner?: AgentOwner,
     idOverride?: string,
     internalOverride?: InternalAgentConfigOverride,
+    coldResume?: ResumableAgentEntry,
   ): string {
     if (this.disposed) throw new Error("AgentManager is disposed");
 
@@ -1841,10 +1965,10 @@ export class AgentManager {
         isolated: options.isolated,
         isolation: options.isolation,
       });
-      options = { ...options, isolated: policy.isolated, isolation: policy.isolation };
+      options = { ...options, isolated: coldResume?.reopen?.isolated || policy.isolated, isolation: policy.isolation };
     }
     if (options.supervisorQuestions === "parent" &&
-        (options.isBackground !== true || options.parentAgentId !== undefined || options.resumeSessionFile ||
+        (options.isBackground !== true || options.parentAgentId !== undefined || coldResume ||
           options.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
       throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
     }
@@ -1932,15 +2056,17 @@ export class AgentManager {
     // Top-level agents get a mention handle derived from their type. The name
     // space covers live records and resumable entries, so a handle is never
     // allocated twice while its conversation is still reachable.
-    if (
-      options.parentAgentId === undefined &&
-      options.reclaimHandle === undefined
-    ) {
+    if (coldResume) {
+      record.handle = coldResume.handle;
+      record.sessionFile = coldResume.sessionFile;
+      record.reopen = coldResume.reopen;
+    } else if (options.parentAgentId === undefined && !owner) {
       record.handle = assignHandle(handleBase(type), this.takenHandles());
-    } else if (options.reclaimHandle !== undefined) {
-      record.handle = options.reclaimHandle;
     }
     this.agents.set(id, record);
+    // Native resumes never unseal a settled owner's nested-delegation branch.
+    // Cold continuation must not reset that safety boundary through eviction.
+    if (coldResume) this.sealNestedSpawns(id);
     // Capture before observers or a synchronous runner can report early usage.
     if (record.owner) this.managedUsageBaselines.set(id, {
       record, owner: record.owner, usage: { ...record.lifetimeUsage },
@@ -1965,6 +2091,7 @@ export class AgentManager {
       prompt,
       options,
       internalOverride,
+      coldResume,
       ...(options.supervisorQuestions === "parent" ? { parentQuestion: this.parentQuestionFactory!(record, ctx) } : {}),
     };
     if (options.supervisorQuestions === "parent") this.parentQuestionAgents.add(record);
@@ -2390,7 +2517,7 @@ export class AgentManager {
   private startAgent(
     id: string,
     record: AgentRecord,
-    { pi, ctx, type, prompt, options, internalOverride, parentQuestion }: SpawnArgs,
+    { pi, ctx, type, prompt, options, internalOverride, parentQuestion, coldResume }: SpawnArgs,
   ) {
     if (this.disposed || record.detached || this.agents.get(id) !== record)
       return;
@@ -2400,6 +2527,9 @@ export class AgentManager {
     assertValidSpawnCwd(options.cwd);
     // Single resolution point for the caller-supplied cwd — the worktree base
     // repo and both cleanup calls below MUST agree on this value forever.
+    if (!record.owner && !record.parentAgentId && typeof ctx.sessionManager?.getBranch === "function") {
+      this.reopenOrigins.set(record, { pi, ctx, current: captureQuestionOrigin(ctx), epoch: this.reopenEpoch });
+    }
     const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
     const baseCwd = customCwd ?? ctx.cwd;
 
@@ -2409,7 +2539,30 @@ export class AgentManager {
     // "off" explicitly opts out; global switch gates "worktree" deterministically.
     let worktreeCwd: string | undefined;
     let worktreeRepoRoot: string | undefined;
-    if (options.isolation === "off") {
+    if (coldResume) {
+      // Queue waits must not turn a valid receipt into unchecked stale authority.
+      if (!this.rememberAgents) throw new Error("Remember agents was disabled while this continuation was queued. Enable it and retry.");
+      const dispatch = resolveSpawnType(type);
+      if (!dispatch.ok || dispatch.fellBackFrom !== undefined || dispatch.type !== type) throw new Error("The original agent type is no longer available. Restore/enable it and retry.");
+      const definition = getAgentConfig(type);
+      if (definition?.persistSession === false) throw new Error("The current agent definition disables session persistence; saved continuation is refused.");
+      const policy = resolveAgentInvocationConfig(definition, {});
+      assertNoRawInheritance(policy.inheritContext);
+      if (!coldResume.reopen?.worktree && policy.isolation === "worktree") throw new Error("The current definition requires a new isolated checkout. Start a new Agent; continuation never creates one.");
+      options = { ...options, isolated: coldResume.reopen!.isolated || policy.isolated, inheritContext: policy.inheritContext,
+        supervisorQuestions: coldResume.reopen!.supervisorQuestions && this.supervisorQuestions && options.supervisorQuestions !== false,
+        maxTurns: resolveMaxTurns(definition, options.maxTurns) };
+      assertReopenRoute(coldResume.reopen?.route, resolveAgentRunModel(ctx, definition, options));
+      validateAgentReopen(coldResume, ctx);
+      if (coldResume.reopen?.worktree) {
+        if (!isWorktreeIsolationEnabled()) throw new Error("Worktree isolation is now disabled; continuation refused.");
+        assertReusableWorktree(coldResume.reopen.worktree);
+        record.worktree = { ...coldResume.reopen.worktree };
+        worktreeCwd = coldResume.reopen.cwd;
+        worktreeRepoRoot = coldResume.reopen.worktree.repoRoot;
+        this.worktreeRepos.add(worktreeRepoRoot);
+      }
+    } else if (options.isolation === "off") {
       // Explicit opt-out — no worktree, no check.
     } else if (options.isolation === "worktree") {
       if (!isWorktreeIsolationEnabled()) {
@@ -2473,6 +2626,7 @@ export class AgentManager {
     this.providerPendingRecords.add(id);
 
     let rawPromise: ReturnType<typeof runAgent>;
+    let discardedColdSession: AgentSession | undefined;
     try {
       rawPromise = runAgent(ctx, type, prompt, {
         pi,
@@ -2510,7 +2664,9 @@ export class AgentManager {
         rememberAgents: this.rememberAgents,
         supervisorQuestions: options.supervisorQuestions ?? this.supervisorQuestions,
         parentQuestion,
-        resumeSessionFile: options.resumeSessionFile,
+        resumeSessionFile: coldResume?.sessionFile,
+        onSessionDiscarded: coldResume ? session => { discardedColdSession = session; } : undefined,
+        ...(coldResume?.reopen?.route ? { [INTERNAL_REOPEN_ROUTE]: { route: { ...coldResume.reopen.route } } } : {}),
         toolset: options.toolset,
         excludeTools: options.excludeTools,
         thread: options.thread,
@@ -2572,6 +2728,32 @@ export class AgentManager {
           record.sessionFile =
             session.sessionManager?.getSessionFile?.() ??
             (session as { sessionFile?: string })?.sessionFile;
+          if (!coldResume && !record.owner && !record.parentAgentId && !this.parentQuestionAgents.has(record) && record.handle && record.sessionFile) {
+            const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
+            const header = session.sessionManager?.getHeader?.();
+            if (parentSessionFile && header?.parentSession === parentSessionFile) {
+              const route = captureReopenRoute(session.model);
+              session.sessionManager.appendCustomEntry(CHILD_IDENTITY_ENTRY_TYPE, {
+                id: record.id, type: record.type, handle: record.handle, rootSessionId: ctx.sessionManager.getSessionId(), parentSessionFile,
+                ...(route ? { route } : {}),
+                cwd: header.cwd, isolation: record.worktree ? "worktree" : "off",
+                isolated: options.isolated === true, supervisorQuestions: options.supervisorQuestions !== false && this.supervisorQuestions,
+                ...(options.excludeTools?.length ? { excludeTools: [...options.excludeTools] } : {}),
+                ...(record.worktree ? { worktree: { ...record.worktree } } : {}),
+              });
+              this.sessionLeases.set(id, acquireAgentSessionLease(record.sessionFile));
+              record.reopen = {
+                version: 1, handle: record.handle, sessionFile: record.sessionFile,
+                ...(route ? { route } : {}),
+                sessionId: header.id, leafId: session.sessionManager.getLeafId()!,
+                rootSessionId: ctx.sessionManager.getSessionId(), parentSessionFile, cwd: header.cwd,
+                isolation: record.worktree ? "worktree" : "off",
+                isolated: options.isolated === true, supervisorQuestions: options.supervisorQuestions !== false && this.supervisorQuestions,
+                ...(options.excludeTools?.length ? { excludeTools: [...options.excludeTools] } : {}),
+                ...(record.worktree ? { worktree: { ...record.worktree } } : {}),
+              };
+            }
+          }
           // Flush any steers that arrived before the session was ready
           for (const pending of this.takePendingSteers(record)) {
             void this.submitPendingSteer(record, session, pending).catch(() => {});
@@ -2714,6 +2896,25 @@ export class AgentManager {
         return responseText;
       })
       .catch(async (err) => {
+        // Even a handoff callback or prompt preparation can fail after cold
+        // admission. Never leave that session available to the live-resume path.
+        // Keep settlement/lease ownership until abort and shutdown have finished.
+        if (coldResume && record.session) {
+          const session = record.session;
+          record.session = undefined;
+          record.sessionFile = coldResume.sessionFile;
+          record.reopen = coldResume.reopen;
+          try {
+            await session.abort();
+          } catch {
+            /* shutdown must still run when abort fails */
+          }
+          await this.awaitSessionTeardown(session);
+          discardedColdSession = session;
+        }
+        if (coldResume && discardedColdSession && !record.detached) {
+          this.refreshReopenAfterTeardown(record, discardedColdSession);
+        }
         const detached = record.detached;
         if (detached && this.disposed) {
           await this.awaitSessionTeardown(record.session);
@@ -2983,6 +3184,7 @@ export class AgentManager {
     onSpawned?: (id: string) => void,
     internalOverride?: InternalAgentConfigOverride,
   ): Promise<{ id: string; record: AgentRecord; handedOff?: boolean }> {
+    assertNoPublicReopen(options);
     // Temporarily register the onSpawned hook so startAgent can call it.
     const prevOnSpawned = this.onSpawned;
     this.onSpawned = onSpawned;
@@ -3005,7 +3207,7 @@ export class AgentManager {
       this.onSpawned = prevOnSpawned;
     }
     const record = this.agents.get(id)!;
-    if (internalOverride || options.resumeSessionFile || options.parentAgentId !== undefined || (options.depth ?? 1) !== 1 || !record.promise) {
+    if (internalOverride || options.parentAgentId !== undefined || (options.depth ?? 1) !== 1 || !record.promise) {
       await record.promise;
       return { id, record };
     }
@@ -3158,6 +3360,10 @@ export class AgentManager {
     if (!this.canResumeRecord(record)) return undefined;
     if (signal?.aborted) return record;
     if (!record.session) return undefined;
+    if (!record.owner && record.reopen?.worktree) {
+      if (!isWorktreeIsolationEnabled()) throw new Error("Worktree isolation is disabled; continuation cannot downgrade the original isolated checkout.");
+      assertReusableWorktree(record.reopen.worktree);
+    }
     if (this.parentQuestionAgents.has(record) && options?.isBackground !== true) {
       throw new Error('This child uses parent clarification; resume it with run_in_background: true to avoid blocking the answering model.');
     }
@@ -3233,6 +3439,11 @@ export class AgentManager {
       return record;
     }
 
+    // Foreground runs also own a real lifecycle promise. Disposal/lease release
+    // must not await the already-completed spawn while this native run is live.
+    let settleForeground!: () => void;
+    record.promise = new Promise<string>(resolve => { settleForeground = () => resolve(record.result ?? ""); });
+    try {
     this.settlingRecords.add(id);
     const control = this.beginResumeControl(id, record, signal, snapshot);
     record.status = "running";
@@ -3290,6 +3501,7 @@ export class AgentManager {
       }
     } finally {
       if (record.detached) this.restoreResumeSnapshot(record, snapshot);
+      this.finishOutput(record);
       control.cleanup();
       this.settlingRecords.delete(id);
       this.retryDeferredRecordRemovals();
@@ -3305,6 +3517,9 @@ export class AgentManager {
     }
     this.retryDeferredRecordRemovals();
     return record;
+    } finally {
+      settleForeground();
+    }
   }
 
   /**
@@ -3427,9 +3642,11 @@ export class AgentManager {
         this.restoreResumeSnapshot(record, snapshot);
         return "";
       }
+      this.finishOutput(record);
       this.notifyComplete(record);
       return record.result ?? "";
     } finally {
+      this.finishOutput(record);
       control.cleanup();
       this.settlingRecords.delete(id);
       if (slotHeld) this.releasePoolSlot(id);
@@ -3883,9 +4100,23 @@ export class AgentManager {
         }
         record.outputCleanup = undefined;
       }
-      this.indexResumable(record);
-      if (record.session) this.trackRecordSessionTeardown(id, record.session);
+      if (record.session) {
+        const session = record.session;
+        const expected = captureAgentReopenMetadata(record);
+        if (expected) record.reopen = expected;
+        if (record.handle) this.retiringHandles.set(id, record.handle);
+        const teardown = this.trackRecordSessionTeardown(id, session);
+        void teardown.then(() => {
+          this.refreshReopenAfterTeardown(record, session, expected);
+          const origin = this.reopenOrigins.get(record);
+          const ownsBranch = origin ? origin.epoch === this.reopenEpoch && origin.current(origin.ctx) : !record.reopen;
+          // Preserve unqualified handles too: they must refuse continuation,
+          // never silently become a fresh agent-type mention. No receipt is minted.
+          if (!this.receiptPublicationClosed && ownsBranch) this.indexResumable({ ...record, session: record.reopen ? undefined : session });
+        }, () => {}).finally(() => this.retiringHandles.delete(id));
+      } else this.indexResumable(record);
       record.session = undefined;
+      this.releaseSessionLeaseAfterSettlement(record);
       this.clearParentSignal(id);
       for (const [thread, threadId] of this.managedThreads) {
         if (threadId !== id) continue;
@@ -3913,8 +4144,9 @@ export class AgentManager {
    */
   private indexResumable(record: AgentRecord): void {
     if (!this.rememberAgents) return;
-    if (record.parentAgentId !== undefined) return;
-    if (!record.sessionFile || !record.session) return;
+    if (record.parentAgentId !== undefined || record.owner || this.parentQuestionAgents.has(record)) return;
+    const reopen = captureAgentReopenMetadata(record);
+    if (!record.sessionFile || (!record.session && !reopen)) return;
     const entry: ResumableAgentEntry = {
       handle: record.handle ?? record.id,
       id: record.id,
@@ -3922,6 +4154,7 @@ export class AgentManager {
       description: record.description,
       sessionFile: record.sessionFile,
       completedAt: record.completedAt ?? Date.now(),
+      ...(reopen ? { reopen } : {}),
     };
     this.resumable.set(entry.handle, entry);
     // Bound the memory a long session can accumulate. Oldest first, since the
@@ -3943,7 +4176,7 @@ export class AgentManager {
    * an evicted conversation that `@handle` can still reopen.
    */
   private takenHandles(): ReadonlySet<string> {
-    const taken = new Set<string>(this.resumable.keys());
+    const taken = new Set<string>([...this.resumable.keys(), ...this.retiringHandles.values()]);
     for (const record of this.agents.values()) {
       if (record.handle) taken.add(record.handle);
     }
@@ -3968,7 +4201,7 @@ export class AgentManager {
     | undefined {
     const wanted = handle.toLowerCase();
     for (const record of this.agents.values()) {
-      if (record.detached) continue;
+      if (record.detached || record.owner || record.parentAgentId) continue;
       if (record.handle?.toLowerCase() === wanted || record.id === handle)
         return { kind: "live", record };
     }
@@ -3979,11 +4212,8 @@ export class AgentManager {
   /** Resolve a resumable entry by handle or id. */
   getResumable(name: string): ResumableAgentEntry | undefined {
     const wanted = name.toLowerCase();
-    for (const entry of this.resumable.values()) {
-      if (entry.handle.toLowerCase() === wanted || entry.id === name)
-        return entry;
-    }
-    return undefined;
+    const matches = [...this.resumable.values()].filter(entry => entry.handle.toLowerCase() === wanted || entry.id === name);
+    return matches.length === 1 ? structuredClone(matches[0]) : undefined;
   }
 
   /** Evicted agents whose conversation can still be reopened, newest first. */
@@ -4488,6 +4718,7 @@ export class AgentManager {
    * notifications, or persistence into the replacement branch.
    */
   detachForBranchChange(): void {
+    this.reopenEpoch++;
     this.clearManagedPersistenceRetries();
     const records = [...this.agents.values()]
       .filter((record) => !this.isFullyCleaned(record))
@@ -4618,7 +4849,10 @@ export class AgentManager {
         /* ignore stale abort errors */
       }
       if (record.session) {
-        this.trackRecordSessionTeardown(record.id, record.session);
+        const session = record.session;
+        const expected = captureAgentReopenMetadata(record);
+        const teardown = this.trackRecordSessionTeardown(record.id, session);
+        void teardown.then(() => this.refreshReopenAfterTeardown(record, session, expected), () => {});
         record.session = undefined;
       }
     }
@@ -4801,6 +5035,7 @@ export class AgentManager {
     // Clear authoritative and ownership metadata only after quarantine, session
     // shutdown, and all cleanup attempts. Detached continuations retain their
     // record object but cannot find it through this manager or recreate anything.
+    for (const record of records) this.releaseSessionLeaseAfterSettlement(record);
     this.agents.clear();
     this.managedSpawns.clear();
     this.managedKeysById.clear();
@@ -4817,6 +5052,7 @@ export class AgentManager {
     this.recordSessionTeardowns.clear();
     this.deferredRecordRemovals.clear();
     this.worktreeRepos.clear();
+    this.receiptPublicationClosed = true;
     return this.worktreeCleanupFailures;
   }
 }

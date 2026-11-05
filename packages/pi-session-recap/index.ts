@@ -367,6 +367,7 @@ async function generateRecap(
     env: auth.env,
     signal,
     cacheRetention: "none" as const,
+    sessionId: ctx.sessionManager.getSessionId(),
     maxTokens: 256,
   };
 

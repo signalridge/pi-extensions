@@ -5,7 +5,7 @@ import { OwnedOverlay } from "../src/ui.js";
 import { nativeTerminal } from "./native-terminal.js";
 
 for (const fullscreen of [true, false])
-  describe(`SDK 1.4.0 native ${fullscreen ? "fullscreen" : "regular"} UI`, () => {
+  describe(`SDK 1.5.0 native ${fullscreen ? "fullscreen" : "regular"} UI`, () => {
     it("runs Kitty encoded character commands, confirmation and p/n scrolling without accepting modified keys or paste", async () => {
       const f = await nativeTerminal(fullscreen);
       let running: Promise<void> | undefined;

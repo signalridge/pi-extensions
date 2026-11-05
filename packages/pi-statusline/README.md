@@ -58,13 +58,13 @@ Useful commands:
 /statusline          open the interactive menu in TUI mode
 /statusline inspect  inspect current extension statuses (also Ctrl+Alt+S)
 /statusline settings edit and apply the canonical JSON document
-/statusline status   show the effective source and diagnostics
+/statusline status   show the effective source, cost origin, and diagnostics
 /statusline help     show configuration help
 ```
 
 ## Inspect extension statuses
 
-Use **Inspect extension statuses** in `/statusline`, `/statusline inspect`, or **Ctrl+Alt+S** to open a compact, read-only list of the current extension statuses. Arrows and Pi's configured selection bindings navigate; Enter opens the selected owner's detail view when that extension cooperates. Other statuses show bounded, sanitized, wrapped plain text inside the inspector. Esc closes without changing the editor draft. Inspection does not change status visibility or settings, execute slash commands, or send model messages. `/statusline status` remains the settings report.
+Use **Inspect extension statuses** in `/statusline`, `/statusline inspect`, or **Ctrl+Alt+S** to open a compact, read-only list of the current extension statuses. Arrows and Pi's configured selection bindings navigate; Enter opens the selected owner's detail view when that extension cooperates. Other statuses show bounded, sanitized, wrapped plain text inside the inspector. Esc closes without changing the editor draft. Inspection does not change status visibility or settings, execute slash commands, or send model messages. `/statusline status` reports settings and the usage snapshot's cost origin.
 
 The shortcut opens only when the host's public focus capabilities identify an editor without autocomplete and no overlay is active. Hosts without these capabilities fail closed; use the slash command instead. The footer itself is unchanged. Lists and pending requests retire with their footer/session owner; removed rows lose selection rather than activating a neighbor.
 
@@ -99,6 +99,16 @@ Model ids, provider ids, active tool names, directory names, and Git branch name
 ## Lifecycle behavior
 
 The footer is installed only for TUI sessions. Git status is collected asynchronously and cached outside rendering, with stale cwd/branch results discarded. Usage totals are maintained by a runtime-owned incremental snapshot: rendering does not rescan session history; session replacement, branch/compaction boundaries rebuild it and message/turn events update it. Standalone usage entries (including cache warming) count toward historical tokens, cache, and cost. When tokens, cache, or cost is configured, the footer checks the session leaf every five seconds (including while idle), copying history only after the leaf changes and inspecting only entries appended since its last check. Presets without those segments skip the usage check. Context percentage comes from `ctx.getContextUsage()`, subject to the display-confidence guard below. Footer timers, branch listeners, pending Git work, command menus, and session ownership are cleaned up on footer disposal, session replacement, compaction, and shutdown. Context usage refreshes after compaction events.
+
+### Cost origin
+
+`/statusline status` reports `provider-reported`, `estimated`, `unknown/legacy`, or
+`mixed/unconfirmed` without adding footer clutter. Only finite nonnegative totals (including zero)
+with an explicit boolean `usage.cost.totalFromProvider` flag establish provider or estimated origin.
+Missing/invalid totals or flags remain unconfirmed, even beside confirmed usage. Aggregation includes
+all existing usage-bearing entry types, and replacement removes the previous entry's attribution as
+well as its numeric contribution. Numeric totals and footer formatting are unchanged. There is no
+price catalogue, pricing configuration, or requested-model/tier repricing.
 
 ### Context display confidence
 
@@ -138,7 +148,7 @@ packages/pi-statusline/
 
 ## Local divergence
 
-Signalridge maintains the modular port, canonical/legacy settings behavior, session-safe refresh cleanup, context display-confidence guard, and the restrained text-first default appearance described above.
+Signalridge maintains the modular port, canonical/legacy settings behavior, session-safe refresh cleanup, context display-confidence guard, and the restrained text-first default appearance described above. Git capture is bounded per operation: status gets 1 MiB and root discovery 16 KiB, counting stdout and stderr together. Incomplete status is not parsed; root discovery failure alone does not discard valid status. Passive debounce, Git refresh, and usage timers do not keep the process alive.
 
 ## License
 

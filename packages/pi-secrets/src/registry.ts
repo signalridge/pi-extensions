@@ -2,6 +2,7 @@ import { type LiteralSecret, type SecretPattern, type SecretSource, SOURCE_ORDER
 import {
   buildPlaceholder,
   hmacDigest,
+  labelRevealsSecret,
   MIN_SECRET_LENGTH,
   PLACEHOLDER_PATTERN,
   type SecretDigest,
@@ -34,8 +35,8 @@ export interface TextResult {
 
 /**
  * Maps secret values to deterministic placeholders and back. A value keeps the
- * first placeholder it receives for the registry's lifetime, so the same history
- * renders to the same bytes on every request.
+ * first safe placeholder it receives. If discovery makes its label unsafe,
+ * outbound copies use a neutral alias; all previously issued tokens still restore.
  */
 export class SecretRegistry {
   readonly #key: string;
@@ -46,6 +47,7 @@ export class SecretRegistry {
   readonly #placeholderByValue = new Map<string, string>();
   readonly #valueByPlaceholder = new Map<string, string>();
   readonly #sourceByValue = new Map<string, SecretSource>();
+  readonly #knownValues = new Set<string>();
 
   constructor(options: SecretRegistryOptions) {
     this.#key = options.key;
@@ -54,7 +56,8 @@ export class SecretRegistry {
       .filter((literal) => literal.value.length >= MIN_SECRET_LENGTH)
       .map((literal) => ({ ...literal, label: safeLabel(literal.label, literal.value) }));
     this.#patterns = options.patterns;
-    // Register configured values up front, in order, so their labels never depend on scan order.
+    // Labels must be checked against the complete configured set even during construction.
+    for (const literal of this.#literals) this.#knownValues.add(literal.value);
     for (const literal of this.#literals) this.#placeholderFor(literal.value, literal.label, literal.source);
   }
 
@@ -75,15 +78,30 @@ export class SecretRegistry {
     if (text.length < MIN_SECRET_LENGTH) return { text, count: 0 };
     const reserved = this.#reserved(text);
     const spans = this.#select(this.#candidates(text, reserved), reserved);
-    if (spans.length === 0) return { text, count: 0 };
+    const replacements = spans.map((span) => ({
+      start: span.start,
+      end: span.end,
+      text: this.#placeholderFor(text.slice(span.start, span.end), span.label, span.source),
+    }));
+    // Treat issued tokens atomically: never redact inside one and produce a nested token.
+    // Old reverse mappings remain valid, but unsafe cached labels cannot leave on a request.
+    for (const [start, end] of reserved) {
+      const token = text.slice(start, end);
+      const value = this.#valueByPlaceholder.get(token);
+      if (value === undefined) continue;
+      const label = token.slice(2, -15);
+      if (this.#safeLabel(label) === label) continue;
+      replacements.push({ start, end, text: this.#placeholderFor(value, "SECRET", undefined) });
+    }
+    if (replacements.length === 0) return { text, count: 0 };
+    replacements.sort((a, b) => a.start - b.start);
     let out = "";
     let cursor = 0;
-    for (const span of spans) {
-      out += text.slice(cursor, span.start);
-      out += this.#placeholderFor(text.slice(span.start, span.end), span.label, span.source);
-      cursor = span.end;
+    for (const replacement of replacements) {
+      out += text.slice(cursor, replacement.start) + replacement.text;
+      cursor = replacement.end;
     }
-    return { text: out + text.slice(cursor), count: spans.length };
+    return { text: out + text.slice(cursor), count: replacements.length };
   }
 
   /** Replace placeholders this registry issued with their values; unknown placeholders stay as written. */
@@ -101,12 +119,17 @@ export class SecretRegistry {
   }
 
   #placeholderFor(value: string, label: string, source: SecretSource | undefined): string {
+    this.#knownValues.add(value);
     const existing = this.#placeholderByValue.get(value);
-    if (existing !== undefined) return existing;
-    label = safeLabel(label, value);
+    if (existing !== undefined) {
+      const existingLabel = existing.slice(2, -15);
+      if (this.#safeLabel(existingLabel) === existingLabel) return existing;
+      label = "SECRET";
+    }
+    label = this.#safeLabel(label);
     let attempt = 0;
     let placeholder = buildPlaceholder(this.#digest, this.#key, label, value, attempt);
-    while (this.#valueByPlaceholder.has(placeholder)) {
+    while (this.#valueByPlaceholder.has(placeholder) && this.#valueByPlaceholder.get(placeholder) !== value) {
       attempt += 1;
       // Unreachable with HMAC-SHA256; a broken digest must fail closed, not spin.
       if (attempt > MAX_COLLISION_ATTEMPTS) throw new Error("secret placeholder digest keeps colliding");
@@ -114,8 +137,16 @@ export class SecretRegistry {
     }
     this.#placeholderByValue.set(value, placeholder);
     this.#valueByPlaceholder.set(placeholder, value);
-    if (source !== undefined) this.#sourceByValue.set(value, source);
+    if (source !== undefined && !this.#sourceByValue.has(value)) this.#sourceByValue.set(value, source);
     return placeholder;
+  }
+
+  #safeLabel(label: string): string {
+    label = safeLabel(label);
+    for (const value of this.#knownValues) {
+      if (labelRevealsSecret(label, value)) return "SECRET";
+    }
+    return label;
   }
 
   // Snapshot verified issued spans before discovery: they must not become
@@ -160,6 +191,7 @@ export class SecretRegistry {
             rank: this.#literals.length + index,
           };
           this.#learned.set(value, learned);
+          this.#knownValues.add(value);
           this.#placeholderFor(value, learned.label, learned.source);
         }
         candidates.push({ start, end, ...learned });

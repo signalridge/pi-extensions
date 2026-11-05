@@ -1,5 +1,6 @@
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CanonicalFingerprints } from "./canonical-fingerprint.js";
 import { PLAN_IMPLEMENTATION_HANDOFF_MESSAGE_TYPE } from "./message-transform.js";
 
 // Shared only by this loaded module: a replacement factory can authenticate
@@ -52,11 +53,6 @@ interface HandoffIdentity {
   workflowId: string;
 }
 
-function contentKey(content: unknown) {
-  return createHash("sha256")
-    .update(JSON.stringify(content) ?? "undefined")
-    .digest("hex");
-}
 function textOf(content: unknown) {
   return Array.isArray(content)
     ? content
@@ -107,21 +103,28 @@ export class PlanInputOwnership {
   // after their workflow retired. Never infer ownership from handoff prose.
   private retiredNatives: Array<{ key: string; timestamp?: number; owner: Owner }> = [];
 
-  constructor(private appendIdentity: (data: HandoffIdentity) => void = () => {}) {}
+  constructor(
+    private appendIdentity: (data: HandoffIdentity) => void = () => {},
+    private fingerprints = new CanonicalFingerprints(),
+  ) {}
+
+  private contentKey = (content: unknown) => this.fingerprints.key(content);
 
   private capture(ctx: ExtensionContext, generation: number): Owner {
     return {
       sessionId: ctx.sessionManager.getSessionId?.(),
-      branch: ctx.sessionManager.getBranch().map((entry) => contentKey(entry)),
+      branch: ctx.sessionManager.getBranch().map(this.contentKey),
       generation,
       manager: ctx.sessionManager,
     };
   }
   private current(owner: Owner, ctx: ExtensionContext, generation: number) {
-    const live = this.capture(ctx, generation);
+    return this.matches(owner, this.capture(ctx, generation));
+  }
+  private matches(owner: Owner, live: Owner) {
     return (
       owner.manager === live.manager &&
-      owner.generation === generation &&
+      owner.generation === live.generation &&
       owner.sessionId === live.sessionId &&
       owner.branch.every((id, index) => live.branch[index] === id)
     );
@@ -141,8 +144,17 @@ export class PlanInputOwnership {
     }
   }
   private live(ctx: ExtensionContext, generation: number) {
-    if (this.observed && !this.current(this.observed, ctx, generation)) this.reset();
-    this.observed = this.capture(ctx, generation);
+    const fallbacks = this.fingerprints.fallbacks;
+    const live = this.capture(ctx, generation);
+    if (this.observed && !this.matches(this.observed, live)) {
+      // reset may abort through a host callback: always recapture afterwards.
+      this.reset();
+      this.observed = this.capture(ctx, generation);
+    } else {
+      // Deduplicate only inert own-data reads. Exotic stringify callbacks keep
+      // the original second capture, never reuse proof across arbitrary code.
+      this.observed = this.observed && fallbacks !== this.fingerprints.fallbacks ? this.capture(ctx, generation) : live;
+    }
     this.prune();
   }
   private token(text: string) {
@@ -164,7 +176,7 @@ export class PlanInputOwnership {
     const token = `<!-- pi-plan-delivery:${sequence}:${createHmac("sha256", deliverySecret).update(sequence).digest("hex")} -->`;
     this.deliveries.set(token, {
       purpose: "revision" in purpose ? { revision: true } : { implementationId: purpose.implementationId },
-      key: contentKey([{ type: "text", text: `${text}\n\n${token}` }]),
+      key: this.contentKey([{ type: "text", text: `${text}\n\n${token}` }]),
       owner: this.capture(ctx, generation),
       expires: Date.now() + 300_000,
       workflowId: randomUUID(),
@@ -180,14 +192,14 @@ export class PlanInputOwnership {
     if (
       token &&
       (!delivery ||
-        contentKey([{ type: "text", text: input.text }, ...(input.images ?? [])]) !== delivery.key ||
+        this.contentKey([{ type: "text", text: input.text }, ...(input.images ?? [])]) !== delivery.key ||
         !this.current(delivery.owner, ctx, generation))
     )
       return { action: "handled" as const };
     const real = input.source === "interactive" || input.source === "rpc";
     const literalToken = real && Boolean(this.token(input.text));
     this.pending.push({
-      key: contentKey([{ type: "text", text: input.text }, ...(input.images ?? [])]),
+      key: this.contentKey([{ type: "text", text: input.text }, ...(input.images ?? [])]),
       real,
       literalToken,
       owner: this.capture(ctx, generation),
@@ -210,7 +222,7 @@ export class PlanInputOwnership {
       return;
     }
     this.seen.add(message);
-    const key = contentKey(message.content);
+    const key = this.contentKey(message.content);
     // Known lanes can drain out of input order. Distinct content cannot erase
     // an exact unique candidate; same-content collisions in any lane fail shut.
     const matches = this.pending.filter((candidate) => candidate.key === key);
@@ -285,11 +297,11 @@ export class PlanInputOwnership {
             entry.type === "message" &&
             entry.message.role === "user" &&
             entry.message.timestamp === binding.native.timestamp &&
-            contentKey(entry.message.content) === binding.key,
+            this.contentKey(entry.message.content) === binding.key,
         );
     return Boolean(
       binding &&
-        contentKey(binding.native.content) === binding.key &&
+        this.contentKey(binding.native.content) === binding.key &&
         nativeOnBranch &&
         this.current(binding.owner, ctx, generation) &&
         (binding.real || (binding.purpose && "revision" in binding.purpose)),
@@ -341,13 +353,13 @@ export class PlanInputOwnership {
           entry.type === "message" &&
           entry.message.role === "user" &&
           entry.message.timestamp === binding.native.timestamp &&
-          contentKey(entry.message.content) === binding.key,
+          this.contentKey(entry.message.content) === binding.key,
       );
       if (!native) {
         remaining.push(binding);
         continue;
       }
-      if (binding.native.timestamp === undefined || contentKey(binding.native.content) !== binding.key) continue;
+      if (binding.native.timestamp === undefined || this.contentKey(binding.native.content) !== binding.key) continue;
       this.appendIdentity({
         version: 1,
         sessionId: binding.owner.sessionId,
@@ -370,11 +382,12 @@ export class PlanInputOwnership {
     this.live(ctx, generation);
     this.commitHandoffs(ctx, generation);
     const branch = ctx.sessionManager.getBranch();
-    // No lifetime identity/body cache: reconcile from the public active branch
-    // every time, so compaction, mutation and session replacement cannot leak it.
+    // No lifetime attribution cache: reconcile from the public active branch
+    // every time. Fingerprints independently revalidate raw values on each hit,
+    // so compaction, mutation and session replacement cannot leak provenance.
     const users = messages.filter((message) => message.role === "user");
     const timestamps = new Set(users.map((message) => message.timestamp));
-    const relevant = new Set(users.map((message) => `${message.timestamp}:${contentKey(message.content)}`));
+    const relevant = new Set(users.map((message) => `${message.timestamp}:${this.contentKey(message.content)}`));
     const nativeEntries = new Map(
       branch
         .filter(
@@ -387,7 +400,7 @@ export class PlanInputOwnership {
     const counts = new Map<string, number>();
     for (const entry of nativeEntries.values()) {
       if (entry.type !== "message" || entry.message.role !== "user") continue;
-      const key = `${entry.message.timestamp}:${contentKey(entry.message.content)}`;
+      const key = `${entry.message.timestamp}:${this.contentKey(entry.message.content)}`;
       if (relevant.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     for (const entry of branch) {
@@ -402,7 +415,7 @@ export class PlanInputOwnership {
         native.type !== "message" ||
         native.message.role !== "user" ||
         native.message.timestamp !== data.timestamp ||
-        contentKey(native.message.content) !== data.key ||
+        this.contentKey(native.message.content) !== data.key ||
         !Array.isArray(native.message.content) ||
         native.message.content.length !== 1 ||
         native.message.content[0]?.type !== "text" ||
@@ -414,14 +427,16 @@ export class PlanInputOwnership {
     }
     return messages.map((message) => {
       if (message.role !== "user") return message;
-      const key = contentKey(message.content);
+      const key = this.contentKey(message.content);
       const retired = this.retiredNatives.some(
         (entry) =>
           entry.timestamp === message.timestamp &&
           entry.key === key &&
           entry.owner.manager === ctx.sessionManager &&
           entry.owner.sessionId === ctx.sessionManager.getSessionId?.() &&
-          entry.owner.branch.every((key, index) => branch[index] !== undefined && contentKey(branch[index]) === key),
+          entry.owner.branch.every(
+            (key, index) => branch[index] !== undefined && this.contentKey(branch[index]) === key,
+          ),
       );
       // Exact accepted native provenance only; the original storage is untouched.
       if (retired && counts.get(`${message.timestamp}:${key}`) === 1) return { ...message, content: [] };
@@ -474,5 +489,6 @@ export class PlanInputOwnership {
     this.prune();
     this.deliveries.clear();
     this.observed = undefined;
+    this.fingerprints.clear();
   }
 }

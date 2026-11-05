@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -95,13 +95,24 @@ test("restarting a client does not reuse the previous server's stderr", async ()
 test("a restart discards a partial JSON-RPC response from the old server", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "pi-lsp-response-restart-"));
   const adapter = fixtureAdapter("partial-response-once", 30);
+  const ready = path.join(root, "fixture.ready");
+  adapter.env = { PI_LSP_TEST_READY: ready };
   const client = new LspClient(adapter, adapter.defaultCommand, root, 300);
+  const startReady = async () => {
+    rmSync(ready, { force: true });
+    await client.start();
+    const deadline = Date.now() + 3000;
+    while (!existsSync(ready)) {
+      assert.ok(Date.now() < deadline, "fixture did not become ready");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
 
   try {
-    await client.start();
+    await startReady();
     await assert.rejects(client.initialize(root), /request timed out: initialize/);
     client.close();
-    await client.start();
+    await startReady();
     await client.initialize(root);
   } finally {
     client.close();

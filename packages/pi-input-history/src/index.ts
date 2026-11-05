@@ -52,6 +52,8 @@ const POPUP_WIDTH = "90%";
 const POPUP_MAX_HEIGHT = "85%";
 /** Same fraction as POPUP_MAX_HEIGHT — used to size the list to the popup. */
 const POPUP_HEIGHT_FRACTION = 0.85;
+/** Two frame rows, one visible result and the query. Requires at least five terminal rows. */
+const MIN_POPUP_ROWS = 4;
 
 /** Share of the popup interior handed to the preview pane. */
 const PREVIEW_FRACTION = 0.42;
@@ -348,6 +350,7 @@ export class HistoryPopupComponent implements Component, Focusable {
   private readonly displayEntries: { preview: string; fullText: string; searchKey: string }[];
 
   private query = "";
+  private closed = false;
   /** Indices into `history` that match the query, newest-first. */
   private matchIndices: number[] = [];
   /** Pointer into `matchIndices`; 0 = newest match = top row. */
@@ -366,9 +369,9 @@ export class HistoryPopupComponent implements Component, Focusable {
       const fullText = stripVTControlCharacters(text);
       return { fullText, preview: toSingleLinePreview(fullText), searchKey: fullText.toLowerCase() };
     });
-    this.input.onEscape = () => this.done(null);
+    this.input.onEscape = () => this.finish(null);
     this.input.onSubmit = () => {
-      this.done(this.getCurrentEntry()?.text ?? null);
+      this.finish(this.getCurrentEntry()?.text ?? null);
     };
     this.recomputeMatches(true);
     this.matchPointer = Math.min(initialSelection, Math.max(0, this.matchIndices.length - 1));
@@ -417,7 +420,19 @@ export class HistoryPopupComponent implements Component, Focusable {
     this.previewOffset = 0;
   }
 
+  private finish(value: string | null): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.done(value);
+  }
+
   handleInput(data: string): void {
+    if (this.closed) return;
+    // Recheck before accepting input: a shrink may precede the next render.
+    if (this.layout().cap < MIN_POPUP_ROWS) {
+      this.finish(null);
+      return;
+    }
     // Newer: ↑ / Ctrl+P (previous line) / Ctrl+S (forward-search counterpart)
     if (matchesKey(data, Key.up) || matchesKey(data, Key.ctrl("p")) || matchesKey(data, Key.ctrl("s"))) {
       this.moveUp();
@@ -446,7 +461,7 @@ export class HistoryPopupComponent implements Component, Focusable {
 
     // Cancel: Ctrl+G / Ctrl+C (Esc is handled via input.onEscape)
     if (matchesKey(data, Key.ctrl("g")) || matchesKey(data, Key.ctrl("c"))) {
-      this.done(null);
+      this.finish(null);
       return;
     }
 
@@ -468,7 +483,7 @@ export class HistoryPopupComponent implements Component, Focusable {
    * the height budget has to be reconstructed from the same fraction the
    * overlay caps us at, minus the frame (2) and the query + help lines (2).
    */
-  private layout(): { rows: number; showHelp: boolean } {
+  private layout(): { cap: number; rows: number; showHelp: boolean } {
     const terminalRows = this.tui.terminal?.rows ?? process.stdout.rows ?? 24;
     // Must mirror the overlay's own maths exactly: it resolves "85%" as
     // floor(termHeight * 85 / 100) and then hard-truncates anything taller with
@@ -480,7 +495,7 @@ export class HistoryPopupComponent implements Component, Focusable {
     // the first thing to drop when the terminal cannot afford it.
     const showHelp = cap >= 5;
     const rows = Math.max(1, Math.min(MAX_LIST_ROWS, cap - 3 - (showHelp ? 1 : 0)));
-    return { rows, showHelp };
+    return { cap, rows, showHelp };
   }
 
   /** Visible window over matchIndices, selection kept centered where possible. */
@@ -559,7 +574,15 @@ export class HistoryPopupComponent implements Component, Focusable {
     const t = this.theme;
     const border = (s: string) => t.fg("borderAccent", s);
     const total = this.matchIndices.length;
-    const { rows, showHelp } = this.layout();
+    const { cap, rows, showHelp } = this.layout();
+    if (this.closed) return [];
+    if (cap < MIN_POPUP_ROWS) {
+      // Never leave an invisible selection answerable. Close after this frame
+      // rather than mutating Pi's overlay stack during its render traversal.
+      this.closed = true;
+      queueMicrotask(() => this.done(null));
+      return [];
+    }
     const now = Date.now();
 
     // Two-pane frame spends 7 columns on chrome: "│ " + list + " │ " + preview + " │".

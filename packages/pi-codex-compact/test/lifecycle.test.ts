@@ -11,7 +11,6 @@ import {
   type OpenAICodexResponsesOptions,
   type Provider,
   type Tool,
-  Type,
 } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import {
@@ -21,6 +20,7 @@ import {
   type SessionEntry,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { test, vi } from "vitest";
 import {
   checkpointMarker,

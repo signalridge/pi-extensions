@@ -6,10 +6,12 @@ import type {
 } from "@signalridge/pi-subagents-protocol";
 import {
   PROTOCOL_VERSION,
+  parseManagedSpawnRequest,
   parseManagedSpawnResponse,
   parseProtocolPing,
   requiredCapabilitiesMatch,
 } from "@signalridge/pi-subagents-protocol";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import type { WorkflowOwner } from "./journal.js";
 
 /** Minimal dispatch task for a script-run agent() call. */
@@ -298,6 +300,31 @@ export interface ManagedSpawnClient {
   checkProtocol?: () => Promise<ManagedProtocolCheck>;
 }
 
+/** Shared wire preflight, also used before the engine submits an allocation lease. */
+export function prepareManagedSpawnRequest(task: DispatchTask, runId: string, nodeId: string, attemptId = "attempt-1") {
+  try {
+    return parseManagedSpawnRequest({
+      requestId: requestId(),
+      spawnKey: `${runId}/${nodeId}/${attemptId}`,
+      type: task.subagent_type,
+      prompt: task.prompt,
+      description: task.description,
+      ...(task.tier === undefined ? {} : { tier: task.tier }),
+      ...(task.toolset === undefined ? {} : { toolset: task.toolset }),
+      ...(task.thread === undefined ? {} : { thread: task.thread }),
+      ...(task.excludeTools === undefined ? {} : { excludeTools: task.excludeTools }),
+      ...(task.isolation === undefined ? {} : { isolation: task.isolation }),
+      owner: { extension: "pi-workflows", runId, nodeId, attemptId },
+    });
+  } catch (error: unknown) {
+    throw new WorkflowError(
+      error instanceof Error ? error.message : String(error),
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false, details: error },
+    );
+  }
+}
+
 /** Event-bus-only client for the additive pi-subagents managed protocol. */
 export function createManagedSpawnClient(
   events: WorkflowEventBus,
@@ -325,29 +352,15 @@ export function createManagedSpawnClient(
      * fingerprint still reuses the persisted tombstone (per-call cache).
      */
     async spawn(task, runId, nodeId, attemptId, signal) {
-      const effectiveAttemptId = attemptId ?? `attempt-1`;
-      const spawnKey = `${runId}/${nodeId}/${effectiveAttemptId}`;
+      // Outside the transport catch: a local rejection never emitted a request,
+      // so it must not create reconciliation or owned-cleanup uncertainty.
+      const request = prepareManagedSpawnRequest(task, runId, nodeId, attemptId);
+      const { spawnKey, owner } = request;
       const requestSignal =
         signal && sessionSignal ? AbortSignal.any([signal, sessionSignal]) : (signal ?? sessionSignal);
       let data: unknown;
       try {
-        data = await call<unknown>(
-          "subagents:rpc:spawn-managed",
-          {
-            requestId: requestId(),
-            spawnKey,
-            type: task.subagent_type,
-            prompt: task.prompt,
-            description: task.description,
-            ...(task.tier === undefined ? {} : { tier: task.tier }),
-            ...(task.toolset === undefined ? {} : { toolset: task.toolset }),
-            ...(task.thread === undefined ? {} : { thread: task.thread }),
-            ...(task.excludeTools === undefined ? {} : { excludeTools: task.excludeTools }),
-            ...(task.isolation === undefined ? {} : { isolation: task.isolation }),
-            owner: { extension: "pi-workflows", runId, nodeId, attemptId: effectiveAttemptId },
-          },
-          requestSignal,
-        );
+        data = await call<unknown>("subagents:rpc:spawn-managed", { ...request }, requestSignal);
       } catch (error: unknown) {
         // Reconciliation must not inherit the signal that caused the original
         // request to fail: shutdown/abort can happen after allocation but before
@@ -357,7 +370,7 @@ export function createManagedSpawnClient(
           {
             requestId: requestId(),
             spawnKey,
-            owner: { extension: "pi-workflows", runId, nodeId, attemptId: effectiveAttemptId },
+            owner,
           },
           undefined,
           5_000,

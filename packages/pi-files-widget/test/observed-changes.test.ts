@@ -14,6 +14,13 @@ const theme = {
   bold: (text: string) => text,
 };
 
+async function until(check: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 100 && !check(); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(check(), true);
+}
+
 test("observed changes propagate ancestry without claiming agent authorship", () => {
   const root = buildFileTreeFromPaths(
     "/project",
@@ -102,7 +109,7 @@ for (const source of ["observed", "agent"] as const) {
     let now = Date.now();
     const clock = spyOn(Date, "now").mockImplementation(() => now);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await until(() => browser.render(120).join("\n").includes("partial"));
       assert.match(browser.render(120).join("\n"), /partial/);
       const path = join(cwd, "folder", "later.ts");
       writeFileSync(path, "later");
@@ -113,7 +120,7 @@ for (const source of ["observed", "agent"] as const) {
       if (source === "observed") browser.handleInput("]");
       browser.handleInput("c");
       if (source === "agent") browser.handleInput("l");
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await until(() => browser.render(120).join("\n").includes("ordinary.ts"));
       const lines = browser.render(120).join("\n");
       assert.match(lines, /ordinary\.ts/);
       assert.equal(lines.split("later.ts").length - 1, 1);
@@ -158,7 +165,7 @@ test("in-flight directory scan merges injected paths and retains nested attribut
   let now = Date.now();
   const clock = spyOn(Date, "now").mockImplementation(() => now);
   try {
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await until(() => entered);
     assert.equal(entered, true);
     for (const path of [join(cwd, "new.ts"), join(cwd, "folder", "nested.ts")]) {
       writeFileSync(path, "injected");

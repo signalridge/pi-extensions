@@ -211,9 +211,9 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
     | ((title: string, options: string[]) => Promise<string | undefined>)
     | undefined;
   const inputOverride = overrides.input as ((title: string, placeholder?: string) => Promise<unknown>) | undefined;
-  const defaultCustom = async (factory: unknown) => {
+  const defaultCustom = async (factory: unknown, existing?: ReturnType<typeof createCustomSelectorHarness>) => {
     if (!selectOverride) return undefined;
-    const harness = createCustomSelectorHarness(factory, 100);
+    const harness = existing ?? createCustomSelectorHarness(factory, 100);
     const options: string[] = [];
     for (let index = 0; index < 200; index += 1) {
       const selected = selectedKitRow(harness.render());
@@ -290,9 +290,17 @@ export function createMockContext(overrides: Record<string, unknown> = {}) {
         }
         return probe.resultPromise;
       }
-      const standard = probe.isPiTuiKitScreen;
-      probe.dispose();
-      return standard ? defaultCustom(factory) : (customOverride ?? defaultCustom)(factory, options);
+      if (probe.isPiTuiKitScreen || !customOverride) return defaultCustom(factory, probe);
+      // A native host invokes a factory once, never disposing a speculative
+      // mount and rebuilding it. Route the same component and completion into
+      // the scripted raw-dialog driver instead.
+      await customOverride((...args: unknown[]) => {
+        const done = args[3];
+        if (typeof done !== "function") throw new Error("Expected custom completion callback");
+        void probe.resultPromise.then((value) => done(value));
+        return probe.component;
+      }, options);
+      return probe.result;
     }
     return (customOverride ?? defaultCustom)(factory, options);
   };

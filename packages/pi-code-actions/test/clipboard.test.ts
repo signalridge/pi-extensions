@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import extension from "../index.js";
 import { copySnippet } from "../src/actions.js";
-import { fakeClipboard } from "./clipboard-host.js";
+import { fakeClipboard, nativePidExists } from "./clipboard-host.js";
 
 function ownership() {
   const controller = new AbortController();
@@ -55,9 +55,18 @@ function codeCommand(snippet: string, mode = "tui") {
 }
 
 let clipboard: ReturnType<typeof fakeClipboard> | undefined;
-afterEach(() => {
-  clipboard?.dispose();
-  clipboard = undefined;
+afterEach(async () => {
+  try {
+    if (clipboard) {
+      await clipboard.dispose();
+      assert.ok(
+        clipboard.receipts().every(({ pid }) => !nativePidExists(pid)),
+        "native fixture survived afterEach",
+      );
+    }
+  } finally {
+    clipboard = undefined;
+  }
 });
 
 test.skipIf(process.platform === "win32")("RPC copy warns without invoking the clipboard writer", async () => {

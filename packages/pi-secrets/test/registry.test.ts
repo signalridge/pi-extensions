@@ -115,6 +115,54 @@ describe("placeholders", () => {
   });
 });
 
+describe("cross-secret labels", () => {
+  const first = "first-secret-value";
+  const second = "OtherSecret123";
+
+  it.each([false, true])("checks the whole constructor set regardless of order (%s)", (reverse) => {
+    const literals = [literal(first, "other-secret-123"), literal(second, "SAFE")];
+    const secrets = registry(reverse ? literals.reverse() : literals);
+    expect(labelsIn(secrets.obfuscate(first).text)).toEqual(["SECRET"]);
+    expect(secrets.restore(secrets.obfuscate(first).text).text).toBe(first);
+  });
+
+  it.each([false, true])("checks all discovered values before emission (%s)", (reverse) => {
+    const patterns = [
+      { label: "other-secret-123", source: "configPattern" as const, regex: compilePattern(first) },
+      { label: "SAFE", source: "configPattern" as const, regex: compilePattern(second) },
+    ];
+    const secrets = new SecretRegistry({ key: "key", literals: [], patterns: reverse ? patterns.reverse() : patterns });
+    const text = reverse ? `${second} ${first}` : `${first} ${second}`;
+    const masked = secrets.obfuscate(text);
+    expect(masked.text).not.toContain("OTHER_SECRET_123");
+    expect(secrets.restore(masked.text).text).toBe(text);
+    expect(secrets.obfuscate(masked.text)).toEqual({ text: masked.text, count: 0 });
+  });
+
+  it("retires now-unsafe constructor and pattern cached labels but restores every old token", () => {
+    for (const configured of [false, true]) {
+      const secrets = new SecretRegistry({
+        key: "key",
+        literals: configured ? [literal(first, "other-secret-123")] : [],
+        patterns: [
+          { label: "other-secret-123", source: "configPattern", regex: compilePattern(first) },
+          { label: "SAFE", source: "configPattern", regex: compilePattern(second) },
+        ],
+      });
+      const old = secrets.obfuscate(first).text;
+      expect(labelsIn(old)).toEqual(["OTHER_SECRET_123"]);
+      secrets.discover(second);
+      const fresh = secrets.obfuscate(first).text;
+      expect(labelsIn(fresh)).toEqual(["SECRET"]);
+      expect(secrets.obfuscate(old)).toEqual({ text: fresh, count: 1 });
+      expect([...fresh.matchAll(PLACEHOLDER_PATTERN)]).toHaveLength(1);
+      expect(secrets.restore(`${old} ${fresh}`).text).toBe(`${first} ${first}`);
+      expect(secrets.obfuscate(fresh)).toEqual({ text: fresh, count: 0 });
+      expect(secrets.obfuscate(first).text).toBe(fresh);
+    }
+  });
+});
+
 describe("pattern-detected secrets", () => {
   it("are learned once, keep their placeholder, and restore", () => {
     const secrets = new SecretRegistry({

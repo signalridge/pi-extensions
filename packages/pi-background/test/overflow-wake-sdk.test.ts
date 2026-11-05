@@ -19,7 +19,7 @@ import { MESSAGE_TYPE } from "../src/notifications.js";
 const OVERFLOW = "Your input exceeds the context window of this model";
 
 // Real host loader, lifecycle, overflow recovery and provider dispatch. No paid model.
-describe.skipIf(VERSION !== "1.4.0" || process.platform === "win32")(
+describe.skipIf(VERSION !== "1.5.0" || process.platform === "win32")(
   "background wakes after a context overflow",
   () => {
     let cwd: string;

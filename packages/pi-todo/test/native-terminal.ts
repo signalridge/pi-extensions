@@ -21,7 +21,7 @@ import { TodoStore } from "../src/store.js";
 
 /** Real InteractiveMode.init(): no replacement ui.custom/input/select or SDK patches. */
 export async function nativeTerminal(fullscreen = true) {
-  if (VERSION !== "1.4.0") throw new Error(`Native lifetime proof requires SDK 1.4.0, got ${VERSION}`);
+  if (VERSION !== "1.5.0") throw new Error(`Native lifetime proof requires SDK 1.5.0, got ${VERSION}`);
   const cwd = mkdtempSync(join(tmpdir(), "todo-native-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir);

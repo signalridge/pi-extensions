@@ -633,6 +633,134 @@ test("equal state payload on a distinct descendant native entry is a different a
   }
 });
 
+const nativeJSON = JSON as typeof JSON & { rawJSON(text: string): object };
+for (const payload of ['"text"', "1", "null"]) {
+  for (const reverse of [false, true]) {
+    test.skipIf(typeof nativeJSON.rawJSON !== "function")(
+      `warm fingerprints cannot transfer completion across native tool_call RawJSON ${payload} prefix replacement (reverse=${reverse})`,
+      async () => {
+        const f = await fixture();
+        try {
+          const raw = nativeJSON.rawJSON(payload);
+          const plain = Object.create(Object.getPrototypeOf(raw), Object.getOwnPropertyDescriptors(raw));
+          const prefix = { data: reverse ? raw : plain };
+          f.manager.appendCustomEntry("opaque-prefix", prefix);
+          const entry = f.manager.getBranch()[0];
+          const id = entry.id;
+          await f.command("start");
+          let changed = false;
+          f.api.on("tool_call", (event) => {
+            if (event.toolName !== "plan_mode_complete" || changed) return;
+            changed = true;
+            prefix.data = reverse ? plain : raw;
+          });
+          f.faux.setResponses([
+            fauxAssistantMessage(fauxToolCall("plan_mode_complete", { plan: "# Must not commit RawJSON" }), {
+              stopReason: "toolUse",
+            }),
+            fauxAssistantMessage("ordinary"),
+          ]);
+          await f.session.prompt("Plan it", { source: "rpc" });
+          expect(changed).toBe(true);
+          expect(f.manager.getBranch()[0]).toBe(entry);
+          expect(entry.id).toBe(id);
+          expect(JSON.stringify(f.state()) ?? "").not.toContain("Must not commit RawJSON");
+          expect(
+            f.manager
+              .getBranch()
+              .some(
+                (item) =>
+                  item.type === "custom" &&
+                  item.customType === "plan-mode-state" &&
+                  JSON.stringify(item.data).includes("Must not commit RawJSON"),
+              ),
+          ).toBe(false);
+        } finally {
+          await f.close();
+        }
+      },
+    );
+  }
+}
+
+for (const boundary of [
+  "deep-prefix",
+  "boxed-prefix",
+  "array-impostor",
+  "state-metadata",
+  "root",
+  "session",
+] as const) {
+  test(`warm fingerprints cannot transfer a completion across a later native tool_call ${boundary} mutation`, async () => {
+    const f = await fixture();
+    try {
+      const opaque = { nested: { text: "original" }, data: {} as unknown, array: [] as unknown };
+      f.manager.appendCustomEntry("opaque-prefix", opaque);
+      await f.command("start");
+      let changed = false;
+      f.api.on("tool_call", (event) => {
+        if (event.toolName !== "plan_mode_complete" || changed) return;
+        changed = true;
+        if (boundary === "deep-prefix") opaque.nested.text = "same object changed";
+        if (boundary === "boxed-prefix") opaque.data = Object.setPrototypeOf(new Boolean(true), Object.prototype);
+        if (boundary === "array-impostor") opaque.array = Object.create(Array.prototype);
+        if (boundary === "state-metadata") Reflect.set(f.state() as object, "metadata", { changed: true });
+        if (boundary === "root") f.manager.resetLeaf();
+        if (boundary === "session") f.manager.newSession();
+      });
+      f.faux.setResponses([
+        fauxAssistantMessage(fauxToolCall("plan_mode_complete", { plan: "# Must not commit" }), {
+          stopReason: "toolUse",
+        }),
+        fauxAssistantMessage("ordinary"),
+      ]);
+      await f.session.prompt("Plan it", { source: "rpc" });
+      expect(changed).toBe(true);
+      expect(JSON.stringify(f.state()) ?? "").not.toContain("Must not commit");
+      expect(
+        f.manager
+          .getBranch()
+          .some(
+            (entry) =>
+              entry.type === "custom" &&
+              entry.customType === "plan-mode-state" &&
+              JSON.stringify(entry.data).includes("Must not commit"),
+          ),
+      ).toBe(false);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("cancelled native navigation preserves a warmed branch and its next accepted revision", async () => {
+  const f = await fixture();
+  try {
+    const root = f.manager.appendCustomEntry("root", {});
+    await f.command("start");
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("plan_mode_complete", { plan: "# Ready before cancel" }), {
+        stopReason: "toolUse",
+      }),
+    ]);
+    await f.session.prompt("Plan it", { source: "rpc" });
+    const leaf = f.manager.getLeafId();
+    f.api.on("session_before_tree", () => ({ cancel: true }));
+    expect((await f.session.navigateTree(root)).cancelled).toBe(true);
+    expect(f.manager.getLeafId()).toBe(leaf);
+    expect(f.state()).toMatchObject({ latestPlan: "# Ready before cancel" });
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("plan_mode_complete", { plan: "# Accepted after cancel" }), {
+        stopReason: "toolUse",
+      }),
+    ]);
+    await f.session.prompt("Revise it", { source: "rpc" });
+    expect(f.state()).toMatchObject({ latestPlan: "# Accepted after cancel" });
+  } finally {
+    await f.close();
+  }
+});
+
 test("late saved-plan authentication cannot transition a committed different branch or discard the source plan", async () => {
   const treeEntered = gate();
   const treeHeld = gate();

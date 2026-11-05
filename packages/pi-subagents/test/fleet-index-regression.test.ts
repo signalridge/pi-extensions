@@ -31,12 +31,17 @@ type Tool = { execute: (id: string, params: Record<string, unknown>, signal: und
 function harness(cwd: string, bus = new Bus()) {
   const lifecycle = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
   const commands = new Map<string, Command>();
+  const widgets = new Map<string, { component: Component; placement?: string }>();
   let widget: Component | undefined; let viewer: (Component & { dispose?(): void }) | undefined;
   let close: (() => void) | undefined; let input: ((data: string) => unknown) | undefined;
   const tui = { terminal: { rows: 40, columns: 120 }, requestRender: vi.fn() } as unknown as TUI;
   const ui = {
     notify: vi.fn(), setStatus: vi.fn(), getEditorText: () => "",
-    setWidget: vi.fn((key: string, factory: ((host: TUI, theme: typeof theme) => Component) | undefined) => { if (key === "fleet") widget = factory?.(tui, theme); }),
+    setWidget: vi.fn((key: string, factory: ((host: TUI, theme: typeof theme) => Component) | undefined, options?: { placement?: string }) => {
+      const component = factory?.(tui, theme);
+      if (key === "fleet") widget = component;
+      if (component) widgets.set(key, { component, placement: options?.placement }); else widgets.delete(key);
+    }),
     onTerminalInput: vi.fn((handler: typeof input) => { input = handler; return () => { input = undefined; }; }),
     custom: vi.fn((factory: (host: TUI, theme: typeof theme, keys: never, done: (result: undefined) => void) => Component) => new Promise<undefined>(resolve => {
       close = () => { viewer?.dispose?.(); resolve(undefined); close = undefined; };
@@ -50,7 +55,7 @@ function harness(cwd: string, bus = new Bus()) {
     registerTool: vi.fn(), registerCommand: (name: string, command: Command) => commands.set(name, command),
     registerMessageRenderer: vi.fn(), appendEntry: vi.fn(), sendMessage: vi.fn() };
   subagentsExtension(pi as never);
-  return { bus, lifecycle, commands, ctx, ui, pi, widget: () => widget, viewer: () => viewer, close: () => close?.(), input: (key: string) => input?.(key) };
+  return { bus, lifecycle, commands, ctx, ui, pi, widgets, widget: () => widget, viewer: () => viewer, close: () => close?.(), input: (key: string) => input?.(key) };
 }
 function nativeSeam() {
   const messages: AgentSession["messages"] = [];
@@ -224,17 +229,24 @@ describe("Fleet real-index accounting, reservation and native peer lifecycle reg
     else { await emit("session_start", {}); await h.lifecycle.get("session_start")?.({}, h.ctx); }
     const workflow = extension.tools.get("workflow")!.definition as unknown as Tool;
     const execute = async (name: string) => workflow.execute(name, { script: `export const meta = { name: ${JSON.stringify(name)}, description: "test" }; return 1;`, background: false }, undefined, undefined, h.ctx);
-    const openFromFleet = async (name: string) => {
-      expect(h.widget()!.render(200).join("\n")).toContain(name);
-      h.input("\x1b[B"); h.input("\x1b[B"); h.input("\r"); await flush();
-      expect(h.viewer()!.render(200).join("\n")).toContain(name); h.close(); await flush(); h.input("\x1b");
+    let workflowCommands = extension.commands;
+    const openFromOverview = async (name: string) => {
+      expect(h.widget()).toBeUndefined();
+      expect([...h.widgets.keys()]).toEqual(["pi-workflows"]);
+      const overview = h.widgets.get("pi-workflows")!;
+      expect(overview.placement).toBe("belowEditor");
+      expect(overview.component.render(200).join("\n")).toContain(`▸ ${name}`);
+      expect(h.input("\x1b[B")).toBeUndefined(); // No competing workflow arrow owner.
+      const opening = workflowCommands.get("workflows")!.handler("", h.ctx);
+      await flush();
+      expect(h.viewer()!.render(200).join("\n")).toContain(name); h.close(); await opening; await flush();
     };
-    await execute("before tree"); await flush(); await openFromFleet("before tree");
+    await execute("before tree"); await flush(); await openFromOverview("before tree");
     const event = { type: "session_tree", oldLeafId: h.ctx.sessionManager.getLeafId(), newLeafId: null };
     h.ctx.sessionManager.resetLeaf();
     if (order === "subagents-first") { await h.lifecycle.get("session_tree")?.(event, h.ctx); await emit("session_tree", event); }
     else { await emit("session_tree", event); await h.lifecycle.get("session_tree")?.(event, h.ctx); }
-    await execute("after tree"); await flush(); await openFromFleet("after tree");
+    await execute("after tree"); await flush(); await openFromOverview("after tree");
     const previous = h;
     await emit("session_shutdown", {}); await previous.lifecycle.get("session_shutdown")?.({}, previous.ctx);
     const replacement = harness(cwd, previous.bus);
@@ -250,9 +262,10 @@ describe("Fleet real-index accounting, reservation and native peer lifecycle reg
     cleanup.push(async () => { h.close(); await emitReload("session_shutdown"); });
     if (order === "subagents-first") { await h.lifecycle.get("session_start")?.({ reason: "reload" }, h.ctx); await emitReload("session_start"); }
     else { await emitReload("session_start"); await h.lifecycle.get("session_start")?.({ reason: "reload" }, h.ctx); }
+    workflowCommands = reloaded.extensions[0].commands;
     const reloadedTool = reloaded.extensions[0].tools.get("workflow")!.definition as unknown as Tool;
     await reloadedTool.execute("after reload", { script: 'export const meta = { name: "after reload", description: "test" }; return 1;', background: false }, undefined, undefined, h.ctx);
-    await flush(); await openFromFleet("after reload");
+    await flush(); await openFromOverview("after reload");
     expect(h.bus.listeners.get(WORKFLOW_UI_CHANNELS.changed)?.size).toBe(1);
   });
 });

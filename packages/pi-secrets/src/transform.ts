@@ -7,27 +7,41 @@ type TextLike = { type: string; text?: unknown };
 
 export type TextMap = (text: string) => string;
 
+/** JSON looks up toJSON before enumerating data, even on unchanged objects. Never execute it. */
+function rejectJsonHook(value: object): void {
+  for (let owner: object | null = value; owner !== null; owner = Object.getPrototypeOf(owner)) {
+    const descriptor = Object.getOwnPropertyDescriptor(owner, "toJSON");
+    if (!descriptor) continue;
+    if (!("value" in descriptor) || typeof descriptor.value === "function") {
+      throw new Error("Non-data JSON serialization hook");
+    }
+    // An inert own value shadows any inherited hook and remains ordinary JSON data.
+    return;
+  }
+}
+
 /** Copy-on-write map over every string in a JSON value; returns the input when nothing changed. */
 export function mapJsonStrings(value: unknown, map: TextMap): unknown {
+  if (value !== null && (typeof value === "object" || typeof value === "function")) rejectJsonHook(value);
   if (typeof value === "string") return map(value);
-  if (Array.isArray(value)) {
-    let changed = false;
-    const next = value.map((item) => {
-      const mapped = mapJsonStrings(item, map);
-      if (mapped !== item) changed = true;
-      return mapped;
-    });
-    return changed ? next : value;
-  }
   if (value !== null && typeof value === "object") {
     let changed = false;
-    const next: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) {
-      const mapped = mapJsonStrings(item, map);
-      if (mapped !== item) changed = true;
-      next[key] = mapped;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    for (const key of Object.getOwnPropertyNames(value)) {
+      const descriptor = descriptors[key];
+      // JSON arrays include indexed data even when an index is non-enumerable.
+      const jsonIndex = Array.isArray(value) && /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length;
+      if (!descriptor?.enumerable && !jsonIndex) continue;
+      if (!descriptor || !("value" in descriptor)) throw new Error("Non-data JSON property");
+      const mapped = mapJsonStrings(descriptor.value, map);
+      if (mapped !== descriptor.value) changed = true;
+      descriptor.value = mapped;
     }
-    return changed ? next : value;
+    if (!changed) return value;
+    // Define own properties, never assign: __proto__ is JSON data, not a setter.
+    // Copy descriptors before definition so even frozen originals can be projected.
+    const next = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value));
+    return Object.defineProperties(next, descriptors);
   }
   return value;
 }

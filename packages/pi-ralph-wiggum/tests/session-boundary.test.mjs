@@ -57,6 +57,7 @@ function makePi() {
   return {
     events,
     sentUserMessages: [],
+    sentMessages: [],
     commands: new Map(),
     tools: new Map(),
     on(name, handler) {
@@ -70,6 +71,9 @@ function makePi() {
     },
     sendUserMessage(message, options) {
       this.sentUserMessages.push({ message, options });
+    },
+    sendMessage(message, options) {
+      this.sentMessages.push({ message, options });
     },
   };
 }
@@ -306,12 +310,15 @@ describe("loop lifecycle", () => {
         },
         ctx,
       );
+      await pi.events.get("agent_settled")({ aborted: stopReason === "aborted" }, ctx);
       assert.equal(readLoop(cwd, "final").status, "active");
       assert.equal(readLoop(cwd, "final").completedAt, undefined);
       assert.equal(pi.sentUserMessages.length, 0, "sent a completed banner");
       assert.match((await inject(pi, ctx)).systemPrompt, /Iteration 3\/3/);
       // A subsequent successful retry can still finish the loop.
       await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+      assert.equal(readLoop(cwd, "final").status, "active");
+      await pi.events.get("agent_settled")({ aborted: false }, ctx);
       assert.equal(readLoop(cwd, "final").status, "completed");
     });
   }
@@ -338,8 +345,12 @@ describe("loop lifecycle", () => {
     ctx.hasPendingMessages = () => false;
     await inject(pi, ctx, pi.sentUserMessages.at(-1).message, "extension");
     await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+    assert.equal(readLoop(cwd, "final").status, "active");
+    await pi.events.get("agent_settled")({ aborted: false }, ctx);
     assert.equal(readLoop(cwd, "final").status, "completed");
-    assert.equal(pi.sentUserMessages.length, 2);
+    assert.equal(pi.sentUserMessages.length, 1);
+    assert.equal(pi.sentMessages.length, 1);
+    assert.equal(pi.sentMessages[0].options.triggerTurn, false);
   });
 
   test("a deferred RPC nuke settles on session abort and ignores a late yes without accessing the retired ctx", async () => {
@@ -470,6 +481,146 @@ describe("loop lifecycle", () => {
     const { pi, ctx } = await boot(cwd, "owner");
     assert.match((await inject(pi, ctx))?.systemPrompt ?? "", /base prompt/);
   });
+});
+
+describe("activation and final settlement", () => {
+  for (const task of ["", " \n\t", null]) {
+    test(`invalid task ${JSON.stringify(task)} cannot change live or persisted activation`, async () => {
+      const cwd = makeTempDir("ralph-invalid-activation-");
+      writeLoop(cwd, { ...baseState, name: "valid", taskFile: ".ralph/valid.md", ownerSessionId: "owner" });
+      writeLoop(cwd, {
+        ...baseState,
+        name: "invalid",
+        taskFile: ".ralph/invalid.md",
+        status: "paused",
+        active: false,
+        ownerSessionId: "foreign",
+      });
+      const file = path.join(cwd, ".ralph", "invalid.md");
+      if (task === null) {
+        fs.unlinkSync(file);
+        fs.mkdirSync(file); // Deterministically unreadable as a UTF-8 file, even with privileged permissions.
+      } else fs.writeFileSync(file, task);
+      const { pi, ctx } = await boot(cwd, "owner");
+      const snapshot = ["valid", "invalid"].map((name) =>
+        fs.readFileSync(path.join(cwd, ".ralph", `${name}.state.json`)),
+      );
+      for (const command of ["start invalid", "resume invalid"]) {
+        await pi.commands.get("ralph").handler(command, ctx);
+        for (const [index, name] of ["valid", "invalid"].entries()) {
+          assert.deepEqual(fs.readFileSync(path.join(cwd, ".ralph", `${name}.state.json`)), snapshot[index]);
+        }
+        assert.equal(pi.sentUserMessages.length, 0);
+        assert.match((await inject(pi, ctx))?.systemPrompt ?? "", /RALPH LOOP - valid/);
+        // Native acceptance may update the valid branch proof, not the failed activation.
+        snapshot[0] = fs.readFileSync(path.join(cwd, ".ralph", "valid.state.json"));
+      }
+      for (const taskContent of ["", " \n\t"]) {
+        await assert.rejects(
+          pi.tools.get("ralph_start").execute("invalid", { name: "invalid", taskContent }, undefined, undefined, ctx),
+          /non-whitespace/,
+        );
+        assert.deepEqual(fs.readFileSync(path.join(cwd, ".ralph", "invalid.state.json")), snapshot[1]);
+      }
+      assert.equal(pi.sentUserMessages.length, 0);
+    });
+  }
+
+  test("a blank next task pauses without advancing the iteration", async () => {
+    const cwd = makeTempDir("ralph-invalid-next-");
+    const { pi, ctx } = await boot(cwd, "owner");
+    await pi.tools
+      .get("ralph_start")
+      .execute("start", { name: "next", taskContent: "Task" }, undefined, undefined, ctx);
+    await inject(pi, ctx, pi.sentUserMessages[0].message, "extension");
+    fs.writeFileSync(path.join(cwd, ".ralph", "next.md"), " \n\t");
+    await pi.tools.get("ralph_done").execute("done", {}, undefined, undefined, ctx);
+    assert.equal(readLoop(cwd, "next").iteration, 1);
+    assert.equal(readLoop(cwd, "next").status, "paused");
+    assert.equal(pi.sentUserMessages.length, 1);
+  });
+
+  test("authorized recovery pauses only demonstrably same-session same-branch duplicates", async () => {
+    const cwd = makeTempDir("ralph-duplicates-");
+    for (const [name, ownerSessionId, ownerBranchIds] of [
+      ["owned-a", "owner", ["root"]],
+      ["owned-b", "owner", ["root"]],
+      ["foreign", "other", ["root"]],
+      ["sibling", "owner", ["sibling-root"]],
+      ["unproved", "owner", []],
+    ])
+      writeLoop(cwd, { ...baseState, name, taskFile: `.ralph/${name}.md`, ownerSessionId, ownerBranchIds });
+    const protectedNames = ["foreign", "sibling", "unproved"];
+    const protectedBytes = protectedNames.map((name) =>
+      fs.readFileSync(path.join(cwd, ".ralph", `${name}.state.json`)),
+    );
+    const { pi, ctx } = await boot(cwd, "owner");
+    assert.deepEqual(["owned-a", "owned-b"].map((name) => readLoop(cwd, name).status).sort(), ["active", "paused"]);
+    assert.equal(pi.sentUserMessages.length, 0, "recovery never dispatches a prompt");
+    // Recover an additional duplicate not referenced by currentLoop on explicit activation.
+    writeLoop(cwd, { ...baseState, name: "extra", taskFile: ".ralph/extra.md", ownerSessionId: "owner" });
+    await pi.commands.get("ralph").handler("start new", ctx);
+    for (const name of ["owned-a", "owned-b", "extra"]) assert.equal(readLoop(cwd, name).status, "paused");
+    for (const [index, name] of protectedNames.entries()) {
+      assert.deepEqual(fs.readFileSync(path.join(cwd, ".ralph", `${name}.state.json`)), protectedBytes[index]);
+    }
+  });
+
+  for (const maxIterations of [1, 2, 0]) {
+    test(`N=${maxIterations} preserves queued/executing identity and duplicate done is harmless`, async () => {
+      const cwd = makeTempDir("ralph-settlement-");
+      const { pi, ctx } = await boot(cwd, "owner");
+      await pi.tools
+        .get("ralph_start")
+        .execute("start", { name: "bounded", taskContent: "Task", maxIterations }, undefined, undefined, ctx);
+      const done = () => pi.tools.get("ralph_done").execute("done", {}, undefined, undefined, ctx);
+      await inject(pi, ctx, pi.sentUserMessages[0].message, "extension");
+      if (maxIterations !== 1) {
+        await done();
+        await done();
+        assert.equal(pi.sentUserMessages.length, 2);
+        assert.equal(readLoop(cwd, "bounded").iteration, 2);
+        await pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+        await pi.events.get("agent_settled")({ aborted: false }, ctx);
+        assert.equal(readLoop(cwd, "bounded").status, "active", "queued final prompt is not executed work");
+        await inject(pi, ctx, pi.sentUserMessages[1].message, "extension");
+      } else {
+        await done();
+        await done();
+        assert.equal(pi.sentUserMessages.length, 1);
+        assert.equal(readLoop(cwd, "bounded").status, "active");
+      }
+      const end = () =>
+        pi.events.get("agent_end")({ messages: [{ role: "assistant", stopReason: "stop", content: [] }] }, ctx);
+      await end();
+      assert.equal(readLoop(cwd, "bounded").status, "active", "agent_end cannot finalize");
+      await pi.events.get("agent_settled")({ aborted: false }, ctx);
+      assert.equal(readLoop(cwd, "bounded").status, maxIterations ? "completed" : "active");
+      assert.equal(pi.sentMessages.length, maxIterations ? 1 : 0);
+      if (maxIterations) assert.equal(pi.sentMessages[0].options.triggerTurn, false);
+      else {
+        await inject(pi, ctx, "Finish the unlimited loop");
+        await pi.events.get("agent_end")(
+          {
+            messages: [
+              {
+                role: "assistant",
+                stopReason: "stop",
+                content: [{ type: "text", text: "<promise>COMPLETE</promise>" }],
+              },
+            ],
+          },
+          ctx,
+        );
+        assert.equal(readLoop(cwd, "bounded").status, "active");
+        await pi.events.get("agent_settled")({ aborted: false }, ctx);
+        assert.equal(readLoop(cwd, "bounded").status, "completed");
+        assert.equal(pi.sentMessages.length, 1);
+        assert.equal(pi.sentMessages[0].options.triggerTurn, false);
+        assert.equal(pi.sentUserMessages.length, 2);
+      }
+    });
+  }
 });
 
 // State files written by older versions must keep loading: the fields were

@@ -64,8 +64,7 @@ export type FleetUICtx = {
 
 type MainEntry = { kind: "main"; id: string };
 type AgentEntry = { kind: "agent"; id: string; record: AgentRecord };
-type GroupEntry = { kind: "group"; id: string; group: OwnerGroup };
-type FleetEntry = MainEntry | AgentEntry | GroupEntry;
+type FleetEntry = MainEntry | AgentEntry;
 
 /** `11s` — integer seconds, no decimal/suffix (matches Claude Code, unlike formatMs). */
 export function formatFleetElapsed(ms: number): string {
@@ -129,11 +128,10 @@ export class FleetList {
   openConversation(selection: AgentSelection, deferConstruction = false): boolean {
     if (!this.canOpenConversation(selection)) return false;
     this.viewingAgentId = selection.snapshot.id;
-    const mode = this.conversationMode();
     void this.openOverlay((tui, theme, keys, done) => {
       if (!selection.current()) { done(undefined); return { render: () => [], invalidate: () => {} }; }
-      return this.conversation(selection, tui, theme, keys, done, undefined, mode);
-    }, mode, deferConstruction);
+      return this.conversation(selection, tui, theme, keys, done, undefined, getConversationViewerMode(tui));
+    }, "auto", deferConstruction);
     return true;
   }
 
@@ -254,7 +252,8 @@ export class FleetList {
       .sort((a, b) => a.startedAt - b.startedAt);
   }
 
-  private groups(): OwnerGroup[] {
+  /** Explicit /agents fallback only; workflow rows never enter the passive Fleet. */
+  retainedWorkflowGroups(): OwnerGroup[] {
     const groups = new Map<string, OwnerGroup>();
     for (const record of this.manager.listAgentsMutable()) {
       if (record.parentAgentId || record.detached) continue;
@@ -264,14 +263,6 @@ export class FleetList {
       if (!group) { group = { id, runId: record.owner!.runId, records: [] }; groups.set(id, group); }
       group.records.push(record);
     }
-    const retained = new Set([...groups.values()].map(group => group.runId));
-    if (this.externalViewingId) retained.add(this.externalViewingId);
-    for (const run of this.workflowClient?.runs(retained) ?? []) {
-      const id = JSON.stringify(["pi-workflows", run.runId]);
-      const group = groups.get(id) ?? { id, runId: run.runId, records: [] };
-      group.summary = run;
-      groups.set(id, group);
-    }
     for (const group of groups.values()) group.records.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
     return [...groups.values()];
   }
@@ -279,7 +270,6 @@ export class FleetList {
   private roster(): FleetEntry[] {
     return [
       { kind: "main", id: "main" },
-      ...this.groups().map(group => ({ kind: "group" as const, id: `group:${group.id}`, group })),
       ...this.agentRecords().map(record => ({ kind: "agent" as const, id: `agent:${record.id}`, record })),
     ];
   }
@@ -396,7 +386,6 @@ export class FleetList {
       return;
     }
     if (!this.ui) return;
-    if (entry.kind === "group") { this.openGroup(entry.group); return; }
     const record = entry.record;
     if (!record.session) {
       this.ui.notify(`Agent is ${record.status}; no session available.`, "info");
@@ -435,14 +424,18 @@ export class FleetList {
     return true;
   }
 
-  private async openGroup(group: OwnerGroup): Promise<void> {
+  /** Owner navigation is explicit; direct child inspection also works with Fleet disabled. */
+  async openRetainedWorkflow(runId: string, preferOwner = true): Promise<void> {
+    const group = this.retainedWorkflowGroups().find(candidate => candidate.runId === runId);
+    if (!group) { this.ui?.notify("No retained child conversations for this workflow.", "info"); return; }
     const client = this.workflowClient;
+    const summary = preferOwner ? client?.runs(new Set([runId])).find(run => run.runId === runId) : undefined;
     const ui = this.ui;
     const generation = this.overlayGeneration;
-    if (group.summary && client) {
+    if (summary && client) {
       this.externalOpening = true;
       try {
-        await client.open(group.summary);
+        await client.open(summary);
         if (generation === this.overlayGeneration && ui === this.ui) this.externalViewingId = group.runId;
         // Admission precedes the peer's dialog factory. Yield through its next
         // macrotask, then rely on public TUI focus for the entire interaction.
@@ -458,19 +451,21 @@ export class FleetList {
       }
     }
     if (generation !== this.overlayGeneration || ui !== this.ui) return;
+    if (preferOwner && !summary) ui?.notify("Workflow inspector unavailable; showing retained children only (no workflow controls).", "warning");
     if (!group.records.length) { ui?.notify("No retained child conversations for this workflow.", "info"); return; }
-    void this.openOverlay((tui, theme, keys, done) => new OwnerGroupViewer(tui, theme, group.runId,
-      () => this.groups().find(candidate => candidate.id === group.id)?.records ?? [],
+    await this.openOverlay((tui, theme, keys, done) => new OwnerGroupViewer(tui, theme, group.runId,
+      () => this.retainedWorkflowGroups().find(candidate => candidate.id === group.id)?.records ?? [],
       (record, back) => this.conversation(captureAgentSelection(this.manager, record), tui, theme, keys, back),
       () => done(undefined), keys));
   }
 
   private async openOverlay(factory: (tui: TUI, theme: Theme, keys: ViewerKeybindings, done: (result: undefined) => void) => Component,
-    mode: "fullscreen" | "overlay" = "overlay", deferConstruction = false): Promise<void> {
+    mode: "fullscreen" | "overlay" | "auto" = "overlay", deferConstruction = false): Promise<void> {
     const ui = this.ui;
     if (!ui) return;
     const generation = ++this.overlayGeneration;
     this.viewerClose = () => {}; // reserve input during asynchronous construction
+    let mountedMode: "fullscreen" | "overlay" = "overlay";
     try {
       if (deferConstruction) await Promise.resolve();
       if (generation !== this.overlayGeneration || ui !== this.ui) return;
@@ -480,9 +475,10 @@ export class FleetList {
           return { render: () => [], invalidate: () => {} };
         }
         this.viewerClose = () => done(undefined);
+        mountedMode = mode === "auto" ? getConversationViewerMode(tui) : mode;
         const component = factory(tui, theme, keys, done);
-        return mode === "fullscreen" ? component : borderedComponent(component, text => theme.fg("borderAccent", text));
-      }, { overlay: true, overlayOptions: getConversationOverlayOptions({ mode: mode === "fullscreen" ? "fullscreen" : undefined }) });
+        return mountedMode === "fullscreen" ? component : borderedComponent(component, text => theme.fg("borderAccent", text));
+      }, { overlay: true, overlayOptions: () => getConversationOverlayOptions({ mode: mountedMode === "fullscreen" ? "fullscreen" : undefined }) });
     } catch {
       if (generation === this.overlayGeneration) ui.notify("Cannot open conversation; try again.", "error");
     } finally {
@@ -547,25 +543,6 @@ export class FleetList {
     for (let a = start; a < start + visible; a++) {
       const entry = agents[a];
       if (entry.kind === "agent") lines.push(this.renderAgentRow(a + 1, sel, entry.record, width, theme));
-      else if (entry.kind === "group") {
-        const run = entry.group.summary;
-        if (run) {
-          const selected = a + 1 === sel;
-          const status = run.status === "failed" ? "error" : run.status === "pending" || run.status === "paused" ? "queued" :
-            run.status === "stopped" || run.status === "interrupted" ? "stopped" : run.status === "completed" ? "completed" : "running";
-          const color = status === "error" ? "error" : status === "stopped" ? "warning" : selected ? "accent" : "dim";
-          const name = sanitizeDisplayText(run.name);
-          const phase = run.currentPhase ? ` · ${sanitizeDisplayText(run.currentPhase)}` : "";
-          // A workflow is an expandable group, not another agent. Keep its
-          // type mark distinct at every outcome; color/text still report status.
-          const left = `  ${theme.fg(color, "▸")} ${theme.fg(selected ? "accent" : "muted", name)} · ${theme.fg(color, run.status)}${phase} · ${run.runningCalls}/${run.callCount} running · ${run.completedCalls} done · ${run.failedCalls} failed${run.restored ? " · restored" : ""}`;
-          const right = `${formatFleetElapsed(run.elapsedMs)}${run.tokenCount === undefined ? "" : ` · ${formatFleetTokens(run.tokenCount)}`}`;
-          lines.push(rightAlign(left, theme.fg("dim", right), width));
-        } else {
-          const label = `  ▸ Workflow ${sanitizeDisplayText(entry.group.runId)} · ${entry.group.records.length} retained children`;
-          lines.push(truncateToWidth(theme.fg(a + 1 === sel ? "accent" : "muted", label), width));
-        }
-      }
     }
     if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `${hiddenBelow} more below`), width));
 

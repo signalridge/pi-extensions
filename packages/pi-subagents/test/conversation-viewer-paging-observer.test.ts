@@ -231,6 +231,8 @@ describe("owned observer paging targets", () => {
     } finally { f.dispose(); }
   });
 
+  // This pressure case keeps 25×80 native key dispatches and their rendering;
+  // budget the measured host frame work separately from production deadlines.
   it("reaches source tails and every tool label after a short prompt without truncating history", () => {
     const message: TestMessage = { role: "assistant", content: [
       { type: "text", text: "a".repeat(30_000) + "SOURCE_TAIL" },
@@ -251,7 +253,7 @@ describe("owned observer paging targets", () => {
       expect(f.messages).toHaveLength(2); expect(f.messages[1]).toBe(message);
       expect(layout.inputs.every(text => text.length <= 8_192)).toBe(true);
     } finally { f.dispose(); }
-  });
+  }, 20_000);
 
   it("pages a continuation in an older bounded window and preserves Home/End and root controls", () => {
     const f = fixture([user("old prompt"), assistant("a".repeat(6_000) + "OLD_TAIL"), ...Array.from({ length: 150 }, (_, i) => assistant(`message-${i}`))]);

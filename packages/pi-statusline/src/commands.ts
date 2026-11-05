@@ -41,6 +41,7 @@ import {
   SEGMENT_NAMES,
   type SegmentName,
 } from "./types.js";
+import type { FooterUsageSummary } from "./usage.js";
 
 const EDIT_SETTINGS_LABEL = "Edit settings JSON";
 const SEGMENT_VIEWPORT_SIZE = 6;
@@ -63,6 +64,7 @@ const SEGMENT_DESCRIPTIONS: Record<SegmentName, string> = {
 export interface StatuslineCommandOptions {
   settingsPath: string;
   getLoaded(): LoadedStatuslineSettings;
+  getUsage?(ctx: ExtensionContext): FooterUsageSummary;
   apply(loaded: LoadedStatuslineSettings, ctx: ExtensionCommandContext): void;
   preview?(palettePreset: PalettePreset | undefined, ctx: ExtensionCommandContext): void;
   save?: (settingsPath: string, rawDocument: string) => LoadedStatuslineSettings;
@@ -401,6 +403,7 @@ async function showPalettePresetPicker(
         container.invalidate();
         updateThemedText();
       },
+      capturesViewportInput: true,
       handleInput(data: string) {
         list.handleInput(data);
         tui.requestRender();
@@ -583,6 +586,7 @@ async function chooseSegments(ctx: ExtensionCommandContext, options: StatuslineC
         container.invalidate();
         updateThemedText();
       },
+      capturesViewportInput: true,
       handleInput(data: string) {
         const moveModeKey = matchesKey(data, "m") || matchesKey(data, Key.shift("m"));
         const lineBreakKey = matchesKey(data, "b") || matchesKey(data, Key.shift("b"));
@@ -889,10 +893,18 @@ function showStatus(ctx: ExtensionCommandContext, options: StatuslineCommandOpti
       `separator: ${loaded.config.separator}`,
       `information: ${inferInformationProfile(loaded.config.segments)}`,
       `segments: ${loaded.config.segments.join(", ") || "none"}`,
+      `cost origin: ${formatCostOrigin(options.getUsage?.(ctx).costOrigin)}`,
       diagnostics ? `warnings: ${diagnostics}` : "warnings: none",
     ].join("\n"),
     loaded.diagnostics.length > 0 ? "warning" : "info",
   );
+}
+
+function formatCostOrigin(origin: FooterUsageSummary["costOrigin"]): string {
+  if (origin === "provider") return "provider-reported";
+  if (origin === "estimated") return "estimated";
+  if (origin === "mixed") return "mixed/unconfirmed";
+  return "unknown/legacy";
 }
 
 function showHelp(ctx: ExtensionCommandContext, settingsPath: string) {
@@ -902,7 +914,7 @@ function showHelp(ctx: ExtensionCommandContext, settingsPath: string) {
       "/statusline — open Appearance, Information, Advanced, Status, and Help",
       "/statusline inspect — inspect extension statuses (Ctrl+Alt+S)",
       "/statusline settings — edit and apply JSON",
-      "/statusline status — show source, path, information level, and warnings",
+      "/statusline status — show source, path, information level, cost origin, and warnings",
       "/statusline help — show this help",
       "Menu actions: Appearance, Information, Advanced, Status, Help, Inspect extension statuses.",
       "Inspector: arrows/configured selection keys navigate, Enter opens owner detail, Esc closes.",

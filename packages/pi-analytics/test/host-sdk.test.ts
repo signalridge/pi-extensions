@@ -98,7 +98,12 @@ for (const phase of ["tools", "streaming"] as const) {
             errorMessage: warm ? "HTTP 503 warm failed" : undefined,
           },
         );
-        Object.assign(message, { provider: requestModel.provider, model: requestModel.id, api: requestModel.api });
+        Object.assign(message, {
+          provider: requestModel.provider,
+          model: requestModel.id,
+          api: requestModel.api,
+          responseModel: warm ? "warm-only" : `reported-${index}`,
+        });
         message.usage.cacheRead = 100_000; // Enough cached context for real warming economics.
         void (async () => {
           await options?.onPayload?.({ warm, index }, requestModel);
@@ -237,6 +242,16 @@ for (const phase of ["tools", "streaming"] as const) {
       assert.equal(run.providerErrorCount, 0);
       assert.deepEqual(run.providerErrors, []);
       assert.equal(run.generations.length, 2, "no phantom warming generation");
+      assert.deepEqual(
+        run.generations.map(({ responseModel }) => responseModel),
+        ["reported-1", "reported-2"],
+      );
+      assert.doesNotMatch(JSON.stringify(run), /warm-only/);
+      for (const message of session.messages) {
+        if (message.role === "assistant" && message.responseModel?.startsWith("reported-")) {
+          assert.equal(message.usage.cacheRead, 100_000, "metadata collection never changes native usage");
+        }
+      }
       assert.deepEqual(
         run.generations.flatMap((generation) => generation.responses.map((response) => response.status)),
         [200],

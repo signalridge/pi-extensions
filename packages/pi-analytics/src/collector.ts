@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { classifyProviderError } from "./errors.js";
+import { reportedModel } from "./reported-model.js";
 import type {
   GenerationOutcome,
   GenerationRecord,
@@ -114,7 +115,13 @@ export class ResponseCollector {
     });
   }
 
-  finishGeneration(input: { now: number; stopReason: string; errorMessage?: string; model?: ModelIdentity }): void {
+  finishGeneration(input: {
+    now: number;
+    stopReason: string;
+    errorMessage?: string;
+    model?: ModelIdentity;
+    responseModel?: unknown;
+  }): void {
     const active = this.active;
     if (!active) return;
     // A virtual route can fail before any provider request exists. Preserve the
@@ -132,6 +139,8 @@ export class ResponseCollector {
       generation.outcome = outcome;
       generation.provider = input.model?.provider;
       generation.model = input.model?.model;
+      const responseModel = reportedModel(input.responseModel);
+      if (responseModel !== undefined) generation.responseModel = responseModel;
       generation.thinkingLevel = input.model?.thinkingLevel;
     }
     if (outcome === "error") {

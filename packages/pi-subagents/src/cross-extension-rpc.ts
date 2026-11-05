@@ -19,6 +19,7 @@ export { CHILD_CONTEXT_CAPABILITY, PROTOCOL_CAPABILITIES, PROTOCOL_VERSION };
 
 import type { ManagedSpawnPolicy, ManagedSpawnRequest, ManagedSpawnResult } from "./agent-manager.js";
 import { getRoutingPolicySnapshot } from "./agent-tiers.js";
+import { assertNoPublicReopen } from "./internal-run.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import type { AgentOwner } from "./types.js";
 
@@ -212,6 +213,8 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
     // Legacy callers may still provide the full spawn options surface. Resolve
     // serializable model strings here, exactly as before; managed callers must
     // use spawn-managed and cannot reach this branch with policy fields.
+    assertNoPublicReopen(params);
+    assertNoPublicReopen(rawOptions);
     let normalizedOptions: Record<string, unknown> = { ...(rawOptions ?? {}) };
     // Legacy spawn is intentionally unowned; owner metadata is accepted only
     // by validateManagedSpawnRequest on the additive managed channel.

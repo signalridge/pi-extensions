@@ -60,21 +60,35 @@ interface ZonedParts {
 const FORMATTER_CACHE_LIMIT = 32;
 const DEFAULT_ENVIRONMENT_REFRESH_MS = 60_000;
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
-let defaultEnvironment: { key: string; checkedAt: number; systemLocale: string; localTimeZone: string } | undefined;
+let defaultEnvironment:
+  | { key: (string | undefined)[]; checkedAt: number; systemLocale: string; localTimeZone: string }
+  | undefined;
+let environmentEpoch = 0;
+
+/** Observe the same lazy OS-default probe as formatting, even on cache hits.
+ * Explicit locales/zones do not depend on OS defaults. No new timer is needed.
+ */
+export function stampFormatEnvironmentEpoch(settings: Readonly<StampSettings>): number {
+  if (settings.timeZone !== "local" && settings.locale !== "system") return 0;
+  resolveDefaultEnvironment();
+  return environmentEpoch;
+}
 
 function resolveDefaultEnvironment(): StampFormatEnvironment {
-  const key = JSON.stringify([process.env.TZ, process.env.LC_ALL, process.env.LC_TIME, process.env.LANG]);
+  const key = [process.env.TZ, process.env.LC_ALL, process.env.LC_TIME, process.env.LANG];
   const now = Date.now();
   const elapsed = defaultEnvironment ? now - defaultEnvironment.checkedAt : -1;
   if (
-    !defaultEnvironment ||
-    defaultEnvironment.key !== key ||
+    !defaultEnvironment?.key.every((value, index) => value === key[index]) ||
     elapsed < 0 ||
     elapsed >= DEFAULT_ENVIRONMENT_REFRESH_MS
   ) {
     // OS defaults can change without a process-environment change. Probe at most
     // once a minute; process-environment changes are observed on the next render.
     const { locale, timeZone } = new Intl.DateTimeFormat().resolvedOptions();
+    if (locale !== defaultEnvironment?.systemLocale || timeZone !== defaultEnvironment?.localTimeZone) {
+      environmentEpoch += 1;
+    }
     defaultEnvironment = { key, checkedAt: now, systemLocale: locale, localTimeZone: timeZone };
   }
   return defaultEnvironment;

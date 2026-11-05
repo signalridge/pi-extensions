@@ -70,3 +70,6 @@ process.stdin.on("data", (chunk) => {
     handle(JSON.parse(body));
   }
 });
+
+// Optional test bootstrap acknowledgement; silent-initialize still stays silent.
+if (process.env.PI_LSP_TEST_READY) writeFileSync(process.env.PI_LSP_TEST_READY, "ready");

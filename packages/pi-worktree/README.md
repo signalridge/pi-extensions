@@ -170,6 +170,10 @@ packages/pi-worktree/
 └── tsconfig.json
 ```
 
+## Local divergence
+
+This fork retains the guarded inventory, quarantine, metadata-pruning, and process-ownership safeguards described above. Git capture budgets count combined stdout/stderr bytes per operation: metadata 64 KiB, inventories 8 MiB, and mutations 1 MiB. Incomplete output is rejected before parsing or expected-nonzero fallback, including sparse-checkout rule checks. An incomplete inventory never authorizes deletion. Mutation overflow may occur after Git commits its change: inspect `git worktree list` and affected paths before retrying; the extension does not automatically roll back that uncertain outcome. Stdin capture handles fragmented UTF-8 and uses the same bounded TERM/KILL/drain ownership on overflow as on cancellation and timeout.
+
 ## License
 
 MIT

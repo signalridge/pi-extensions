@@ -16,7 +16,7 @@ initTheme("dark", false);
 // The installed host only disposes mounted components. In particular it does
 // not mount (or dispose) a factory result whose done() ran in an earlier microtask.
 function createLoaderHost() {
-  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+  assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let text = "original draft";
   let mounted: Component | undefined;
   let mounts = 0;
@@ -49,8 +49,8 @@ function createLoaderHost() {
       requestRender: render,
     },
     keybindings: { matches: () => false, getKeys: () => [] },
-    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
-    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
+    // 1.0.4 mounts directly; 1.5.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.5.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   return {
     custom: ((factory, options) =>
@@ -102,8 +102,8 @@ test.each(["virtual", "unavailable"] as const)(
       model:
         outcome === "virtual" ? { api: "pi-virtual", provider: "test", id: "virtual", reasoning: false } : undefined,
     });
-    // 1.0.4 reattaches the editor on every close; 1.4.0 never replaced it for a dialog closed before mounting.
-    const restoresPerRun = VERSION === "1.4.0" ? 0 : 1;
+    // 1.0.4 reattaches the editor on every close; 1.5.0 never replaced it for a dialog closed before mounting.
+    const restoresPerRun = VERSION === "1.5.0" ? 0 : 1;
     try {
       for (let invocation = 0; invocation < 3; invocation++) {
         await command.run();

@@ -1,15 +1,15 @@
 import { createHash } from "node:crypto";
 import { type BigIntStats, closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Fingerprints, fingerprint } from "./fingerprint.js";
 import { MAX_BYTES, STATE_TYPE } from "./state.js";
+
+export { fingerprint } from "./fingerprint.js";
 
 type SessionReader = ExtensionContext["sessionManager"];
 
 export const VOLATILE = "in-memory, not persistent after process exit";
 export const NOT_READY = "Send an ordinary message first, or use explicit --no-session for volatile Todo state.";
-export function fingerprint(value: unknown): string {
-  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
-}
 export function isState(entry: SessionEntry): boolean {
   return entry.type === "custom" && entry.customType === STATE_TYPE;
 }
@@ -25,14 +25,14 @@ const CHUNK_BYTES = 32 * 1024;
 function identity(stat: BigIntStats): string {
   return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs, stat.mode].join(":");
 }
-function persistedConversation(manager: SessionReader, committed: ReadonlySet<string>): boolean {
+function persistedConversation(manager: SessionReader, committed: ReadonlySet<string>, hashes: Fingerprints): boolean {
   return manager
     .getEntries()
     .some(
       (entry) =>
         entry.type === "message" &&
         (entry.message.role === "user" || entry.message.role === "assistant") &&
-        committed.has(fingerprint(entry)),
+        committed.has(hashes.hash(entry)),
     );
 }
 
@@ -42,6 +42,11 @@ function persistedConversation(manager: SessionReader, committed: ReadonlySet<st
  * as native canonical JSON with optional terminal CR, not arbitrary JSON whitespace.
  */
 export class Persistence {
+  constructor(private readonly hashes = new Fingerprints()) {}
+  retire() {
+    this.cache = undefined;
+    this.hashes.clear();
+  }
   private cache?: {
     manager: SessionReader;
     path: string;
@@ -51,6 +56,7 @@ export class Persistence {
   };
   inspect(manager: SessionReader): Durability {
     const path = manager.getSessionFile();
+    if (this.cache && (this.cache.manager !== manager || this.cache.path !== path)) this.retire();
     if (!path) return { kind: "volatile", committed: new Set(), conversation: false, incomplete: false };
     const header = manager.getHeader();
     if (!header || header.id !== manager.getSessionId())
@@ -72,7 +78,7 @@ export class Persistence {
       const before = fstatSync(fd, { bigint: true });
       if (!before.isFile()) throw new Error("Todo unavailable: session path is not a regular file.");
       const key = identity(before);
-      const headerKey = fingerprint(header);
+      const headerKey = this.hashes.hash(header);
       const cached = this.cache;
       if (
         cached &&
@@ -83,7 +89,16 @@ export class Persistence {
       ) {
         if (identity(statSync(path, { bigint: true })) !== key)
           throw new Error("Todo unavailable: session file changed during verification.");
-        return { ...cached.result, conversation: persistedConversation(manager, cached.result.committed) };
+        return { ...cached.result, conversation: persistedConversation(manager, cached.result.committed, this.hashes) };
+      }
+      // Operation-local hints only: complete raw-line digests equal to known
+      // canonical native values need no parse/stringify/hash round trip. The
+      // disk index still comes from the ENTIRE freshly read file. Unknown or
+      // noncanonical lines retain the original bounded parser path.
+      const known = new Set<string>();
+      for (const entry of manager.getEntries()) {
+        const hash = this.hashes.known(entry);
+        if (hash !== undefined) known.add(hash);
       }
       const committed = new Set<string>();
       let headerSeen = false;
@@ -95,7 +110,9 @@ export class Persistence {
       const finish = () => {
         if (trailing[0] !== 13) digest.update(trailing);
         const hash = digest.digest("hex");
-        if (lineBytes <= LINE_LIMIT) {
+        if (lineBytes <= LINE_LIMIT && headerSeen && known.has(hash)) {
+          committed.add(hash);
+        } else if (lineBytes <= LINE_LIMIT) {
           const line = Buffer.concat(pieces).toString("utf8");
           let entry: unknown;
           try {
@@ -152,7 +169,7 @@ export class Persistence {
       const result: Durability = {
         kind: "file",
         committed,
-        conversation: persistedConversation(manager, committed),
+        conversation: persistedConversation(manager, committed, this.hashes),
         incomplete: lineBytes > 0,
       };
       this.cache = { manager, path, identity: key, header: headerKey, result };
@@ -168,6 +185,6 @@ export class Persistence {
       throw new Error("Todo unavailable: incomplete session JSONL tail; repair storage and reconcile/reload.");
   }
   includes(result: Durability, entry: SessionEntry): boolean {
-    return result.kind === "volatile" || result.committed.has(fingerprint(entry));
+    return result.kind === "volatile" || result.committed.has(this.hashes.hash(entry));
   }
 }

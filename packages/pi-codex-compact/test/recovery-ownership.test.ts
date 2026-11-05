@@ -566,7 +566,7 @@ for (const phase of ["active-dispose", "pending-cancel", "pending-expiry"] as co
     test(`real native overlapping ${dialog} dialog is untouched by recovery ${phase}`, async () => {
       const f = fixture();
       try {
-        assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+        assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
         initTheme("dark");
         const children: unknown[] = [];
         const editor = { getText: () => "Unrelated editor text", setText: vi.fn() };
@@ -584,8 +584,8 @@ for (const phase of ["active-dispose", "pending-cancel", "pending-expiry"] as co
           keybindings: {},
           renderWidgets() {},
           disposeActiveSelector() {},
-          // 1.4.0 manages custom dialogs through a stack, rather than one editor slot.
-          ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
+          // 1.5.0 manages custom dialogs through a stack, rather than one editor slot.
+          ...(VERSION === "1.5.0" ? { extensionDialogs: [], programStatus: { setBlocked: vi.fn() } } : {}),
         });
         const method = (name: string) =>
           Reflect.get(InteractiveMode.prototype, name) as (...args: unknown[]) => unknown;

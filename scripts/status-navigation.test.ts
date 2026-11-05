@@ -193,6 +193,8 @@ function terminalHost(fullscreen: boolean) {
       tui.renderNow();
     },
     dock: () => dock.render(120).map((line) => stripVTControlCharacters(line).trimEnd()),
+    widgets,
+    below,
     close: () => views.at(-1)?.close(),
     dispose: () => {
       for (const view of [...views].reverse()) view.close();
@@ -210,7 +212,10 @@ for (const fullscreen of [false, true]) {
       mkdirSync(agentDir);
       mkdirSync(join(cwd, ".pi"));
       writeFileSync(join(agentDir, "pi-statusline.json"), JSON.stringify({ segments: ["model"] }));
-      writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, fleetView: true }));
+      writeFileSync(
+        join(cwd, ".pi", "subagents.json"),
+        JSON.stringify({ schedulingEnabled: false, fleetView: !reverse }),
+      );
       const oldAgentDir = process.env.PI_CODING_AGENT_DIR;
       process.env.PI_CODING_AGENT_DIR = agentDir;
       const host = terminalHost(fullscreen);
@@ -314,8 +319,13 @@ for (const fullscreen of [false, true]) {
         host.close();
         await next;
         const lines = host.dock();
-        const group = lines.findIndex((line) => line.includes("▸ workflow navigation"));
+        expect(host.widgets.get("pi-workflows")?.container).toBe(host.below);
+        expect(host.widgets.has("fleet")).toBe(false); // Even childless workflows have only one owner surface.
+        expect(lines.filter((line) => line.includes("▸ workflow navigation"))).toHaveLength(1);
         const footer = lines.indexOf("FOOTER");
+        // Footer status is a separate compact summary, not another overview.
+        expect(lines.slice(0, footer).filter((line) => line.includes("Workflows ·"))).toHaveLength(1);
+        const group = lines.findIndex((line) => line.includes("▸ workflow navigation"));
         expect(group).toBeGreaterThanOrEqual(0);
         expect(footer, JSON.stringify(lines)).toBeGreaterThan(group);
         expect(lines.slice(group + 1, footer)).toEqual([""]);

@@ -20,7 +20,7 @@ import { MESSAGE_TYPE, Notifications } from "../src/notifications.js";
 import { nativeUIFixture } from "./tui-fixture.js";
 
 // Real host loader, lifecycle, provider dispatch and tool pipeline. No paid model.
-describe.skipIf(!["1.4.0"].includes(VERSION) || process.platform === "win32")(
+describe.skipIf(!["1.5.0"].includes(VERSION) || process.platform === "win32")(
   "background on supported installed Pi",
   () => {
     const cleanup: (() => Promise<void>)[] = [];

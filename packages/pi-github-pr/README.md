@@ -75,6 +75,8 @@ The extension runs passively:
 - If the directory has no GitHub PR, the statusline entry stays empty.
 - If `gh` is missing or unauthenticated, the statusline shows a short hint such as `PR gh missing` or `PR gh auth`.
 
+Each subprocess has an independent combined stdout/stderr capture budget: PR metadata 1 MiB, GraphQL counts 64 KiB, and Git HEAD-path discovery 16 KiB. Incomplete output is rejected before parsing or CLI failure classification; overflow is not reported as a timeout. These operation budgets are not settings.
+
 ## Known limits
 
 - Requires `gh`; there is no direct GitHub API, `GITHUB_TOKEN` fallback, or manual `GH_HOST` requirement.
