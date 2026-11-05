@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.18.0
+### Minor Changes
+
+- 3096585: Continue remembered ordinary agents after eviction or reload using their original ID and handle. Branch-owned bounded receipts validate native child ownership, exact saved history, current definitions and existing isolation before reopening; managed workflow children remain under their owner's recovery controls. Public Agent, registry and legacy RPC calls reject internal session-file and handle-reclaim capabilities. New receipts fence the public physical catalog provider/API/model/baseUrl before cold continuation; only exact routes from Pi AI's public SDK built-in catalog qualify, conservatively including the actual model ID. Unknown/custom endpoints (which may hide credentials in URL paths) are never retained in receipts or native ownership markers, including when parsing saved receipts. Fresh custom-provider agents still run normally without cold-reopen proof. Missing or changed route proof and opaque replay without issuer/profile proof are refused with sanitized fresh-agent guidance. This catalog fence does not qualify authentication-time endpoint pinning or cross-profile/cross-issuer replay. Cold sessions are handed off only after final admission, and failed setup/handoff sessions cannot become live-resume fallbacks. Reject explicit cold `isolated`/`isolation` parameters before allocation instead of dropping them; use a fresh Agent for per-call isolation transitions. Finalize shutdown-written native leaves only with renewed ownership, original-route and plain-history proof on the owning parent branch, and hold leases through actual foreground-resume and teardown settlement.
+  
+  Manual agent creation now saves model/thinking choices as references to the existing tier catalogue, with explicit approval before adding a new tier and no silent edits to existing tiers. Explicit thinking `off` is reported as unsupported by the current shared tier schema instead of being saved as an ignored pin or translated to inherit. Generated definitions also reference tiers rather than retired model/thinking frontmatter.
+- 3096585: Give Workflows one rich below-editor overview and keep Subagents Fleet limited to independent agents. Preserve workflow navigation, completed-call token semantics, periodic projection/footer updates, and exact retained-child access through the owner navigator and explicit `/agents` retained-child paths, including when Fleet is disabled. No execution/model policy or managed/UI protocol changes.
+  
+  Update both packages together for the new layout: older Subagents can still duplicate the new overview; newer Subagents paired with older Workflows leaves the older upper progress panel. Existing running sessions do not acquire these UI changes until a later normal activation.
+
+### Patch Changes
+
+- 3096585: Extract atomic agent-file mutations and cooperative locking into a lightweight Node-only module so cooperating workers can start without loading the SDK. Preserve the existing exports and mutation behavior, including lock bounds, ownership checks, permissions, and recovery files.
+- 3096585: Restore the deprecated optional `model` and `thinking` fields on the exported `NewAgentInput` type so existing deep-import consumers continue to compile. Each present retired key, including inherited keys, now warns by name to use `tier`, without reading or logging its value. Manual agent files still serialize only `tier` for routing; legacy inputs are ignored, never translated into routing policy or written as ineffective frontmatter.
+- 3096585: Reuse unchanged bounded conversation-viewer projections before sanitization and cache their independently width-clamped transcript rows. Keep in-place streaming updates, source paging, resize and compaction invalidation, and existing history/cache budgets intact.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.17.0
 ### Minor Changes
 

@@ -1,5 +1,24 @@
 # @signalridge/pi-btw
 
+## 1.6.0
+### Minor Changes
+
+- 3096585: Qualify the shared TUI Kit 0.69 release against Pi 1.5, synchronizing all consumer ranges. Forward native viewport capture through border adapters and declare it for custom selectors so configured paging reaches the focused list while overlays retain priority.
+  
+  Settle bordered custom interactions locally on dispose-only host teardown without invoking a stale host completion callback. Preserve consumer-owned cancellation, session fences, draft handling, and accepted-work draining; dispose wrapped components exactly once.
+- 3096585: Add an optional synchronous Secrets-owned event projection for cooperating BTW and advisor requests, before history truncation, with bounded validation and fail-closed ownership/cancellation checks. Preserve opt-in and destination consent; never rewrite stored history or blanket-restore side replies.
+  
+  Prevent cross-secret placeholder labels, safely replace now-unsafe cached labels while retaining old restoration mappings, and preserve own JSON data properties and frozen descriptors during copy-on-write projection. Document the limited native/cooperating request coverage and upstream divergence.
+  
+  Withhold unsafe executable/accessor JSON serialization hooks before discovery or unchanged-copy returns. Keep discovery and claim validation inside the generic error boundary, and observe rejected native promise replies across realms without invoking thenable getters.
+
+### Patch Changes
+
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.5.0
 ### Minor Changes
 

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.4.0
+### Minor Changes
+
+- 3096585: Qualify the shared TUI Kit 0.69 release against Pi 1.5, synchronizing all consumer ranges. Forward native viewport capture through border adapters and declare it for custom selectors so configured paging reaches the focused list while overlays retain priority.
+  
+  Settle bordered custom interactions locally on dispose-only host teardown without invoking a stale host completion callback. Preserve consumer-owned cancellation, session fences, draft handling, and accepted-work draining; dispose wrapped components exactly once.
+- 3096585: Preserve optional native cost provenance in assistant metadata and label provider, estimated, and unknown totals truthfully. Retain the historical public cost field and readable legacy entries without rewriting history or repricing usage.
+
+### Patch Changes
+
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+- 3096585: Requalify optional cost attribution when the active native branch leaf changes, so duplicate, malformed or overflowing annotations cannot leave a stale known-origin label on mounted or fresh stamp renderers. Preserve frozen v4 history and successful source/tool ordering.
+- 3096585: Keep the frozen version-4 stamp usage shape readable after rollback. Store optional cost origin in separately versioned, branch-local annotations referencing exact native stamp IDs; overlay validated origin only for display. Failed or ambiguous annotation writes leave the source stamp valid and attribution unknown, without repricing or rewriting history.
+- 3096585: Reuse unchanged, uncoloured stamp labels, metadata and wrapped rows during transcript repaints with bounded value-sensitive caches. Keep theme colouring, native-branch cost attribution and the existing lazy OS-default refresh live, and clear cached work on component invalidation or session retirement. Retry failed label formatting without caching an empty result, observe property enumerability changes and bypass accessor-backed snapshots without extra getter calls.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.3.5
 ### Patch Changes
 

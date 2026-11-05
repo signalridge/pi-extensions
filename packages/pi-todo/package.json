@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-todo",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "An opt-in, branch-local session checklist for Pi.",
   "type": "module",
   "license": "MIT",

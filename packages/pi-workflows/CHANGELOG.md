@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.12.0
+### Minor Changes
+
+- 3096585: Give Workflows one rich below-editor overview and keep Subagents Fleet limited to independent agents. Preserve workflow navigation, completed-call token semantics, periodic projection/footer updates, and exact retained-child access through the owner navigator and explicit `/agents` retained-child paths, including when Fleet is disabled. No execution/model policy or managed/UI protocol changes.
+  
+  Update both packages together for the new layout: older Subagents can still duplicate the new overview; newer Subagents paired with older Workflows leaves the older upper progress panel. Existing running sessions do not acquire these UI changes until a later normal activation.
+
+### Patch Changes
+
+- 3096585: Do not charge managed-request preflight rejections as submissions, and finalize schema-invalid logical calls with their exact settled attempt metadata. Count all owner-side workflows in the passive overview without expanding the bounded peer snapshot.
+- 3096585: Validate complete managed requests before allocating dispatch leases, preserving local validation diagnostics and completed resume prefixes. Apply structured-output constraints conjunctively and extract balanced JSON from large malformed replies in linear time without changing bounded repair behavior.
+- 3096585: Validate persisted transcript pointers with the managed protocol contract and settle logical calls when a token budget prevents a repair attempt, preserving the completed child's usage and ownership on restore.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.11.1
 ### Patch Changes
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1
+### Patch Changes
+
+- 3096585: Validate Ralph tasks before activation, preserve running-operation ownership, recover only owned duplicate loops, and finalize outcomes at settlement with non-triggering banners. Attribute consented recap requests to their owning session and restore the upstream MIT notice.
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+
 ## 1.4.0
 ### Minor Changes
 

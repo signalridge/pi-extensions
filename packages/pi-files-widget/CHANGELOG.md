@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.9
+### Patch Changes
+
+- 3096585: Keep confirmed viewer searches available for next/previous navigation. Serialize scan and count pumps across root changes, bound sibling metadata work, and refresh Git metadata asynchronously with cancellation, stale-result fences, and explicit failure indicators instead of false clean results.
+- 3096585: Release cancelled or timed-out Git queries after confirmed direct-child termination even when descendants retain output pipes. Align confirmed search with an explicitly wrapped source presentation and retain fullscreen paging ownership on the returned browser component.
+- 3096585: Reveal the first raw source search occurrence through escaped controls and Unicode case expansion, rather than matching artificial display escapes. Preserve grapheme-aware wrapping when confirming, navigating, or resizing search results.
+- 3096585: Move the development SDK pins to exact Pi 1.5.0 while retaining wildcard host-owned peers and canonical TypeBox 1.3.27. Import the advisor's schema builder directly from TypeBox and report the required `truncated` flag from local Git process adapters. Update SDK fixtures for the new baseline and pi-schema validation diagnostics without changing lifecycle, consent, or model-selection policy.
+- Updated dependencies [3096585]
+- Updated dependencies [3096585]
+  - @signalridge/pi-ui@1.5.0
+
 ## 1.2.8
 ### Patch Changes
 
