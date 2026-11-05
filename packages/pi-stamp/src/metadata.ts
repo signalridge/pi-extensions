@@ -4,6 +4,7 @@ export const ASSISTANT_STOP_REASONS = ["stop", "toolUse", "length", "error", "ab
 export type StampAssistantMetadataMode = (typeof ASSISTANT_METADATA_MODES)[number];
 export type AssistantStopReason = (typeof ASSISTANT_STOP_REASONS)[number];
 export type ToolStampOutcome = "success" | "error";
+export type AssistantStampCostOrigin = "provider" | "estimated" | "unknown";
 
 export interface AssistantStampUsageData {
   input?: number;
@@ -12,7 +13,10 @@ export interface AssistantStampUsageData {
   cacheRead?: number;
   cacheWrite?: number;
   totalTokens?: number;
+  /** Historical public field name; stores Pi's best available total, not necessarily an estimate. */
   estimatedCost?: number;
+  /** View-only annotation; never persisted inside the frozen version-4 usage shape. */
+  costOrigin?: AssistantStampCostOrigin;
 }
 
 export interface AssistantStampDiagnosticSummary {
@@ -69,7 +73,7 @@ export function captureAssistantMetadata(value: unknown): AssistantMetadataData 
   };
 }
 
-export function isAssistantMetadataData(value: unknown): value is AssistantMetadataData {
+export function isAssistantMetadataData(value: unknown, allowViewOrigin = false): value is AssistantMetadataData {
   if (
     !isRecord(value) ||
     !hasOnlyKeys(value, [
@@ -89,7 +93,7 @@ export function isAssistantMetadataData(value: unknown): value is AssistantMetad
     (Object.hasOwn(value, "responseModel") && !isSafeMetadataText(value.responseModel)) ||
     (Object.hasOwn(value, "responseId") && !isSafeMetadataText(value.responseId)) ||
     !isAssistantStopReason(value.stopReason) ||
-    (Object.hasOwn(value, "usage") && !isUsageData(value.usage))
+    (Object.hasOwn(value, "usage") && !isUsageData(value.usage, allowViewOrigin))
   ) {
     return false;
   }
@@ -122,7 +126,7 @@ export function formatAssistantMetadataLines(
   mode: StampAssistantMetadataMode,
   debug: boolean,
 ): string[] {
-  if (mode === "off" || !isAssistantMetadataData(metadata)) return [];
+  if (mode === "off" || !isAssistantMetadataData(metadata, true)) return [];
   const lines = mode === "compact" ? [formatCompactMetadata(metadata)] : formatExpandedMetadata(metadata);
   if (!debug) return lines;
   if (metadata.responseId) lines.push(`debug · response id ${metadata.responseId}`);
@@ -193,6 +197,13 @@ function captureUsage(value: unknown): AssistantStampUsageData | undefined {
   return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
+export function captureAssistantCostOrigin(value: unknown): AssistantStampCostOrigin | undefined {
+  if (!isRecord(value) || !isRecord(value.usage) || !isRecord(value.usage.cost)) return undefined;
+  const cost = value.usage.cost;
+  if (!isReportedCost(cost.total)) return undefined;
+  return cost.totalFromProvider === true ? "provider" : cost.totalFromProvider === false ? "estimated" : "unknown";
+}
+
 function captureDiagnostics(value: unknown): Pick<AssistantMetadataData, "diagnosticCount" | "diagnostics"> {
   if (!Array.isArray(value) || value.length === 0) return {};
   const diagnostics: AssistantStampDiagnosticSummary[] = [];
@@ -231,7 +242,7 @@ function formatCompactMetadata(metadata: Readonly<AssistantMetadataData>): strin
   return [
     model,
     tokens === undefined ? undefined : `${formatInteger(tokens)} tok`,
-    cost === undefined ? undefined : `est ${formatCost(cost)}`,
+    cost === undefined ? undefined : `${metadata.usage?.costOrigin ?? "unknown"} ${formatCost(cost)}`,
   ]
     .filter((part): part is string => part !== undefined)
     .join(" · ");
@@ -256,7 +267,9 @@ function formatExpandedMetadata(metadata: Readonly<AssistantMetadataData>): stri
     usage.cacheRead === undefined ? undefined : `cache read ${formatInteger(usage.cacheRead)}`,
     usage.cacheWrite === undefined ? undefined : `cache write ${formatInteger(usage.cacheWrite)}`,
     usage.totalTokens === undefined ? undefined : `total ${formatInteger(usage.totalTokens)}`,
-    usage.estimatedCost === undefined ? undefined : `est cost ${formatCost(usage.estimatedCost)}`,
+    usage.estimatedCost === undefined
+      ? undefined
+      : `${usage.costOrigin ?? "unknown"} cost ${formatCost(usage.estimatedCost)}`,
   ]
     .filter((part): part is string => part !== undefined)
     .join(" · ");
@@ -274,14 +287,22 @@ function formatCost(value: number): string {
   return `$${value.toFixed(digits).replace(/(?:\.0+|(?<fraction>\.\d*?[1-9])0+)$/u, "$<fraction>")}`;
 }
 
-function isUsageData(value: unknown): value is AssistantStampUsageData {
-  if (!isRecord(value) || !hasOnlyKeys(value, USAGE_FIELDS) || Object.keys(value).length === 0) {
+function isUsageData(value: unknown, allowViewOrigin: boolean): value is AssistantStampUsageData {
+  const fields = allowViewOrigin ? [...USAGE_FIELDS, "costOrigin"] : USAGE_FIELDS;
+  if (!isRecord(value) || !hasOnlyKeys(value, fields) || Object.keys(value).length === 0) {
     return false;
   }
-  for (const field of USAGE_FIELDS) {
+  for (const field of fields) {
     if (!Object.hasOwn(value, field)) continue;
     const amount = value[field];
-    if (field === "estimatedCost") {
+    if (field === "costOrigin") {
+      if (
+        !isReportedCost(value.estimatedCost) ||
+        (amount !== "provider" && amount !== "estimated" && amount !== "unknown")
+      ) {
+        return false;
+      }
+    } else if (field === "estimatedCost") {
       if (!isReportedCost(amount)) return false;
     } else if (!isReportedTokenCount(amount)) {
       return false;

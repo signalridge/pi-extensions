@@ -24,7 +24,7 @@
 
 import { createHash } from "node:crypto";
 import type { ManagedOwner } from "@signalridge/pi-subagents-protocol";
-import { isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
+import { isManagedAgentTier, parseManagedTerminalSnapshot } from "@signalridge/pi-subagents-protocol";
 import {
   MAX_CALLS_PER_WORKFLOW,
   normalizeAgentRetries,
@@ -402,6 +402,17 @@ function parseResult(raw: unknown, label: string): CallResult {
   }
   const updatedAt = validTimestamp(raw.updatedAt, label);
   const tierIdentity = parseCallTierIdentity(raw, label);
+  // Transcript pointers have their own managed protocol contract (including
+  // normalization and the 2000-character bound), not the journal identity cap.
+  const outputFile =
+    raw.outputFile === undefined
+      ? undefined
+      : parseManagedTerminalSnapshot({
+          status,
+          outputFile: raw.outputFile,
+          compactionCount,
+          completedAt: updatedAt,
+        }).outputFile;
   const result: CallResult = {
     status,
     compactionCount,
@@ -413,9 +424,7 @@ function parseResult(raw: unknown, label: string): CallResult {
       : { attemptId: boundedString(raw.attemptId, `${label}.attemptId`, JOURNAL_ID_LIMIT) }),
     ...(raw.result === undefined ? {} : { result: raw.result }),
     ...(raw.error === undefined ? {} : { error: boundedString(raw.error, `${label}.error`, JOURNAL_ERROR_LIMIT) }),
-    ...(raw.outputFile === undefined
-      ? {}
-      : { outputFile: boundedString(raw.outputFile, `${label}.outputFile`, JOURNAL_ID_LIMIT) }),
+    ...(outputFile === undefined ? {} : { outputFile }),
     ...(raw.tokenCount === undefined
       ? {}
       : {

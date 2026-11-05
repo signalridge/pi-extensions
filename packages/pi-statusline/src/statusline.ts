@@ -22,7 +22,7 @@ import {
 import { inspectStatuses, type StatusReader } from "./status-inspector.js";
 import { type TerminalLifetime, terminalLifetime } from "./terminal-lifetime.js";
 import type { PalettePreset } from "./types.js";
-import { FooterUsageAccumulator } from "./usage.js";
+import { FooterUsageAccumulator, summarizeFooterUsage } from "./usage.js";
 
 const STATUSLINE_KEY = "statusline";
 const GIT_STATUS_REFRESH_INTERVAL_MS = 30_000;
@@ -251,6 +251,7 @@ export default function statusline(pi: ExtensionAPI) {
       gitStatusDebounceTimer = undefined;
       runGitStatusRefresh(cwd, generation, requestId);
     }, GIT_STATUS_EVENT_DEBOUNCE_MS);
+    gitStatusDebounceTimer.unref?.();
   };
 
   const scheduleGitStatusRefreshForContext = (ctx: ExtensionContext) => {
@@ -314,6 +315,7 @@ export default function statusline(pi: ExtensionAPI) {
         refreshFooterGitStatus();
         tui.requestRender();
       }, GIT_STATUS_REFRESH_INTERVAL_MS);
+      clock.unref?.();
       // Pi persists standalone usage without a corresponding extension event.
       // Its append-only leaf is a cheap change signal; getEntries() copies the entire history.
       const usageClock = setInterval(() => {
@@ -324,6 +326,7 @@ export default function statusline(pi: ExtensionAPI) {
           retire();
         }
       }, USAGE_REFRESH_INTERVAL_MS);
+      usageClock.unref?.();
 
       const retire = () => {
         if (retired) return;
@@ -443,6 +446,12 @@ export default function statusline(pi: ExtensionAPI) {
   const commandOptions: StatuslineCommandOptions = {
     settingsPath: configPath,
     getLoaded: () => loaded ?? loadStatuslineSettings(configPath),
+    getUsage: (ctx) => {
+      // Headless sessions do not install/rebuild a footer; report persisted usage on demand.
+      if (ctx.mode !== "tui" || !ctx.hasUI) return summarizeFooterUsage(ctx.sessionManager.getEntries());
+      refreshStandaloneUsage(ctx);
+      return footerUsage.snapshot();
+    },
     getMenuOwner,
     inspect,
     apply(next, ctx) {

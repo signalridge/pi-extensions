@@ -4,6 +4,7 @@
 
 import type { ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentReopenMetadata } from "./agent-reopen.js";
 import type { AgentTierResolutionSnapshot } from "./agent-tiers.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { WorktreeCleanupResult, WorktreeInfo } from "./worktree.js";
@@ -166,6 +167,8 @@ export interface AgentRecord {
    * spawn so an evicted record can be reopened as a resumable entry.
    */
   sessionFile?: string;
+  /** Native ordinary-child ownership receipt; retained even after worktree cleanup. */
+  reopen?: AgentReopenMetadata;
   /**
    * Resumable mention handle, when the agent was addressable by `@handle`.
    * Only top-level agents carry one.
@@ -235,6 +238,8 @@ export interface ResumableAgentEntry {
   /** Always set — a record with no session file is never indexed. */
   sessionFile: string;
   completedAt: number;
+  /** Validated branch-owned receipt; absent on legacy in-memory mention entries. */
+  reopen?: AgentReopenMetadata;
 }
 
 export interface AgentInvocation {
@@ -264,7 +269,7 @@ export interface AgentInvocation {
  * Immutable, observation-only snapshot returned by public record lookups.
  * Live sessions and manager control handles are intentionally excluded.
  */
-export type AgentRecordSnapshot = Omit<Readonly<AgentRecord>, "session" | "abortController" | "promise" | "outputCleanup" | "owner" | "ancestorAgentIds" | "lifetimeUsage" | "pendingSteers" | "invocation"> & {
+export type AgentRecordSnapshot = Omit<Readonly<AgentRecord>, "session" | "abortController" | "promise" | "outputCleanup" | "owner" | "ancestorAgentIds" | "lifetimeUsage" | "pendingSteers" | "invocation" | "reopen"> & {
   readonly owner?: Readonly<AgentOwner>;
   readonly ancestorAgentIds?: readonly string[];
   readonly lifetimeUsage: Readonly<LifetimeUsage>;

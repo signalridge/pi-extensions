@@ -43,8 +43,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.7",
-    "@earendil-works/pi-coding-agent": "1.4.0",
-    "@earendil-works/pi-tui": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@earendil-works/pi-tui": "1.5.0",
     "@types/node": "26.1.2",
     "typescript": "7.0.2"
   },
@@ -54,7 +54,7 @@
     "directory": "packages/pi-stamp"
   },
   "dependencies": {
-    "@narumitw/pi-tui-kit": "^0.54.0",
+    "@narumitw/pi-tui-kit": "^0.69.0",
     "@signalridge/pi-ui": "^1.4.1"
   },
   "homepage": "https://github.com/signalridge/pi-extensions/tree/main/packages/pi-stamp",

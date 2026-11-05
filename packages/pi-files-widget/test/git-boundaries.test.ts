@@ -93,7 +93,7 @@ test("Git status, inventory, tree and numstat preserve exact special filenames a
 
 test("metadata display is inert while opening and commenting keep original filesystem path and source", {
   skip: skip || process.platform === "win32",
-}, (t) => {
+}, async (t) => {
   const { root, git } = initRepo(t, `browser-${hostile}-`);
   const name = `file-${hostile}-雪\\tail .txt`;
   writeFileSync(join(root, name), "source unchanged\nsecond");
@@ -111,6 +111,7 @@ test("metadata display is inert while opening and commenting keep original files
     () => {},
   );
   try {
+    await until(() => browser.render(2000).some((line) => line.includes(sanitizeDisplayText(name))));
     const lines = browser.render(2000);
     assert.ok(lines[0].includes(sanitizeDisplayText(root)));
     assert.ok(lines.some((line) => line.includes(sanitizeDisplayText(name))));
@@ -136,7 +137,7 @@ test("metadata display is inert while opening and commenting keep original files
 
 test("open browser refreshes branch and clean tracked inventory, preserves exact selection and closes removed viewer", {
   skip,
-}, (t) => {
+}, async (t) => {
   const { root, git } = initRepo(t);
   writeFileSync(join(root, "a-removed.txt"), "removed");
   writeFileSync(join(root, "z-kept .txt"), "kept");
@@ -160,10 +161,12 @@ test("open browser refreshes branch and clean tracked inventory, preserves exact
     () => {},
   );
   try {
-    assert.ok(browser.render(200)[0].includes("(A)"));
+    await until(() => browser.render(200)[0].includes("(A)"));
     browser.handleInput("j"); // keep selection on the same exact trailing-space path
     git("checkout", "-q", "B");
     now += POLL_INTERVAL_MS + 1;
+    browser.render(200); // Poll requests metadata without blocking this render.
+    await until(() => browser.render(200)[0].includes("(B)"));
     const lines = browser.render(200);
     assert.ok(lines[0].includes("(B)"));
     assert.ok(lines.some((line) => line.includes("b-new-clean.txt")));
@@ -175,6 +178,8 @@ test("open browser refreshes branch and clean tracked inventory, preserves exact
     assert.ok(browser.render(200)[0].includes("b-new-clean.txt"));
     git("checkout", "-q", "A");
     now += POLL_INTERVAL_MS + 1;
+    browser.render(200);
+    await until(() => browser.render(200)[0].includes("(A)"));
     const back = browser.render(200);
     assert.ok(back[0].includes("(A)"), "removed viewer no longer owns the display");
     assert.ok(back.some((line) => line.includes("a-removed.txt")));
@@ -228,12 +233,15 @@ test("branch replacement fences a deferred old count and its completion/render t
     await until(() => entered);
     git("checkout", "-q", "B");
     now += POLL_INTERVAL_MS + 1;
-    assert.ok(browser.render(200)[0].includes("(B)"));
-    await until(() => browser.render(200).some((line) => line.includes("2L")));
+    browser.render(200);
+    await until(() => browser.render(200)[0].includes("(B)"));
+    // The replacement root queues counts but cannot start a second count pump
+    // while the retired generation is still awaiting readFile.
+    assert.ok(!browser.render(200).some((line) => line.includes("99L")));
     const before = renders;
     release();
-    await pause(100);
-    assert.equal(renders, before, "old batch does not render after finishing");
+    await until(() => browser.render(200).some((line) => line.includes("2L")));
+    assert.ok(renders > before, "only the replacement batch publishes fresh counts");
     assert.ok(
       !browser.render(200).some((line) => line.includes("99L")),
       "old count never mutates or populates replacement cache",

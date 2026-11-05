@@ -186,6 +186,35 @@ provider, or endpoint fail locally even with a new opt-in; start a fresh `/btw` 
 prevents a previous *side-thread answer* that echoed private context from reaching a different
 provider. Same-destination follow-ups remain available without sharing the parent transcript again.
 
+### Optional Secrets cooperation
+
+If the experimental, opt-in `@signalridge/pi-secrets` extension is also loaded,
+`/btw` and `advisor` use its public synchronous `pi-secrets:projection:v1` event
+service. Secrets projects full eligible history **before** the 40,000-character
+budget is applied, and the assembled side request is projected again. Questions,
+prior side messages and parent context use the same discovered-secret registry.
+Either load order works. With no Secrets service, the existing path is unchanged;
+this package does not load or enable Secrets itself. A loaded service that refuses,
+fails, returns malformed data or loses ownership blocks the request—never a raw
+fallback. Admission is bounded to 50,000 strings/8 Mi characters per batch; larger
+inputs are withheld, not partially projected. Caller JSON traversal is limited to
+100 nested objects and 100,000 visited JSON values. See the Secrets README for the
+public envelope contract. Executable/accessor JSON serialization hooks, including
+inherited `toJSON` hooks in tool arguments, withhold the request without being run;
+inert JSON keys named `toJSON` remain valid. Discovery/validation errors are generic
+and never relay provider exception text. Promise replies, including cross-realm
+native promises, are rejected synchronously while late rejections are observed
+without reading arbitrary thenable getters.
+
+This does not replay parent request hooks or change history/destination consent.
+Without this cooperation, parent context remains unfiltered as described above;
+other parent-hook redactions still are not inherited. Projection changes only the
+request copy, never stored parent or side history. Replies keep placeholders; they
+are not blanket-restored. Native tool execution retains its existing authorized
+restoration behavior. Compaction generation, export, non-cooperating extensions,
+system prompts, images and opaque replay/signature data are not covered. This is
+cooperative text projection, not global protection or signed-provider acceptance.
+
 ## Model and thinking level
 
 By default, `/btw` uses the current session model. To use an independent model for side
@@ -359,6 +388,11 @@ tool guidance were rewritten for Pi. Local divergence:
   refusals are local. The empty-response retry and host retry wrapper are not ported.
 - The provider routing identity is an independent UUID per session rather than a value derived
   from the main session's ID.
+- Optional Secrets cooperation is a local public-event integration, with no source imports,
+  duplicated detector/settings schema, provider registry or replay of native request hooks.
+  Original upstream MIT notices remain in `LICENSE`.
+- Advisor calls fence their opening session/branch across credential resolution and completion,
+  and reject stale results instead of delivering them to another branch.
 
 ## License
 

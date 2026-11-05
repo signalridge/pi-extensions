@@ -76,6 +76,7 @@ function makeCtx(model) {
       getApiKeyAndHeaders: async () => ({ ok: true, ...auth }),
     },
     sessionManager: {
+      getSessionId: () => "recap-owning-session",
       getBranch: () => branch,
       buildContextEntries: () => branch,
     },
@@ -148,6 +149,7 @@ for (const call of [codex, nonCodex]) {
   assert.deepEqual(call.options.env, auth.env);
   assert.equal(call.options.cacheRetention, "none");
   assert.equal(call.options.maxTokens, 256);
+  assert.equal(call.options.sessionId, "recap-owning-session");
   assert.ok(call.options.signal instanceof AbortSignal);
 }
 

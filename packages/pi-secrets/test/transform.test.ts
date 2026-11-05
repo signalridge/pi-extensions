@@ -244,6 +244,110 @@ describe("JSON string helpers", () => {
     expect(mapJsonStrings(value.keep, mask)).toBe(value.keep);
   });
 
+  it("preserves own __proto__/constructor data and frozen nested descriptors without prototype mutation", () => {
+    const args = deepFreeze(
+      JSON.parse(`{"__proto__":{"nested":"${SECRET}"},"constructor":"${SECRET}","list":[{"__proto__":"${SECRET}"}]}`),
+    );
+    const before = JSON.stringify(args);
+    const projected = mapJsonStrings(args, mask) as Record<string, unknown>;
+    expect(JSON.stringify(args)).toBe(before);
+    expect(Object.getPrototypeOf(projected)).toBe(Object.prototype);
+    expect(Object.hasOwn(projected, "__proto__")).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(projected, "__proto__")).toEqual({
+      value: { nested: "[S]" },
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+    expect(JSON.parse(JSON.stringify(projected))).toEqual(JSON.parse(before.replaceAll(SECRET, "[S]")));
+    expect(Object.getPrototypeOf(projected.list)).toBe(Array.prototype);
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype);
+    expect(mapJsonStrings(projected, mask)).toBe(projected);
+  });
+
+  it("maps non-enumerable array indices because JSON serialization includes them", () => {
+    const input = Object.freeze(Object.defineProperty([SECRET], "0", { enumerable: false }));
+    const output = mapJsonStrings(input, mask);
+    expect(JSON.stringify(input)).toBe(JSON.stringify([SECRET]));
+    expect(JSON.stringify(output)).toBe('["[S]"]');
+    expect(Object.getOwnPropertyDescriptor(output, "0")).toEqual({
+      value: "[S]",
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  });
+
+  it("keeps null prototypes, non-enumerable and symbol descriptors on changed objects", () => {
+    const symbol = Symbol("opaque");
+    const value = Object.create(null, {
+      text: { value: SECRET, enumerable: true },
+      hidden: { value: SECRET },
+      [symbol]: { value: "opaque" },
+    });
+    const projected = mapJsonStrings(value, mask);
+    expect(Object.getPrototypeOf(projected)).toBe(null);
+    expect(Object.getOwnPropertyDescriptor(projected, "text")?.value).toBe("[S]");
+    expect(Object.getOwnPropertyDescriptor(projected, "hidden")).toEqual(
+      Object.getOwnPropertyDescriptor(value, "hidden"),
+    );
+    expect(Object.getOwnPropertyDescriptor(projected, symbol)).toEqual(Object.getOwnPropertyDescriptor(value, symbol));
+  });
+
+  it("rejects effective own/inherited executable and accessor JSON hooks before discovery or identity returns", () => {
+    for (const inherited of [false, true]) {
+      for (const accessor of [false, true]) {
+        let reads = 0;
+        const hook = Object.defineProperty(
+          {},
+          "toJSON",
+          accessor
+            ? {
+                get() {
+                  reads++;
+                  return () => SECRET;
+                },
+              }
+            : {
+                value() {
+                  reads++;
+                  return SECRET;
+                },
+              },
+        );
+        const input = inherited ? Object.create(hook) : hook;
+        Object.defineProperty(input, "hidden", { value: SECRET });
+        Object.freeze(input);
+        const map = () => {
+          throw new Error("discovery must not run");
+        };
+        expect(() => mapJsonStrings(input, map)).toThrow("Non-data JSON serialization hook");
+        expect(reads).toBe(0);
+        expect(Object.getOwnPropertyDescriptor(input, "hidden")?.value).toBe(SECRET);
+        expect(Object.isFrozen(input)).toBe(true);
+      }
+    }
+  });
+
+  it("preserves inert toJSON data, including values shadowing inherited serializers", () => {
+    const proto = {
+      toJSON: () => {
+        throw new Error("must not execute");
+      },
+    };
+    const input = Object.freeze(
+      Object.create(proto, {
+        toJSON: { value: SECRET, enumerable: true },
+        hidden: { value: SECRET },
+      }),
+    );
+    const output = mapJsonStrings(input, mask);
+    expect(Object.getPrototypeOf(output)).toBe(proto);
+    expect(JSON.stringify(output)).toBe('{"toJSON":"[S]"}');
+    expect(Object.getOwnPropertyDescriptor(output, "hidden")).toEqual(Object.getOwnPropertyDescriptor(input, "hidden"));
+    expect(mapJsonStrings(output, mask)).toBe(output);
+  });
+
   it("restore nested input in place, keeping object identity and keys", () => {
     const nested = {
       headers: { [SECRET]: SECRET },

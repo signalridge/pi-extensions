@@ -347,8 +347,11 @@ describe("workflow inspection", () => {
     const { engine } = harness();
     const unsafe = "\u001b[31munsafe\u0000";
     const label = unsafe + "x".repeat(1_000);
+    // The display still clips a valid wire description; persistence/logging
+    // independently retain the longer original text.
+    const dispatchLabel = label.slice(0, 512);
     const started = await engine.start(
-      `${META} phase("entered"); for(let i=0;i<200;i++) log(${JSON.stringify(label)}); await agent("prompt",{label:${JSON.stringify(label)}}); return ${JSON.stringify(label)};`,
+      `${META} phase("entered"); for(let i=0;i<200;i++) log(${JSON.stringify(label)}); await agent("prompt",{label:${JSON.stringify(dispatchLabel)}}); return ${JSON.stringify(label)};`,
     );
     const value = snapshot(engine, started.runId);
     expect(value.events).toHaveLength(INSPECTION_LIMITS.events);

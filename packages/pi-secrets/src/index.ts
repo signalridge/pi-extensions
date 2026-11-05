@@ -5,6 +5,7 @@ import {
   type ExtensionContext,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
+import { registerProjection } from "./projection.js";
 import {
   createSecretsSession,
   formatStatus,
@@ -45,6 +46,8 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
 /** Register the secret obfuscation hooks, with environment/agent-dir seams for tests. */
 export function registerSecrets(pi: ExtensionAPI, options: SecretsExtensionOptions = {}): void {
   let session: SecretsSession | undefined;
+  let projectionOwner: { session: SecretsSession; ctx: ExtensionContext } | undefined;
+  registerProjection(pi, () => projectionOwner);
 
   const open = (ctx: ExtensionContext): SecretsSession => {
     session = createSecretsSession({
@@ -53,6 +56,7 @@ export function registerSecrets(pi: ExtensionAPI, options: SecretsExtensionOptio
       projectConfigDir: join(ctx.cwd, CONFIG_DIR_NAME),
       projectTrusted: projectTrusted(ctx),
     });
+    projectionOwner = { session, ctx };
     return session;
   };
 
@@ -64,6 +68,7 @@ export function registerSecrets(pi: ExtensionAPI, options: SecretsExtensionOptio
   });
 
   pi.on("session_shutdown", () => {
+    projectionOwner = undefined;
     session = undefined;
   });
 

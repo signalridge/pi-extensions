@@ -38,6 +38,7 @@ export interface BorderedComponent {
   dispose?(): void;
   waitForPending?(): Promise<void>;
   wantsKeyRelease?: boolean;
+  capturesViewportInput?: boolean;
   width?: SizeValue;
   focused?: boolean;
   readonly __piTuiKitScreen?: true;
@@ -75,12 +76,32 @@ export function wrapCustomUi(ui: ExtensionUIContext): ExtensionUIContext {
   if (wrappedUIs.has(ui)) return ui;
 
   const custom = ((factory: CustomFactory<unknown>, options?: CustomOptions) =>
-    ui.custom<unknown>((tui, theme, keybindings, done) => {
-      const created = factory(tui, theme, keybindings, done);
-      const border = (component: BorderedComponent): BorderedComponent =>
-        borderedComponent(component, (text) => theme.fg("borderAccent", text));
-      return isPromiseLike(created) ? created.then(border) : border(created);
-    }, options)) as ExtensionUIContext["custom"];
+    new Promise<unknown>((resolve, reject) => {
+      let finished = false;
+      const disposed = () => {
+        if (finished) return;
+        finished = true;
+        resolve(undefined);
+      };
+      const interaction = ui.custom<unknown>((tui, theme, keybindings, done) => {
+        const created = factory(tui, theme, keybindings, (result) => {
+          // Host reset disposes without completing custom(). Never call done after
+          // that boundary: it could restore an obsolete draft or remove a sibling.
+          if (finished) return;
+          finished = true;
+          done(result);
+        });
+        const border = (component: BorderedComponent): BorderedComponent =>
+          new BorderAdapter(component, (text) => theme.fg("borderAccent", text), disposed);
+        return isPromiseLike(created) ? created.then(border) : border(created);
+      }, options);
+      // Dispose-only host teardown has no result. Settle only our adapter's
+      // promise; consumers still own cancellation and accepted-work draining.
+      void interaction.then((result) => {
+        finished = true;
+        resolve(result);
+      }, reject);
+    })) as ExtensionUIContext["custom"];
 
   const wrapped = new Proxy(ui, {
     get(target, property, receiver) {
@@ -127,10 +148,12 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
   private addedBorders = false;
   private contentHeight = 0;
   private ownsMouseGesture = false;
+  private disposed = false;
+  private readonly onDispose?: () => void;
   handleInput?: (data: string) => void;
   handleMouse?: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 
-  constructor(inner: BorderedComponent, borderColor: (text: string) => string) {
+  constructor(inner: BorderedComponent, borderColor: (text: string) => string, onDispose?: () => void) {
     super();
     // Native overlay ancestry uses instanceof Container, not structural children.
     // Container exists throughout the supported Pi range; mouse types do not.
@@ -138,6 +161,7 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
     Object.defineProperty(this, "handleMouse", { value: undefined, writable: true, configurable: true });
     this.inner = inner;
     this.borderColor = borderColor;
+    this.onDispose = onDispose;
     if (typeof inner.handleInput === "function") {
       this.handleInput = (data) => this.inner.handleInput?.(data);
     }
@@ -193,6 +217,10 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
     return this.inner.wantsKeyRelease;
   }
 
+  get capturesViewportInput(): boolean | undefined {
+    return this.inner.capturesViewportInput;
+  }
+
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
     const lines = this.inner.render(safeWidth);
@@ -212,7 +240,11 @@ class BorderAdapter extends BorderContainer implements BorderedComponent {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.ownsMouseGesture = false;
+    // Fence re-entrant completion from the child's disposal before cleanup.
+    this.onDispose?.();
     this.inner.dispose?.();
   }
 

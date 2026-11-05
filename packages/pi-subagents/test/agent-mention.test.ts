@@ -141,6 +141,7 @@ describe("mentionRoster", () => {
     });
     await manager.getRecordMutable(id)?.promise;
     manager.clearCompleted();
+    await vi.waitFor(() => expect(manager.listResumable()).toHaveLength(1));
 
     const roster = mentionRoster(manager, [
       typeInfo("Explore"),

@@ -42,7 +42,7 @@ function conversationOf(context: TranscriptContext): string {
 }
 
 async function fixture(options: { before: (pi: ExtensionAPI) => void; after: (pi: ExtensionAPI) => void }) {
-  expect(VERSION).toBe("1.4.0");
+  expect(VERSION).toBe("1.5.0");
   const root = mkdtempSync(join(tmpdir(), "pi-secrets-sdk-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");

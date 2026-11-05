@@ -21,7 +21,7 @@ const MAIN = 'package main\n\nfunc greet(name string) string { return name }\n\n
 const OTHER = "package main\n\nvar _ = greet\n";
 
 test("the real Pi SDK routes model tool calls through navigation, schema validation and an applied rename", async () => {
-  assert.equal(VERSION, "1.4.0");
+  assert.equal(VERSION, "1.5.0");
   const root = mkdtempSync(path.join(tmpdir(), "pi-lsp-sdk-"));
   const cwd = path.join(root, "project");
   const agentDir = path.join(root, "agent");
@@ -150,7 +150,7 @@ test("the real Pi SDK routes model tool calls through navigation, schema validat
         "other.go:3:9: var _ = greet",
       ].join("\n"),
     );
-    assert.match(textOf(1), /^Validation failed for tool "lsp_hover":\n {2}- line: must be >= 1\n/);
+    assert.match(textOf(1), /^Validation failed for tool "lsp_hover":\n {2}- line: expected >= 1\n/);
     assert.match(
       textOf(2),
       /^navigator renamed main.go:3:6 \(greet\) to "welcome": applied 3 edit\(s\) in 2 file\(s\)\./,

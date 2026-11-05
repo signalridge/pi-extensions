@@ -57,7 +57,7 @@ const scenarios: Scenario[] = [
 
 for (const scenario of scenarios) {
   test(`installed SDK: ${scenario.name}`, async () => {
-    assert.equal(VERSION, "1.4.0");
+    assert.equal(VERSION, "1.5.0");
     const saved = new Map(PINNED_ENV.map((name) => [name, process.env[name]]));
     for (const name of PINNED_ENV) delete process.env[name];
     const cwd = mkdtempSync(join(tmpdir(), "tab-notify-"));

@@ -57,4 +57,31 @@ for (const directory of packageDirs) {
 }
 assert.equal(untested.length, 0, `package(s) with no test files at all: ${untested.join(", ")}`);
 assert.ok(checked > 0, "no package tests discovered");
-console.log(`check-test-inventory: ${checked} test files covered by package test scripts`);
+const rootManifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+for (const [script, entry] of [
+  ["test:config", "scripts/smoke-pi-loaders.test.mjs"],
+  ["test:schema", "scripts/pi-schema.test.mjs"],
+  ["smoke:pi", "scripts/smoke-pi-loaders.mjs"],
+  ["smoke:source-schemas", "scripts/smoke-pi-source-schemas.mjs"],
+]) {
+  assert.ok(
+    rootManifest.scripts[script]?.includes(`run-pi-smoke.mjs ${entry}`),
+    `${entry} must run through the isolated native launcher`,
+  );
+}
+assert.ok(
+  rootManifest.scripts.check.includes("bun run test:schema"),
+  "root check omits the native validator/execute matrix",
+);
+assert.ok(
+  rootManifest.scripts["smoke:pi"].includes("bun run smoke:source-schemas"),
+  "package smoke omits source schema qualification",
+);
+const integrationTypes = JSON.parse(readFileSync(join(root, "tsconfig.integration.json"), "utf8"));
+assert.ok(
+  integrationTypes.include.includes("scripts/pi-schema-inference.fixture.ts"),
+  "SDK inference fixture is not typechecked",
+);
+console.log(
+  `check-test-inventory: ${checked} package test files; native schema/execute, source/package smoke and SDK inference gates wired`,
+);

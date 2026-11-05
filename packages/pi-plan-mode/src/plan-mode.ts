@@ -1,5 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CanonicalFingerprints, canonicalEntryKey } from "./canonical-fingerprint.js";
 import { completePlanArguments } from "./command.js";
 import {
   normalizePlanModeCompletion,
@@ -114,7 +115,11 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     setThinkingLevel: (level) => setOwnedThinkingLevel(level),
   });
   const implementationRetention = createImplementationRetentionCoordinator();
-  const inputOwnership = new PlanInputOwnership((data) => pi.appendEntry(PLAN_HANDOFF_IDENTITY_ENTRY, data));
+  const fingerprints = new CanonicalFingerprints();
+  const inputOwnership = new PlanInputOwnership(
+    (data) => pi.appendEntry(PLAN_HANDOFF_IDENTITY_ENTRY, data),
+    fingerprints,
+  );
   let stateOrigin: ReturnType<typeof captureStateOrigin> | undefined;
   function captureStateOrigin(ctx: Pick<ExtensionContext, "sessionManager">) {
     const branch = ctx.sessionManager.getBranch();
@@ -124,10 +129,10 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
     return {
       manager: ctx.sessionManager,
       sessionId: ctx.sessionManager.getSessionId?.(),
-      branch: branch.map((entry) => createHash("sha256").update(JSON.stringify(entry)).digest("hex")),
+      branch: branch.map((entry) => fingerprints.key(entry, canonicalEntryKey)),
       // A descendant may share the full prefix but own a newer authoritative
       // state. Pin the complete native entry, including identity and data.
-      source: source && createHash("sha256").update(JSON.stringify(source)).digest("hex"),
+      source: source && fingerprints.key(source, canonicalEntryKey),
     };
   }
   function originIsCurrent(
@@ -531,6 +536,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
       restoreThinkingLevel();
     }
     clearUi(ctx);
+    fingerprints.clear();
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -1455,6 +1461,7 @@ export default function planMode(pi: ExtensionAPI, dependencies: PlanModeDepende
 
   function restoreState(ctx: ExtensionContext) {
     state = restorePlanModeState(ctx.sessionManager.getBranch(), STATE_ENTRY_TYPE);
+    fingerprints.clear();
     stateOrigin = captureStateOrigin(ctx);
     reconcileModelHandoff(ctx);
   }

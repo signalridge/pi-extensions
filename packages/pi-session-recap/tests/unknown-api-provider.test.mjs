@@ -57,6 +57,7 @@ const ctx = {
     getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "unused" }),
   },
   sessionManager: {
+    getSessionId: () => "recap-test",
     getBranch: () => branch,
     buildContextEntries: () => branch,
   },

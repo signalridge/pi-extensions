@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { clampThinkingLevel, Type, type Usage } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Usage } from "@earendil-works/pi-ai";
 import type {
   AgentToolResult,
   AgentToolUpdateCallback,
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   type BtwModelRegistry,
   type BtwProviderRegistry,
@@ -14,6 +15,8 @@ import {
   isVirtualBtwModel,
   resolveConfiguredBtwModel,
 } from "./btw.js";
+import { createSecretsProjection } from "./secrets-projection.js";
+import { captureSessionOrigin } from "./session-origin.js";
 import { type BtwSettingsLoadResult, parseBtwModelReference, readBtwSettings } from "./settings.js";
 import {
   type BtwThinkingLevel,
@@ -77,6 +80,8 @@ export interface RunAdvisorOptions {
   signal?: AbortSignal;
   onUpdate?: AgentToolUpdateCallback<AdvisorDetails>;
   completeSimple?: CompleteSimpleFunction;
+  projectionEvents?: ExtensionAPI["events"];
+  isCurrent?: () => boolean;
 }
 
 export function buildAdvisorPrompt(question: string, conversationContext: string): string {
@@ -102,12 +107,16 @@ export async function runAdvisor({
   ctx,
   signal,
   onUpdate,
+  projectionEvents,
+  isCurrent = () => true,
   completeSimple = createModelRegistryCompleteSimple(ctx.modelRegistry),
 }: RunAdvisorOptions): Promise<AgentToolResult<AdvisorDetails>> {
   const label = sanitizeSingleLine(reference);
   const cancelled = (usage?: Usage) =>
     advisorError("The advisor request was cancelled before the reviewer answered.", { model: label }, usage);
-  if (signal?.aborted) return cancelled();
+  const ownsOrigin = captureSessionOrigin(ctx);
+  const currentRequest = () => !signal?.aborted && isCurrent() && ownsOrigin();
+  if (!currentRequest()) return cancelled();
   // Managed children and print/JSON runs have no attached client.
   if (!ctx.hasUI) return advisorError("The advisor is available only in interactive sessions.", { model: label });
   const parsed = parseBtwModelReference(reference);
@@ -129,12 +138,12 @@ export async function runAdvisor({
     if (signal.aborted) onAbort();
   });
   const resolution = await Promise.race([
-    resolveConfiguredBtwModel(reference, ctx.modelRegistry, () => !signal?.aborted),
+    resolveConfiguredBtwModel(reference, ctx.modelRegistry, currentRequest),
     aborted,
   ]).finally(() => {
     if (onAbort) signal?.removeEventListener("abort", onAbort);
   });
-  if (!resolution || signal?.aborted || resolution.kind === "stale") return cancelled();
+  if (!resolution || !currentRequest() || resolution.kind === "stale") return cancelled();
   if (resolution.kind === "invalid") {
     return advisorError(`The reviewer ${label} is not a provider/model-id reference.`, { model: label });
   }
@@ -163,7 +172,18 @@ export async function runAdvisor({
   }
 
   const level = clampThinkingLevel(selected.model, thinkingLevel);
-  const prompt = buildAdvisorPrompt(question.trim(), buildSessionConversationContext(ctx.sessionManager));
+  let prompt: string;
+  try {
+    const project = createSecretsProjection(projectionEvents, ctx, signal, currentRequest);
+    // Seed question discovery before history is budgeted; then refresh any cached aliases.
+    if (project) project([question]);
+    const history = buildSessionConversationContext(ctx.sessionManager, project);
+    prompt = buildAdvisorPrompt(project ? project([question.trim()])[0] : question.trim(), history);
+    if (project) prompt = project([prompt])[0];
+  } catch {
+    return advisorError("Secret projection unavailable; the advisor request was withheld.", { model: label });
+  }
+  if (!currentRequest()) return cancelled();
   onUpdate?.({
     content: [{ type: "text", text: `Consulting ${label}…` }],
     details: { model: label, thinkingLevel: level },
@@ -171,6 +191,7 @@ export async function runAdvisor({
 
   let response: unknown;
   try {
+    if (!currentRequest()) return cancelled();
     response = await completeSideRequest({
       model: selected.model,
       systemPrompt: ADVISOR_SYSTEM_PROMPT,
@@ -182,10 +203,10 @@ export async function runAdvisor({
       completeSimple,
     });
   } catch (error: unknown) {
-    if (signal?.aborted) return cancelled();
+    if (!currentRequest()) return cancelled();
     return advisorError(`The reviewer ${label} request failed: ${formatError(error)}`, { model: label });
   }
-  if (signal?.aborted) return cancelled(isAssistantMessage(response) ? response.usage : undefined);
+  if (!currentRequest()) return cancelled(isAssistantMessage(response) ? response.usage : undefined);
   if (!isAssistantMessage(response)) {
     return advisorError(`The reviewer ${label} returned a malformed response.`, { model: label });
   }
@@ -221,9 +242,22 @@ export function registerBtwAdvisor(pi: ExtensionAPI, dependencies: BtwAdvisorDep
   // share the reviewer's prompt cache without borrowing the parent session's.
   const routingId = randomUUID();
   let registered = false;
+  let live = false;
+  let generation = 0;
+  pi.on("session_shutdown", () => {
+    live = false;
+    generation++;
+  });
+  pi.on("session_tree", () => {
+    generation++;
+  });
   pi.on("session_start", async (_event, ctx) => {
+    live = true;
     if (registered || !ctx.hasUI) return;
+    const opening = generation;
+    const origin = captureSessionOrigin(ctx);
     const loaded = await readSettings();
+    if (opening !== generation || !origin()) return;
     const reference = loaded.kind === "loaded" ? loaded.settings.advisorModel : undefined;
     if (!reference || registered) return;
     const parsed = parseBtwModelReference(reference);
@@ -249,6 +283,7 @@ export function registerBtwAdvisor(pi: ExtensionAPI, dependencies: BtwAdvisorDep
       ],
       parameters: ADVISOR_PARAMETERS,
       async execute(_toolCallId, params, signal, onUpdate, toolCtx) {
+        const attempt = generation;
         return runAdvisor({
           reference,
           routingId,
@@ -258,6 +293,8 @@ export function registerBtwAdvisor(pi: ExtensionAPI, dependencies: BtwAdvisorDep
           signal,
           onUpdate,
           completeSimple: dependencies.completeSimple,
+          projectionEvents: pi.events,
+          isCurrent: () => live && attempt === generation,
         });
       },
     });

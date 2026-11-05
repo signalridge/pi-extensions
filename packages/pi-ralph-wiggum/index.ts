@@ -81,6 +81,7 @@ export default function (pi: ExtensionAPI) {
   let activeSessionId: string | undefined;
   let liveOwner: LoopOwner | undefined;
   const ownership = new IterationOwnership();
+  let outcome: { nonce: string; loop: string; iteration: number; complete: boolean } | undefined;
 
   let acceptedRun:
     | { ctx: ExtensionContext; signal: AbortSignal; nonce: string; loop: string; owner: LoopOwner }
@@ -103,6 +104,7 @@ export default function (pi: ExtensionAPI) {
   function retireOwnership(ctx?: ExtensionContext) {
     const run = ctx ? ownedAcceptedRun(ctx) : undefined;
     acceptedRun = undefined;
+    outcome = undefined;
     // Never abort a new root through a captured old context.
     run?.ctx.abort();
     ownership.retire();
@@ -111,6 +113,16 @@ export default function (pi: ExtensionAPI) {
   }
 
   function claimLoop(ctx: ExtensionContext, state: LoopState) {
+    // Activation has already validated its task and running-operation fence.
+    // Recover duplicates only with positive session AND branch ownership proof.
+    for (const other of listLoops(ctx)) {
+      if (other.name !== state.name && other.status === "active" && isOwnedByCurrentSession(ctx, other)) {
+        other.status = "paused";
+        other.active = false;
+        saveState(ctx, other);
+      }
+    }
+    outcome = undefined;
     acceptedRun = undefined;
     ownership.retire();
     currentLoop = state.name;
@@ -326,7 +338,7 @@ export default function (pi: ExtensionAPI) {
     saveState(ctx, state);
     retireOwnership();
     updateUI(ctx);
-    pi.sendUserMessage(banner, { deliverAs: "followUp" });
+    pi.sendMessage({ customType: "ralph-status", content: banner, display: true }, { triggerTurn: false });
   }
 
   function stopLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
@@ -466,6 +478,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (ownedAcceptedRun(ctx)) {
+        ctx.ui.notify("Ralph iteration is still running. Stop it or wait for it to settle before starting.", "warning");
+        return;
+      }
+
       const isPath = args.name.includes("/") || args.name.includes("\\");
       const loopName = isPath ? sanitize(path.basename(args.name, path.extname(args.name))) : args.name;
       const taskFile = isPath ? args.name : path.join(RALPH_DIR, `${loopName}.md`);
@@ -488,6 +505,12 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Created task file: ${taskFile}`, "info");
       }
 
+      const content = tryRead(fullPath);
+      if (!content?.trim()) {
+        ctx.ui.notify(`Task file must be readable and non-whitespace: ${taskFile}`, "error");
+        return;
+      }
+
       const state: LoopState = {
         name: loopName,
         taskFile,
@@ -507,11 +530,6 @@ export default function (pi: ExtensionAPI) {
       saveState(ctx, state);
       updateUI(ctx);
 
-      const content = tryRead(fullPath);
-      if (!content) {
-        ctx.ui.notify(`Could not read task file: ${taskFile}`, "error");
-        return;
-      }
       sendIteration(ctx, state, content, false);
     },
 
@@ -549,11 +567,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Pause this session's current loop if different. A loop transferred to
-      // another session must not be mutated from the stale former owner.
-      if (currentLoop && currentLoop !== loopName) {
-        const curr = getCurrentOwnedState(ctx);
-        if (curr) pauseLoop(ctx, curr);
+      const content = readTaskFile(ctx, state.taskFile);
+      if (!content?.trim()) {
+        ctx.ui.notify(`Could not read task file with non-whitespace content: ${state.taskFile}`, "error");
+        return;
       }
 
       state.status = "active";
@@ -565,12 +582,6 @@ export default function (pi: ExtensionAPI) {
       updateUI(ctx);
 
       ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
-
-      const content = readTaskFile(ctx, state.taskFile);
-      if (!content) {
-        ctx.ui.notify(`Could not read task file: ${state.taskFile}`, "error");
-        return;
-      }
 
       const needsReflection =
         state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
@@ -814,6 +825,20 @@ Examples:
       // touching task files, persisted state, or live iteration ownership.
       const invalid = invalidLoopControl(params);
       if (invalid) throw new Error(`${invalid} must be a nonnegative safe integer.`);
+      if (typeof params.taskContent !== "string" || !params.taskContent.trim()) {
+        throw new Error("taskContent must be non-whitespace text.");
+      }
+      if (ownedAcceptedRun(ctx)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Ralph iteration is still running. Stop it or wait for it to settle before starting.",
+            },
+          ],
+          details: {},
+        };
+      }
       const loopName = sanitize(params.name);
       const taskFile = path.join(RALPH_DIR, `${loopName}.md`);
 
@@ -892,33 +917,30 @@ Examples:
         };
       }
 
+      // The final iteration still owns its outcome until final settlement,
+      // including any agent_before_settle continuation or automatic retry.
+      if (state.maxIterations > 0 && state.iteration >= state.maxIterations) {
+        return {
+          content: [{ type: "text", text: "Max iterations reached. Loop will stop when this run settles." }],
+          details: {},
+        };
+      }
+
+      const content = readTaskFile(ctx, state.taskFile);
+      if (!content?.trim()) {
+        pauseLoop(ctx, state);
+        return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };
+      }
+
       // Consume this iteration's authority before publishing the next one.
       ownership.finishIteration();
       state.iteration++;
-
-      // Check max iterations
-      if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
-        completeLoop(
-          ctx,
-          state,
-          `───────────────────────────────────────────────────────────────────────
-⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
-───────────────────────────────────────────────────────────────────────`,
-        );
-        return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: {} };
-      }
 
       const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
       if (needsReflection) state.lastReflectionAt = state.iteration;
 
       saveState(ctx, state);
       updateUI(ctx);
-
-      const content = readTaskFile(ctx, state.taskFile);
-      if (!content) {
-        pauseLoop(ctx, state);
-        return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };
-      }
 
       // Queue next iteration - use followUp so user can still interrupt
       sendIteration(ctx, state, content, needsReflection);
@@ -1010,12 +1032,38 @@ Examples:
     updateUI(ctx);
   });
 
-  pi.on("agent_settled", () => {
+  pi.on("agent_start", () => {
+    // A continuation/retry replaces the preceding low-level run's candidate.
+    outcome = undefined;
+  });
+
+  pi.on("agent_settled", (event, ctx) => {
+    const candidate = outcome;
+    outcome = undefined;
+    const state = getCurrentOwnedState(ctx);
+    const iteration = state && ownership.current(ctx, currentLoop, state.iteration);
+    if (
+      !event.aborted &&
+      candidate &&
+      state &&
+      iteration &&
+      candidate.nonce === iteration.nonce &&
+      candidate.loop === state.name &&
+      candidate.iteration === state.iteration &&
+      !ctx.hasPendingMessages()
+    ) {
+      if (candidate.complete) {
+        completeLoop(ctx, state, `RALPH LOOP COMPLETE: ${state.name} | ${state.iteration} iterations`);
+      } else if (state.maxIterations > 0 && state.iteration >= state.maxIterations) {
+        completeLoop(ctx, state, `RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached`);
+      }
+    }
     acceptedRun = undefined;
     ownership.settled();
   });
 
   pi.on("agent_end", async (event, ctx) => {
+    outcome = undefined;
     const state = getCurrentOwnedState(ctx);
     if (state?.status !== "active" || !ownership.current(ctx, currentLoop, state.iteration)) {
       updateUI(ctx);
@@ -1038,31 +1086,16 @@ Examples:
             .join("\n")
         : "";
 
-    if (hasCompletionMarker(text)) {
-      completeLoop(
-        ctx,
-        state,
-        `───────────────────────────────────────────────────────────────────────
-✅ RALPH LOOP COMPLETE: ${state.name} | ${state.iteration} iterations
-───────────────────────────────────────────────────────────────────────`,
-      );
-      return;
+    const iteration = ownership.current(ctx, currentLoop, state.iteration);
+    if (iteration) {
+      outcome = {
+        nonce: iteration.nonce,
+        loop: state.name,
+        iteration: state.iteration,
+        complete: hasCompletionMarker(text),
+      };
     }
-
-    // Check max iterations
-    if (state.maxIterations > 0 && state.iteration >= state.maxIterations) {
-      completeLoop(
-        ctx,
-        state,
-        `───────────────────────────────────────────────────────────────────────
-⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
-───────────────────────────────────────────────────────────────────────`,
-      );
-      return;
-    }
-
-    // Don't auto-continue - let the agent call ralph_done to proceed
-    // This allows user's "stop" message to be processed first
+    // Only settlement can finalize this candidate. Do not auto-continue.
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -1082,8 +1115,7 @@ Examples:
         const candidateMtime = safeMtimeMs(getPath(ctx, candidate.name, ".state.json"));
         return candidateMtime > bestMtime ? candidate : best;
       });
-      currentLoop = mostRecent.name;
-      liveOwner = captureOwner(ctx);
+      if (readTaskFile(ctx, mostRecent.taskFile)?.trim()) claimLoop(ctx, mostRecent);
     }
 
     if (active.length > 0 && ctx.hasUI) {

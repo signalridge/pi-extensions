@@ -8,6 +8,9 @@
  * has to outlive the record.
  */
 
+import { parseAgentReopenMetadata } from "./agent-reopen.js";
+import type { ResumableAgentEntry } from "./types.js";
+
 /** `customType` of the session entry a finished top-level agent appends. */
 export const AGENT_RECORD_ENTRY_TYPE = "subagents:record";
 
@@ -53,4 +56,25 @@ export function findSavedAgentRecord(branch: readonly unknown[], id: string): Sa
     if (isSavedAgentRecord(entry.data) && entry.data.id === id) return entry.data;
   }
   return undefined;
+}
+
+/** Latest eligible ordinary receipts only, bounded like the live eviction index. */
+export function savedResumableAgents(branch: readonly unknown[], rootSessionId: string): ResumableAgentEntry[] {
+  const seen = new Set<string>();
+  const entries: ResumableAgentEntry[] = [];
+  for (let index = branch.length - 1; index >= 0 && entries.length < 128; index--) {
+    const item = branch[index] as { type?: unknown; customType?: unknown; data?: unknown } | null;
+    if (item?.type !== "custom" || item.customType !== AGENT_RECORD_ENTRY_TYPE ||
+      typeof item.data !== "object" || item.data === null) continue;
+    const data = item.data as Record<string, unknown>;
+    if (typeof data.id !== "string" || seen.has(data.id)) continue;
+    seen.add(data.id); // A later unsupported receipt must invalidate an earlier one.
+    if (!isSavedAgentRecord(data) || data.owner !== undefined || data.parentAgentId !== undefined ||
+      !/^[a-z0-9][a-z0-9_-]{0,127}$/i.test(data.id) || data.type.length > 256 || data.description.length > 1_000) continue;
+    const reopen = parseAgentReopenMetadata(data.reopen);
+    if (!reopen || reopen.rootSessionId !== rootSessionId) continue;
+    entries.push({ id: data.id, type: data.type, description: data.description,
+      handle: reopen.handle, sessionFile: reopen.sessionFile, completedAt: data.completedAt ?? data.startedAt, reopen });
+  }
+  return entries;
 }

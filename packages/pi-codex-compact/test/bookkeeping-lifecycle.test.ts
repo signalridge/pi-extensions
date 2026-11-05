@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { getCurrentTools, type Model, type Tool, Type } from "@earendil-works/pi-ai";
+import { getCurrentTools, type Model, type Tool } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
 import { type ExtensionContext, type SessionBeforeCompactEvent, SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { test, vi } from "vitest";
 import { createCheckpointDetails, fallbackSummary } from "../src/checkpoint.js";
 import { createCodexCompactExtension } from "../src/codex-compact.js";

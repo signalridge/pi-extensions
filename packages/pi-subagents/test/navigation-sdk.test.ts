@@ -32,7 +32,7 @@ import subagentsExtension from "../src/index.js";
 
 vi.setConfig({ testTimeout: 30_000 });
 
-describe.skipIf(VERSION !== "1.4.0")(
+describe.skipIf(VERSION !== "1.5.0")(
   "Pi SDK summary navigation",
   () => {
     let cwd = "";

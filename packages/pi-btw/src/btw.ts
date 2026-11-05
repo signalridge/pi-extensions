@@ -34,6 +34,7 @@ import {
   runBtwMenuPreservingEditor,
   showBtwCommandMenu,
 } from "./menu.js";
+import { createSecretsProjection, projectJson, type TextProjection } from "./secrets-projection.js";
 import { captureSessionOrigin } from "./session-origin.js";
 import {
   type BtwSettings,
@@ -463,6 +464,7 @@ export default function btw(pi: ExtensionAPI, dependencies: BtwExtensionDependen
               state,
               ctx: fullscreenCtx,
               isSessionCurrent: ownsCommandSession,
+              projectionEvents: pi.events,
             });
           },
           { isSessionCurrent: ownsCommandSession, registerClose: registerFullscreenClose },
@@ -625,8 +627,9 @@ interface BtwThreadSteeringControl {
   questions: readonly string[];
   submit: (question: string) => void;
   thinking: BtwThreadThinkingControl;
-  prepareContext: () => string | false;
+  prepareContext: (project?: TextProjection) => string | false;
   isCurrent: () => boolean;
+  projectionEvents?: ExtensionAPI["events"];
 }
 
 type BtwBringToMainChoice =
@@ -650,6 +653,7 @@ interface RunBtwThreadOptions {
   state?: BtwThreadState;
   ctx: ExtensionCommandContext;
   isSessionCurrent?: () => boolean;
+  projectionEvents?: ExtensionAPI["events"];
   dependencies?: RunBtwThreadDependencies;
 }
 
@@ -707,6 +711,7 @@ export async function runBtwThread({
   state,
   ctx,
   isSessionCurrent,
+  projectionEvents,
   dependencies = {},
 }: RunBtwThreadOptions): Promise<BtwThreadResult> {
   const ask = dependencies.ask ?? askThreadQuestion;
@@ -733,11 +738,11 @@ export async function runBtwThread({
       return false;
     }
   };
-  const prepareContext = (includeParent: boolean): string | false => {
+  const prepareContext = (includeParent: boolean, project?: TextProjection): string | false => {
     if (!ownsSession()) return false;
     // Public Pi context hooks cannot be replayed here. Never read the parent
     // projection unless this particular request names its physical destination.
-    return includeParent ? buildSessionConversationContext(sessionManager) : "";
+    return includeParent ? buildSessionConversationContext(sessionManager, project) : "";
   };
   const thinkingLevels = getSupportedThinkingLevels(selected.model);
   const pendingWrites = new Set<Promise<void>>();
@@ -811,8 +816,9 @@ export async function runBtwThread({
                 if (ownsSession()) steeringQuestions.push(question);
               },
               thinking: createThinkingControl(),
-              prepareContext: () => prepareContext(parsed.includeParent),
+              prepareContext: (project) => prepareContext(parsed.includeParent, project),
               isCurrent: ownsSession,
+              projectionEvents,
             });
       if (!ownsSession()) return { kind: "closed" };
       if (result.kind === "aborted") {
@@ -1210,6 +1216,7 @@ async function askThreadQuestion(
       signal: view.signal,
       completeSimple: createModelRegistryCompleteSimple(ctx.modelRegistry),
       prepareContext: steering.prepareContext,
+      createProjection: () => createSecretsProjection(steering.projectionEvents, ctx, view.signal, steering.isCurrent),
       isCurrent: steering.isCurrent,
     }).then((result) => {
       if (settled) return;
@@ -1261,13 +1268,58 @@ type SessionEntry = {
   message?: SessionMessage;
 };
 
-export function buildSessionConversationContext(manager: ExtensionCommandContext["sessionManager"]): string {
+export function buildSessionConversationContext(
+  manager: ExtensionCommandContext["sessionManager"],
+  project?: TextProjection,
+): string {
   // Pi 0.87+ applies context edits in the projection; raw branch messages can
   // contain omitted or replaced content that must not reach the side provider.
   if (typeof manager.buildSessionProjection === "function") {
-    return serializeConversationContext(manager.buildSessionProjection().messages, (message) => message);
+    return serializeConversationContext(
+      projectConversation(manager.buildSessionProjection().messages, project),
+      (message) => message,
+    );
   }
-  return buildConversationContext(manager.getBranch());
+  if (!project) return buildConversationContext(manager.getBranch());
+  return serializeConversationContext(
+    projectConversation(
+      manager.getBranch().flatMap((entry) => (entry.type === "message" ? [entry.message] : [])),
+      project,
+    ),
+    (message) => message,
+  );
+}
+
+function projectConversation(messages: readonly SessionMessage[], project?: TextProjection): readonly SessionMessage[] {
+  if (!project) return messages;
+  // Admit only the serialization surface, at full length, before any budget slicing.
+  // Images, reasoning and opaque metadata are not side-request context.
+  const visible = messages.filter(
+    (message) =>
+      ["user", "assistant", "toolResult", "custom", "bashExecution", "compactionSummary", "branchSummary"].includes(
+        message.role ?? "",
+      ) && !(message.role === "bashExecution" && message.excludeFromContext),
+  );
+  return projectJson(
+    visible.map((message) => ({
+      role: message.role,
+      stopReason: message.stopReason,
+      toolName: message.toolName,
+      command: message.command,
+      output: message.output,
+      summary: message.summary,
+      content: Array.isArray(message.content)
+        ? message.content.flatMap<MessageContentBlock>((block: MessageContentBlock) =>
+            block?.type === "text" && typeof block.text === "string"
+              ? [{ type: "text", text: block.text }]
+              : block?.type === "toolCall" && typeof block.name === "string"
+                ? [{ type: "toolCall", name: block.name, arguments: block.arguments }]
+                : [],
+          )
+        : message.content,
+    })),
+    project,
+  );
 }
 
 export function buildConversationContext(entries: readonly SessionEntry[]) {

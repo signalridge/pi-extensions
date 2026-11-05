@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   createAgentSession,
   DefaultPackageManager,
@@ -24,6 +24,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { assertExactHost, assertPerimeter, qualifySessionSchemas } from "./pi-schema-qualification.mjs";
 import { createResponseRendezvous, queueAdmissionReady } from "./smoke-response-rendezvous.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
@@ -231,13 +232,24 @@ export async function activateRoots(
   );
 
   const errors = [];
+  const faux = fauxProvider({ provider: "package-loader-smoke", models: [{ id: "offline", reasoning: false }] });
+  const modelRuntime =
+    options.modelRuntime ??
+    (await ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(),
+      modelsPath: null,
+      modelsStorePath: join(consumer, "models.json"),
+      allowModelNetwork: false,
+      refreshOnCreate: false,
+    }));
+  if (!options.modelRuntime) modelRuntime.registerNativeProvider(faux.provider);
   const { session } = await createAgentSession({
     cwd: consumer,
     agentDir,
     settingsManager,
     sessionManager: options.sessionManager ?? SessionManager.inMemory(consumer),
-    ...(options.model ? { model: options.model } : {}),
-    ...(options.modelRuntime ? { modelRuntime: options.modelRuntime } : {}),
+    model: options.model ?? faux.getModel(),
+    modelRuntime,
     resourceLoader: loader,
     // Keep built-in tools disabled to avoid model/tool execution, but retain
     // extension tools so coexistence checks are meaningful.
@@ -248,7 +260,8 @@ export async function activateRoots(
   const names = session.getAllTools().map((tool) => tool.name);
   assert.equal(new Set(names).size, names.length, `${label} registered duplicate tools`);
   assert.equal(errors.length, 0, `${label} activation errors: ${errors.join("; ")}`);
-  // AgentSession 0.85 exposes tools but not commands. If a future public
+  qualifySessionSchemas(session, `packaged ${label}`, { requireSamples: options.requireSchemaSamples ?? false });
+  // AgentSession exposes tools but not commands. If a future public
   // session API provides command discovery, enforce the same uniqueness gate;
   // never reach into Pi's private ExtensionRunner just for this smoke.
   const commandDiscovery = session;
@@ -257,7 +270,11 @@ export async function activateRoots(
     const commandNames = commands.map((command) => command.name);
     assert.equal(new Set(commandNames).size, commandNames.length, `${label} registered duplicate commands`);
   }
-  if (!options.keepSession) session.dispose();
+  if (!options.keepSession) {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    session.dispose();
+    assert.deepEqual(errors, [], `${label} shutdown errors`);
+  }
   return {
     resourceCount: loadedExtensions.extensions.length,
     toolCount: names.length,
@@ -623,6 +640,8 @@ return 0;`;
 }
 
 async function main() {
+  assertExactHost();
+  assertPerimeter();
   const temp = mkdtempSync(join(tmpdir(), "pi-independent-package-smoke-"));
   const previousHome = process.env.HOME;
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -656,6 +675,11 @@ async function main() {
         );
         reports.push({ directory, ...report });
         console.log(`smoke: ${manifest.name} (${report.resourceCount} resource, ${report.toolCount} tools)`);
+        if (report.session) {
+          await report.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+          report.session.dispose();
+          assert.deepEqual(report.errors, [], `${manifest.name} shutdown errors`);
+        }
         // Independent sessions are intentionally created in one Node process. Pi's
         // extension lifecycle normally clears this singleton on shutdown, but the
         // loader smoke disposes an in-memory session directly; clear the fixture's
@@ -757,8 +781,10 @@ async function main() {
         models: [{ id: "smoke-model", name: "Signalridge smoke", reasoning: false }],
       });
       const modelRuntime = await ModelRuntime.create({
-        authPath: join(agentDir, "auth.json"),
+        credentials: new InMemoryCredentialStore(),
         modelsPath: null,
+        modelsStorePath: join(consumer, "models.json"),
+        allowModelNetwork: false,
         refreshOnCreate: false,
       });
       modelRuntime.registerNativeProvider(faux.provider);
@@ -784,7 +810,9 @@ async function main() {
         console.log(`smoke: stable pi-subagents + pi-workflows ordering (${pair.toolCount} tools)`);
         await runRealPiWorkflowIntegration(pair.session, faux);
         assert.equal(flaky.state.remaining, 0, "journal retry fixture was not exercised");
+        await pair.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
         pair.session.dispose();
+        assert.deepEqual(pair.errors, [], "stable pair shutdown errors");
         delete globalThis[Symbol.for("pi-subagents:manager")];
         delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
         delete globalThis[Symbol.for("pi-subagents:manager-active")];
@@ -840,7 +868,9 @@ async function main() {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
         assert.equal(recoveryStatus, "completed");
+        await recoveryPair.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
         recoveryPair.session.dispose();
+        assert.deepEqual(recoveryPair.errors, [], "stable pair recovery shutdown errors");
         delete globalThis[Symbol.for("pi-subagents:manager")];
         delete globalThis[Symbol.for("pi-subagents:rpc-owner")];
         delete globalThis[Symbol.for("pi-subagents:manager-active")];
@@ -859,41 +889,51 @@ async function main() {
       const manifest = JSON.parse(readFileSync(join(packagesRoot, directory, "package.json"), "utf8"));
       return manifest.signalridgePackage?.kind !== "library" && manifest.piExtension?.lifecycle === "stable";
     });
-    const stableAllTemp = mkdtempSync(join(temp, "stable-all-"));
-    try {
-      const roots = [];
-      const fallbackRoots = [];
-      let expectedResources = 0;
-      for (const directory of stableDirectories) {
-        const extracted = join(stableAllTemp, directory);
-        mkdirSync(extracted, { recursive: true });
-        run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
-        const packageRoot = join(extracted, "package");
-        const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
-        roots.push(packageRoot);
-        fallbackRoots.push(join(packagesRoot, directory));
-        expectedResources += manifest.pi.extensions.length;
+    const combinations = [["stable", stableDirectories]];
+    if (process.argv.includes("--include-experimental")) combinations.push(["explicit-all", extensionDirs()]);
+    for (const [scope, directories] of combinations) {
+      const stableAllTemp = mkdtempSync(join(temp, `${scope}-all-`));
+      try {
+        const roots = [];
+        const fallbackRoots = [];
+        let expectedResources = 0;
+        for (const directory of directories) {
+          const extracted = join(stableAllTemp, directory);
+          mkdirSync(extracted, { recursive: true });
+          run("tar", ["-xzf", tarballs.get(directory), "-C", extracted]);
+          const packageRoot = join(extracted, "package");
+          const manifest = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+          const packedDependencyRoots = extractPackedDependencies(stableAllTemp, manifest, tarballs);
+          linkPackedDependencies(packageRoot, manifest, packedDependencyRoots);
+          roots.push(packageRoot);
+          fallbackRoots.push(join(packagesRoot, directory));
+          expectedResources += manifest.pi.extensions.length;
+        }
+        const consumer = join(stableAllTemp, "consumer");
+        const agentDir = join(stableAllTemp, "agent");
+        mkdirSync(consumer, { recursive: true });
+        mkdirSync(agentDir, { recursive: true });
+        const allStable = await activateRoots(
+          roots,
+          consumer,
+          agentDir,
+          expectedResources,
+          `${scope} packages (${directories.length})`,
+          fallbackRoots,
+          { keepSession: true, requireSchemaSamples: true },
+        );
+        console.log(
+          `smoke: ${scope} packages (${directories.length} packages, ${allStable.resourceCount} resources, ${allStable.toolCount} tools)`,
+        );
+        await allStable.session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        allStable.session.dispose();
+        assert.deepEqual(allStable.errors, [], `${scope} shutdown errors`);
+      } finally {
+        rmSync(stableAllTemp, { recursive: true, force: true });
       }
-      const consumer = join(stableAllTemp, "consumer");
-      const agentDir = join(stableAllTemp, "agent");
-      mkdirSync(consumer, { recursive: true });
-      mkdirSync(agentDir, { recursive: true });
-      const allStable = await activateRoots(
-        roots,
-        consumer,
-        agentDir,
-        expectedResources,
-        `all stable packages (${stableDirectories.length})`,
-        fallbackRoots,
-        { keepSession: true },
-      );
-      console.log(
-        `smoke: all stable packages (${stableDirectories.length} packages, ${allStable.resourceCount} resources, ${allStable.toolCount} tools)`,
-      );
-    } finally {
-      rmSync(stableAllTemp, { recursive: true, force: true });
     }
 
+    assertPerimeter();
     assert.equal(reports.length, extensionDirs().length, "not every extension package was independently activated");
     console.log(
       `smoke-pi-loaders: activated ${reports.length} independent package tarballs, the stable pair, and ${stableDirectories.length} stable packages together`,

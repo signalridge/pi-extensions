@@ -21,6 +21,7 @@ const ROUTING_POLICY_SNAPSHOT = {
   fingerprint: routingPolicyFingerprint(ROUTING_POLICY),
 };
 const CAPABILITIES = { ...PROTOCOL_CAPABILITIES };
+const TASK = { subagent_type: "general-purpose", prompt: "work", description: "test" };
 const EXPECTED_CHECK = {
   routingPolicy: ROUTING_POLICY,
   routingPolicyFingerprint: ROUTING_POLICY_SNAPSHOT.fingerprint,
@@ -168,7 +169,7 @@ describe("pi-subagents protocol capability check", () => {
     const session = new AbortController();
     const client = createManagedSpawnClient(bus, protocol.signal, session.signal);
 
-    const pending = client.spawn({} as never, "run-1", "a", "attempt-1");
+    const pending = client.spawn(TASK, "run-1", "a", "attempt-1");
     expect(dispatched).toBe(true);
     session.abort(new Error("session ended"));
     await expect(pending).rejects.toThrow("subagents:rpc:spawn-managed request aborted");
@@ -193,7 +194,7 @@ describe("pi-subagents protocol capability check", () => {
       });
     });
     const client = createManagedSpawnClient(bus);
-    await expect(client.spawn({} as never, "run-1", "a", undefined)).resolves.toEqual({
+    await expect(client.spawn(TASK, "run-1", "a", undefined)).resolves.toEqual({
       id: "agent-terminal",
       state: "completed",
       terminal: {

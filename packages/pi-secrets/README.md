@@ -14,7 +14,8 @@ The package is **experimental** and opt-in.
 It protects the provider-bound conversation: user, assistant and tool-result
 text, extension messages, `!` command output and branch/compaction summaries as
 they appear in each request. Placeholders reach the provider instead of values,
-and the provider's copy of the transcript contains no values.
+for the detected values on these covered text surfaces. Cooperating `/btw` and
+`advisor` requests can also opt into the request-only projection described below.
 
 It does **not**:
 
@@ -26,10 +27,10 @@ It does **not**:
   context files, skills, tool declarations) are sent unchanged. Keep secrets out
   of them.
 - **Cover requests Pi or other extensions build outside the conversation hooks.**
-  Compaction and branch-summary generation, and side requests other extensions
-  make through the model registry (recaps, side questions), serialize history
-  without passing through the request transform. Their *results* are
-  obfuscated when they re-enter the conversation; their inputs are not.
+  Compaction, branch-summary generation, export, and non-cooperating side requests
+  do not pass through this transform. Their *results* are obfuscated when they
+  re-enter covered conversation text; their inputs are not. This is not global
+  protection and does not intercept opaque host/provider replay formats.
 - **Protect child sessions that do not load it.** A tool call that starts a
   subagent is restored like any other, so the task text the child receives
   contains real values; the child's own requests are covered only when its
@@ -66,11 +67,15 @@ A placeholder is `$$LABEL_HASH$$`. The label names the source (the environment
 variable, the configured `name`, or the pattern, for example `GITHUB_TOKEN`); it
 never contains the value. The 12-character hash is an HMAC-SHA256 of the value
 under a private per-installation key, so a transcript reader cannot test
-candidate passwords against it. The same value always gets the same placeholder,
-so a conversation renders to the same bytes on every request and the provider's
-prompt cache keeps working. Hash collisions are detected and resolved to distinct
+candidate passwords against it. A value keeps the same safe placeholder, so
+unchanged knowledge produces byte-stable requests. Before emission, labels are
+checked against every relevant configured or discovered value, including normalized
+letters/digits. An unsafe label becomes `SECRET`. If later discovery makes a cached
+label unsafe, outgoing copies use a neutral alias; old issued tokens still restore
+to their original values. Stored history is never rewritten. Hash collisions are detected and resolved to distinct
 placeholders, overlapping secrets are replaced as one span, and verified placeholders
-issued by this registry are never rewritten. Fabricated placeholder-shaped text does
+issued by this registry are treated atomically, not redacted inside their labels.
+Only an unsafe label is replaced by its safe alias. Fabricated placeholder-shaped text does
 not exempt secrets inside it from redaction.
 
 The key is stored in `pi-secrets.key` in Pi's agent directory, created with mode
@@ -116,7 +121,40 @@ Tool results are not rewritten in `tool_result`: Pi persists what that hook
 returns, and the next request obfuscates the stored result anyway.
 
 If the request rewrite fails unexpectedly, the extension aborts the run and
-sends no conversation messages rather than an unredacted transcript.
+sends no conversation messages rather than an unredacted transcript. JSON tool
+arguments with executable or accessor `toJSON` hooks (including inherited hooks)
+are withheld without executing the hook, even if no enumerable secret was found.
+An inert data key named `toJSON` remains valid JSON data.
+
+## Optional cooperating side requests
+
+Loading this experimental package explicitly opts into its small public
+`pi.events` service, `pi-secrets:projection:v1`. Pi-btw discovers it at request time,
+so either extension load order works. No Secrets service means pi-btw keeps its
+existing path. A loaded but unavailable, refusing, throwing, malformed, duplicate,
+or stale service withholds the side request rather than falling back to raw text.
+Parent-history and destination consent remain pi-btw's responsibility.
+
+The synchronous discovery envelope is `{ version: 1, accept }`. Secrets calls
+`accept({ version: 1, project })` before the emit returns, including when the
+session is unavailable. `project({ version: 1, sessionId, leafId, texts })` returns
+`{ version: 1, ok: true, texts }` in the same string order, or
+`{ version: 1, ok: false }`. Envelopes must be own-data-property plain/null-prototype
+objects; texts must be dense plain arrays of strings. A batch is limited to 50,000
+strings and 8 Mi characters (input and output). There is no async reply or retry.
+Requests must name the live session and leaf. Capabilities retire at session
+replacement/shutdown, and callers fence live branch ownership and cancellation.
+This is a cooperative in-process contract, **not authentication** of extensions;
+loaded extensions already have full process access.
+
+All batch strings are discovered before any are projected. Cooperating callers
+project full eligible history before truncation/budget slicing, then project the
+assembled side request. Neither stored history nor side-thread messages change;
+side replies are not blanket-restored. Only the existing native `tool_call`
+boundary restores issued tokens. The coverage is limited to native conversation
+requests and cooperating pi-btw `/btw`/`advisor` requests. System prompts, images,
+opaque signatures, compaction generation and export remain outside this service.
+Rewritten signed reasoning is not a claim of acceptance by signed providers.
 
 ## Configuration
 
@@ -143,8 +181,8 @@ Both apply. Each file holds a `secrets` array:
 - `pattern`: a JavaScript regular expression; matches of at least 8 characters
   are obfuscated. `flags` may contain `i`, `m`, `s`, `u` and `v`; scanning is
   always global.
-- `name`: optional label for the placeholder. A name that would reveal the value
-  is replaced with `SECRET`.
+- `name`: optional label for the placeholder. A name that would reveal any known
+  secret is replaced with `SECRET`.
 
 Each entry needs exactly one of `value` or `pattern`. A missing file is empty;
 invalid JSON or invalid entries are skipped with warnings that name the file
@@ -189,6 +227,11 @@ diverges from the upstream subsystem:
 - the pattern list was rewritten and narrowed (no generic bearer-token rule) and
   environment-name matching skips reference names such as `_FILE` and `_SOCK`;
 - overlapping matches are merged into one restorable span;
+- cross-secret label admission and cached safe aliases preserve old restoration;
+- JSON argument projections preserve own data properties (including `__proto__`),
+  descriptors and frozen originals without invoking prototype setters;
+- the optional synchronous projection service and pi-btw cooperation are local
+  additions, not an upstream host interception mechanism;
 - it never rewrites session storage and does not restore placeholders for
   display, and it covers neither native provider replay formats nor compaction
   requests, which upstream rewrites inside its own host.

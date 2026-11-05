@@ -44,7 +44,8 @@ const PREVIEW_CHARS = 500;
 type Message = AgentSession["messages"][number];
 type TextCursor = { block: number; offset: number };
 type MessagePage = { cursor: TextCursor; row: number };
-type LayoutEntry = { text: string; signature: string; sourceLength: number; lines: string[]; failed: boolean; next?: TextCursor; moreRows: boolean; markdown?: Markdown };
+type RawProjection = { text: string; calls: string[]; command: string; role: string; width: number; row: number; block: number; offset: number; next?: TextCursor };
+type LayoutEntry = { raw: RawProjection; text: string; signature: string; sourceLength: number; lines: string[]; fitted?: { width: number; lines: string[]; padded: (string | undefined)[] }; failed: boolean; next?: TextCursor; moreRows: boolean; markdown?: Markdown };
 type RowAnchor = { message: Message; index: number; row: number };
 
 /** Reject invalid geometry before allocation; terminal-sized work has a hard ceiling. */
@@ -93,7 +94,7 @@ function boundedMessageText(message: Message, limit: number, cursor: TextCursor)
     const end = sourceEnd(part, offset, remaining);
     const chunk = part.slice(offset, end);
     if (block.type === "text") text += (text ? "\n" : "") + chunk;
-    else calls.push(sanitizeDisplayText(chunk));
+    else calls.push(chunk);
     spent += chunk.length + 1;
     if (end < part.length) { offset = end; break; }
     offset = 0;
@@ -441,8 +442,8 @@ export class ConversationViewer implements Component, Focusable {
     const th = this.theme;
     const innerW = this.fullscreen ? width < 3 ? width : width - 2 : width - 4;
     this.lastInnerW = innerW;
-    const row = (content: string, rail = " ") => {
-      const fitted = truncateToWidth(content, innerW, "…", true);
+    const row = (content: string, rail = " ", cached?: string) => {
+      const fitted = cached ?? truncateToWidth(content, innerW, "…", true);
       return this.fullscreen ? width < 3 ? fitted : ` ${fitted}${rail}` : `${th.fg("borderAccent", "│")} ${fitted} ${th.fg("borderAccent", "│")}`;
     };
     const rule = (left: string, right: string) => th.fg("borderAccent", `${left}${"─".repeat(Math.max(0, width - 2))}${right}`);
@@ -488,7 +489,19 @@ export class ConversationViewer implements Component, Focusable {
     for (let i = 0; i < height; i++) {
       const thumb = i >= thumbTop && i < thumbTop + thumbHeight;
       const rail = this.fullscreen && maxScroll > 0 ? th.fg(thumb ? "accent" : "dim", thumb ? "┃" : "│") : " ";
-      lines.push(row(visible[i] ?? "", rail));
+      const anchor = this.rowAnchors[this.scrollOffset + i];
+      const entry = anchor && this.layouts.get(anchor.message);
+      const fitted = entry?.fitted;
+      let padded: string | undefined;
+      if (anchor && fitted?.width === innerW) {
+        padded = fitted.padded[anchor.row];
+        if (padded === undefined) {
+          padded = truncateToWidth(visible[i] ?? "", innerW, "…", true);
+          fitted.padded[anchor.row] = padded;
+        }
+      }
+      // Only transcript fitting is cached; rails, chrome and runtime state stay live.
+      lines.push(row(visible[i] ?? "", rail, padded));
     }
     if (!this.autoScroll && (maxScroll > 0 || this.windowEnd < this.messageCount)) {
       const text = this.newMessages > 0 ? `${this.newMessages} new message${this.newMessages === 1 ? "" : "s"}` : "Jump to latest";
@@ -638,18 +651,31 @@ export class ConversationViewer implements Component, Focusable {
     }
     // Narrow widths reduce the raw input bound, BEFORE Markdown/wrapping can expand it.
     const source = boundedMessageText(msg, preview ? PREVIEW_SCAN_LIMIT : Math.min(MAX_MESSAGE_CHARS, Math.max(128, width * 16)), preview ? { block: 0, offset: 0 } : page.cursor);
+    const commandSource = isBashExecutionMessage(msg) ? msg.command.slice(0, MAX_MESSAGE_CHARS) : "";
+    let entry = this.layouts.get(msg);
+    const shortened = !!entry && source.sourceLength < entry.sourceLength;
+    const raw: RawProjection = { text: source.text, calls: source.calls, command: commandSource, role: msg.role, width,
+      row: page.row, block: page.cursor.block, offset: page.cursor.offset, next: source.next };
+    const previous = entry?.raw;
+    // Compare bounded VALUES, not message/block identity: streams mutate existing objects.
+    // Keep the sanitized-signature/failure path below for every raw projection change.
+    if (entry && previous && !shortened && previous.text === raw.text && previous.command === raw.command
+      && previous.role === raw.role && previous.width === raw.width && previous.row === raw.row
+      && previous.block === raw.block && previous.offset === raw.offset
+      && previous.next?.block === raw.next?.block && previous.next?.offset === raw.next?.offset
+      && previous.calls.length === raw.calls.length && previous.calls.every((call, i) => call === raw.calls[i])) {
+      entry.sourceLength = source.sourceLength; entry.next = preview ? undefined : source.next; return entry.lines;
+    }
     const safe = safeTerminalText(source.text);
     const capped = preview ? truncateCodePoints(safe, PREVIEW_CHARS, "") : safe;
     const text = capped.trim();
     const omitted = !!source.next || capped.length < safe.length;
-    const calls = source.calls;
-    const command = isBashExecutionMessage(msg) ? sanitizeDisplayText(msg.command.slice(0, MAX_MESSAGE_CHARS)) : "";
+    const calls = source.calls.map(call => sanitizeDisplayText(call));
+    const command = commandSource ? sanitizeDisplayText(commandSource) : "";
     const signature = `${msg.role}\0${text}\0${omitted}\0${command}\0${calls.join("\0")}\0${page.row}\0${page.cursor.block}:${page.cursor.offset}`;
-    let entry = this.layouts.get(msg);
-    const shortened = !!entry && source.sourceLength < entry.sourceLength;
-    if (entry?.signature === signature && !shortened) { entry.sourceLength = source.sourceLength; entry.next = preview ? undefined : source.next; return entry.lines; }
+    if (entry?.signature === signature && !shortened) { entry.raw = raw; entry.sourceLength = source.sourceLength; entry.next = preview ? undefined : source.next; return entry.lines; }
     const failed = !!entry?.failed && !shortened && text.startsWith(entry.text);
-    entry = { text, signature, sourceLength: source.sourceLength, lines: [], failed, next: preview ? undefined : source.next, moreRows: false, markdown: entry?.markdown };
+    entry = { raw, text, signature, sourceLength: source.sourceLength, lines: [], failed, next: preview ? undefined : source.next, moreRows: false, markdown: entry?.markdown };
     if (!this.layouts.has(msg) && this.layouts.size >= MAX_MESSAGES) this.layouts.delete(this.layouts.keys().next().value as Message);
     this.layouts.set(msg, entry);
     if (!text && calls.length === 0 && !command && !source.next) return [];
@@ -744,7 +770,11 @@ export class ConversationViewer implements Component, Focusable {
     for (const group of groups) {
       if (!group.lines.length) continue;
       if (lines.length) append("");
-      group.lines.forEach((line, row) => { append(line, { message: group.message, index: group.index, row }); });
+      const entry = this.layouts.get(group.message);
+      // Retain the independent second width safeguard, but fit each layout only once.
+      const fitted = entry?.fitted?.width === width ? entry.fitted.lines : group.lines.map(line => truncateToWidth(line, width));
+      if (entry && entry.fitted?.width !== width) entry.fitted = { width, lines: fitted, padded: [] };
+      fitted.forEach((line, row) => { lines.push(line); this.rowAnchors.push({ message: group.message, index: group.index, row }); });
     }
     if (this.windowEnd < messages.length) append(width < 8 ? "↓" : "↓ newer messages available · scroll down / End");
     if (!messages.length) append(this.theme.fg("dim", "waiting for first message"));

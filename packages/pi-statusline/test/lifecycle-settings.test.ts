@@ -139,7 +139,8 @@ test("palette picker previews the highlighted preset and restores on cancel", as
           (value: unknown) => {
             result = value;
           },
-        ) as { handleInput?(data: string): void };
+        ) as { capturesViewportInput?: boolean; handleInput?(data: string): void };
+        assert.equal(component.capturesViewportInput, true);
         component.handleInput?.("\u001b[B");
         preview = footer?.render(200)[0] ?? "";
         component.handleInput?.("\u001b");

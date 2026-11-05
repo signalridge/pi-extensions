@@ -8,6 +8,7 @@ export default defineConfig({
       "scripts/status-navigation.test.ts",
       "scripts/goal-compaction-composition.test.ts",
       "scripts/goal-rules-composition.test.ts",
+      "scripts/secrets-side-requests.test.ts",
     ],
     setupFiles: ["packages/pi-input-history/test/vitest.setup.ts"],
   },

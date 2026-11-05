@@ -18,7 +18,7 @@ import type { ActiveGoal, GoalStateEntryData } from "../src/persistence.js";
 const OVERFLOW = "Your input exceeds the context window of this model";
 
 // Real host overflow recovery, compaction and prompt dispatch. No paid model.
-describe.skipIf(VERSION !== "1.4.0")("goal continuation after a context overflow on installed Pi 1.4.0", () => {
+describe.skipIf(VERSION !== "1.5.0")("goal continuation after a context overflow on installed Pi 1.5.0", () => {
   let cwd: string;
   let agentDir: string;
   let previousAgentDir: string | undefined;

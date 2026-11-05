@@ -58,6 +58,33 @@ test("forwards input, focus, invalidation, and disposal", () => {
   assert.deepEqual(calls, ["input:enter", "invalidate", "dispose"]);
 });
 
+test("forwards live viewport capture without opting in passive components", () => {
+  let capture: boolean | undefined;
+  const framed = borderedComponent(
+    {
+      get capturesViewportInput() {
+        return capture;
+      },
+      render: () => ["content"],
+      invalidate() {},
+    },
+    (text) => text,
+  );
+  assert.equal(framed.capturesViewportInput, undefined);
+  capture = true;
+  assert.equal(framed.capturesViewportInput, true);
+  capture = false;
+  assert.equal(framed.capturesViewportInput, false);
+});
+
+test("disposes a bordered component exactly once", () => {
+  let disposals = 0;
+  const framed = borderedComponent({ render: () => [], invalidate() {}, dispose: () => disposals++ }, (text) => text);
+  framed.dispose?.();
+  framed.dispose?.();
+  assert.equal(disposals, 1);
+});
+
 test("keeps passive components passive and forwards pending work", async () => {
   let pendingFinished = false;
   const component = {

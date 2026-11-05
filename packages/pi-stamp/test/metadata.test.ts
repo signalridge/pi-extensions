@@ -125,14 +125,14 @@ test("assistant metadata formatting distinguishes compact, expanded, and explici
   assert.ok(metadata);
   assert.deepEqual(formatAssistantMetadataLines(metadata, "off", false), []);
   assert.deepEqual(formatAssistantMetadataLines(metadata, "compact", false), [
-    "requested-model → actual-model · 1,234 tok · est $0.018",
+    "requested-model → actual-model · 1,234 tok · unknown $0.018",
   ]);
   assert.deepEqual(formatAssistantMetadataLines(metadata, "expanded", false), [
     "api anthropic-messages · provider anthropic · requested requested-model · response actual-model · stop toolUse",
-    "tokens in 100 · out 200 · reasoning 50 · cache read 300 · cache write 400 · total 1,234 · est cost $0.018",
+    "tokens in 100 · out 200 · reasoning 50 · cache read 300 · cache write 400 · total 1,234 · unknown cost $0.018",
   ]);
   assert.deepEqual(formatAssistantMetadataLines(metadata, "compact", true), [
-    "requested-model → actual-model · 1,234 tok · est $0.018",
+    "requested-model → actual-model · 1,234 tok · unknown $0.018",
     "debug · response id resp-1",
     "debug · diagnostics 2",
     "debug · rate_limit · Timeout · code ETIMEDOUT",
@@ -144,7 +144,7 @@ test("assistant metadata formatting distinguishes compact, expanded, and explici
   });
   assert.ok(tinyCost);
   assert.deepEqual(formatAssistantMetadataLines(tinyCost, "compact", false), [
-    "requested-model → actual-model · 1,000,000 tok · est <$0.0001",
+    "requested-model → actual-model · 1,000,000 tok · unknown <$0.0001",
   ]);
   const wholeCost = captureAssistantMetadata({
     ...COMPLETE_MESSAGE,
@@ -152,7 +152,7 @@ test("assistant metadata formatting distinguishes compact, expanded, and explici
   });
   assert.ok(wholeCost);
   assert.deepEqual(formatAssistantMetadataLines(wholeCost, "compact", false), [
-    "requested-model → actual-model · 1,234 tok · est $1.2",
+    "requested-model → actual-model · 1,234 tok · unknown $1.2",
   ]);
 });
 

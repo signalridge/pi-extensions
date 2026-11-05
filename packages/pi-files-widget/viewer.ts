@@ -7,6 +7,7 @@ import { sanitizeDisplayText } from "@signalridge/pi-ui";
 import { DEFAULT_VIEWER_HEIGHT, MAX_VIEWER_HEIGHT, MIN_PANEL_HEIGHT, SEARCH_SCROLL_OFFSET } from "./constants.js";
 import { loadFileContent } from "./file-viewer.js";
 import { createTextInputBuffer } from "./input-utils.js";
+import { layoutSearchSource } from "./source-search.js";
 import type { FileNode } from "./types.js";
 import { isMarkdownPath, isUntrackedStatus } from "./utils.js";
 
@@ -36,6 +37,7 @@ interface ViewerState {
   commentText: string;
   searchQuery: string;
   searchMatches: number[];
+  searchRows: number[];
   searchIndex: number;
   lastRenderWidth: number;
   lastLoadedMtimeMs: number | null;
@@ -79,6 +81,7 @@ export function createViewer(
     commentText: "",
     searchQuery: "",
     searchMatches: [],
+    searchRows: [],
     searchIndex: 0,
     lastRenderWidth: 0,
     lastLoadedMtimeMs: null,
@@ -110,7 +113,13 @@ export function createViewer(
     clampScroll();
   }
 
+  function isSourceSearchMode(): boolean {
+    return state.mode === "search" || !!state.searchQuery;
+  }
+
   function resetSearch(): void {
+    if (isSourceSearchMode()) state.lastRenderWidth = 0;
+    state.searchRows = [];
     state.searchQuery = "";
     state.searchMatches = [];
     state.searchIndex = 0;
@@ -140,7 +149,7 @@ export function createViewer(
     }
 
     state.mode = mode;
-    if (mode !== "search") resetSearch();
+    if (mode === "select" || mode === "comment") resetSearch();
     if (mode !== "comment") resetComment();
     if (mode === "normal") {
       clearSelection();
@@ -189,10 +198,21 @@ export function createViewer(
       return;
     }
     refreshRawContent();
-    const hasChanges = !!state.file.gitStatus;
-    const result = loadFileContent(state.file.path, getRoot(), state.diffMode, hasChanges, width, state.renderMarkdown);
-    state.content = result.lines;
-    state.renderMarkdown = result.renderedMarkdown;
+    if (isSourceSearchMode()) {
+      reloadSearchContent(width);
+    } else {
+      const hasChanges = !!state.file.gitStatus;
+      const result = loadFileContent(
+        state.file.path,
+        getRoot(),
+        state.diffMode,
+        hasChanges,
+        width,
+        state.renderMarkdown,
+      );
+      state.content = result.lines;
+      state.renderMarkdown = result.renderedMarkdown;
+    }
     state.lastRenderWidth = width;
     clampScroll();
     if (state.searchQuery) {
@@ -200,8 +220,22 @@ export function createViewer(
     }
   }
 
+  function reloadSearchContent(width: number): void {
+    const layout = layoutSearchSource(state.rawContent, width, state.searchQuery);
+    state.content = layout.lines;
+    state.searchRows = layout.matchRows;
+  }
+
+  function revealSearchMatch(): void {
+    const sourceLine = state.searchMatches[state.searchIndex];
+    const row = state.searchRows[sourceLine];
+    if (row !== undefined) state.scroll = Math.max(0, row - SEARCH_SCROLL_OFFSET);
+    clampScroll();
+  }
+
   function updateSearchMatches(options: { preserveActiveMatch?: boolean } = {}): void {
     const activeMatch = options.preserveActiveMatch ? state.searchMatches[state.searchIndex] : undefined;
+    reloadSearchContent(state.lastRenderWidth || process.stdout.columns || 80);
 
     state.searchMatches = [];
     if (!state.searchQuery) {
@@ -237,8 +271,7 @@ export function createViewer(
       state.searchIndex = nearestIndex;
     }
 
-    state.scroll = Math.max(0, state.searchMatches[state.searchIndex] - SEARCH_SCROLL_OFFSET);
-    clampScroll();
+    revealSearchMatch();
   }
 
   function jumpToNextMatch(direction: 1 | -1): void {
@@ -246,8 +279,7 @@ export function createViewer(
     state.searchIndex += direction;
     if (state.searchIndex < 0) state.searchIndex = state.searchMatches.length - 1;
     if (state.searchIndex >= state.searchMatches.length) state.searchIndex = 0;
-    state.scroll = Math.max(0, state.searchMatches[state.searchIndex] - SEARCH_SCROLL_OFFSET);
-    clampScroll();
+    revealSearchMatch();
   }
 
   function buildCommentPayload(): CommentPayload | null {
@@ -279,7 +311,9 @@ export function createViewer(
     const isUntracked = isUntrackedStatus(state.file.gitStatus);
 
     let header = theme.bold(sanitizeDisplayText(state.file.name));
-    if (isUntracked) {
+    if (isSourceSearchMode()) {
+      header += theme.fg("accent", " [SOURCE SEARCH]");
+    } else if (isUntracked) {
       header += theme.fg("dim", " [UNTRACKED]");
     } else if (state.diffMode) {
       header += theme.fg("warning", " [DIFF]");
@@ -364,7 +398,7 @@ export function createViewer(
     } else if (state.mode === "select") {
       help = theme.fg("dim", "Source lines (unwrapped, clipped)  j/k: extend  c: comment  Esc: cancel");
     } else if (state.mode === "search") {
-      help = theme.fg("dim", "Type to search  Enter: confirm  Esc: cancel");
+      help = theme.fg("dim", "Wrapped source search  Enter: confirm  Esc: cancel");
     } else {
       const isUntracked = state.file && isUntrackedStatus(state.file.gitStatus);
       const markdownHelp = isMarkdownFile() && !state.diffMode ? "m: raw/render  " : "";
@@ -397,6 +431,7 @@ export function createViewer(
       state.scroll = 0;
       state.diffMode = !!file.gitStatus && !isUntrackedStatus(file.gitStatus);
       state.renderMarkdown = isMarkdownPath(file.path);
+      resetSearch();
       setMode("normal");
       state.content = [];
       state.lastRenderWidth = 0;
@@ -414,6 +449,7 @@ export function createViewer(
       state.rawContent = "";
       state.renderMarkdown = true;
       state.lastLoadedMtimeMs = null;
+      resetSearch();
       setMode("normal");
     },
 
@@ -486,8 +522,10 @@ export function createViewer(
 
       if (state.mode === "search") {
         if (matchesKey(data, Key.enter)) {
+          if (!state.searchQuery) state.lastRenderWidth = 0;
           setMode("normal");
         } else if (matchesKey(data, Key.escape)) {
+          resetSearch();
           setMode("normal");
         } else if (matchesKey(data, Key.backspace)) {
           state.searchQuery = state.searchQuery.slice(0, -1);
@@ -516,8 +554,11 @@ export function createViewer(
         return { type: "none" };
       }
       if (matchesKey(data, "/") && state.mode !== "select") {
+        const width = state.lastRenderWidth || process.stdout.columns || 80;
+        resetSearch();
         switchMarkdownToRaw();
         setMode("search");
+        reloadContent(width);
         return { type: "none" };
       }
       if (matchesKey(data, "n") && state.mode !== "select" && state.searchMatches.length > 0) {
@@ -580,6 +621,7 @@ export function createViewer(
         state.file.gitStatus &&
         !isUntrackedStatus(state.file.gitStatus)
       ) {
+        resetSearch();
         state.diffMode = !state.diffMode;
         state.lastRenderWidth = 0;
         state.scroll = 0;

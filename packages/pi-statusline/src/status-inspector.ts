@@ -78,6 +78,7 @@ export async function inspectStatuses(
         }
       }, 100);
       return {
+        capturesViewportInput: true,
         dispose() {
           if (disposed) return;
           disposed = true;

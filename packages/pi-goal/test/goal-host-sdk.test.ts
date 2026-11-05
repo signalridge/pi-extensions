@@ -26,7 +26,7 @@ import goal from "../src/goal.js";
 import type { ActiveGoal, GoalStateEntryData } from "../src/persistence.js";
 
 // This regression uses the installed host and its actual codemode executor, not tool mocks.
-describe.skipIf(VERSION !== "1.4.0")("terminal goals on installed Pi 1.4.0", () => {
+describe.skipIf(VERSION !== "1.5.0")("terminal goals on installed Pi 1.5.0", () => {
   let cwd: string;
   let agentDir: string;
   let previousAgentDir: string | undefined;

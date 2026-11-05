@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import * as childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { test, vi } from "vitest";
 import { GitWorktreeError, worktreeInventory } from "../src/git.ts";
 import { GitInputError, runGitInput } from "../src/git-input.ts";
@@ -156,6 +158,7 @@ for (const boundary of [
             assert.match(failed.message, /cancelled|timed out/u);
           } else {
             assert.equal(result && "killed" in result ? result.killed : undefined, true);
+            assert.equal(result && "truncated" in result ? result.truncated : undefined, false);
             assert.equal(failed, undefined);
           }
           assert.equal(vi.getTimerCount(), 0);
@@ -288,13 +291,149 @@ for (const failure of ["false", "EPERM"] as const) {
   );
 }
 
+test.skipIf(process.platform === "win32")(
+  "real stdin Git overflow drains and confirms the owned child's exit",
+  async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "worktree-overflow-git-"));
+    writeFileSync(
+      join(cwd, "git"),
+      `#!${process.execPath}\nprocess.on('SIGTERM', () => {}); process.stdin.resume(); process.stdout.write('12345'); process.stderr.write('67890'); setInterval(() => {}, 1000);\n`,
+      { mode: 0o755 },
+    );
+    vi.stubEnv("PATH", cwd);
+    const spawn = vi.mocked(childProcess.spawn);
+    spawn.mockClear();
+    let child: childProcess.ChildProcessWithoutNullStreams | undefined;
+    try {
+      const pending = runGitInput(["overflow"], cwd, "", undefined, 15_000, 8);
+      child = spawn.mock.results[0].value as childProcess.ChildProcessWithoutNullStreams;
+      const kill = vi.spyOn(child, "kill");
+      const result = await pending;
+      assert.equal(result.truncated, true);
+      assert.equal(result.killed, true);
+      assert.notEqual(result.code, 0);
+      assert.equal(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr), 8);
+      assert.deepEqual(kill.mock.calls, [["SIGTERM"], ["SIGKILL"]]);
+      assert.notEqual(child.signalCode, null, "actual exit is confirmed before settlement");
+      assert.equal(child.listenerCount("close"), 0);
+      assert.equal(child.stdout.listenerCount("data"), 0);
+    } finally {
+      if (child?.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      spawn.mockRestore();
+      vi.unstubAllEnvs();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  },
+);
+
+function controlledChild() {
+  const child = Object.assign(new EventEmitter(), {
+    pid: 123,
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn((_signal: NodeJS.Signals) => true),
+  });
+  vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as childProcess.ChildProcessWithoutNullStreams);
+  return child;
+}
+
+for (const boundary of ["abort", "timeout", "overflow"] as const) {
+  test(`stdin ${boundary} waits for delayed close and distinguishes truncation`, async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const child = controlledChild();
+    const controller = new AbortController();
+    let settled = false;
+    const pending = runGitInput(["test", boundary], "/repo", "", controller.signal, 15_000, 8).then((result) => {
+      settled = true;
+      return result;
+    });
+    // Separate writes to the two pipes are each below the cap but combined overflow.
+    child.stdout.write(Buffer.from("12345"));
+    child.stderr.write(Buffer.from(boundary === "overflow" ? "67890" : "67"));
+    if (boundary === "abort") controller.abort();
+    if (boundary === "timeout") await vi.advanceTimersByTimeAsync(15_000);
+    assert.equal(settled, false);
+    assert.deepEqual(child.kill.mock.calls, [["SIGTERM"]]);
+    await vi.advanceTimersByTimeAsync(250);
+    assert.deepEqual(child.kill.mock.calls, [["SIGTERM"], ["SIGKILL"]]);
+    assert.equal(settled, false, "signal acceptance is not exit confirmation");
+    // Continue draining after overflow; these bytes must not accumulate.
+    if (boundary === "overflow") child.stdout.write(Buffer.alloc(1024, 120));
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+    assert.equal(settled, false, "wait for output drain/close, not just exit");
+    child.emit("close", 0, null);
+    const result = await pending;
+    assert.equal(result.truncated, boundary === "overflow");
+    assert.equal(result.killed, true);
+    assert.equal(result.stdout, "12345");
+    assert.equal(result.stderr, boundary === "overflow" ? "678" : "67");
+    assert.equal(result.code, boundary === "overflow" ? 1 : 0);
+    assert.equal(vi.getTimerCount(), 0);
+  });
+}
+
+for (const maxBuffer of [0, 1, 2, 3, 4, 5, 6, 7]) {
+  test(`stdin fragmented UTF-8 is byte bounded at ${maxBuffer} bytes`, async () => {
+    const child = controlledChild();
+    const pending = runGitInput(["utf8", String(maxBuffer)], "/repo", "", undefined, 15_000, maxBuffer);
+    const encoded = Buffer.from("a€b"); // 5 bytes, fragmented inside the three-byte code point.
+    child.stdout.write(encoded.subarray(0, 2));
+    child.stdout.write(encoded.subarray(2, 3));
+    child.stdout.write(encoded.subarray(3));
+    child.stderr.write(Buffer.from("é"));
+    child.exitCode = 0;
+    child.emit("close", 0, null);
+    const result = await pending;
+    assert.equal(result.stdout, maxBuffer === 0 ? "" : maxBuffer < 4 ? "a" : maxBuffer === 4 ? "a€" : "a€b");
+    assert.equal(result.stderr, maxBuffer === 7 ? "é" : "");
+    assert.equal(result.truncated, maxBuffer < 7);
+    assert.ok(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr) <= maxBuffer);
+    assert.doesNotMatch(result.stdout + result.stderr, /�/u);
+    assert.equal(result.code, maxBuffer < 7 ? 1 : 0);
+  });
+}
+
+test("unconfirmed overflow retains truthful diagnostics and releases only on actual exit", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const child = controlledChild();
+  const args = ["unconfirmed-overflow"];
+  const pending = runGitInput(args, "/repo", "", undefined, 15_000, 5).catch((error: unknown) => error);
+  child.stdout.write(Buffer.from("123"));
+  child.stderr.write(Buffer.from("456"));
+  await vi.advanceTimersByTimeAsync(1250);
+  const error = await pending;
+  assert.ok(error instanceof GitInputError);
+  assert.equal(error.reason, "output overflow (5 bytes)");
+  assert.equal(error.truncated, true);
+  assert.equal(error.terminationConfirmed, false);
+  assert.equal(error.stdout, "123");
+  assert.equal(error.stderr, "45");
+  assert.doesNotMatch(error.message, /timeout|cancellation/u);
+  await assert.rejects(runGitInput(args, "/repo", ""), /Previous Git termination is unconfirmed/u);
+  assert.equal(child.kill.mock.calls.length, 2);
+  child.exitCode = 0;
+  child.emit("exit", 0, null);
+  const replacement = controlledChild();
+  const admitted = runGitInput(args, "/repo", "");
+  replacement.exitCode = 0;
+  replacement.emit("close", 0, null);
+  assert.equal((await admitted).truncated, false);
+  assert.equal(vi.getTimerCount(), 0);
+});
+
 test("already cancelled stdin Git never spawns", async () => {
   const spawn = vi.mocked(childProcess.spawn);
   spawn.mockClear();
   try {
     const controller = new AbortController();
     controller.abort();
-    assert.equal((await runGitInput([], ".", "", controller.signal)).killed, true);
+    const result = await runGitInput([], ".", "", controller.signal);
+    assert.equal(result.killed, true);
+    assert.equal(result.truncated, false);
     assert.equal(spawn.mock.calls.length, 0);
   } finally {
     spawn.mockRestore();

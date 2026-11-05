@@ -351,9 +351,11 @@ describe("job manager", () => {
       const folder = await mkdtemp(join(tmpdir(), "background-inherited-pipe-"));
       const marker = join(folder, "child.pid");
       try {
-        const script = `process.on("SIGTERM",()=>console.log("TERM-drained"));require("node:fs").writeFileSync(${JSON.stringify(marker)},String(process.pid));console.log("inherited");setInterval(()=>{},1000)`;
+        // Exercise inherited pipes and TERM drainage, not a second Node cold
+        // startup inside the command's deliberately short 200ms deadline.
+        const script = `trap 'printf "TERM-drained\\n"' TERM; printf '%s' "$$" > ${quote(marker)}; printf 'inherited\\n'; while :; do sleep 1; done`;
         const job = await instance.start({
-          command: `${quote(process.execPath)} -e ${quote(script)} & while [ ! -s ${quote(marker)} ]; do sleep .01; done; printf 'shell-complete\\n'`,
+          command: `/bin/sh -c ${quote(script)} & while [ ! -s ${quote(marker)} ]; do sleep .01; done; printf 'shell-complete\\n'`,
           cwd,
           timeoutMs,
         });
@@ -422,11 +424,20 @@ describe("job manager", () => {
     });
     managers.push(instance);
     const running = await instance.start({ command: "sleep 20", cwd });
-    const completed: string[] = [];
-    for (let index = 0; index < 33; index++) {
-      const job = await instance.start({ command: "printf 'hit\\n'", cwd, watch: { patterns: ["hit"] } });
-      await finished(instance, job.id);
-      completed.push(job.id);
+    // Establish the oldest finished identity before batching the remaining jobs.
+    // This tests retention, not 33 serial helper startups within the runner guard.
+    const oldest = await instance.start({ command: "printf 'hit\\n'", cwd, watch: { patterns: ["hit"] } });
+    await finished(instance, oldest.id);
+    const completed: string[] = [oldest.id];
+    const batchSize = LIMITS.running - 1; // The long-running job still owns one slot.
+    for (let index = 1; index < 33; index += batchSize) {
+      const batch = await Promise.all(
+        Array.from({ length: Math.min(batchSize, 33 - index) }, () =>
+          instance.start({ command: "printf 'hit\\n'", cwd, watch: { patterns: ["hit"] } }),
+        ),
+      );
+      await Promise.all(batch.map((job) => finished(instance, job.id)));
+      completed.push(...batch.map((job) => job.id));
     }
     expect(instance.list()).toHaveLength(32);
     expect(instance.get(running.id).status).toBe("running");

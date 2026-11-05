@@ -36,7 +36,7 @@ function context(cwd: string) {
     cwd,
     model: undefined,
     modelRegistry: { ...mockParentRegistry, find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: vi.fn(() => "s1"), getEntries: vi.fn(() => []) },
+    sessionManager: { getSessionId: vi.fn(() => "s1"), getEntries: vi.fn(() => []), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as never;
 }

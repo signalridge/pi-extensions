@@ -99,7 +99,11 @@ test("the blur threshold cannot bypass the settlement debounce", async (t) => {
       find: (provider, id) => (provider === "test" && id === "test" ? ctx.model : undefined),
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key" }),
     },
-    sessionManager: { getBranch: () => branch, buildSessionProjection: () => buildSessionProjection(branch) },
+    sessionManager: {
+      getSessionId: () => "recap-test",
+      getBranch: () => branch,
+      buildSessionProjection: () => buildSessionProjection(branch),
+    },
     ui: {
       setStatus() {},
       setWidget(_key, content) {

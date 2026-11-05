@@ -33,7 +33,7 @@ for (const boundary of [
   "print-result-barrier",
 ] as const) {
   test(`actual SDK disposal retires statusline ${boundary}, even when unsubscribe throws`, async () => {
-    assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+    assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
     const cwd = mkdtempSync(join(tmpdir(), "statusline-dispose-"));
     const agentDir = join(cwd, "agent");
     mkdirSync(agentDir);

@@ -25,7 +25,7 @@ import type { ManagedRoutingPolicy } from "@signalridge/pi-subagents-protocol";
 import { agentTierPolicyIdentity, isManagedAgentTier } from "@signalridge/pi-subagents-protocol";
 import { parse } from "acorn";
 import { checkRuntimeBindings } from "./capabilities.js";
-import { WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
+import { AllocationFreeDispatchError, WorkflowError, WorkflowErrorCode, wrapError } from "./errors.js";
 import {
   executeOrchestration,
   normalizeOrchestration,
@@ -1038,31 +1038,34 @@ async function withTimeout<T>(
 
 /** Extract the first balanced JSON value ({...} or [...]) from text. */
 export function findJsonBlock(text: string): string | undefined {
-  for (let start = 0; start < text.length; start += 1) {
-    if (text[start] !== "{" && text[start] !== "[") continue;
-    const stack: string[] = [];
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < text.length; i += 1) {
-      const char = text[i];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (char === "\\") escaped = true;
-        else if (char === '"') inString = false;
-        continue;
-      }
-      if (char === '"') {
-        inString = true;
-        continue;
-      }
-      if (char === "{" || char === "[") stack.push(char === "{" ? "}" : "]");
-      else if (char === "}" || char === "]") {
-        if (stack.pop() !== char) break;
-        if (stack.length === 0) return text.slice(start, i + 1);
-      }
-    }
+  // Suffix summaries avoid rescanning after every malformed opening bracket.
+  // stringEnd[i] is the position after a closing quote when already in a string
+  // at i; contentEnd[i] is the first unconsumed closing bracket after skipping
+  // balanced children/strings, or -1 for an incomplete/mismatched suffix.
+  // Compute candidates even inside strings: an unmatched/malformed outer prefix
+  // must still allow a later, independently balanced candidate, as before.
+  const stringEnd = new Int32Array(text.length + 2);
+  const contentEnd = new Int32Array(text.length + 1);
+  stringEnd[text.length] = stringEnd[text.length + 1] = contentEnd[text.length] = -1;
+  let start = -1;
+  let end = -1;
+  for (let i = text.length - 1; i >= 0; i--) {
+    const char = text[i];
+    stringEnd[i] = char === '"' ? i + 1 : stringEnd[i + (char === "\\" ? 2 : 1)];
+    if (char === "}" || char === "]") contentEnd[i] = i;
+    else if (char === '"') {
+      const after = stringEnd[i + 1];
+      contentEnd[i] = after < 0 ? -1 : contentEnd[after];
+    } else if (char === "{" || char === "[") {
+      const close = contentEnd[i + 1];
+      if (close >= 0 && text[close] === (char === "{" ? "}" : "]")) {
+        start = i;
+        end = close + 1;
+        contentEnd[i] = contentEnd[end];
+      } else contentEnd[i] = -1;
+    } else contentEnd[i] = contentEnd[i + 1];
   }
-  return undefined;
+  return start < 0 ? undefined : text.slice(start, end);
 }
 
 // ── Minimal plain-JSON-Schema validator ──────────────────────────────────────
@@ -1078,13 +1081,11 @@ function validateValue(value: unknown, schema: SchemaNode, path: string): string
   if (schema.const !== undefined) {
     if (JSON.stringify(value) !== JSON.stringify(schema.const))
       errors.push(`${path}: expected const ${JSON.stringify(schema.const)}`);
-    return errors;
   }
   if (schema.enum !== undefined) {
     if (!(schema.enum as unknown[]).some((e) => JSON.stringify(e) === JSON.stringify(value))) {
       errors.push(`${path}: value not in enum`);
     }
-    return errors;
   }
   const type = schema.type;
   if (type !== undefined) {
@@ -1790,12 +1791,34 @@ export async function runWorkflow<T = unknown>(
           ? `\n\nReply with a single raw JSON value (object or array) matching exactly this JSON Schema:\n${JSON.stringify(schema)}\nDo not wrap it in prose or markdown fences.`
           : "";
       let repairFeedback = "";
+      let previousAttempt: { tokens: number; tokenUsage?: AgentUsage; tier?: string } | undefined;
 
       try {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           // Outside the attempt catch: a rejected admission is not a provider
           // attempt and must not be charged an estimated failure or retried.
-          checkBudget();
+          try {
+            checkBudget();
+          } catch (error) {
+            const workflowError = wrapError(error, { agentLabel: label });
+            // A between-attempt denial ends the logical call, but it neither
+            // starts nor charges another physical child. Preserve the previous
+            // attempt's observations; the engine independently requires exact
+            // settled-generation facts before making a durable terminal result.
+            if (previousAttempt && !isAborted() && workflowError.code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED) {
+              options.onAgentEnd?.({
+                id: deltaKey,
+                label,
+                ...phaseObservation(assignedPhase),
+                result: null,
+                ...previousAttempt,
+                error: workflowError.message,
+                errorCode: workflowError.code,
+                recoverable: workflowError.recoverable,
+              });
+            }
+            throw error;
+          }
           usage = undefined;
           const externalSignal = options.signal;
           let onExternalAbort: (() => void) | undefined;
@@ -1964,7 +1987,12 @@ export async function runWorkflow<T = unknown>(
             if (isAborted()) throw error;
 
             const workflowError = wrapError(error, { agentLabel: label });
-            const tokens = recordTokens(null);
+            const allocationFree = error instanceof AllocationFreeDispatchError;
+            // Only trusted local preflight proves this attempt never submitted.
+            // A rejected repair still owns the logical call's earlier dispatch;
+            // neither transport text nor a lost reply can refund that lease.
+            if (allocationFree && attempt === 1) shared.physicalAgentCount--;
+            const tokens = allocationFree ? 0 : recordTokens(null);
             // This attempt's store writes must not survive it — a failed attempt
             // shares this call's deltaKey with every other attempt, so without
             // rolling back here its writes would stay live in the store and merge
@@ -1977,6 +2005,7 @@ export async function runWorkflow<T = unknown>(
                 `agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`,
               );
               options.onRetrySpend?.(tokens);
+              previousAttempt = { tokens, tokenUsage: usage, tier: resolvedTier };
               continue;
             }
 

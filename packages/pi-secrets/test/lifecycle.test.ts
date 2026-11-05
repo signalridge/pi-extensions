@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createEventBus } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import secrets, { PLACEHOLDER_GUIDELINE, registerSecrets, SECRETS_COMMAND } from "../src/index.js";
 
@@ -35,6 +36,7 @@ function harness(options: { trusted?: boolean; userConfig?: string } = {}) {
   const handlers = new Map<string, Handler[]>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
   const pi = {
+    events: createEventBus(),
     on(event: string, handler: Handler) {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     },
@@ -81,6 +83,7 @@ describe("extension lifecycle", () => {
     const events: string[] = [];
     const commands: string[] = [];
     secrets({
+      events: createEventBus(),
       on: (event: string) => events.push(event),
       registerCommand: (name: string) => commands.push(name),
     } as never);

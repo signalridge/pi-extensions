@@ -84,7 +84,8 @@ Full detail lives in each package's README —
 [`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
 resume semantics, and routing table;
 [`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling. The tested development host is **Pi 1.4.0**.
+FleetView, and scheduling. The development host target is **Pi 1.5.0**;
+the previous full acceptance baseline was Pi 1.4.0.
 Host-provided peers use `"*"` for module ownership, not as a claim that every Pi
 version is supported. See [compatibility and verification](docs/compatibility.md)
 for current host contracts and integration limits.

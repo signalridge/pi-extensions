@@ -1,3 +1,4 @@
+import { isResponseModel } from "../reported-model.js";
 import type {
   GenerationOutcome,
   GenerationRecord,
@@ -97,6 +98,7 @@ function parseGeneration(value: unknown, index: number, budget: ParseBudget): Ge
   return {
     id: requiredString(item.id, `${prefix}.id`),
     ordinal: boundedCount(item.ordinal, `${prefix}.ordinal`),
+    ...optionalProperty("responseModel", optionalResponseModel(item.responseModel, `${prefix}.responseModel`)),
     ...optionalProperty("provider", optionalString(item.provider, `${prefix}.provider`)),
     ...optionalProperty("model", optionalString(item.model, `${prefix}.model`)),
     ...optionalProperty("thinkingLevel", optionalString(item.thinkingLevel, `${prefix}.thinkingLevel`)),
@@ -194,6 +196,12 @@ function requiredString(value: unknown, name: string): string {
 
 function optionalString(value: unknown, name: string): string | undefined {
   return value === undefined ? undefined : requiredString(value, name);
+}
+
+function optionalResponseModel(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!isResponseModel(value)) invalid(name);
+  return value;
 }
 
 function boundedInteger(value: unknown, name: string, maximum: number): number {

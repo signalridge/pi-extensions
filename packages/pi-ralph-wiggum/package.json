@@ -29,7 +29,7 @@
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "1.4.0"
+    "@earendil-works/pi-coding-agent": "1.5.0"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",

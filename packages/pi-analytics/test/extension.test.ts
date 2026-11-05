@@ -37,6 +37,7 @@ const emptySnapshot: AnalyticsSnapshot = {
     },
   },
   responses: {
+    modelPairs: [],
     count: 0,
     llmCalls: 0,
     average: 0,
@@ -226,6 +227,61 @@ test("non-reload session starts restore unambiguous raw-hook accounting", async 
       run.generations[0]?.responses.map(({ status }) => status),
       reason === "reload" ? [] : [200],
     );
+  }
+});
+
+test("native reported models never use selected identity, trigger catalog lookups or prove failed dispatch", async () => {
+  for (const [responseModel, expected] of [
+    [undefined, undefined],
+    ["physical", "physical"],
+    ["snapshot", "snapshot"],
+    [42, undefined],
+  ] as const) {
+    const store = new FakeStore();
+    const mock = createMockPi();
+    createAnalyticsExtension({ createStore: () => store })(mock.pi);
+    const started = lifecycleContext({
+      model: { provider: "virtual", id: "selected" },
+      modelRegistry: new Proxy({}, { get: () => assert.fail("analytics must not query models or providers") }),
+    });
+    await emit(mock, "session_start", { reason: "startup" }, started.ctx);
+    await emit(mock, "before_agent_start", { systemPromptOptions: { skills: [] } }, started.ctx);
+    await emit(mock, "turn_start", {}, started.ctx);
+    await emit(
+      mock,
+      "message_end",
+      {
+        message: { role: "assistant", provider: "provider", model: "physical", stopReason: "stop", responseModel },
+      },
+      started.ctx,
+    );
+    await emit(mock, "agent_settled", {}, started.ctx);
+    const run = store.runs[0];
+    assert.equal(run?.initialModel, "selected");
+    assert.equal(run?.generations[0]?.model, "physical");
+    assert.equal(run?.generations[0]?.responseModel, expected);
+    assert.deepEqual(mock.setModels, []);
+    assert.deepEqual(mock.thinkingLevels, []);
+
+    await emit(mock, "before_agent_start", { systemPromptOptions: { skills: [] } }, started.ctx);
+    await emit(mock, "turn_start", {}, started.ctx);
+    await emit(
+      mock,
+      "message_end",
+      {
+        message: {
+          role: "assistant",
+          provider: "virtual",
+          model: "selected",
+          stopReason: "error",
+          responseModel: "not-proof",
+        },
+      },
+      started.ctx,
+    );
+    await emit(mock, "agent_settled", {}, started.ctx);
+    assert.deepEqual(store.runs[1]?.generations, []);
+    assert.doesNotMatch(JSON.stringify(store.runs[1]), /not-proof/);
   }
 });
 

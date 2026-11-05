@@ -6,6 +6,7 @@ import { type ExtensionContext, SessionManager } from "@earendil-works/pi-coding
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { empty, MAX_BYTES, STATE_TYPE } from "../src/state.js";
 import { TodoStore } from "../src/store.js";
+import { postAppendFault } from "./append-fault.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => {
@@ -89,10 +90,27 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
     expect(f.manager.getBranch()).toEqual([]);
     expect(f.store.read(f.ctx)).toEqual(empty());
   });
-  it("does not recover an EIO ghost completion on reconciliation or actual reopen", () => {
+  it.each([false, true])("native Pi 1.5 rolls back failed append memory (disk write completed=%s)", (afterWrite) => {
     const f = fixture();
     const first = f.store.mutate(f.ctx, add);
-    const spy = fault(f.file);
+    const branch = f.manager.getBranch();
+    const before = readFileSync(f.file, "utf8");
+    const spy = fault(f.file, afterWrite);
+    expect(() => f.store.mutate(f.ctx, { action: "clear", baseRevision: 1 })).toThrow(/EIO/);
+    expect(spy).toHaveBeenCalledOnce();
+    expect(f.manager.getBranch()).toEqual(branch);
+    expect(f.store.read(f.ctx)).toEqual(first);
+    expect(readFileSync(f.file, "utf8").includes('"revision":2')).toBe(afterWrite);
+    if (!afterWrite) expect(readFileSync(f.file, "utf8")).toBe(before);
+    spy.mockRestore();
+    syncBuiltinESMExports();
+    const open = reopened(f);
+    expect(open.store.read(open.ctx)).toEqual(afterWrite ? { ...first, revision: 2, tasks: [] } : first);
+  });
+  it("does not recover a lost-write acknowledgement ghost on reconciliation or actual reopen", () => {
+    const f = fixture();
+    const first = f.store.mutate(f.ctx, add);
+    const spy = postAppendFault(f.manager);
     expect(() =>
       f.store.mutate(f.ctx, {
         action: "update",
@@ -123,14 +141,7 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
   it("quarantines unreadable post-append storage until explicit repaired reconciliation", () => {
     const f = fixture();
     const original = readFileSync(f.file, "utf8");
-    const nativeAppend = fs.appendFileSync;
-    vi.spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof fs.appendFileSync>) => {
-      if (args[0] !== f.file) return nativeAppend(...args);
-      renameSync(f.file, `${f.file}.saved`);
-      mkdirSync(f.file);
-      throw new Error("EIO; verification destination unreadable");
-    });
-    syncBuiltinESMExports();
+    postAppendFault(f.manager, "custom", "unreadable");
     expect(() => f.store.mutate(f.ctx, add)).toThrow(/unavailable.*uncertain/i);
     expect(f.store.isUnavailable).toBe(true);
     expect(() => f.store.read(f.ctx)).toThrow(/unavailable/);
@@ -187,9 +198,9 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
     expect(destination.getBranch()).toEqual([]);
     expect(() => f.store.read(f.ctx)).toThrow(/ownership/);
   });
-  it("accepts a positively verified commit even when native append throws AFTER the complete disk write", () => {
+  it("accepts a positively verified commit when public append acknowledgement throws AFTER the complete write", () => {
     const f = fixture();
-    const spy = fault(f.file, true);
+    const spy = postAppendFault(f.manager, "custom", "commit");
     expect(f.store.mutate(f.ctx, add).revision).toBe(1);
     expect(spy).toHaveBeenCalledOnce();
     spy.mockRestore();
@@ -285,7 +296,7 @@ describe("native file-backed durability (no private SDK writes or rollback)", ()
       const first = f.store.mutate(f.ctx, add);
       f.store.read(f.ctx); // Warm the durability cache before memory diverges.
       const before = readFileSync(f.file, "utf8");
-      const spy = fault(f.file);
+      const spy = postAppendFault(f.manager, "message");
       expect(() => f.manager.appendMessage({ role: "user", content: "x".repeat(bytes), timestamp: 2 })).toThrow("EIO");
       spy.mockRestore();
       syncBuiltinESMExports();

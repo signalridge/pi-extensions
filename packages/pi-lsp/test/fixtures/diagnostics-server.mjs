@@ -443,3 +443,6 @@ process.stdin.on("data", (chunk) => {
     handle(JSON.parse(body));
   }
 });
+
+// Optional test bootstrap acknowledgement, separate from any RPC response.
+if (process.env.PI_LSP_TEST_READY) writeFileSync(process.env.PI_LSP_TEST_READY, "ready");

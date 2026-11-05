@@ -10,7 +10,7 @@ initTheme("dark", false);
 // exposing the same public UI API an extension receives. No production patches.
 // Both qualified hosts restore the opening draft synchronously inside done().
 function sdkHost() {
-  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+  assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let text = "original draft";
   let invalid = false;
   let writes = 0;
@@ -39,8 +39,8 @@ function sdkHost() {
       hideOverlay() {},
     },
     keybindings: {},
-    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
-    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
+    // 1.0.4 mounts directly; 1.5.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.5.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as { createExtensionUIContext(): ExtensionUIContext };
   const native = host.createExtensionUIContext();
   const ui: ExtensionUIContext = {

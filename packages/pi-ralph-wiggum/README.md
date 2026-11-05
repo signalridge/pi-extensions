@@ -61,7 +61,9 @@ Each iteration delivery has a private, one-use identity, consumed at accepted na
 
 Pending provenance expires after five minutes and is bounded to 256 candidates and 128 deliveries. Authenticated runtime nonces still recognize stale deliveries after eviction or retirement without retaining old task bodies or an unbounded replay list. An expired queued iteration needs an explicit `/ralph resume <name>`. Pause, cancel, and confirmed nuke synchronously retire ownership before deleting state. An active authenticated iteration also aborts immediately through its public operation context, so a later awaited tool-call handler cannot let a previously permitted substantive tool execute. The abort is pinned to the accepted nonce, live manager/session/branch, and original signal; it never transfers to a new root, ordinary manual user turn, or unrelated background wake. User continuations may advance loop progress without transferring ownership of their operation. Late tools from retired extension iterations remain blocked until settlement.
 
-State publication uses private temporary files and atomic rename. Malformed state warns by filename, remains unchanged, and does not prevent other valid loops from loading. Resume refuses to replace a still-running authenticated iteration; stop it or wait for settlement first, preserving its cancellation authority.
+State publication uses private temporary files and atomic rename. Malformed state warns by filename, remains unchanged, and does not prevent other valid loops from loading. Start and resume refuse to replace a still-running authenticated iteration; stop it or wait for settlement first, preserving its cancellation authority. Task content must be readable and non-whitespace before activation changes ownership or state. Authorized activation pauses duplicate active loops only when the same session and branch prove ownership; foreign and sibling-branch loops remain untouched.
+
+Completion and iteration-limit outcomes are finalized at `agent_settled`, after retries and any pre-settlement continuation. Terminal banners are non-triggering custom messages, not extra user turns; they remain visible to future model context.
 
 ## Completion gate
 
@@ -119,7 +121,7 @@ ralph_start({
 
 ## Credits
 
-Based on Geoffrey Huntley's Ralph Wiggum approach for long-running agent tasks.
+Based on Geoffrey Huntley's Ralph Wiggum approach for long-running agent tasks and Thomas Mustier's [Pi extension](https://github.com/tmustier/pi-extensions/tree/f2632e7da3cadc4f22fb8367e7c4454779ec1a05/pi-ralph-wiggum). Local adaptations retain exact-content HMAC admission, session/branch ownership, and operation-scoped cancellation rather than permissive marker matching.
 
 ## Changelog
 

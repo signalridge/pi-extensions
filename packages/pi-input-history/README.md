@@ -8,7 +8,7 @@
 
 Pi's built-in ↑/↓ history only covers the current session and is lost on reload. This extension persists your last 100 prompts across sessions and adds an fzf/atuin-style **Ctrl+R** popup — a scrollable, live-filtered list of past prompts — so you can find any of them instantly.
 
-The popup is rendered with Pi's native TUI components and adapts to narrow terminals.
+The popup is rendered with Pi's native TUI components and adapts to narrow terminals. It requires at least five terminal rows to keep both the query and a result visible. Opening below that minimum, or shrinking below it while searching, cancels the popup without changing the draft.
 
 ## Install
 

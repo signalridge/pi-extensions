@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { type FSWatcher, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExecResult } from "@earendil-works/pi-coding-agent";
+import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 import { getCapabilities } from "@earendil-works/pi-tui";
 import { afterAll, onTestFinished, test, vi } from "vitest";
 import githubPr, {
@@ -43,7 +43,6 @@ test("formatLinkedStatus reads hyperlink capability on each call", () => {
   }
 });
 
-type ExecOptions = { cwd?: string; signal?: AbortSignal; timeout?: number };
 type ExecCall = { command: string; args: string[]; options?: ExecOptions };
 type ExecFunction = (command: string, args: string[], options?: ExecOptions) => Promise<ExecResult>;
 
@@ -58,6 +57,7 @@ const okResult = (stdout: unknown): ExecResult => ({
   stderr: "",
   code: 0,
   killed: false,
+  truncated: false,
 });
 
 const textResult = (stdout: string, code = 0, stderr = ""): ExecResult => ({
@@ -65,6 +65,7 @@ const textResult = (stdout: string, code = 0, stderr = ""): ExecResult => ({
   stderr,
   code,
   killed: false,
+  truncated: false,
 });
 
 const sampleCounts = {
@@ -279,15 +280,15 @@ test("runGhPrView calls gh pr view for the current branch and reports actionable
       ? {
           command: process.env.ComSpec ?? "cmd.exe",
           args: ["/d", "/s", "/c", `set "GH_HOST=" && gh ${prArgs.join(" ")}`],
-          options: { cwd: "/repo", signal: undefined, timeout: 10_000 },
+          options: { cwd: "/repo", signal: undefined, timeout: 10_000, maxBuffer: 1024 * 1024 },
         }
       : {
           command: "env",
           args: ["-u", "GH_HOST", "gh", ...prArgs],
-          options: { cwd: "/repo", signal: undefined, timeout: 10_000 },
+          options: { cwd: "/repo", signal: undefined, timeout: 10_000, maxBuffer: 1024 * 1024 },
         },
   );
-  assert.deepEqual(calls[1]?.options, { cwd: "/repo", signal: undefined, timeout: 10_000 });
+  assert.deepEqual(calls[1]?.options, { cwd: "/repo", signal: undefined, timeout: 10_000, maxBuffer: 64 * 1024 });
   assert.deepEqual(calls[1]?.args.slice(0, 6), ["api", "graphql", "--hostname", "github.com", "-f", calls[1]?.args[5]]);
   assert.match(calls[1]?.args[5] ?? "", /^query=\s*query PullRequestCounts/);
   assert.deepEqual(calls[1]?.args.slice(6), [
@@ -978,6 +979,23 @@ test("a missing HEAD watcher still starts the initial refresh without a turn req
 
 test("a HEAD change after watcher installation still replaces the prior refresh", async () => {
   const { root, headPath } = createGitHeadFixture();
+  const actualWatch = (await vi.importActual<typeof fs>("node:fs")).watch;
+  const probeName = ".watch-ready";
+  const probePath = join(root, ".git", probeName);
+  let installed = false;
+  let watchReady = false;
+  const watch = vi
+    .mocked(fs.watch)
+    .mockReset()
+    .mockImplementation(actualWatch)
+    .mockImplementationOnce((watchPath, options, listener) => {
+      const watcher = actualWatch(watchPath, options, (event, name) => {
+        if (!name || name.toString() === probeName) watchReady = true;
+        listener?.(event, name);
+      });
+      installed = true;
+      return watcher;
+    });
 
   const mock = createMockPi();
   const gitResult = deferred<ExecResult>();
@@ -1006,7 +1024,16 @@ test("a HEAD change after watcher installation still replaces the prior refresh"
     sessionStart({}, context.ctx);
     await agentEnd({}, context.ctx);
     gitResult.resolve(textResult(".git/HEAD\n"));
-    await drainMicrotasks();
+    await waitFor(() => installed, "HEAD watcher installed");
+    // A completed refresh or drained microtasks do not prove that the OS event
+    // stream is active. Use a real non-HEAD directory probe before the mutation.
+    let probes = 0;
+    await waitFor(() => {
+      if (watchReady) return true;
+      writeFileSync(probePath, String(++probes));
+      return false;
+    }, "real HEAD watcher is active");
+    assert.equal(watch.mock.calls[0]?.[0], join(root, ".git"));
     assert.equal(prViews(), 1);
     writeFileSync(headPath, "ref: refs/heads/main\n");
     await waitFor(() => (context.statuses.get("github-pr") ?? "").includes("#456"), "changed HEAD status");
@@ -1015,6 +1042,7 @@ test("a HEAD change after watcher installation still replaces the prior refresh"
   } finally {
     gitResult.resolve(textResult(".git/HEAD\n"));
     await sessionShutdown({}, context.ctx);
+    watch.mockReset().mockImplementation(actualWatch);
   }
 });
 

@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Extension, ExtensionContext, InlineExtension, LoadExtensionsResult, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
@@ -21,7 +21,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
+import { type AgentTierResolution, type AgentTierResolutionSnapshot, resolveAgentTier } from "./agent-tiers.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { createAskGate } from "./ask-tools.js";
 import { runInChildSessionContext } from "./child-context.js";
@@ -34,8 +34,10 @@ import { formatGateVerdict, type GateExec, runGate, workspaceFingerprint } from 
 import {
   INTERNAL_AGENT_CONFIG_OVERRIDE,
   INTERNAL_PARENT_POLICY_SNAPSHOT,
+  INTERNAL_REOPEN_ROUTE,
   INTERNAL_RESOLVED_ISOLATED,
   type InternalAgentConfigOverride,
+  type InternalReopenRouteProof,
   type ParentPolicySnapshot,
 } from "./internal-run.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
@@ -46,11 +48,12 @@ import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager
 import { ANSWER_SUBAGENT_QUESTION, type ParentQuestionHandler } from "./parent-questions.js";
 import { captureProjectTrust, childProjectTrust, configurationMcpFactory, isProjectResource } from "./project-trust.js";
 import { buildAgentPrompt, inheritableParentPrompt, type PromptExtras } from "./prompts.js";
+import { assertPlainReopenHistory, assertReopenRoute } from "./reopen-route.js";
 import { getDefaultTurnPolicy, type RunBudgets, selectResumeTurnPolicy, sessionBudgets, setDefaultTurnPolicy } from "./run-budget-policy.js";
 import { shutdownAndDisposeSession } from "./session-lifecycle.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createSupervisorTool } from "./supervisor.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentConfig, SubagentType, ThinkingLevel } from "./types.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -577,6 +580,22 @@ function resolveDefaultModel(
   return resolveConfiguredDefaultModel(registry) ?? parentModel;
 }
 
+/** One model precedence for admission and execution; never restores a saved model. */
+export function resolveAgentRunModel(
+  ctx: ExtensionContext,
+  agentConfig: AgentConfig | undefined,
+  options: Pick<RunOptions, "model" | "agentTier" | "requireAgentTier" | typeof INTERNAL_PARENT_POLICY_SNAPSHOT>,
+  tierResolution?: AgentTierResolution,
+): Model<Api> | undefined {
+  const parentSnapshot = options[INTERNAL_PARENT_POLICY_SNAPSHOT];
+  const parentModel = parentSnapshot ? parentSnapshot.model : ctx.model;
+  const tier = tierResolution ?? resolveAgentTier({
+    requestedTier: options.agentTier, requireTier: options.requireAgentTier === true,
+    agentConfig, parentModel, modelRegistry: ctx.modelRegistry,
+  });
+  return tier.snapshot ? tier.model : options.model ?? resolveDefaultModel(parentModel, ctx.modelRegistry, agentConfig?.model);
+}
+
 /** Info about a tool event in the subagent. */
 export interface ToolActivity {
   type: "start" | "end";
@@ -645,6 +664,8 @@ export interface RunOptions {
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  /** Internal ownership notification after runner-owned shutdown/disposal settles. */
+  onSessionDiscarded?: (session: AgentSession) => void;
   /**
    * Called after pi-subagents resolves a user-named agent tier.
    *
@@ -684,6 +705,7 @@ export interface RunOptions {
    * so no public spawn surface forwards it.
    */
   resumeSessionFile?: string;
+  readonly [INTERNAL_REOPEN_ROUTE]?: InternalReopenRouteProof;
   /**
    * Project default for persisting a top-level agent's conversation to disk,
    * from the `rememberAgents` setting. Frontmatter `persist_session:` still
@@ -1029,6 +1051,14 @@ export async function runAgent(
         ? undefined
         : shortModelLabel(agentTierResolution.model);
     options.onAgentTierResolved?.(agentTierSnapshot, tierModelLabel);
+  }
+
+  const model = resolveAgentRunModel(ctx, agentConfig, options, agentTierResolution);
+  if (options.resumeSessionFile) {
+    const savedSession = SessionManager.open(options.resumeSessionFile);
+    assertSafeChildSession({ messages: [], sessionManager: savedSession });
+    assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, model);
+    assertPlainReopenHistory(savedSession, options[INTERNAL_REOPEN_ROUTE]!.route);
   }
 
   const env = await detectEnv(options.pi, effectiveCwd);
@@ -1458,9 +1488,6 @@ export async function runAgent(
 
   // A resolved tier owns both values. In particular, a pre-resolved parent or
   // legacy model/thinking option from a caller cannot bypass it.
-  const model = agentTierSnapshot
-    ? agentTierResolution.model
-    : options.model ?? resolveDefaultModel(parentModel, ctx.modelRegistry, agentConfig?.model);
   // Untiered: explicit option > agent config > the parent session's level.
   // A parent at "off" passes "off": omitting the option would let Pi apply its
   // per-model or default thinking level instead of the parent's.
@@ -1618,6 +1645,7 @@ export async function runAgent(
   // context without a session manager (a bare programmatic ctx) must still
   // persist rather than take the whole spawn down.
   const parentSession = persistSession ? ctx.sessionManager?.getSessionFile?.() : undefined;
+  if (options.resumeSessionFile) assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, model);
   const sessionManager = options.resumeSessionFile
     ? // Reopening an existing conversation: the file already carries its own
       // header (cwd, parent) and history, so none of the create-time options
@@ -1630,6 +1658,7 @@ export async function runAgent(
       : SessionManager.inMemory(effectiveCwd);
   if (options.resumeSessionFile) {
     assertSafeChildSession({ messages: [], sessionManager });
+    assertPlainReopenHistory(sessionManager, options[INTERNAL_REOPEN_ROUTE]!.route);
   }
 
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
@@ -1711,7 +1740,7 @@ export async function runAgent(
   // handles scope; the tool_call handler still enforces ask_tools.
   if (inScope) installExtensionToolScope(session, inScope);
 
-  if (options.onSessionCreated) {
+  if (!options.resumeSessionFile && options.onSessionCreated) {
     // Mark ownership before invoking the callback: manager wrappers assign the
     // session to their record at callback entry, so a callback exception must
     // still be cleaned up by that manager rather than this runner.
@@ -1762,6 +1791,25 @@ export async function runAgent(
 
   try {
     throwIfAborted(options.signal);
+    if (options.resumeSessionFile) {
+      assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, session.model);
+      assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, resolveAgentRunModel(ctx, agentConfig, options));
+      assertSafeChildSession(session);
+      assertPlainReopenHistory(session.sessionManager, options[INTERNAL_REOPEN_ROUTE]!.route);
+      // A cold session is not a live-resume capability until admission passes.
+      // Preserve callback-exception ownership: the manager owns it at entry and
+      // quarantines a failed cold attempt before publishing its terminal state.
+      if (options.onSessionCreated) {
+        handedOff = true;
+        options.onSessionCreated(session);
+      }
+      // A synchronous handoff observer can also change policy/history or abort.
+      throwIfAborted(options.signal);
+      assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, session.model);
+      assertReopenRoute(options[INTERNAL_REOPEN_ROUTE]?.route, resolveAgentRunModel(ctx, agentConfig, options));
+      assertSafeChildSession(session);
+      assertPlainReopenHistory(session.sessionManager, options[INTERNAL_REOPEN_ROUTE]!.route);
+    }
     await session.prompt(prompt);
   } finally {
     approvalTimer.armApproved = () => {};
@@ -1786,6 +1834,7 @@ export async function runAgent(
         if (!options.signal?.aborted) await session.abort();
       } finally {
         await shutdownAndDisposeSession(session);
+        options.onSessionDiscarded?.(session);
       }
     }
   }

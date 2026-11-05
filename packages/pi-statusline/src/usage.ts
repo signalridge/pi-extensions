@@ -6,11 +6,14 @@ interface UsageLike {
   output?: number;
   cacheRead?: number;
   cacheWrite?: number;
-  cost?: { total?: number };
+  cost?: { total?: number; totalFromProvider?: boolean };
 }
 
 // Older supported Pi hosts do not include standalone usage in SessionEntry.
 type UsageSessionEntry = SessionEntry | { type: "usage"; id: string; usage: UsageLike };
+
+export type FooterCostOrigin = "provider" | "estimated" | "unknown" | "mixed";
+type CostOriginCounts = Record<Exclude<FooterCostOrigin, "mixed">, number>;
 
 export interface FooterUsageSummary {
   input: number;
@@ -18,6 +21,8 @@ export interface FooterUsageSummary {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+  /** Absent on older snapshots; unknown/legacy is never assumed to be estimated. */
+  costOrigin?: FooterCostOrigin;
   latestCacheHitRate?: number;
 }
 
@@ -53,6 +58,16 @@ function usageForMessage(message: AgentMessage): { usage: UsageLike; assistant: 
 
 interface Contribution extends FooterUsageSummary {
   assistant: boolean;
+  costOrigin: Exclude<FooterCostOrigin, "mixed">;
+}
+
+function costOrigin(usage: UsageLike): Contribution["costOrigin"] {
+  const total = usage.cost?.total;
+  // A provenance flag without a usable total establishes nothing. Zero does count.
+  if (typeof total !== "number" || !Number.isFinite(total) || total < 0) return "unknown";
+  if (usage.cost?.totalFromProvider === true) return "provider";
+  if (usage.cost?.totalFromProvider === false) return "estimated";
+  return "unknown";
 }
 
 function contribution(usage: UsageLike, assistant: boolean): Contribution {
@@ -67,17 +82,29 @@ function contribution(usage: UsageLike, assistant: boolean): Contribution {
     cacheRead,
     cacheWrite,
     cost: usage.cost?.total ?? 0,
+    costOrigin: costOrigin(usage),
     latestCacheHitRate: assistant && promptTokens > 0 ? (cacheRead / promptTokens) * 100 : undefined,
     assistant,
   };
 }
 
-function addContribution(target: FooterUsageSummary, value: Contribution, direction: 1 | -1): void {
+function addContribution(
+  target: FooterUsageSummary,
+  origins: CostOriginCounts,
+  value: Contribution,
+  direction: 1 | -1,
+): void {
   target.input += direction * value.input;
   target.output += direction * value.output;
   target.cacheRead += direction * value.cacheRead;
   target.cacheWrite += direction * value.cacheWrite;
   target.cost += direction * value.cost;
+  origins[value.costOrigin] += direction;
+  const present = (Object.keys(origins) as (keyof CostOriginCounts)[]).filter((origin) => origins[origin] > 0);
+  // Keep legacy-only snapshots structurally compatible; consumers treat absence as unknown.
+  if (present.length === 1 && present[0] !== "unknown") target.costOrigin = present[0];
+  else if (present.length > 1) target.costOrigin = "mixed";
+  else delete target.costOrigin;
 }
 
 /**
@@ -87,6 +114,7 @@ function addContribution(target: FooterUsageSummary, value: Contribution, direct
  */
 export class FooterUsageAccumulator {
   private summary: FooterUsageSummary = emptyFooterUsageSummary();
+  private origins: CostOriginCounts = { provider: 0, estimated: 0, unknown: 0 };
   private readonly messageContributions = new Map<string, Contribution>();
   private readonly usageEntryIds = new Set<string>();
   private scannedEntryCount = 0;
@@ -98,6 +126,7 @@ export class FooterUsageAccumulator {
 
   reset(entries: readonly UsageSessionEntry[]): void {
     this.summary = emptyFooterUsageSummary();
+    this.origins = { provider: 0, estimated: 0, unknown: 0 };
     this.messageContributions.clear();
     this.usageEntryIds.clear();
     this.scannedEntryCount = entries.length;
@@ -140,7 +169,7 @@ export class FooterUsageAccumulator {
     const value = usageForEntry(entry);
     if (!value || this.usageEntryIds.has(entry.id)) return false;
     this.usageEntryIds.add(entry.id);
-    addContribution(this.summary, contribution(value.usage, false), 1);
+    addContribution(this.summary, this.origins, contribution(value.usage, false), 1);
     return true;
   }
 
@@ -156,8 +185,8 @@ export class FooterUsageAccumulator {
     const key = keyOverride ?? this.messageKey(message);
     const next = contribution(value.usage, value.assistant);
     const previous = this.messageContributions.get(key);
-    if (previous) addContribution(this.summary, previous, -1);
-    addContribution(this.summary, next, 1);
+    if (previous) addContribution(this.summary, this.origins, previous, -1);
+    addContribution(this.summary, this.origins, next, 1);
     this.messageContributions.set(key, next);
     if (value.assistant) {
       this.summary.latestCacheHitRate = next.latestCacheHitRate;
@@ -199,12 +228,13 @@ export class FooterUsageAccumulator {
 
 export function summarizeFooterUsage(entries: readonly UsageSessionEntry[]): FooterUsageSummary {
   const totals = emptyFooterUsageSummary();
+  const origins: CostOriginCounts = { provider: 0, estimated: 0, unknown: 0 };
 
   for (const entry of entries) {
     const value = usageForEntry(entry);
     if (!value) continue;
     const current = contribution(value.usage, value.assistant);
-    addContribution(totals, current, 1);
+    addContribution(totals, origins, current, 1);
     if (current.assistant) totals.latestCacheHitRate = current.latestCacheHitRate;
   }
 

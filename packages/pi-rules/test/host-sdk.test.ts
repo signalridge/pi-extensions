@@ -30,12 +30,12 @@ afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn();
 });
 
-/** A real Pi 1.4 session with this extension, a faux provider and rule files under `project/` and `agent/`. */
+/** A real Pi 1.5 session with this extension, a faux provider and rule files under `project/` and `agent/`. */
 async function fixture(
   files: Record<string, string>,
   options: { trusted?: boolean; probe?: (pi: ExtensionAPI) => void } = {},
 ) {
-  expect(VERSION).toBe("1.4.0");
+  expect(VERSION).toBe("1.5.0");
   const root = mkdtempSync(join(tmpdir(), "pi-rules-sdk-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");

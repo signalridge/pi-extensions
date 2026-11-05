@@ -21,7 +21,7 @@ function gate() {
   });
   return { promise, release };
 }
-async function fixture(earlier = () => {}) {
+async function fixture(earlier = () => {}, retry = { enabled: false }) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ralph-sdk-"));
   const faux = fauxProvider({ provider: "ralph-faux", models: [{ id: "test", contextWindow: 200_000 }] });
   const runtime = await ModelRuntime.create({
@@ -73,7 +73,7 @@ async function fixture(earlier = () => {}) {
     resourceLoader: loader,
     settingsManager: SettingsManager.inMemory({
       compaction: { enabled: false },
-      retry: { enabled: false },
+      retry,
       images: { autoResize: false },
     }),
   });
@@ -752,6 +752,19 @@ for (const stopFirst of [false, true]) {
       assert.deepEqual(fs.readFileSync(stateFile), before);
       assert.equal(fs.existsSync(path.join(f.cwd, ".ralph", "other.md")), false);
       assert.equal(f.queued.length, 1);
+      // Valid starts must not replace the accepted operation either.
+      await f.command("start other");
+      await start.execute(
+        "valid-second",
+        { name: "other", taskContent: "A valid task" },
+        undefined,
+        undefined,
+        f.session.extensionRunner.createCommandContext(),
+      );
+      assert.deepEqual(fs.readFileSync(stateFile), before);
+      assert.equal(fs.existsSync(path.join(f.cwd, ".ralph", "other.md")), false);
+      assert.equal(f.queued.length, 1);
+      assert.equal(toolSignal.aborted, false);
       if (stopFirst) {
         await f.command("stop");
         assert.equal(toolSignal.aborted, true, "resume rejection preserves cancellation capability");
@@ -773,6 +786,120 @@ for (const stopFirst of [false, true]) {
     }
   });
 }
+
+for (const finalReason of ["stop", "error", "aborted"]) {
+  test(`before-settle continuation retains N=1 ownership through final ${finalReason}`, async () => {
+    const f = await fixture();
+    try {
+      await f.command("start owned --max-iterations 1");
+      let boundaries = 0;
+      let requests = 0;
+      const banners = () =>
+        f.manager.getBranch().filter((entry) => entry.type === "custom_message" && entry.customType === "ralph-status");
+      f.api.on("agent_before_settle", (event) => {
+        assert.equal(f.state().status, "active", "agent_end must not finalize the owned iteration");
+        if (boundaries++ === 0)
+          return {
+            entries: [
+              ...event.entries,
+              { type: "custom_message", customType: "review", content: "Verify once more.", display: false },
+            ],
+            continue: true,
+          };
+      });
+      f.faux.setResponses([
+        () => {
+          requests++;
+          return response("<promise>COMPLETE</promise>");
+        },
+        () => {
+          requests++;
+          assert.equal(f.state().status, "active");
+          return fauxAssistantMessage("Final outcome", {
+            stopReason: finalReason,
+            errorMessage: finalReason === "error" ? "nonretryable" : undefined,
+          });
+        },
+        () => {
+          throw new Error("a banner must not trigger a billed turn");
+        },
+      ]);
+      await f.session.prompt(f.queued[0], { source: "extension" });
+      assert.equal(requests, 2);
+      assert.equal(f.state().status, finalReason === "stop" ? "completed" : "active");
+      assert.equal(f.state().iteration, 1);
+      assert.equal(f.queued.length, 1, "no terminal user follow-up");
+      assert.equal(banners().length, finalReason === "stop" ? 1 : 0);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("abort during before-settle invalidates an earlier successful completion candidate", async () => {
+  const f = await fixture();
+  const entered = gate();
+  const release = gate();
+  try {
+    await f.command("start owned --max-iterations 1");
+    f.api.on("agent_before_settle", async () => {
+      assert.equal(f.state().status, "active");
+      entered.release();
+      await release.promise;
+    });
+    f.faux.setResponses([response("<promise>COMPLETE</promise>")]);
+    const running = f.session.prompt(f.queued[0], { source: "extension" });
+    await entered.promise;
+    const aborting = f.session.abort();
+    release.release();
+    await Promise.all([running, aborting]);
+    assert.equal(f.state().status, "active");
+    assert.equal(f.queued.length, 1);
+    assert.equal(
+      f.manager.getBranch().some((entry) => entry.type === "custom_message" && entry.customType === "ralph-status"),
+      false,
+    );
+  } finally {
+    release.release();
+    await f.close();
+  }
+});
+
+test("automatic SDK retry preserves executing identity and finalizes only after retry settlement", async () => {
+  const f = await fixture(() => {}, { enabled: true, maxRetries: 1, baseDelayMs: 1 });
+  try {
+    await f.command("start owned --max-iterations 1");
+    let requests = 0;
+    const contexts = [];
+    f.faux.setResponses([
+      (ctx) => {
+        requests++;
+        contexts.push(ctx);
+        return fauxAssistantMessage("<promise>COMPLETE</promise>", {
+          stopReason: "error",
+          errorMessage: "429 rate limit exceeded",
+        });
+      },
+      (ctx) => {
+        requests++;
+        contexts.push(ctx);
+        assert.equal(f.state().status, "active");
+        return response("Retried successfully");
+      },
+      () => {
+        throw new Error("unexpected banner-triggered request");
+      },
+    ]);
+    await f.session.prompt(f.queued[0], { source: "extension" });
+    assert.equal(requests, 2, "automatic retry must actually run");
+    assert.equal(f.state().status, "completed");
+    assert.equal(f.state().iteration, 1);
+    assert.equal(f.queued.length, 1);
+    for (const ctx of contexts) assert.match(JSON.stringify(ctx), /RALPH LOOP - owned - Iteration 1\/1/);
+  } finally {
+    await f.close();
+  }
+});
 
 test("handled overlapping and transformed real inputs never acquire completion ownership", async () => {
   const f = await fixture();

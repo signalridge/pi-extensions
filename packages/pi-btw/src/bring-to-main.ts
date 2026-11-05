@@ -155,6 +155,7 @@ export function formatBtwBringToMain(segments: readonly BtwBringToMainSegment[])
 }
 
 export class BtwTextRangeSelector implements Component {
+  readonly capturesViewportInput = true;
   private readonly lines: BtwSelectionLine[];
   private cursor: BtwTextPosition = { line: 0, column: 0 };
   private anchor: BtwTextPosition | undefined;

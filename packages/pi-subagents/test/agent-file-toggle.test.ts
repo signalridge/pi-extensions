@@ -387,6 +387,16 @@ describe("atomic agent file writes", () => {
     expect(["first", "second"]).toContain(readFileSync(path, "utf-8"));
   });
 
+  it("retires a blocked helper when its test owner removes the barrier directory", async () => {
+    const ready = join(directory, "retire.ready");
+    const child = runWorker(["create", filePath(), "", "never committed", ready, join(directory, "retire.go")]);
+    await waitForReady([ready]);
+    rmSync(directory, { recursive: true, force: true });
+    const result = await child;
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("Worker owner retired before releasing the barrier");
+  });
+
   it("removes a source only when its read snapshot still matches", async () => {
     const path = filePath();
     writeFileSync(path, "original");
@@ -527,12 +537,13 @@ describe("agent file frontmatter helpers", () => {
     const created = buildNewAgentFile({
       description: "Scout: audit #security",
       tools: "read, ext:foo # injection",
-      model: "provider/model:thinking",
+      tier: "review:policy",
       systemPrompt: "Do the work.",
     });
     expect(created).toContain('description: "Scout: audit #security"\n');
     expect(created).toContain('tools: "read, ext:foo # injection"\n');
-    expect(created).toContain('model: "provider/model:thinking"\n');
+    expect(created).toContain('tier: review:policy\n');
+    expect(created).not.toMatch(/^model:|^thinking:/m);
 
     const config: AgentConfig = {
       name: "scout",

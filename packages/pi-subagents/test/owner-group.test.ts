@@ -113,7 +113,7 @@ describe("retained workflow children", () => {
     expect(child.dispose).toHaveBeenCalledTimes(2);
   });
 
-  it("places owner containers before ordinary rows and fences stale controls on thread reuse and detach", async () => {
+  it("keeps Fleet independent and explicitly opens retained children with stale controls fenced on thread reuse and detach", async () => {
     const records = [record("ordinary", { owner: undefined }), record("a"), record("b", { status: "queued", session: undefined }),
       record("c", { owner: { extension: "pi-workflows", runId: "other", nodeId: "c" } }), record("detached", { detached: true })];
     const manager = { listAgentsMutable: () => records, steer: vi.fn(() => true), abort: vi.fn(() => true) } as unknown as AgentManager;
@@ -126,9 +126,12 @@ describe("retained workflow children", () => {
     const fleet = new FleetList(manager, new Map());
     fleet.setUICtx(ui); fleet.update();
     const output = widget!.render(120).join("\n");
-    expect(output.indexOf("Workflow run")).toBeLessThan(output.indexOf("child ordinary"));
-    expect(output).toContain("2 retained children"); expect(output).not.toContain("detached");
-    fleet.handleKey("\x1b[B"); fleet.handleKey("\x1b[B"); fleet.handleKey("\r"); // group
+    expect(output).toContain("child ordinary"); expect(output).not.toContain("Workflow");
+    expect(output).not.toContain("child a"); expect(output).not.toContain("detached");
+    expect(fleet.retainedWorkflowGroups().find(group => group.runId === "run")?.records).toHaveLength(2);
+    fleet.setEnabled(false);
+    const opening = fleet.openRetainedWorkflow("run", false);
+    expect(overlay!.render(80).join("\n")).toContain("2 retained children");
     overlay!.handleInput!("\r"); // a conversation
     overlay!.handleInput!("\r"); // composer
     for (const char of "draft") overlay!.handleInput!(char);
@@ -138,7 +141,7 @@ describe("retained workflow children", () => {
     expect(overlay!.render(80).join("\n")).toContain("draft retained");
     fleet.dispose();
     done?.(undefined);
-    await Promise.resolve();
+    await opening;
     expect(widget).toBeUndefined();
   });
 });

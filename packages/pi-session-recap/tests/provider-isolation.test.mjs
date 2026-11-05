@@ -301,7 +301,7 @@ test("real Pi context redaction protects parent wire, but only explicit target c
 
     facade.getApiKeyAndHeaders = getAuth;
     await session.prompt("/recap");
-    assert.equal(recapWire.length, 1);
+    assert.equal(recapWire.length, 1, JSON.stringify(notices));
     assert.equal(parentWire.length, 1, "recap must go to the named destination, not the parent provider");
     assert.equal(recapWire[0].model.provider, recap.provider);
     assert.match(JSON.stringify(recapWire[0].context.messages), /PRIVATE_PARENT_SECRET/);

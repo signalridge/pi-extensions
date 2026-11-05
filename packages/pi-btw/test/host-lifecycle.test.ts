@@ -28,7 +28,7 @@ initTheme("dark", false);
 // Call Pi's actual showExtensionCustom implementation on a minimal TUI shell.
 // In particular, its savedText/restoreEditor logic must not be simulated away.
 function createPiEditorHost(initialText: string, laterCompletionText?: string) {
-  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+  assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   let editorText = initialText;
   let openComponent: Component | undefined;
   let opened!: () => void;
@@ -73,8 +73,8 @@ function createPiEditorHost(initialText: string, laterCompletionText?: string) {
       requestRender() {},
     },
     keybindings: { matches: () => false, getKeys: () => [] },
-    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
-    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
+    // 1.0.4 mounts directly; 1.5.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.5.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
   }) as unknown as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"] };
   const custom: ExtensionCommandContext["ui"]["custom"] = (factory, options) =>
     host.showExtensionCustom(

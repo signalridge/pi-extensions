@@ -16,7 +16,7 @@ initTheme("dark", false);
 // Pi's actual closure captures the draft, restores it synchronously in done, and
 // mounts asynchronously. Native navigateTree does not reset this custom UI.
 function editorHost() {
-  assert.ok(["1.0.4", "1.4.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
+  assert.ok(["1.0.4", "1.5.0"].includes(VERSION), `Unqualified Pi host version: ${VERSION}`);
   const editor = {
     text: "",
     getText() {
@@ -32,6 +32,8 @@ function editorHost() {
   editorContainer.addChild(editor);
   let focus: Component = editor;
   let restores = 0;
+  type Blocked = NonNullable<Parameters<ExtensionCommandContext["ui"]["custom"]>[1]>["blocked"];
+  const statuses: Blocked[] = [];
   const host = Object.assign(Object.create(InteractiveMode.prototype) as object, {
     editor,
     defaultEditor: editor,
@@ -58,8 +60,13 @@ function editorHost() {
     footerDataProvider: { clearExtensionStatuses() {} },
     footer: { invalidate() {} },
     keybindings: new KeybindingsManager(TUI_KEYBINDINGS),
-    // 1.0.4 mounts directly; 1.4.0 owns a dialog stack and terminal-status reporter.
-    ...(VERSION === "1.4.0" ? { extensionDialogs: [], programStatus: { setBlocked() {} } } : {}),
+    // 1.0.4 mounts directly; 1.5.0 owns a dialog stack and terminal-status reporter.
+    ...(VERSION === "1.5.0"
+      ? {
+          extensionDialogs: [],
+          programStatus: { setBlocked: (_owner: string, blocked: Blocked) => statuses.push(blocked) },
+        }
+      : {}),
   }) as { showExtensionCustom: ExtensionCommandContext["ui"]["custom"]; resetExtensionUI(): void };
   return {
     editor,
@@ -72,6 +79,9 @@ function editorHost() {
     },
     get restores() {
       return restores;
+    },
+    get blocked() {
+      return statuses.at(-1);
     },
   };
 }
@@ -167,7 +177,12 @@ for (const boundary of boundaries) {
       const pending = fixture.command(args, fixture.ctx);
       const old = await mounted(fixture.host);
       const retainedInput = old.handleInput;
+      assert.deepEqual(
+        fixture.host.blocked,
+        args === "last" ? { kind: "question", message: "Select Code Snippet" } : undefined,
+      );
       fixture.emit(boundary);
+      assert.equal(fixture.host.blocked, undefined);
       // Assert before any await: retiring a dialog must restore the captured empty
       // draft now, not overwrite the tree target's user message in a continuation.
       assert.deepEqual(fixture.host.editorContainer.children, [fixture.host.editor]);
@@ -228,21 +243,28 @@ for (const preMount of [false, true]) {
         return factory(tui, theme, keys, rawDone);
       }, options);
     const ctx = { mode: "tui", hasUI: true, ui: { custom } } as ExtensionCommandContext;
-    const pending = ownedCustom<string>(ctx, owner, (_tui, _theme, _keys, done) => {
-      retainedDone = done;
-      return {
-        render: () => [],
-        invalidate() {},
-        handleInput: () => inputs++,
-        dispose: () => disposals++,
-      };
-    });
+    const pending = ownedCustom<string>(
+      ctx,
+      owner,
+      (_tui, _theme, _keys, done) => {
+        retainedDone = done;
+        return {
+          render: () => [],
+          invalidate() {},
+          handleInput: () => inputs++,
+          dispose: () => disposals++,
+        };
+      },
+      { blocked: { kind: "question", message: "Choose" } },
+    );
     const old = preMount ? undefined : await mounted(host);
+    assert.deepEqual(host.blocked, preMount ? undefined : { kind: "question", message: "Choose" });
     controller.abort();
+    assert.equal(host.blocked, undefined);
     assert.deepEqual(host.editorContainer.children, [host.editor]);
     assert.equal(host.focus, host.editor);
-    // 1.4.0 never replaced the editor for a dialog closed before mounting, so it has no focus to restore.
-    const restores = preMount && VERSION === "1.4.0" ? 0 : 1;
+    // 1.5.0 never replaced the editor for a dialog closed before mounting, so it has no focus to restore.
+    const restores = preMount && VERSION === "1.5.0" ? 0 : 1;
     assert.equal(host.restores, restores);
     host.editor.setText("replacement draft");
     assert.equal(await pending, undefined);
@@ -273,14 +295,20 @@ test("actual SDK reset disposes [codeDialog, foreignDialog] exactly once and loc
   const ctx = { mode: "tui", hasUI: true, ui: { custom: host.custom } } as ExtensionCommandContext;
   let ownedDisposals = 0;
   let foreignDisposals = 0;
-  const owned = ownedCustom<string>(ctx, { signal: new AbortController().signal, isCurrent: () => true }, () => ({
-    render: () => [],
-    invalidate() {},
-    dispose: () => {
-      ownedDisposals++;
-    },
-  }));
+  const owned = ownedCustom<string>(
+    ctx,
+    { signal: new AbortController().signal, isCurrent: () => true },
+    () => ({
+      render: () => [],
+      invalidate() {},
+      dispose: () => {
+        ownedDisposals++;
+      },
+    }),
+    { blocked: { kind: "question", message: "Choose" } },
+  );
   await mounted(host);
+  assert.deepEqual(host.blocked, { kind: "question", message: "Choose" });
   void host.custom(() => ({
     render: () => [],
     invalidate() {},
@@ -290,12 +318,28 @@ test("actual SDK reset disposes [codeDialog, foreignDialog] exactly once and loc
   }));
   await Promise.resolve();
   host.reset();
+  assert.equal(host.blocked, undefined);
   assert.equal(await owned, undefined);
   assert.equal(ownedDisposals, 1);
   assert.equal(foreignDisposals, 1);
   host.reset();
   assert.equal(ownedDisposals, 1);
   assert.equal(foreignDisposals, 1);
+});
+
+test("native inline snippet question clears on cancellation and restores the draft", async () => {
+  assert.equal(VERSION, "1.5.0");
+  const fixture = commandHost();
+  fixture.host.editor.setText("  untouched\n draft  ");
+  const picking = fixture.command("last", fixture.ctx);
+  const picker = await mounted(fixture.host);
+  assert.deepEqual(fixture.host.blocked, { kind: "question", message: "Select Code Snippet" });
+  picker.handleInput?.("\u001b");
+  await picking;
+  assert.equal(fixture.host.blocked, undefined);
+  assert.equal(fixture.host.editor.text, "  untouched\n draft  ");
+  assert.deepEqual(fixture.execs, []);
+  assert.deepEqual(fixture.notices, []);
 });
 
 test("normal picker appends to the TUI draft and run pane closes normally", async () => {
@@ -308,6 +352,7 @@ test("normal picker appends to the TUI draft and run pane closes normally", asyn
   assert.deepEqual(fixture.notices, ["Inserted snippet into editor."]);
   const running = fixture.command("last run 1", fixture.ctx);
   const pane = await mounted(fixture.host);
+  assert.equal(fixture.host.blocked, undefined, "output observation is not a question");
   assert.match(pane.render(100).join("\n"), /hello/);
   pane.handleInput?.("\r");
   await running;

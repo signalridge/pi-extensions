@@ -7,14 +7,20 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   type EntryRenderer,
+  type EntryRenderOptions,
   type ExtensionAPI,
   type ExtensionContext,
+  keyHint,
+  keyText,
   SessionManager,
   type Settings,
   SettingsManager,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
-import welcome, { collectResources } from "../src/index.js";
+import { KeybindingsManager } from "@earendil-works/pi-tui";
+import welcome, { collectHints, collectResources } from "../src/index.js";
+
+const renderOptions: EntryRenderOptions = { expanded: false, keyText, keyHint };
 
 type Data = { rows: [string, string][]; hints?: string[] };
 const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as Theme;
@@ -56,19 +62,61 @@ function harness(manager = SessionManager.inMemory(), settings: Settings = {}) {
     manager,
     ctx,
     start: () => start?.({}, ctx),
-    render: () => {
+    render: (options = renderOptions, width = 160) => {
       const entry = manager
         .buildContextEntries()
         .find((entry) => entry.type === "custom" && entry.customType === "welcome-card");
       assert.ok(entry?.type === "custom");
       return (
-        renderer?.(entry as Parameters<EntryRenderer<Data>>[0], { expanded: false }, theme)
-          ?.render(160)
+        renderer?.(entry as Parameters<EntryRenderer<Data>>[0], options, theme)
+          ?.render(width)
           .join("\n") ?? ""
       );
     },
   };
 }
+
+test("resumed cards use host-injected remapped and unbound hints without changing stored facts", async () => {
+  const manager = SessionManager.inMemory();
+  manager.appendCustomEntry("welcome-card", { ...facts, hints: ["obsolete interrupt"] });
+  const h = harness(manager);
+  await h.start();
+  const before = JSON.stringify(manager.getEntries());
+  const keys = new KeybindingsManager(
+    {
+      "app.interrupt": { defaultKeys: "escape" },
+      "app.clear": { defaultKeys: "ctrl+c" },
+      "app.tools.expand": { defaultKeys: "ctrl+o" },
+    },
+    {
+      "app.interrupt": ["ctrl+x", "ctrl+z"],
+      "app.clear": [],
+      "app.tools.expand": "ctrl+e",
+    },
+  );
+  const options: EntryRenderOptions = {
+    expanded: false,
+    keyText: (id) => keys.getKeys(id).join("/"),
+    keyHint: () => {
+      throw new Error("card styling must use the supplied theme, not styled hints");
+    },
+  };
+  assert.deepEqual(collectHints(options), ["Ctrl+X/Ctrl+Z interrupt", "/ commands", "! bash", "Ctrl+E expand tools"]);
+  assert.ok(Array.isArray(collectHints()), "no-argument API is preserved");
+  assert.match(h.render(options), /Ctrl\+X\/Ctrl\+Z interrupt/);
+  assert.match(h.render(options), /Ctrl\+E expand tools/);
+  assert.doesNotMatch(h.render(options), /obsolete|clear/);
+  assert.match(h.render(options), /original workspace/);
+  // The same host formatter can see new bindings on the next renderer call.
+  keys.setUserBindings({ "app.interrupt": "ctrl+b", "app.clear": [], "app.tools.expand": [] });
+  assert.match(h.render(options), /Ctrl\+B interrupt/);
+  assert.doesNotMatch(h.render(options), /Ctrl\+X|expand tools|clear/);
+  assert.match(h.render(options, 19), /Ctrl\+B interrupt/);
+  keys.setUserBindings({ "app.interrupt": [], "app.clear": [], "app.tools.expand": [] });
+  assert.match(h.render(options), /\/ commands · ! bash/);
+  assert.doesNotMatch(h.render(options), /interrupt|expand tools|clear/);
+  assert.equal(JSON.stringify(manager.getEntries()), before);
+});
 
 test("a normal resume/reload does not duplicate a visible welcome card", async () => {
   const h = harness();
@@ -286,11 +334,20 @@ test("actual host resources_discover skills/prompts appear in the post-bind rend
         false,
       );
       const renderer = session.extensionRunner.getEntryRenderer("welcome-card");
-      const text = renderer?.(entry, { expanded: false }, theme)?.render(160).join("\n") ?? "";
+      const text = renderer?.(entry, renderOptions, theme)?.render(160).join("\n") ?? "";
       assert.match(text, /Inventory:\s+live at render/);
       assert.match(text, /Skills:\s+discovered-skill/);
       assert.match(text, /Prompts:\s+\/discovered-prompt/);
       assert.match(text, /Available themes:\s+package-theme/);
+      assert.equal((entry.data as Data).hints, undefined, "new entries persist facts, not bindings");
+      const injected: EntryRenderOptions = {
+        expanded: false,
+        keyText: (id) => (id === "app.interrupt" ? "ctrl+j" : ""),
+        keyHint: () => "unused styled hint",
+      };
+      const remapped = renderer?.(entry, injected, theme)?.render(160).join("\n") ?? "";
+      assert.match(remapped, /Ctrl\+J interrupt/);
+      assert.doesNotMatch(remapped, /clear|expand tools|unused styled hint/);
     } finally {
       session.dispose();
     }

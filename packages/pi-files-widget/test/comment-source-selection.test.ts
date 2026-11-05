@@ -49,6 +49,111 @@ function selectedRows(rows: string[]): string[] {
   return rows.filter((row) => row.startsWith("\x1b[44m"));
 }
 
+test("confirmed search advances and wraps; Escape cancels without closing or retaining matches", () => {
+  const source = Array.from({ length: 70 }, (_, i) => (i % 25 === 0 ? `needle ${i}` : `row ${i}`));
+  const f = fixture(source.join("\n"), { lines: source, renderedMarkdown: false });
+  try {
+    f.viewer.render(80);
+    f.viewer.handleInput("/");
+    f.viewer.handleInput("needle");
+    f.viewer.handleInput("\r");
+    assert.match(f.viewer.render(80)[0], /\[1\/3\]/);
+    f.viewer.handleInput("n");
+    assert.match(f.viewer.render(80)[0], /\[2\/3\]/);
+    assert.ok(f.viewer.render(80).some((line) => line.includes("needle 25")));
+    f.viewer.handleInput("n");
+    assert.match(f.viewer.render(80)[0], /\[3\/3\]/);
+    f.viewer.handleInput("n");
+    assert.match(f.viewer.render(80)[0], /\[1\/3\]/);
+    f.viewer.handleInput("N");
+    assert.match(f.viewer.render(80)[0], /\[3\/3\]/);
+    assert.deepEqual(f.viewer.handleInput("\x1b"), { type: "none" });
+    assert.equal(f.viewer.isOpen(), true);
+    const cleared = f.viewer.render(80);
+    f.viewer.handleInput("n");
+    assert.deepEqual(f.viewer.render(80), cleared);
+    f.viewer.handleInput("/");
+    f.viewer.handleInput("needle");
+    f.viewer.handleInput("\x1b");
+    assert.doesNotMatch(f.viewer.render(80)[0], /\[\d\/3\]|needle/);
+  } finally {
+    f.dispose();
+  }
+});
+
+test("confirmed search uses source-to-row alignment after a 60-row first line, n/N, and resize", () => {
+  const source = Array.from({ length: 80 }, (_, i) =>
+    i === 0 ? "long first source ".repeat(160) : i === 25 || i === 50 ? `needle source ${i + 1}` : `source ${i + 1}`,
+  );
+  const f = fixture(source.join("\n"), { lines: [], renderedMarkdown: false });
+  f.loader.mockImplementation((_path, _cwd, _diff, _changes, width) => ({
+    lines: source.flatMap((line, i) =>
+      wrapTextWithAnsi(line, Math.max(1, (width ?? 80) - 7)).map(
+        (row, j) => `${j === 0 ? String(i + 1).padStart(4) : "    "} │ ${row}`,
+      ),
+    ),
+    renderedMarkdown: false,
+  }));
+  try {
+    const ordinary = f.viewer.render(40);
+    f.viewer.handleInput("/");
+    f.viewer.handleInput("need");
+    assert.match(f.viewer.render(55)[0], /\/need█/);
+    f.viewer.handleInput("le");
+    f.viewer.handleInput("\r");
+    for (const [input, match, count, width] of [
+      ["", "needle source 26", "1/2", 40],
+      ["n", "needle source 51", "2/2", 40],
+      ["N", "needle source 26", "1/2", 60],
+      ["n", "needle source 51", "2/2", 30],
+      ["n", "needle source 26", "1/2", 50],
+    ] as const) {
+      if (input) f.viewer.handleInput(input);
+      const rows = f.viewer.render(width);
+      assert.ok(
+        rows.some((line) => line.includes(match)),
+        `exact active match visible: ${match} at ${width}`,
+      );
+      if (width >= 40) assert.ok(rows[0].includes(`[${count}]`));
+      assert.ok(rows.every((line) => visibleWidth(line) <= width));
+    }
+    f.viewer.handleInput("\x1b");
+    f.viewer.handleInput("g");
+    assert.deepEqual(f.viewer.render(40), ordinary, "clearing search restores ordinary wrapping/formatter");
+    f.viewer.handleInput("v");
+    sendComment(f.viewer);
+    assert.equal(f.comments[0].selectedText, source[0], "search never rewrites source or selection payload");
+  } finally {
+    f.dispose();
+  }
+});
+
+for (const change of ["file", "close", "diff", "markdown", "select"] as const) {
+  test(`confirmed search is cleared by incompatible ${change} transition`, () => {
+    const source = "needle\nplain\nneedle";
+    const f = fixture(source, { lines: source.split("\n"), renderedMarkdown: false }, "M", "file.md");
+    try {
+      f.viewer.render(80);
+      f.viewer.handleInput("d"); // Search raw source, not the initial diff.
+      f.viewer.render(80);
+      f.viewer.handleInput("/");
+      f.viewer.handleInput("needle");
+      f.viewer.handleInput("\r");
+      assert.match(f.viewer.render(80)[0], /\[1\/2\]/);
+      if (change === "close") f.viewer.close();
+      if (change === "file" || change === "close") {
+        f.viewer.setFile({ name: "file.md", path: f.path, isDirectory: false });
+      } else {
+        f.viewer.handleInput(change === "diff" ? "d" : change === "markdown" ? "m" : "v");
+      }
+      assert.doesNotMatch(f.viewer.render(80)[0], /\[\d\/2\]/);
+      assert.deepEqual(f.comments, []);
+    } finally {
+      f.dispose();
+    }
+  });
+}
+
 test("default diff near line 90 cannot emit a comment on unrelated early source", () => {
   const source = Array.from({ length: 100 }, (_, i) => `source line ${i + 1}`);
   source[0] = "private early source must not be sent";

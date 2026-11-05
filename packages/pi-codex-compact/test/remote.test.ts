@@ -7,9 +7,9 @@ import {
   type Model,
   type OpenAICodexResponsesOptions,
   type Provider,
-  Type,
 } from "@earendil-works/pi-ai";
 import { openaiCodexProvider } from "@earendil-works/pi-ai/providers/openai-codex";
+import { Type } from "typebox";
 import { test, vi } from "vitest";
 import { createDiagnosticTrace, type DiagnosticPhase, diagnosticsPath, flushDiagnostics } from "../src/diagnostics.js";
 import { type CompactionFailureCode, failureFrom, formatCompactionFailure } from "../src/failure.js";

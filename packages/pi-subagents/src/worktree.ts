@@ -240,6 +240,24 @@ function worktreeRegistration(cwd: string, worktreePath: string): string[] | und
   );
 }
 
+/** A continuation may reuse a verified clean checkout, never manufacture a replacement. */
+export function assertReusableWorktree(worktree: WorktreeInfo): void {
+  const guidance = `Inspect the original checkout and Git registration (${worktree.path}) with git worktree list --porcelain and git status. Restore/repair it explicitly, or start a new Agent with a sanitized summary; no replacement worktree is created.`;
+  try {
+    if (!existsSync(worktree.path) || !existsSync(worktree.workPath)) throw new Error("original isolated checkout is missing");
+    if (realpathSync(worktree.path) === realpathSync(worktree.repoRoot) ||
+      !worktreeRegistration(worktree.repoRoot, worktree.path)) throw new Error("isolated checkout has unknown Git ownership");
+    const root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: worktree.workPath, stdio: "pipe", timeout: 5000 }).toString().trim();
+    if (realpathSync(root) !== realpathSync(worktree.path)) throw new Error("working directory no longer belongs to the isolated checkout");
+    const commonDirectory = (cwd: string) => realpathSync(resolve(cwd, execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, stdio: "pipe", timeout: 5000 }).toString().trim()));
+    if (commonDirectory(worktree.repoRoot) !== commonDirectory(worktree.workPath)) throw new Error("isolated checkout now belongs to another Git repository");
+    const dirty = execFileSync("git", ["status", "--porcelain"], { cwd: worktree.path, stdio: "pipe", timeout: 5000 }).toString().trim();
+    if (dirty) throw new Error("original isolated checkout is dirty; preserve and review its changes first");
+  } catch (error) {
+    throw new Error(`Cannot continue isolated agent: ${error instanceof Error ? error.message : String(error)}. ${guidance}`);
+  }
+}
+
 /**
  * Protect observed missing-checkout metadata, even while execution is pinned.
  * Only inspects registration and establishes a Git recovery lock; never stages,

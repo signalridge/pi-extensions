@@ -46,6 +46,9 @@ export interface PullRequestStatus {
 const STATUS_KEY = "github-pr";
 const GH_TIMEOUT_MS = 10_000;
 const GIT_TIMEOUT_MS = 5_000;
+const PR_PAYLOAD_MAX_BYTES = 1024 * 1024;
+const PR_COUNTS_MAX_BYTES = 64 * 1024;
+const GIT_HEAD_MAX_BYTES = 16 * 1024;
 const BRANCH_REFRESH_DEBOUNCE_MS = 100;
 const PR_REFRESH_INTERVAL_MS = 60_000;
 const RETRY_BASE_MS = 1_000;
@@ -391,8 +394,9 @@ async function createBranchWatcher(
       cwd,
       signal,
       timeout: GIT_TIMEOUT_MS,
+      maxBuffer: GIT_HEAD_MAX_BYTES,
     });
-    if (signal?.aborted || result.killed || result.code !== 0) return undefined;
+    if (result.truncated || signal?.aborted || result.killed || result.code !== 0) return undefined;
 
     const gitHead = result.stdout.trim();
     if (!gitHead) return undefined;
@@ -749,6 +753,7 @@ async function runGhPrCountQuery(
     cwd,
     signal,
     "gh api graphql",
+    PR_COUNTS_MAX_BYTES,
   );
 
   if (result.killed) throw new Error("gh api graphql timed out or was cancelled.");
@@ -788,10 +793,11 @@ async function execGh(
   cwd: string,
   signal: AbortSignal | undefined,
   command: string,
+  maxBuffer = PR_PAYLOAD_MAX_BYTES,
 ): Promise<ExecResult> {
   let result: ExecResult;
   try {
-    result = await pi.exec(executable, args, { cwd, signal, timeout: GH_TIMEOUT_MS });
+    result = await pi.exec(executable, args, { cwd, signal, timeout: GH_TIMEOUT_MS, maxBuffer });
   } catch (error) {
     const message = formatError(error);
     if (isGhExecutableMissingMessage(message.toLowerCase())) {
@@ -799,6 +805,8 @@ async function execGh(
     }
     throw new Error(`${command} could not start: ${message}`);
   }
+  // Incomplete output is never a valid payload, expected nonzero, or executable probe.
+  if (result.truncated) throw new Error(`${command} output exceeded ${maxBuffer} bytes; result is incomplete.`);
   // Pi can flatten spawn ENOENT into code 1 with no output. An empty failure
   // alone is not evidence: check the effective PATH, including GH_HOST launchers.
   if (

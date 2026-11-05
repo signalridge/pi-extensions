@@ -139,7 +139,7 @@ describe("real index UI controls and managed thread transcript wiring", () => {
     const beforeSubscribers = seam.subscribers.size;
     const next = await managed("attempt-2", "call-2"); expect(next).toBe(record); expect(next.session).toBe(seam.session);
     expect(readFileSync(path, "utf-8")).toBe(prefix); expect(seam.subscribers.size).toBe(beforeSubscribers + 1);
-    expect(h.widget()!.render(200).join("\n")).toContain("retained children");
+    expect(h.widget()).toBeUndefined(); // Managed children do not duplicate the workflow overview.
     // Idempotent retry must not subscribe, reset tracking or touch the file.
     await managed("attempt-2", "call-2"); expect(seam.subscribers.size).toBe(beforeSubscribers + 1); expect(readFileSync(path, "utf-8")).toBe(prefix);
     await openOwned(next, { ...owner, nodeId: "call-2", attemptId: "attempt-2" }); await flush();
@@ -177,8 +177,28 @@ describe("real index UI controls and managed thread transcript wiring", () => {
     const seen = new Set<string>();
     h.ui.select.mockImplementation(async (title, rows) => { if (seen.has(title)) return undefined; seen.add(title); return rows[0]; });
     const command = h.commands.get("agents")!.handler("", h.ctx); await flush();
-    expect(h.ui.custom.mock.calls[0][1]).toEqual({ overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 } });
+    const options = h.ui.custom.mock.calls[0][1] as { overlay: boolean; overlayOptions: () => unknown };
+    expect(options.overlay).toBe(true);
+    expect(options.overlayOptions()).toEqual({ anchor: "top-left", width: "100%", maxHeight: "100%", margin: 0 });
     expect(h.viewer()!.render(120).length).toBeLessThanOrEqual(40);
+    h.close(); await command;
+  });
+
+  it("keeps the explicit retained-child fallback reachable from /agents without Fleet rows or an owner peer", async () => {
+    await managed();
+    const offered = new Set<string>();
+    h.ui.select.mockImplementation(async (title, rows) => {
+      if (offered.has(title)) return undefined;
+      offered.add(title);
+      if (title === "Agents") return rows.find(row => row.startsWith("Retained workflow children ("));
+      if (title === "Workflow child access") return "Inspect retained children";
+      return rows[0];
+    });
+    const command = h.commands.get("agents")!.handler("", h.ctx); await flush();
+    expect(h.widget()).toBeUndefined();
+    expect(h.viewer()!.render(120).join("\n")).toContain("1 retained children");
+    h.viewer()!.handleInput!("\r");
+    expect(h.viewer()!.render(120).join("\n")).toContain("thread");
     h.close(); await command;
   });
 
@@ -206,7 +226,7 @@ describe("real index UI controls and managed thread transcript wiring", () => {
     const record = await managed();
     const oldSnapshot = { version: 1, surfaceId: "old-surface", runs: [{ version: 1, surfaceId: "old-surface", runId: "meta-run", name: "old branch metadata", status: "running", callCount: 0, runningCalls: 0, completedCalls: 0, failedCalls: 0, elapsedMs: 0, restored: false }] };
     h.bus.emit(WORKFLOW_UI_CHANNELS.changed, oldSnapshot);
-    expect(h.widget()!.render(200).join("\n")).toContain("old branch metadata");
+    expect(h.widget()).toBeUndefined(); // Metadata remains usable for explicit owner delegation only.
     const oldInputCleanup = h.ui.onTerminalInput.mock.results[0].value;
     expect(typeof oldInputCleanup).toBe("function");
     await h.lifecycle.get("session_tree")?.({}, h.ctx);

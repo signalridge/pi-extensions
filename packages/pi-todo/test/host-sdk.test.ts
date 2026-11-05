@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import todo from "../src/extension.js";
 import { CONTEXT_TYPE, type Params, type Snapshot, STATE_TYPE } from "../src/state.js";
 import { OwnedOverlay } from "../src/ui.js";
+import { postAppendFault } from "./append-fault.js";
 import { terminalFixture } from "./terminal.js";
 
 const cleanup: (() => Promise<void> | void)[] = [];
@@ -36,7 +37,7 @@ async function fixture(
     fileBacked?: boolean;
   } = {},
 ) {
-  expect(VERSION).toBe("1.4.0");
+  expect(VERSION).toBe("1.5.0");
   const cwd = mkdtempSync(join(tmpdir(), "todo-sdk-"));
   const agentDir = join(cwd, "agent");
   mkdirSync(agentDir);
@@ -203,6 +204,23 @@ for (const mode of ["print", "rpc"] as const)
   });
 
 describe("real host ownership and context", () => {
+  it("does not leak a warm derived checklist after a deep same-ID native mutation", async () => {
+    const f = await fixture({ fileBacked: true });
+    f.faux.setResponses([fauxAssistantMessage("Started.")]);
+    await f.session.prompt("Ordinary persisted conversation.");
+    await f.call({ action: "add", baseRevision: 0, title: "Do not leak stale authority" });
+    expect(JSON.stringify(await f.session.extensionRunner.emitContext([]))).toContain("Do not leak stale authority");
+    const ancestor = f.session.sessionManager
+      .getBranch()
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant");
+    if (ancestor?.type !== "message" || ancestor.message.role !== "assistant")
+      throw new Error("Missing native ancestor");
+    ancestor.message.content.push({ type: "text", text: "Same ID, deep mutation after cache warmup" });
+    const context = JSON.stringify(await f.session.extensionRunner.emitContext([]));
+    expect(context).toContain("no authoritative checklist supplied");
+    expect(context).not.toContain("Do not leak stale authority");
+    await expect(f.call({ action: "clear", baseRevision: 1 })).rejects.toThrow(/ownership/);
+  });
   it("keeps verified file-backed storage quiet without weakening task results or context", async () => {
     const terminal = terminalFixture();
     cleanup.push(() => terminal.dispose());
@@ -238,7 +256,7 @@ describe("real host ownership and context", () => {
     );
     expect(f.errors).toEqual([]);
   });
-  it("quarantines orphaned native ancestry after prompt-driven EIO and automatic tool-result persistence on reopen", async () => {
+  it("quarantines orphaned ancestry after a lost-write acknowledgement and automatic tool-result persistence on reopen", async () => {
     const terminal = terminalFixture();
     cleanup.push(() => terminal.dispose());
     const f = await fixture({ fileBacked: true, terminal });
@@ -248,13 +266,7 @@ describe("real host ownership and context", () => {
     const ancestor = f.session.sessionManager.getLeafId();
     const file = f.session.sessionManager.getSessionFile();
     if (!file || !ancestor) throw new Error("Missing native checkpoint");
-    const nativeAppend = fs.appendFileSync;
-    const fault = vi.spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof fs.appendFileSync>) => {
-      if (args[0] === file && String(args[1]).includes(`"customType":"${STATE_TYPE}"`))
-        throw Object.assign(new Error("native EIO"), { code: "EIO" });
-      nativeAppend(...args);
-    });
-    syncBuiltinESMExports();
+    const fault = postAppendFault(f.session.sessionManager);
     try {
       f.faux.setResponses([
         fauxAssistantMessage(fauxToolCall("todo", { action: "clear", baseRevision: 1 }), { stopReason: "toolUse" }),
@@ -329,7 +341,7 @@ describe("real host ownership and context", () => {
       f.session.sessionManager.getBranch().some((e) => e.type === "custom_message" && e.customType === CONTEXT_TYPE),
     ).toBe(false);
   });
-  it("rejects a fresh Todo mutation before append after ordinary-message EIO and reload retaining the manager", async () => {
+  it("rejects a fresh Todo mutation after a lost ordinary-message acknowledgement and reload retaining the manager", async () => {
     const f = await fixture({ fileBacked: true });
     f.faux.setResponses([fauxAssistantMessage("Started.")]);
     await f.session.prompt("Ordinary persisted conversation.");
@@ -338,10 +350,7 @@ describe("real host ownership and context", () => {
     const file = manager.getSessionFile();
     if (!file) throw new Error("Missing native file");
     const before = fs.readFileSync(file, "utf8");
-    const fault = vi.spyOn(fs, "appendFileSync").mockImplementation(() => {
-      throw Object.assign(new Error("ordinary message EIO"), { code: "EIO" });
-    });
-    syncBuiltinESMExports();
+    const fault = postAppendFault(manager, "message");
     try {
       expect(() => manager.appendMessage({ role: "user", content: "Failed ordinary append", timestamp: 2 })).toThrow(
         "EIO",
@@ -387,19 +396,14 @@ describe("real host ownership and context", () => {
     expect((await f.call({ action: "clear", baseRevision: 1 })).details).toMatchObject({ revision: 2, tasks: [] });
     expect(f.errors).toEqual([]);
   });
-  it("native EIO ghosts stay out of authoritative context and reload recovery until actual file reopen", async () => {
+  it("lost-write acknowledgement ghosts stay out of authoritative context and reload recovery until actual file reopen", async () => {
     const f = await fixture({ fileBacked: true });
     f.faux.setResponses([fauxAssistantMessage("Started.")]);
     await f.session.prompt("Ordinary persisted conversation.");
     const first = await f.call({ action: "add", baseRevision: 0, title: "Keep durable state" });
     const file = f.session.sessionManager.getSessionFile();
     if (!file) throw new Error("Missing native file");
-    const nativeAppend = fs.appendFileSync;
-    const fault = vi.spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof fs.appendFileSync>) => {
-      if (args[0] === file && String(args[1]).includes(STATE_TYPE)) throw new Error("native EIO");
-      nativeAppend(...args);
-    });
-    syncBuiltinESMExports();
+    const fault = postAppendFault(f.session.sessionManager);
     try {
       await expect(f.call({ action: "clear", baseRevision: 1 })).rejects.toThrow("native EIO");
       expect(f.session.sessionManager.getBranch().at(-1)).toMatchObject({ data: { revision: 2, tasks: [] } });

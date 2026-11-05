@@ -36,76 +36,81 @@ export async function pickSnippet(
   }));
   const searchIndex = buildSearchIndex(snippets, items);
 
-  const selectedIndex = await ownedCustom<string | null>(ctx, ownership, (tui, theme, _kb, done) => {
-    const container = new Container();
+  const selectedIndex = await ownedCustom<string | null>(
+    ctx,
+    ownership,
+    (tui, theme, _kb, done) => {
+      const container = new Container();
 
-    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
-    const title = new Text(theme.fg("accent", theme.bold("Select Code Snippet")), 1, 0);
-    container.addChild(title);
+      container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
+      const title = new Text(theme.fg("accent", theme.bold("Select Code Snippet")), 1, 0);
+      container.addChild(title);
 
-    const list = new SelectList(items, Math.min(items.length, 12), {
-      selectedPrefix: (t) => theme.fg("accent", t),
-      selectedText: (t) => theme.fg("accent", t),
-      description: (t) => theme.fg("muted", t),
-      scrollInfo: (t) => theme.fg("dim", t),
-      noMatch: (t) => theme.fg("warning", t),
-    });
+      const list = new SelectList(items, Math.min(items.length, 12), {
+        selectedPrefix: (t) => theme.fg("accent", t),
+        selectedText: (t) => theme.fg("accent", t),
+        description: (t) => theme.fg("muted", t),
+        scrollInfo: (t) => theme.fg("dim", t),
+        noMatch: (t) => theme.fg("warning", t),
+      });
 
-    list.onSelect = (item) => done(`copy:${item.value}`);
-    list.onCancel = () => done(null);
-    container.addChild(list);
+      list.onSelect = (item) => done(`copy:${item.value}`);
+      list.onCancel = () => done(null);
+      container.addChild(list);
 
-    const help = new Text(
-      theme.fg("dim", "Filter: (none)   Enter copy   Right/Tab insert   Up/Down navigate   Esc cancel"),
-      1,
-      0,
-    );
-    container.addChild(help);
-    container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
-
-    let filter = "";
-    const updateFilter = (next: string) => {
-      filter = next;
-      const listAny = list as unknown as { filteredItems: SelectItem[]; selectedIndex: number };
-      listAny.filteredItems = rankedFilterItems(filter, items, searchIndex);
-      listAny.selectedIndex = 0;
-
-      help.setText(
-        theme.fg(
-          "dim",
-          `Filter: ${filter.length > 0 ? filter : "(none)"}   Enter copy   Right/Tab insert   Up/Down navigate   Esc cancel`,
-        ),
+      const help = new Text(
+        theme.fg("dim", "Filter: (none)   Enter copy   Right/Tab insert   Up/Down navigate   Esc cancel"),
+        1,
+        0,
       );
-      list.invalidate();
-      tui.requestRender();
-    };
+      container.addChild(help);
+      container.addChild(new DynamicBorder((s: string) => theme.fg("borderAccent", s)));
 
-    return {
-      render: (width: number) => container.render(width),
-      invalidate: () => container.invalidate(),
-      handleInput: (data: string) => {
-        if (matchesKey(data, "backspace")) {
-          if (filter.length > 0) updateFilter(filter.slice(0, -1));
-          return;
-        }
+      let filter = "";
+      const updateFilter = (next: string) => {
+        filter = next;
+        const listAny = list as unknown as { filteredItems: SelectItem[]; selectedIndex: number };
+        listAny.filteredItems = rankedFilterItems(filter, items, searchIndex);
+        listAny.selectedIndex = 0;
 
-        if (matchesKey(data, "right") || matchesKey(data, "tab")) {
-          const selected = list.getSelectedItem();
-          if (selected) done(`insert:${selected.value}`);
-          return;
-        }
-
-        const printable = decodeKittyPrintable(data) ?? data;
-        if (printable.length === 1 && printable >= " " && printable <= "~") {
-          updateFilter(filter + printable);
-          return;
-        }
-
-        list.handleInput?.(data);
+        help.setText(
+          theme.fg(
+            "dim",
+            `Filter: ${filter.length > 0 ? filter : "(none)"}   Enter copy   Right/Tab insert   Up/Down navigate   Esc cancel`,
+          ),
+        );
+        list.invalidate();
         tui.requestRender();
-      },
-    };
-  });
+      };
+
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          if (matchesKey(data, "backspace")) {
+            if (filter.length > 0) updateFilter(filter.slice(0, -1));
+            return;
+          }
+
+          if (matchesKey(data, "right") || matchesKey(data, "tab")) {
+            const selected = list.getSelectedItem();
+            if (selected) done(`insert:${selected.value}`);
+            return;
+          }
+
+          const printable = decodeKittyPrintable(data) ?? data;
+          if (printable.length === 1 && printable >= " " && printable <= "~") {
+            updateFilter(filter + printable);
+            return;
+          }
+
+          list.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
+    },
+    { blocked: { kind: "question", message: "Select Code Snippet" } },
+  );
 
   if (selectedIndex === null || selectedIndex === undefined) return undefined;
   const [action, rawIndex] = selectedIndex.split(":");

@@ -1,12 +1,17 @@
 import { existsSync, writeFileSync } from "node:fs";
-import { atomicCreateFile, atomicReplaceFile, removeFileIfUnchanged } from "../src/agent-file-toggle.js";
+import { dirname } from "node:path";
+import { atomicCreateFile, atomicReplaceFile, removeFileIfUnchanged } from "../src/agent-file-mutations.js";
 
 const [operation, path, expectedSource, content, readyPath, goPath] = process.argv.slice(2);
 
 async function waitForGo(): Promise<void> {
   if (!readyPath || !goPath) return;
   writeFileSync(readyPath, `${process.pid}\n`, { mode: 0o600 });
-  while (!existsSync(goPath)) await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  while (!existsSync(goPath)) {
+    // Failed parent tests retire their temporary directory before releasing us.
+    if (!existsSync(dirname(goPath))) throw new Error("Worker owner retired before releasing the barrier");
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 try {

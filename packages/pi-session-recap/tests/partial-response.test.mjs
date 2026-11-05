@@ -59,7 +59,7 @@ function harness() {
       find: (provider, id) => (provider === model.provider && id === model.id ? model : undefined),
       getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test", headers: {}, baseUrl: model.baseUrl }),
     },
-    sessionManager: { getBranch: () => branch, buildContextEntries: () => branch },
+    sessionManager: { getSessionId: () => "recap-test", getBranch: () => branch, buildContextEntries: () => branch },
     ui: {
       setStatus() {},
       setWidget(_key, content) {

@@ -43,11 +43,13 @@ With a Pi 0.99+ virtual model selected, the override must still name a concrete 
 
 The recap sends no system prompt, tools, or Agent Skills, and never writes to the prompt cache. Reasoning is always off: most APIs disable thinking when no reasoning level is requested, while Codex models receive an explicit `reasoningEffort: "none"`. On Pi 0.87+, it uses up to 30 recent messages from Pi's pre-hook projected session context (plus a user boundary if needed), the earliest non-omitted user request on the active branch, and the active compaction or branch summary. Incomplete assistant turns and orphaned or duplicate tool results do not consume the recent window. When a large result run crosses the window, the recap keeps its assistant call with the newest paired results within the bound. Context edits to the initial request are honored, including replacement and omission. If the host does not expose projections, it uses compaction-aware context entries with the same recent-window treatment; that fallback is not a blanket older-host compatibility guarantee. Large initial requests and individual tool results retain their beginning and end.
 
+Both completion paths pass the owning Pi session ID for provider conversation attribution, including OpenCode's required session header. This does not change destination consent, authentication, context validation, or cancellation.
+
 Custom providers work when they use a built-in pi-ai API type. Pi-only custom handlers are skipped because the standalone compatibility layer cannot route them; select a supported physical model as the recap destination.
 
 ### Upstream attribution
 
-The fullscreen transcript placement and explicit Codex reasoning-off behavior are derived from [tmustier/pi-extensions `session-recap` v0.5.0](https://github.com/tmustier/pi-extensions/tree/09706a7/session-recap). Projected-context recaps and settlement handling follow [upstream v0.5.1](https://github.com/tmustier/pi-extensions/tree/4a63a2e/session-recap), adapted here for older Pi hosts, branch ownership, model selection, authentication checks, and bounded native-message context.
+The fullscreen transcript placement and explicit Codex reasoning-off behavior are derived from [tmustier/pi-extensions `session-recap` v0.5.0](https://github.com/tmustier/pi-extensions/tree/09706a7/session-recap). Projected-context recaps and settlement handling follow [upstream v0.5.1](https://github.com/tmustier/pi-extensions/tree/4a63a2e/session-recap), adapted here for older Pi hosts, branch ownership, model selection, authentication checks, and bounded native-message context. Session attribution follows [pinned upstream v0.6.1](https://github.com/tmustier/pi-extensions/tree/f2632e7da3cadc4f22fb8367e7c4454779ec1a05/session-recap), preserving these local privacy and cancellation boundaries. The upstream MIT notice is retained alongside the local notice in `LICENSE`.
 
 ## Install
 
