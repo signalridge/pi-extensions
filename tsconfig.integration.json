@@ -1,8 +1,14 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "rootDir": "." },
+  "compilerOptions": {
+    "rootDir": ".",
+    "paths": {
+      "@signalridge/pi-subagents/src/agent-file-toggle.ts": ["./packages/pi-subagents/src/agent-file-toggle.ts"]
+    }
+  },
   "include": [
     "scripts/pi-schema-inference.fixture.ts",
+    "scripts/subagent-input-compat.fixture.ts",
     "scripts/editor-composition.test.ts",
     "scripts/status-navigation.test.ts",
     "scripts/fixtures/workflow-cli.ts",

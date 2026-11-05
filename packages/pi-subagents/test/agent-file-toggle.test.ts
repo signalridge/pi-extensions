@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -25,6 +26,7 @@ import {
   disableInContent,
   enableInContent,
   isDisabledContent,
+  type NewAgentInput,
   removeFileIfUnchanged,
   serializeAgentFile,
   withAgentFileLock,
@@ -446,6 +448,102 @@ describe("atomic agent file writes", () => {
     expect(readFileSync(join(directory, recoveryFiles()[0]!), "utf-8")).toBe("original");
 
     expect(fsMocks.renameSync).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("manual agent input compatibility", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.mocked(console.warn).mockRestore();
+  });
+
+  const currentInput = {
+    description: "Scout: audit #security",
+    tools: "read, ext:foo # injection",
+    tier: "review:policy",
+    systemPrompt: "Do the work.",
+  };
+  const currentOutput = '---\ndescription: "Scout: audit #security"\ntools: "read, ext:foo # injection"\ntier: review:policy\nprompt_mode: replace\n---\n\nDo the work.\n';
+
+  it("preserves current wizard output byte-for-byte without warnings", () => {
+    expect(buildNewAgentFile(Object.freeze({ ...currentInput }))).toBe(currentOutput);
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it.each(["model", "thinking"] as const)("warns for each present retired %s input, including empty and undefined values", (key) => {
+    for (const value of ["synthetic-private-value", "", undefined]) {
+      vi.mocked(console.warn).mockClear();
+      const input = Object.freeze({ ...currentInput, [key]: value });
+      expect(buildNewAgentFile(input)).toBe(currentOutput);
+      expect(console.warn).toHaveBeenCalledExactlyOnceWith(
+        `[pi-subagents] manual agent input "${key}" is retired and ignored; use "tier" instead.`,
+      );
+      expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toContain("synthetic-private-value");
+    }
+  });
+
+  it("warns separately for both retired keys without translating thinking off or writing legacy routing", () => {
+    const output = buildNewAgentFile({
+      description: "Legacy consumer",
+      tools: "read",
+      model: "synthetic-private-model",
+      thinking: "off",
+      systemPrompt: "Prompt",
+    });
+    expect(output).toBe('---\ndescription: "Legacy consumer"\ntools: read\nprompt_mode: replace\n---\n\nPrompt\n');
+    expect(output).not.toMatch(/^model:|^thinking:|^tier:/m);
+    expect(console.warn).toHaveBeenCalledTimes(2);
+    expect(console.warn).toHaveBeenNthCalledWith(1,
+      '[pi-subagents] manual agent input "model" is retired and ignored; use "tier" instead.');
+    expect(console.warn).toHaveBeenNthCalledWith(2,
+      '[pi-subagents] manual agent input "thinking" is retired and ignored; use "tier" instead.');
+    expect(JSON.stringify(vi.mocked(console.warn).mock.calls)).not.toMatch(/synthetic-private-model|off/);
+  });
+
+  it("detects legacy own-property presence without reading getters or mutating inputs", () => {
+    const input = Object.freeze({
+      ...currentInput,
+      get model(): string { throw new Error("must not read legacy model"); },
+      get thinking(): string { throw new Error("must not read legacy thinking"); },
+    });
+    expect(buildNewAgentFile(input)).toBe(currentOutput);
+    expect(console.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it("warns for typed inherited legacy keys without reading prototype getters", () => {
+    class LegacyPrototypeInput {
+      get model(): string { throw new Error("must not read inherited model"); }
+      get thinking(): string { throw new Error("must not read inherited thinking"); }
+    }
+    const input: NewAgentInput = Object.freeze(Object.assign(new LegacyPrototypeInput(), currentInput));
+    expect(buildNewAgentFile(input)).toBe(currentOutput);
+    expect(console.warn).toHaveBeenCalledTimes(2);
+    expect(console.warn).toHaveBeenNthCalledWith(1,
+      '[pi-subagents] manual agent input "model" is retired and ignored; use "tier" instead.');
+    expect(console.warn).toHaveBeenNthCalledWith(2,
+      '[pi-subagents] manual agent input "thinking" is retired and ignored; use "tier" instead.');
+  });
+
+  it.each(["review: policy # comment", "review\nmodel: injected", "review:policy"])("round-trips YAML-sensitive tier %j without legacy frontmatter", (tier) => {
+    const output = buildNewAgentFile({ ...currentInput, tier });
+    const parsed = parseFrontmatter<Record<string, unknown>>(output);
+    expect(parsed.frontmatter).toEqual({
+      description: currentInput.description,
+      tools: currentInput.tools,
+      tier,
+      prompt_mode: "replace",
+    });
+    expect(output).not.toMatch(/^model:|^thinking:/m);
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it("preserves empty-tier omission without warnings", () => {
+    const output = buildNewAgentFile({ ...currentInput, tier: "" });
+    expect(output).toBe(currentOutput.replace("tier: review:policy\n", ""));
+    expect(console.warn).not.toHaveBeenCalled();
   });
 });
 

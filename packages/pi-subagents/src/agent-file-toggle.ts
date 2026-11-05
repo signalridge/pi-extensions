@@ -202,12 +202,21 @@ function formatYamlScalar(value: string): string {
 export interface NewAgentInput {
   description: string;
   tools: string;
+  /** @deprecated Retired and ignored; use tier instead. */
+  model?: string;
+  /** @deprecated Retired and ignored; use tier instead. */
+  thinking?: string;
   tier?: string;
   systemPrompt: string;
 }
 
 /** Serialize the manual wizard's free-text fields safely as YAML scalars. */
 export function buildNewAgentFile(input: NewAgentInput): string {
+  for (const key of ["model", "thinking"] as const) {
+    if (key in input) {
+      console.warn(`[pi-subagents] manual agent input "${key}" is retired and ignored; use "tier" instead.`);
+    }
+  }
   const tierLine = input.tier ? `\ntier: ${formatYamlScalar(input.tier)}` : "";
   return `---
 description: ${JSON.stringify(input.description)}
