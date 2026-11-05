@@ -493,11 +493,7 @@ for (const payload of ['"text"', "1", "null"]) {
 
 test("the module loads and fingerprints ordinary data when RawJSON APIs are absent", () => {
   const moduleURL = new URL("../src/canonical-fingerprint.ts", import.meta.url).href;
-  execFileSync("mise", [
-    "exec",
-    "bun@1.3.14",
-    "--",
-    "bun",
+  execFileSync("bun", [
     "--eval",
     `Reflect.deleteProperty(JSON, "rawJSON");
      Reflect.deleteProperty(JSON, "isRawJSON");
@@ -646,10 +642,8 @@ test("entry/node/byte/depth bounds evict or fall back without changing canonical
 });
 
 test("cached snapshots do not retain raw object graphs across garbage collection", () => {
-  const output = execFileSync(
-    "mise",
-    ["exec", "bun@1.3.14", "--", "bun", fileURLToPath(new URL("./fingerprint-gc.fixture.mjs", import.meta.url))],
-    { encoding: "utf8" },
-  );
+  const output = execFileSync("bun", [fileURLToPath(new URL("./fingerprint-gc.fixture.mjs", import.meta.url))], {
+    encoding: "utf8",
+  });
   expect(output.trim()).toBe("weak roots collected; bounded snapshots cleared");
 });
