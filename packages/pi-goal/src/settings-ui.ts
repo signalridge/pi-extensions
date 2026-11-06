@@ -78,15 +78,15 @@ export async function showGoalSettings(
           {
             id: "experimentalGoals",
             label: "Ordered goal queue",
-            description: "Enable experimental add, prioritize, skip, and drop-last workflows.",
-            currentValue: runtime.settings.experimental.goals ? "Experimental" : "Off",
-            values: ["Off", "Experimental"],
+            description: "Opt in to stable add, prioritize, skip, and drop-last workflows.",
+            currentValue: runtime.settings.experimental.goals ? "On" : "Off",
+            values: ["Off", "On"],
             action: "set-queue",
           },
           {
             id: "experimentalNotices",
-            label: "Experimental notice",
-            description: "Say once per session that experimental behavior and persisted state may change.",
+            label: "Queue notice",
+            description: "Announce the stable, opt-in queue once per session when enabled.",
             currentValue: runtime.settings.experimental.notices ? "On" : "Off",
             values: ["On", "Off"],
             action: "set-notices",
@@ -112,8 +112,8 @@ export async function showGoalSettings(
           `Automatic-work limit: ${formatAutomaticWork(runtime.settings.continuationLimits.automaticTurns)}`,
           `No-progress guard: ${formatNoProgressProtection(runtime.settings.continuationLimits.noProgressTurns)}`,
           `Goal tools: ${visibilityLabel(runtime.settings.toolVisibility)}`,
-          `Ordered goal queue: ${runtime.settings.experimental.goals ? "Experimental" : "Off"}`,
-          `Experimental notice: ${runtime.settings.experimental.notices ? "On" : "Off"}`,
+          `Ordered goal queue: ${runtime.settings.experimental.goals ? "On" : "Off"}`,
+          `Queue notice: ${runtime.settings.experimental.notices ? "On" : "Off"}`,
           `Managed run RPC: ${runtime.settings.rpc.enabled ? "On" : "Off"}`,
         ],
         hint: "back",
@@ -169,7 +169,7 @@ export async function showGoalSettings(
         }
       },
       "set-queue": async ({ value }) => {
-        const enabled = value === "Experimental";
+        const enabled = value === "On";
         if (enabled === runtime.settings.experimental.goals) return { kind: "stay" };
         const next = await nextQueueSettings(runtime, ctx, enabled);
         if (!next) return { kind: "rejected" };
@@ -189,7 +189,7 @@ export async function showGoalSettings(
               );
             }
           }
-          notifyTerminal(ctx.ui, `Ordered goal queue: ${enabled ? "Experimental" : "Off"}.`, "info");
+          notifyTerminal(ctx.ui, `Ordered goal queue: ${enabled ? "On" : "Off"}.`, "info");
           return { kind: "stay" };
         } catch (error) {
           notifySettingsFailure(ctx, settingsPath, error);
@@ -207,7 +207,7 @@ export async function showGoalSettings(
           applyGoalSettings(runtime, next, ctx, {
             save: (settings) => (options.save ?? saveGoalSettings)(settings, settingsPath),
           });
-          notifyTerminal(ctx.ui, `Experimental notice: ${enabled ? "On" : "Off"}.`, "info");
+          notifyTerminal(ctx.ui, `Queue notice: ${enabled ? "On" : "Off"}.`, "info");
           return { kind: "stay" };
         } catch (error) {
           notifySettingsFailure(ctx, settingsPath, error);
@@ -470,8 +470,8 @@ async function nextQueueSettings(runtime: GoalRuntime, ctx: ExtensionCommandCont
   if (runtime.settings.experimental.goals === enabled) return undefined;
   if (enabled && !runtime.settings.experimental.goals) {
     const confirmed = await ctx.ui.confirm(
-      "Enable experimental goal queue?",
-      "Queue behavior and persisted state may change between releases. Existing single-goal behavior remains available.",
+      "Enable ordered goal queue?",
+      "Opt in to the stable queue commands and automatic advancement between goals. Existing single-goal behavior remains available; disabling the queue later preserves retained goals and freezes their automatic work.",
     );
     if (!confirmed) return undefined;
   }
@@ -480,7 +480,7 @@ async function nextQueueSettings(runtime: GoalRuntime, ctx: ExtensionCommandCont
     (runtime.queuedGoals.length > 0 || runtime.pendingQueueAction !== undefined) &&
     !(await ctx.ui.confirm(
       "Freeze ordered goal queue?",
-      `Disabling the experiment preserves ${retainedGoalCount(runtime)} goal(s) but freezes automatic work until the setting is re-enabled. No goal data will be deleted.`,
+      `Disabling the queue preserves ${retainedGoalCount(runtime)} goal(s) but freezes automatic work until the setting is re-enabled. No goal data will be deleted.`,
     ))
   ) {
     return undefined;

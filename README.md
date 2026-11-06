@@ -123,7 +123,7 @@ pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
 | --- | --- |
 | `pi-subagents` | Managed subagent runtime — tiers, workflow-owner Fleet groups, queueing, isolation, scheduling, RPC and opt-in background clarification to the main agent |
 | `pi-workflows` | JavaScript orchestration over those subagents — fan-out, phases, budgets, quality helpers, journal-backed resume |
-| `pi-goal` | Autonomous `/goal` completion, with opt-in experimental ordered queues |
+| `pi-goal` | Autonomous `/goal` completion, with stable, opt-in ordered queues |
 | `pi-ralph-wiggum` | Long-running agent loops for iterative development |
 | `pi-plan-mode` | Codex-like read-only `/plan` collaboration mode, with an optional implementation model |
 | `pi-agent-guidance` | Loads provider-specific context files (`CLAUDE.md`, `CODEX.md`, `GEMINI.md`) based on the current model, and context files from subdirectories the agent works in |
