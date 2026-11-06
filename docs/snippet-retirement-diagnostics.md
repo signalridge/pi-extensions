@@ -61,8 +61,8 @@ node candidate/scripts/snippet-retirement-diagnostics.mjs baseline candidate evi
 ```
 
 `primary` checks x64, Node version, and GitHub ImageOS. `secondary` explicitly
-labels container or other Linux experiments and **cannot** satisfy the primary
-closure requirement. Containers change PID namespace/reaping behavior; record
+labels container or other Linux experiments and **cannot** supply native primary
+evidence for either adjudication route below. Containers change PID namespace/reaping behavior; record
 that fact. Do not add host-PID, privileged, or an init process silently.
 
 ## Observer and cleanup contract
@@ -140,13 +140,135 @@ supervisor exit alone, or infer signal delivery merely from kill() success.
 
 A baseline that never reproduces MUST report
 **INCONCLUSIVE: baseline failure not reproduced**. A passing candidate or ordinary
-PR CI cannot turn that into a root-cause claim. A secondary reproduction also
+PR CI alone cannot turn that into a root-cause claim. A secondary reproduction also
 cannot replace native primary evidence. Even a primary reproduction requires
 human adjudication; `closureAuthorized` is always false.
 
-Before #64 closes, retain a native primary baseline pre-rescue failure and its
-natural-versus-forced timeline, establish the actual cause from those records,
-verify the candidate's assertions and ordinary PR CI, and perform any required
-normal release. If evidence instead shows a real survivor bug, investigate it
-before changing runtime architecture. This harness is diagnostic, not a
-permanent flaky required-baseline-reproduction check.
+Two human adjudication outcomes must remain distinct:
+
+- **Literal reproduction:** retain a native primary baseline pre-rescue assertion
+  failure and its natural-versus-forced timeline before claiming reproduction;
+  establish its cause from those records. This threshold is unchanged.
+- **Qualified mechanism diagnosis:** a direct native, same-protocol counterexample
+  to the old predicate's assumed invariant can resolve the faulty-invariant
+  diagnosis deliverable without reproducing the baseline exception, provided
+  identity/ownership, retirement ordering, natural disappearance without rescue,
+  and independent review support it. Passing retries alone do not meet this bar.
+  Record the unmet reproduction criterion and limits on historical attribution.
+
+This explicitly qualifies the earlier universal wording, "Before #64 closes,
+retain a native primary baseline pre-rescue failure": that remains necessary for
+**literal reproduction**, not for every qualified human diagnosis disposition.
+It does not make all original criteria fulfilled or change machine adjudication:
+non-reproducing runs remain INCONCLUSIVE and `closureAuthorized` remains false.
+Before any human closure, review the evidence and candidate assertions, require
+ordinary PR CI/merge, and perform any required normal release. If evidence instead
+shows a real survivor bug, investigate it before changing runtime architecture.
+This harness is diagnostic, not a permanent flaky required-baseline-reproduction
+check.
+
+## Results and evidence — 2026-11-06
+
+### Native comparison and retained artifacts
+
+Both attempts of [run 42165409121](https://github.com/signalridge/pi-extensions/actions/runs/42165409121)
+compared original `c00f9f990f201340b27658dcb525ddcdb14c08ec` with the **exact PR #90
+candidate** `6cc9a342738e1c986259360e8b0df9f0b4dcdee1`. Merged PR #90 commit
+`fca9f0dab5eb68bfa70a45cd21f4bab4bc93dc87` has the same tree as that candidate:
+`eb20a980a5eb427af91b3402eebb134bea57791f`.
+
+| Attempt | Alternating pairs / rounds | Baseline failures | Candidate failures | Rescues | Confirmed cleanups |
+| --- | --- | --- | --- | --- | --- |
+| [1](https://github.com/signalridge/pi-extensions/actions/runs/42165409121/attempts/1) | 200 / 400 | 0 | 0 | 0 | 400 |
+| [2](https://github.com/signalridge/pi-extensions/actions/runs/42165409121/attempts/2) | 200 / 400 | 0 | 0 | 0 | 400 |
+
+That is **400 pairs / 800 rounds total**. Both attempts preserved the unrelated
+sentinel in every round and finally reaped it. Both `summary.json` files report
+`baselineFailures: 0`, `fixedFailures: 0`,
+**INCONCLUSIVE: baseline failure not reproduced**, and `closureAuthorized: false`.
+No third rerun is planned; these green counts do not establish the diagnosis.
+
+Each attempt used native Ubuntu 24.04 x64, with both arms sequentially on the same
+VM within that attempt, Node **24.21.0** and Bun **1.3.14**. Those exact runtime
+versions match historical failing run 39971697137, attempt 1. The new runner image
+was **20261101.360.1**, kernel **7.0.0-1017-azure**, not the October 12 historical
+image or exact historical VM. No Docker secondary result is used as primary
+evidence.
+
+Downloadable artifact provenance (filenames below are relative to each extracted
+artifact):
+
+- Attempt 1: [`snippet-retirement-evidence-42165409121-1`](https://github.com/signalridge/pi-extensions/actions/runs/42165409121/artifacts/13479280540),
+  ID `13479280540`, digest
+  `sha256:f8f1d82eb544b38ab29141ca4dfd176be9f3704694de97856b04108e8490cd83`.
+- Attempt 2: [`snippet-retirement-evidence-42165409121-2`](https://github.com/signalridge/pi-extensions/actions/runs/42165409121/artifacts/13479882000),
+  ID `13479882000`, digest
+  `sha256:9ec05543d4a2048c49d8653392d95b474a3315d02b9ae85e7125a97cb1931450`.
+
+After download, a local audit checked both corpora's source/package/lock/harness
+hashes against the recorded Git revisions, runtime agreement, dimensions and
+alternating order, all round cleanups, and sentinel preservation/reaping. That
+post-download audit report is **not** part of the uploaded CI artifacts. The
+publicly downloadable `host.json`, `baseline-source.json`, `candidate-source.json`,
+`summary.json`, `sentinel.json`, and per-round records retain the underlying
+evidence for those checks.
+
+### Direct counterexample, not a passing retry
+
+Attempt 1, `158-candidate.jsonl`, lines **15–18**, directly contradicts the old
+immediate assumption that retirement fulfillment implies every recorded descendant
+already makes `alive(pid)` false:
+
+- The earlier identity receipt records UID **1001**, worker PID **47076**,
+  starttime **49202**, PGID = SID **46961**, via shell **46968** under supervisor
+  **46961**. The predicate-time raw stat matches PID/starttime/PGID/SID; UID comes
+  from that earlier receipt, not a UID reread during predicate evaluation.
+- All four records share `clockOrigin: 1793941264092.9146`. Retirement fulfilled at
+  monotonic **841.468544 ms** (`session_before_tree`) and **841.487800 ms**
+  (`session_shutdown`), after supervisor exit/close.
+- The original `alive()` evaluation at **841.655281–841.692120 ms** returned
+  **true**, with raw state **R** and no errno: **0.186737–0.223576 ms** after the
+  first retirement return, also after the second. The old c00 assertion
+  `tree.pids().every((pid) => !alive(pid))` rejects this Boolean observation.
+- The next poll at **851.806162 ms** returned **ESRCH**, without fixture rescue.
+  The worker was absent by the next approximately 10 ms sample, not at a measured
+  exact exit time. Subsequent natural-observation and cleanup records confirm
+  disappearance without rescue.
+
+This is a kernel-visible non-zombie R observation after the ownership barrier,
+followed by natural absence, not evidence of useful execution or certainty about
+kernel internals. It rules out a permanent survivor **in this observation**, not
+in all historical incidents. Unlike a green retry, it supplies an actual value
+that falsifies the old immediate predicate invariant on the same retirement
+protocol. It does **not** reproduce an exception in the baseline arm.
+
+### Ownership, source scope, and qualified disposition
+
+`packages/pi-code-actions/src/snippet-process.ts` is byte-identical between c00 and
+the exact candidate. Package-root `index.ts` is **not** byte-identical (clipboard
+changes), but the relevant run tracking and `Promise.allSettled(runs)` retirement
+path are unchanged. Changes in actions, owned-custom dialogs and UI do not alter
+the selected RPC `run 1` path; the process fixture body is unchanged. Candidate
+Promise probes and observer instrumentation can alter scheduling, so this is not
+a claim that the uninstrumented old test would have sampled R at the same instant.
+
+The actual `runSnippet` settled marker checks both first and repeated retirement
+returns. The independent gated test keeps owned cleanup blocked and proves that
+neither return fulfills until that cleanup is released. The current test thus
+separates **awaiting the owned run** from **bounded natural descendant
+disappearance**, rather than blindly widening a timeout. Existing limits remain
+250 ms grace, 1000 ms supervisor waits, 10000 ms test, 3000 ms retirement, and
+4000 ms descendant observation; no production assertion, default, guard, timer,
+or runtime architecture is changed by this findings document.
+
+Independent verification in two passes checked the recorded data and exact old
+Boolean condition against the artifact records and source comparison above. A
+separate review judged the mechanism sufficient for a **qualified resolution of
+the diagnosis deliverable**, while requiring the universal closure wording above
+to be reconciled. The proposed
+human disposition is to resolve the faulty immediate invariant on that basis,
+**not** to claim the requested baseline failure was reproduced, all initial
+criteria were fulfilled, or the historical incidents were conclusively explained.
+The literal baseline-exception reproduction criterion is still **unmet**. Machine
+outputs remain unchanged. This document does not close #64: final independent doc
+review and ordinary PR CI/merge remain prerequisites to a maintainer's decision.
