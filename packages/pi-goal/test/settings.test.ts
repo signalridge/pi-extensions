@@ -16,9 +16,8 @@ test("normalizeGoalSettings applies defaults and accepts bounded continuation li
   // must not carry their definitions or prompt guidelines. Changing this
   // default changes the context cost of every session that installs pi-goal.
   assert.equal(DEFAULT_GOAL_SETTINGS.toolVisibility, "after-first-goal");
-  // The experimental notice defaults to On: enabling an experiment should say
-  // once that its persisted state may change. It is a setting rather than a
-  // repeated prompt so a reader who has accepted it can stop being told.
+  // Promotion preserves the fully supported legacy namespace and defaults:
+  // queue execution stays opt-in, and the announcement remains a separate choice.
   assert.deepEqual(DEFAULT_GOAL_SETTINGS.experimental, { goals: false, notices: true });
   assert.deepEqual(normalizeGoalSettings({}), DEFAULT_GOAL_SETTINGS);
   assert.deepEqual(normalizeGoalSettings({ futureOption: true }), DEFAULT_GOAL_SETTINGS);
@@ -90,6 +89,28 @@ test("normalizeGoalSettings applies defaults and accepts bounded continuation li
     { continuationLimits: { noProgressTurns: "3" } },
   ]) {
     assert.equal(normalizeGoalSettings(value), undefined);
+  }
+});
+
+test("legacy queue keys round-trip both explicit boolean values without migration", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-goal-stable-settings-"));
+  t.onTestFinished(() => rm(directory, { recursive: true, force: true }));
+  const settingsPath = join(directory, "pi-goal.json");
+  for (const goals of [false, true]) {
+    for (const notices of [false, true]) {
+      const legacy = { experimental: { goals, notices, futureQueue: "preserved" } };
+      writeFileSync(settingsPath, JSON.stringify(legacy));
+      const normalized = normalizeGoalSettings(legacy);
+      assert.ok(normalized);
+      assert.deepEqual(normalized.experimental, { goals, notices });
+      assert.deepEqual(readGoalSettings(settingsPath), { kind: "loaded", settings: normalized });
+      saveGoalSettings(normalized, settingsPath);
+      assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), {
+        ...DEFAULT_GOAL_SETTINGS,
+        experimental: { goals, notices, futureQueue: "preserved" },
+      });
+      assert.deepEqual(readGoalSettings(settingsPath), { kind: "loaded", settings: normalized });
+    }
   }
 });
 

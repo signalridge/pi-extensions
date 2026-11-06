@@ -15,11 +15,9 @@ test("default command parsing keeps queue words inside ordinary objectives", () 
     "pop",
     "shift",
   ]) {
-    assert.deepEqual(parseCommand(objective), {
-      kind: "start",
-      objective,
-      tokenBudget: undefined,
-    });
+    const expected = { kind: "start", objective, tokenBudget: undefined };
+    assert.deepEqual(parseCommand(objective), expected);
+    assert.deepEqual(parseCommand(objective, { experimentalGoals: false }), expected);
   }
 
   const completions = completeGoalArguments("") ?? [];
@@ -33,7 +31,7 @@ test("default command parsing keeps queue words inside ordinary objectives", () 
   );
 });
 
-test("experimental queue commands normalize canonical names and hidden aliases", () => {
+test("opt-in queue commands normalize canonical names and hidden aliases", () => {
   for (const [input, expected] of [
     ["add docs", { kind: "add", objective: "docs", tokenBudget: undefined }],
     ["push docs", { kind: "add", objective: "docs", tokenBudget: undefined }],
@@ -59,7 +57,7 @@ test("experimental queue commands normalize canonical names and hidden aliases",
   });
 });
 
-test("experimental autocomplete exposes intent names but keeps aliases hidden", () => {
+test("opt-in autocomplete exposes intent names but keeps aliases hidden", () => {
   const completions = completeGoalArguments("", QUEUE_FEATURE) ?? [];
   assert.deepEqual(
     completions

@@ -33,11 +33,10 @@ export const DEFAULT_GOAL_SETTINGS: GoalSettings = {
   // unfinished goal reveals them at startup. Set `"always"` to keep them
   // resident.
   toolVisibility: "after-first-goal",
-  // `notices` is on by default: a user who enabled an experiment should be told
-  // once per session that its persisted state may change. It exists so that
-  // acknowledgement is a setting rather than a repeated prompt — a warning the
-  // reader cannot accept stops carrying information, and the same notification
-  // level carries failures worth reading.
+  // The stable queue remains opt-in. Keep the fully supported `experimental`
+  // namespace and both boolean defaults for settings-file compatibility.
+  // `notices` controls only the once-per-session queue announcement, never
+  // validation or recovery warnings.
   experimental: { goals: false, notices: true },
   rpc: { enabled: false },
   continuationLimits: { automaticTurns: 25, noProgressTurns: 3 },

@@ -34,7 +34,7 @@ import { formatGoalSafetyPause, hasAssistantToolCall } from "./safety.js";
 import { DEFAULT_GOAL_SETTINGS, readGoalSettings } from "./settings.js";
 
 const EXPERIMENTAL_GOALS_WARNING =
-  "Experimental ordered goals are enabled for pi-goal. Queue behavior and persisted state may change.";
+  "Ordered goal queue is enabled for pi-goal. Its command and persisted-state compatibility contract is stable; queue execution remains opt-in.";
 
 interface GoalLifecycleOptions {
   settingsPath?: string;
@@ -107,7 +107,7 @@ export function registerGoalLifecycle(
       notifyTerminal(ctx.ui, `pi-goal settings ignored: ${settingsResult.reason}. Using default settings.`, "warning");
     }
     if (runtime.settings.experimental.goals && runtime.settings.experimental.notices) {
-      notifyTerminal(ctx.ui, EXPERIMENTAL_GOALS_WARNING, "warning");
+      notifyTerminal(ctx.ui, EXPERIMENTAL_GOALS_WARNING, "info");
     }
     try {
       runtime.toolPolicy.prepareSessionStart(runtime.settings.toolVisibility, previousToolVisibility);
@@ -126,7 +126,7 @@ export function registerGoalLifecycle(
       ctx.ui.setStatus(STATUS_KEY, "queue off");
       notifyTerminal(
         ctx.ui,
-        "An experimental goal queue is frozen because experimental.goals is disabled. Re-enable it and run /reload to continue, or use /goal clear.",
+        "An ordered goal queue is frozen because experimental.goals is disabled. Re-enable it and run /reload to continue, or use /goal clear.",
         "warning",
       );
       return;
@@ -587,8 +587,7 @@ export function registerGoalLifecycle(
       abortCurrentTurn(ctx);
       return {
         block: true,
-        reason:
-          "The experimental goal queue is frozen. Re-enable experimental.goals and run /reload, or use /goal clear.",
+        reason: "The ordered goal queue is frozen. Re-enable experimental.goals and run /reload, or use /goal clear.",
       };
     }
     if (

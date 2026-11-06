@@ -434,9 +434,39 @@ test("standard settings keep all six controls on one level", async () => {
     "No-progress guard",
     "Goal tools",
     "Ordered goal queue",
-    "Experimental notice",
+    "Queue notice",
     "Managed run RPC",
   ]);
+});
+
+test("ordered queue settings present stable opt-in wording and keep the legacy key", async () => {
+  const state = runtime();
+  assert.equal(state.settings.experimental.goals, false);
+  let saved: GoalSettings | undefined;
+  let confirmation = "";
+  const selections = ["Ordered goal queue", undefined];
+  const context = createMockContext({
+    hasUI: true,
+    mode: "tui",
+    select: async () => selections.shift(),
+    confirm: async (title: string, message: string) => {
+      confirmation = `${title}\n${message}`;
+      return true;
+    },
+  });
+  await showGoalSettings(state, context.ctx, {
+    settingsPath: "/tmp/pi-goal.json",
+    save(settings) {
+      saved = structuredClone(settings);
+    },
+  });
+  assert.match(confirmation, /^Enable ordered goal queue\?/);
+  assert.match(confirmation, /Opt in to the stable queue commands and automatic advancement/);
+  assert.doesNotMatch(confirmation, /experimental|may change between releases/i);
+  assert.deepEqual(saved?.experimental, { goals: true, notices: true });
+  assert.deepEqual(state.settings.experimental, { goals: true, notices: true });
+  assert.equal(state.queueFrozen, false);
+  assert.match(context.notifications.at(-1)?.message ?? "", /^Ordered goal queue: On\.$/);
 });
 
 test("automatic-work settings can open directly from the safety recovery flow", async () => {
@@ -706,7 +736,7 @@ test("automatic-work editing rejects a replacement active goal without saving", 
   assert.match(context.notifications.at(-1)?.message ?? "", /active goal changed/i);
 });
 
-test("Experimental notice setting saves and silences the session-start warning", async () => {
+test("Queue notice setting saves the supported legacy key and silences the announcement", async () => {
   const state = runtime();
   state.settings = {
     ...structuredClone(state.settings),
@@ -714,7 +744,7 @@ test("Experimental notice setting saves and silences the session-start warning",
   };
   let saved: GoalSettings | undefined;
   // `undefined` cycles to the next value, which from the default `On` is `Off`.
-  const selections = ["Experimental notice", undefined];
+  const selections = ["Queue notice", undefined];
   const context = createMockContext({
     hasUI: true,
     mode: "tui",
@@ -728,20 +758,20 @@ test("Experimental notice setting saves and silences the session-start warning",
     },
   });
 
-  // The notice is a setting, not a mode: the queue stays experimental.
+  // Only the announcement changes: the stable queue remains explicitly enabled.
   assert.deepEqual(saved?.experimental, { goals: true, notices: false });
   assert.deepEqual(state.settings.experimental, { goals: true, notices: false });
   assert.equal(state.queueFrozen, false);
-  assert.match(context.notifications.at(-1)?.message ?? "", /Experimental notice: Off/i);
+  assert.match(context.notifications.at(-1)?.message ?? "", /Queue notice: Off/i);
 });
 
-test("Experimental notice setting rolls back when save fails", async () => {
+test("Queue notice setting rolls back when save fails", async () => {
   const state = runtime();
   state.settings = {
     ...structuredClone(state.settings),
     experimental: { goals: true, notices: true },
   };
-  const selections = ["Experimental notice", undefined];
+  const selections = ["Queue notice", undefined];
   const context = createMockContext({
     hasUI: true,
     mode: "tui",

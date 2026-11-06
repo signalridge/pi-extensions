@@ -28,7 +28,10 @@ type GoalTool = {
   }>;
 };
 
-test("experimental mode keeps singular registration and exposes canonical queue completions", async () => {
+const QUEUE_NOTICE =
+  "Ordered goal queue is enabled for pi-goal. Its command and persisted-state compatibility contract is stable; queue execution remains opt-in.";
+
+test("stable opt-in queue keeps singular registration and exposes canonical queue completions", async () => {
   const harness = await createHarness();
   assert.deepEqual([...harness.mock.commands.keys()], ["goal"]);
   assert.deepEqual(
@@ -42,15 +45,26 @@ test("experimental mode keeps singular registration and exposes canonical queue 
     ),
     ["pause", "resume", "clear", "edit", "status", "add", "prioritize", "drop-last", "skip", "--tokens"],
   );
-  assert.ok(
-    harness.notifications.some(({ message, level }) => level === "warning" && /experimental.*goals/i.test(message)),
+  assert.deepEqual(
+    harness.notifications.filter(({ message }) => message === QUEUE_NOTICE),
+    [{ message: QUEUE_NOTICE, level: "info" }],
   );
+  assert.equal(
+    harness.notifications.some(({ message }) => /experimental.*goals|persisted state may change/i.test(message)),
+    false,
+  );
+  await harness.command("first goal");
+  await harness.command("add second goal");
+  await harness.command("status");
+  await settled(harness);
+  await settled(harness);
+  assert.equal(harness.notifications.filter(({ message }) => message === QUEUE_NOTICE).length, 1);
 });
 
-test("silencing the experimental notice keeps the queue experimental", async () => {
+test("silencing the queue notice keeps stable queue operations and validation warnings", async () => {
   const harness = await createHarness({}, quietSettingsPath);
   assert.equal(
-    harness.notifications.some(({ message, level }) => level === "warning" && /experimental.*goals/i.test(message)),
+    harness.notifications.some(({ message }) => message === QUEUE_NOTICE),
     false,
   );
   // Only the notice is suppressed: the queue still parses and mutates.
@@ -62,6 +76,78 @@ test("silencing the experimental notice keeps the queue experimental", async () 
       { text: "first goal", status: "active" },
       { text: "last goal", status: "queued" },
     ],
+  );
+  const beforeInvalid = structuredClone(lastState(harness.mock));
+  await harness.command("add --tokens invalid rejected goal");
+  assert.deepEqual(lastState(harness.mock), beforeInvalid);
+  assert.ok(
+    harness.notifications.some(({ message, level }) => level === "warning" && /Invalid token budget/.test(message)),
+  );
+  assert.equal(
+    harness.notifications.some(({ message }) => message === QUEUE_NOTICE),
+    false,
+  );
+});
+
+test("legacy queue keys honor both boolean values without activating disabled parsing", async () => {
+  for (const goals of [false, true]) {
+    for (const notices of [false, true]) {
+      const path = join(settingsDirectory, `legacy-${goals}-${notices}.json`);
+      writeFileSync(path, JSON.stringify({ toolVisibility: "always", experimental: { goals, notices } }));
+      const harness = await createHarness({}, path);
+      assert.equal(
+        harness.notifications.filter(({ message }) => message === QUEUE_NOTICE).length,
+        goals && notices ? 1 : 0,
+      );
+      assert.equal(
+        harness.notifications.some(({ level }) => level === "warning"),
+        false,
+      );
+      await harness.command("add docs");
+      assert.equal(stateGoals(harness.mock)[0]?.text, goals ? "docs" : "add docs");
+      assert.equal(stateGoals(harness.mock).length, 1);
+      assert.equal(lastState(harness.mock)?.pendingAction, undefined);
+    }
+  }
+});
+
+test("notices false still reports frozen-queue recovery and blocks stale Goal tools", async () => {
+  const path = join(settingsDirectory, "quiet-disabled.json");
+  writeFileSync(path, JSON.stringify({ experimental: { goals: false, notices: false } }));
+  const branch = [
+    {
+      type: "custom",
+      customType: "goal-state",
+      data: { goal: storedGoal("head", "active"), queue: [storedGoal("tail", "queued")] },
+    },
+  ];
+  let aborts = 0;
+  const harness = await createHarness(
+    {
+      abort: () => aborts++,
+      sessionManager: { getBranch: () => branch, getEntries: () => branch },
+    },
+    path,
+  );
+  assert.equal(
+    harness.notifications.some(({ message }) => message === QUEUE_NOTICE),
+    false,
+  );
+  assert.ok(
+    harness.notifications.some(
+      ({ message, level }) => level === "warning" && /ordered goal queue is frozen/.test(message),
+    ),
+  );
+  const blocked = await harness.mock.events.get("tool_call")?.[0]?.({ toolName: "goal_complete" }, harness.ctx);
+  assert.deepEqual(blocked, {
+    block: true,
+    reason: "The ordered goal queue is frozen. Re-enable experimental.goals and run /reload, or use /goal clear.",
+  });
+  assert.equal(aborts, 1);
+  assert.equal(harness.mock.sentUserMessages.length, 0);
+  assert.deepEqual(
+    stateGoals(harness.mock).map(({ id }) => id),
+    ["head-id", "tail-id"],
   );
 });
 
@@ -1397,8 +1483,8 @@ test("separate factory runtimes keep independent queues", async () => {
 
 test("disabled settings freeze retained queues without losing state", async () => {
   const frozenState: GoalStateEntryData = {
-    goal: storedGoal("head", "active"),
-    queue: [storedGoal("later", "queued")],
+    goal: { ...storedGoal("head", "active"), automaticModelTurns: 7, tokenBudget: 2_000 },
+    queue: [{ ...storedGoal("later", "queued"), automaticModelTurns: 3, tokenBudget: 1_000 }],
   };
   const branch = [{ type: "custom", customType: "goal-state", data: frozenState }];
   const harness = await createHarness(
@@ -1412,10 +1498,16 @@ test("disabled settings freeze retained queues without losing state", async () =
   );
   assert.equal(harness.statuses.get("goal"), "queue off");
   assert.equal(harness.mock.sentUserMessages.length, 0);
+  assert.ok(
+    harness.notifications.some(
+      ({ message, level }) => level === "warning" && /An ordered goal queue is frozen/.test(message),
+    ),
+  );
   await harness.command("");
   assert.match(harness.notifications.at(-1)?.message ?? "", /queue.*off|re-enable/i);
   await harness.command("resume");
   assert.match(harness.notifications.at(-1)?.message ?? "", /re-enable.*reload/i);
+  assert.doesNotMatch(harness.notifications.at(-1)?.message ?? "", /experimental goal queue/i);
   assert.equal(lastState(harness.mock)?.queue?.[0]?.text, "later");
 
   const retained = lastState(harness.mock);
@@ -1424,10 +1516,18 @@ test("disabled settings freeze retained queues without losing state", async () =
   const restored = await createHarness({
     sessionManager: { getBranch: () => restoredBranch, getEntries: () => restoredBranch },
   });
-  assert.equal(restored.statuses.get("goal"), "active 0s · automatic 0/25");
+  assert.equal(restored.statuses.get("goal"), "active 0/2k · automatic 7/25");
   assert.deepEqual(
-    stateGoals(restored.mock).map(({ text }) => text),
-    ["head", "later"],
+    stateGoals(restored.mock).map(({ id, text, automaticModelTurns, tokenBudget }) => ({
+      id,
+      text,
+      automaticModelTurns,
+      tokenBudget,
+    })),
+    [
+      { id: "head-id", text: "head", automaticModelTurns: 7, tokenBudget: 2_000 },
+      { id: "later-id", text: "later", automaticModelTurns: 3, tokenBudget: 1_000 },
+    ],
   );
 
   await harness.command("clear");
