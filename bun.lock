@@ -172,7 +172,7 @@
     },
     "packages/pi-goal": {
       "name": "@signalridge/pi-goal",
-      "version": "1.6.0",
+      "version": "1.7.0",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
