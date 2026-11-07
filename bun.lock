@@ -24,7 +24,7 @@
     },
     "packages/pi-agent-guidance": {
       "name": "@signalridge/pi-agent-guidance",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "devDependencies": {
         "@earendil-works/pi-ai": "1.5.0",
         "@earendil-works/pi-coding-agent": "1.5.0",
@@ -35,7 +35,7 @@
     },
     "packages/pi-analytics": {
       "name": "@signalridge/pi-analytics",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -71,7 +71,7 @@
     },
     "packages/pi-background": {
       "name": "@signalridge/pi-background",
-      "version": "1.7.1",
+      "version": "1.7.2",
       "devDependencies": {
         "@earendil-works/pi-ai": "1.5.0",
         "@earendil-works/pi-coding-agent": "1.5.0",
@@ -85,7 +85,7 @@
     },
     "packages/pi-btw": {
       "name": "@signalridge/pi-btw",
-      "version": "1.6.0",
+      "version": "1.6.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -107,7 +107,7 @@
     },
     "packages/pi-code-actions": {
       "name": "@signalridge/pi-code-actions",
-      "version": "1.2.9",
+      "version": "1.2.10",
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "1.5.0",
         "@earendil-works/pi-tui": "1.5.0",
@@ -119,7 +119,7 @@
     },
     "packages/pi-codex-compact": {
       "name": "@signalridge/pi-codex-compact",
-      "version": "1.12.0",
+      "version": "1.12.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -142,7 +142,7 @@
     },
     "packages/pi-files-widget": {
       "name": "@signalridge/pi-files-widget",
-      "version": "1.2.9",
+      "version": "1.2.10",
       "dependencies": {
         "@signalridge/pi-ui": "^1.5.0",
       },
@@ -157,7 +157,7 @@
     },
     "packages/pi-github-pr": {
       "name": "@signalridge/pi-github-pr",
-      "version": "1.2.9",
+      "version": "1.2.10",
       "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "@earendil-works/pi-coding-agent": "1.5.0",
@@ -172,7 +172,7 @@
     },
     "packages/pi-goal": {
       "name": "@signalridge/pi-goal",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -207,7 +207,7 @@
     },
     "packages/pi-input-history": {
       "name": "@signalridge/pi-input-history",
-      "version": "1.2.11",
+      "version": "1.2.12",
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
@@ -224,7 +224,7 @@
     },
     "packages/pi-lsp": {
       "name": "@signalridge/pi-lsp",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "devDependencies": {
         "@biomejs/biome": "2.5.7",
         "@earendil-works/pi-ai": "1.5.0",
@@ -240,7 +240,7 @@
     },
     "packages/pi-plan-mode": {
       "name": "@signalridge/pi-plan-mode",
-      "version": "1.6.0",
+      "version": "1.6.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -258,7 +258,7 @@
     },
     "packages/pi-ralph-wiggum": {
       "name": "@signalridge/pi-ralph-wiggum",
-      "version": "1.2.10",
+      "version": "1.2.11",
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "1.5.0",
       },
@@ -269,7 +269,7 @@
     },
     "packages/pi-recall": {
       "name": "@signalridge/pi-recall",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -290,7 +290,7 @@
     },
     "packages/pi-rules": {
       "name": "@signalridge/pi-rules",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "devDependencies": {
         "@biomejs/biome": "^2.5.7",
         "@earendil-works/pi-ai": "1.5.0",
@@ -307,7 +307,7 @@
     },
     "packages/pi-secrets": {
       "name": "@signalridge/pi-secrets",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "devDependencies": {
         "@biomejs/biome": "^2.5.7",
         "@earendil-works/pi-ai": "1.5.0",
@@ -322,7 +322,7 @@
     },
     "packages/pi-session-recap": {
       "name": "@signalridge/pi-session-recap",
-      "version": "1.4.1",
+      "version": "1.4.2",
       "devDependencies": {
         "@earendil-works/pi-ai": "1.5.0",
         "@earendil-works/pi-coding-agent": "1.5.0",
@@ -350,7 +350,7 @@
     },
     "packages/pi-stamp": {
       "name": "@signalridge/pi-stamp",
-      "version": "1.4.0",
+      "version": "1.4.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -369,7 +369,7 @@
     },
     "packages/pi-statusline": {
       "name": "@signalridge/pi-statusline",
-      "version": "1.6.0",
+      "version": "1.6.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",
@@ -390,7 +390,7 @@
     },
     "packages/pi-subagents": {
       "name": "@signalridge/pi-subagents",
-      "version": "1.18.0",
+      "version": "1.19.0",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.6.0",
         "@signalridge/pi-ui": "^1.4.0",
@@ -423,7 +423,7 @@
     },
     "packages/pi-tab-status": {
       "name": "@signalridge/pi-tab-status",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "devDependencies": {
         "@earendil-works/pi-agent-core": "1.5.0",
         "@earendil-works/pi-ai": "1.5.0",
@@ -465,7 +465,7 @@
     },
     "packages/pi-usage-extension": {
       "name": "@signalridge/pi-usage-extension",
-      "version": "1.3.1",
+      "version": "1.3.2",
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "1.5.0",
         "@earendil-works/pi-tui": "1.5.0",
@@ -477,7 +477,7 @@
     },
     "packages/pi-welcome": {
       "name": "@signalridge/pi-welcome",
-      "version": "1.3.11",
+      "version": "1.3.12",
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
@@ -485,7 +485,7 @@
     },
     "packages/pi-workflows": {
       "name": "@signalridge/pi-workflows",
-      "version": "1.12.0",
+      "version": "1.12.1",
       "dependencies": {
         "@signalridge/pi-subagents-protocol": "^1.6.0",
         "@signalridge/pi-ui": "^1.4.0",
@@ -515,7 +515,7 @@
     },
     "packages/pi-worktree": {
       "name": "@signalridge/pi-worktree",
-      "version": "1.5.0",
+      "version": "1.5.1",
       "dependencies": {
         "@narumitw/pi-tui-kit": "^0.69.0",
         "@signalridge/pi-ui": "^1.4.1",

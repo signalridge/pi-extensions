@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.2.12
+### Patch Changes
+
+- 3da7832: Tighten package onboarding, consolidate detailed contracts into package-local references where needed, and correct stale documentation without changing runtime behavior or defaults.
+
 ## 1.2.11
 ### Patch Changes
 
