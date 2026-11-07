@@ -1,30 +1,7 @@
 /**
- * check-shared-dep-ranges.mjs — one shared dependency, one declared floor.
- *
- * A dependency that several packages import is a shared surface whether or not
- * anyone treats it as one. When each package picks its own floor, npm and bun
- * are free to satisfy each package separately, and they do: this repository had
- * `@narumitw/pi-tui-kit` declared at three disjoint floors (`^0.54.0`,
- * `^0.51.0`, `^0.49.1`) across nine packages, and the lockfile duly resolved
- * three different copies — 0.54.0, 0.51.0, and 0.49.3 — installed side by side.
- *
- * That is worse than it looks for a TUI kit. Nothing fails at install; the
- * duplicates only surface as a theme that renders one way in one extension and
- * another way in the next, or a widget contract that silently means two
- * different things in the same session. The floors also encode a claim nobody
- * checked: "0.49.1 is enough for this package" was never validated after the
- * package started using APIs added later.
- *
- * So the rule is a single declared range per shared dependency, and this script
- * is what keeps it true. It is deliberately narrow — it compares the range
- * STRINGS, not their semantics. Two ranges that happen to overlap are still a
- * finding: the point is one intentional answer per dependency, not an
- * accidental intersection.
- *
- * A dependency counts as shared once `MIN_PACKAGES` packages declare it, so a
- * dependency two packages happen to share is governed the same way as one nine
- * of them do. `EXEMPT` names the dependencies deliberately allowed to diverge;
- * it is empty, and an entry added to it should say why in a comment.
+ * Enforce one exact declared range for shared third-party runtime/peer surfaces.
+ * Compare range strings, not semver intersections; development tools are out of
+ * scope. See CONTRIBUTING.md#shared-dependencies.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -44,20 +21,8 @@ const MIN_PACKAGES = 2;
 const EXEMPT = new Set([]);
 
 /**
- * Runtime surfaces only.
- *
- * `peerDependencies` are in scope because they are the same kind of claim as a
- * dependency range ("this package works against that version") and the same
- * kind of bug when they disagree — a pi session loads every extension into ONE
- * host process, so two packages naming different host ranges are two packages
- * disagreeing about the thing they are both running inside.
- *
- * `devDependencies` are deliberately out of scope. A build tool is not a shared
- * surface: nothing loads two packages' compilers into one process, and
- * `pi-subagents` intentionally carries its own toolchain (it is excluded from
- * the root `tsconfig.json` and `biome.json` — see `docs/package-boundaries.md`).
- * Policing that here would report a deliberate arrangement as a defect on every
- * run.
+ * Runtime and peer dependencies share a host; development toolchains do not.
+ * Subagents intentionally runs its own lint/type/test configuration.
  */
 const SECTIONS = ["dependencies", "peerDependencies"];
 
@@ -81,9 +46,7 @@ const declared = new Map();
 for (const { manifest } of manifests) {
   for (const section of SECTIONS) {
     for (const [dependency, range] of Object.entries(manifest[section] ?? {})) {
-      // Workspace-internal packages are versioned together by Changesets and
-      // legitimately move at their own pace; this rule is about third-party
-      // surfaces the repository does not control.
+      // Workspace packages declare independently versioned internal contracts.
       if (workspaceNames.has(dependency)) continue;
       if (EXEMPT.has(dependency)) continue;
       const bySection = declared.get(dependency) ?? new Map();

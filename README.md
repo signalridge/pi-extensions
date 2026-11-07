@@ -1,197 +1,126 @@
 # signalridge Pi extensions
 
-A monorepo of [Pi](https://pi.dev) extensions. Every directory under `packages/`
-is independently publishable to npm and independently understandable; the
-private root is never published and declares no Pi manifest.
+Independent extensions for [Pi](https://pi.dev): subagents, workflows, developer tools and session UI. Each package has its own configuration, README and npm release; the private repository root is development tooling only.
 
-Two of them are designed as a pair — start there.
+The development host is **Pi 1.5.0**. See [compatibility](docs/compatibility.md) for platform and integration limits.
 
----
+## Install
+
+Install only the packages you need. For orchestration, load both packages:
+
+```sh
+pi install npm:@signalridge/pi-subagents
+pi install npm:@signalridge/pi-workflows
+```
+
+Other packages install the same way. Experimental packages are opt-in. Do not load an npm copy and a checkout copy of the same extension together.
+
+To try the pair from this checkout without loading installed extensions:
+
+```sh
+pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
+```
 
 ## The pair: `pi-subagents` + `pi-workflows`
 
 <a id="who-owns-what"></a>
 
-`pi-workflows` owns orchestration, phases, budgets, journal and resume; `pi-subagents` alone owns model/thinking/tool/skill policy, cwd, isolation, transcripts, retries, stop and live `maxConcurrent` queue capacity. They communicate through the typed protocol-v4 event bus, not source imports. Workflows requires separately loaded Subagents `>=1.9.0`; the peer dependency does not activate it.
-
-A plain JavaScript workflow fans out work:
+Subagents owns child execution, model tiers, tools, queueing, isolation and transcripts. Workflows owns orchestration, phases, budgets and journal-backed recovery. They communicate through protocol-v4 events; Workflows requires separately loaded Subagents `>=1.9.0`.
 
 ```js
-export const meta = { name: "audit", description: "Scan, then synthesize" };
-
-const findings = await parallel([
-  () => agent("Check for cross-package imports", { strength: "low" }),
-  () => agent("Check for secrets", { strength: "low" }),
+export const meta = { name: "review", description: "Review independent areas" };
+const results = await parallel([
+  () => agent("Review the API", { strength: "medium" }),
+  () => agent("Review the tests", { strength: "medium" }),
 ]);
-
-return agent("Synthesize: " + JSON.stringify(findings), { strength: "high" });
+return agent("Summarize the findings: " + JSON.stringify(results));
 ```
 
 <a id="why-it-is-split-this-way"></a>
 
-Scripts express effort only as `low`/`medium`/`high` **strengths**, not model/thinking/tier or a separate concurrency policy. `/workflows strength` maps those words to the host's Agent tiers without changing the catalogue; runs read and clamp to the live Subagents pool. See [model routing](packages/pi-workflows/README.md#model-routing).
-
-Full detail lives in each package's README —
-[`pi-workflows`](packages/pi-workflows/README.md) for the runtime globals,
-resume semantics, and routing table;
-[`pi-subagents`](packages/pi-subagents/README.md) for agent types, tiers,
-FleetView, and scheduling. The development host target is **Pi 1.5.0**;
-the previous full acceptance baseline was Pi 1.4.0.
-Host-provided peers use `"*"` for module ownership, not as a claim that every Pi
-version is supported. See [compatibility and verification](docs/compatibility.md)
-for current host contracts and integration limits.
-
----
-
-## Install
-
-Packages are installed individually; each package's own `pi.extensions`
-manifest controls what Pi loads.
-
-```bash
-pi install npm:@signalridge/pi-subagents   # >=1.9.0, protocol v4
-pi install npm:@signalridge/pi-workflows
-# Optional developer/question tools:
-pi install npm:@signalridge/pi-lsp
-pi install npm:@signalridge/pi-ask-user-question
-```
-
-> **Install any one package from a single source.** An npm copy alongside a
-> local checkout of the same package loads both, and the duplicate registers its
-> tools twice.
-
-To run from this checkout, load the local directories and skip the installed
-catalogue with `-ne`:
-
-```bash
-pi -ne -e ./packages/pi-subagents -e ./packages/pi-workflows
-```
+Scripts choose effort through strengths, not models or a second concurrency policy. See [Workflows](packages/pi-workflows/README.md) and [Subagents](packages/pi-subagents/README.md) for configuration and examples.
 
 ## Package inventory
 
-### Orchestration and agents
+### Orchestration
 
-| Package | What it does |
+| Package | Purpose |
 | --- | --- |
-| `pi-subagents` | Managed subagent runtime — tiers, workflow-owner Fleet groups, queueing, isolation, scheduling, RPC and host-routed background clarification |
-| `pi-workflows` | JavaScript orchestration over those subagents — fan-out, phases, budgets, quality helpers, journal-backed resume |
-| `pi-goal` | Autonomous `/goal` completion, with stable, opt-in ordered queues |
-| `pi-ralph-wiggum` | Long-running agent loops for iterative development |
-| `pi-plan-mode` | Codex-like read-only `/plan` collaboration mode, with an optional implementation model |
-| `pi-agent-guidance` | Loads provider-specific context files (`CLAUDE.md`, `CODEX.md`, `GEMINI.md`) based on the current model, and context files from subdirectories the agent works in |
-| `pi-ask-user-question` | Structured user-question tool for agents |
+| [pi-subagents](packages/pi-subagents/README.md) | Child sessions, tiers, queueing, isolation, scheduling and host-routed clarification |
+| [pi-workflows](packages/pi-workflows/README.md) | JavaScript orchestration, phases, budgets and recovery |
+| [pi-goal](packages/pi-goal/README.md) | Autonomous goals and opt-in ordered queues |
+| [pi-ralph-wiggum](packages/pi-ralph-wiggum/README.md) | File-backed iterative development loops |
+| [pi-plan-mode](packages/pi-plan-mode/README.md) | Read-only planning and optional implementation handoff |
+| [pi-agent-guidance](packages/pi-agent-guidance/README.md) | Provider-specific and subdirectory context files |
+| [pi-ask-user-question](packages/pi-ask-user-question/README.md) | Structured user decisions |
 
 ### Developer tools
 
-| Package | What it does |
+| Package | Purpose |
 | --- | --- |
-| `pi-lsp` | Language-agnostic LSP diagnostics, fixes, navigation and preview-first rename through a shared runner |
-| `pi-github-pr` | GitHub pull request review, checks, and comment status |
-| `pi-code-actions` | Pick code blocks from recent assistant messages to copy or insert |
-| `pi-files-widget` | In-terminal file browser and viewer |
-| `pi-btw` | `/btw` side-question command; parent-history sharing is per-question opt-in. Optional `advisor` tool for a second opinion from a configured reviewer model |
-| `pi-stamp` | Transcript timestamps, assistant metadata, and tool timing |
+| [pi-lsp](packages/pi-lsp/README.md) | Diagnostics, navigation, fixes and preview-first rename |
+| [pi-github-pr](packages/pi-github-pr/README.md) | Pull request review, checks and comments |
+| [pi-code-actions](packages/pi-code-actions/README.md) | Copy or insert assistant code blocks |
+| [pi-files-widget](packages/pi-files-widget/README.md) | File browser, viewer and annotations |
+| [pi-btw](packages/pi-btw/README.md) | Side questions and an optional reviewer model |
+| [pi-stamp](packages/pi-stamp/README.md) | Transcript timestamps, metadata and tool timing |
 
 ### Session and interface
 
-| Package | What it does |
+| Package | Purpose |
 | --- | --- |
-| `pi-statusline` | Theme-native statusline |
-| `pi-input-prefix` | Theme-aware rounded input editor and prompt token |
-| `pi-input-history` | Text-preserving prompt history with grapheme-safe search/highlights and an fzf/atuin-style `Ctrl+R` picker |
-| `pi-welcome` | Startup resource and repository summary card |
-| `pi-session-recap` | While-you-were-away recap above the editor; raw-history requests require explicit model and consent flags |
-| `pi-tab-status` | Terminal tab status indicators and opt-in desktop notifications |
-| `pi-usage-extension` | Usage statistics dashboard |
-
-### Host and provider integration
-
-| Package | What it does |
-| --- | --- |
-| `pi-gpt-fast` | Opt-in OpenAI and Codex priority service tier |
-
-### Opt-in
-
-Publishable, but install them deliberately rather than as part of a default set.
-
-| Package | What it does | Requires |
-| --- | --- | --- |
-| `pi-worktree` | Safe interactive Git worktree management and workspace switching | A project that allows git worktrees |
-| `pi-worktime` | Per-prompt active worktime tracking | — |
+| [pi-statusline](packages/pi-statusline/README.md) | Footer and status inspection |
+| [pi-input-prefix](packages/pi-input-prefix/README.md) | Themed input editor |
+| [pi-input-history](packages/pi-input-history/README.md) | Prompt history and search |
+| [pi-welcome](packages/pi-welcome/README.md) | Startup summary |
+| [pi-session-recap](packages/pi-session-recap/README.md) | While-away recap; raw-history requests require explicit consent |
+| [pi-tab-status](packages/pi-tab-status/README.md) | Terminal title and opt-in notifications |
+| [pi-usage-extension](packages/pi-usage-extension/README.md) | Usage dashboard |
+| [pi-worktime](packages/pi-worktime/README.md) | Opt-in active worktime tracking |
+| [pi-worktree](packages/pi-worktree/README.md) | Opt-in Git worktree management; requires a project that permits worktrees |
+| [pi-gpt-fast](packages/pi-gpt-fast/README.md) | Opt-in OpenAI/Codex priority service tier |
 
 ### Experimental
 
-Marked `piExtension.lifecycle: experimental`, which keeps them out of a release
-unless a changeset names them: `pi-recall`, `pi-codex-compact`, `pi-analytics`,
-[`pi-background`](packages/pi-background/README.md) (session-owned background
-shell jobs and event-driven log monitors; local macOS/Linux only), and
-[`pi-todo`](packages/pi-todo/README.md) (revisioned, branch-local checklists with
-explicit manual controls; not a project backlog or execution scheduler),
-[`pi-sessions`](packages/pi-sessions/README.md) (human-owned history navigation
-and editable linked-session handoff; destination draft only, never auto-send),
-[`pi-rules`](packages/pi-rules/README.md) (project and user rule files: always-on
-guidance, an on-demand index and tool-call reminders or blocks), and
-[`pi-secrets`](packages/pi-secrets/README.md) (reversible placeholders that keep
-secrets out of provider-bound context while tools still get real values).
+Install these deliberately; review each package's requirements and limits first.
+
+| Package | Purpose |
+| --- | --- |
+| [pi-analytics](packages/pi-analytics/README.md) | Derived usage analytics |
+| [pi-background](packages/pi-background/README.md) | Session-owned local shell jobs and log monitors |
+| [pi-codex-compact](packages/pi-codex-compact/README.md) | Codex checkpoint-aware compaction |
+| [pi-recall](packages/pi-recall/README.md) | Session recall |
+| [pi-rules](packages/pi-rules/README.md) | Rule discovery, reminders and tool-call blocks |
+| [pi-secrets](packages/pi-secrets/README.md) | Request-projection secret placeholders |
+| [pi-sessions](packages/pi-sessions/README.md) | Human-owned history navigation and editable handoff |
+| [pi-todo](packages/pi-todo/README.md) | Revisioned session checklists, not a project scheduler |
 
 ### Libraries
 
-Not Pi extensions. They register no resources, hold no state, and are consumed
-as ordinary npm dependencies — never listed in Pi's extension package map.
+These are ordinary dependencies, not extensions to enable in Pi.
 
-| Package | What it does |
+| Package | Purpose |
 | --- | --- |
-| `pi-subagents-protocol` | Side-effect-free wire contracts for the managed subagent protocol |
-| `pi-ui` | Side-effect-free bordered UI, inert display encoding and opt-in public custom-editor preservation adapters |
-
-## Boundaries
-
-Packages communicate through Pi's public APIs and `pi.events`; no extension
-imports another extension's source. Each package owns a defined area — the
-footer, the input editor, the workflow journal, the subagent queue — and
-consumes other packages' state without mutating it.
-
-[`docs/package-boundaries.md`](docs/package-boundaries.md) is the ownership
-matrix, including persistence boundaries and the one-declared-range rule for
-shared rendering dependencies.
+| [pi-subagents-protocol](packages/pi-subagents-protocol/README.md) | Side-effect-free managed-agent wire contracts |
+| [pi-ui](packages/pi-ui/README.md) | Shared UI framing and inert display encoding |
 
 ## Development
 
-```bash
-bun install --frozen-lockfile
-bun run check     # format + lint + typecheck + test
+Use Node 24 and Bun 1.3.14:
+
+```sh
+bun install --frozen-lockfile --ignore-scripts
+bun run check
 ```
 
-Every package owns its own `lint`, `typecheck`, `test`, `format`, and `check`
-scripts, runnable individually. Run `bun run check` before committing.
+<a id="boundaries"></a>
 
-## Release
-
-A change to a published package needs a changeset naming it:
-
-```bash
-bun run changeset
-bun run changeset:status
-```
-
-The Actions workflow opens a Version Packages PR once changes reach `main`;
-merging it publishes only the changed packages, via npm Trusted
-Publishing/OIDC. See [`docs/releasing.md`](docs/releasing.md) for setup,
-bootstrap, rate-limit, and recovery guidance.
-
-The custom packer/publisher is for [new-package bootstrap](docs/releasing.md#new-package-bootstrap) and [partial-release recovery](docs/releasing.md#rate-limits-and-recovery), not normal releases. Bootstrap/token mode requires exactly one selected package. Experimental packages are packed/published only by intentional selection.
-
-See [`LEGAL-NOTICES.md`](LEGAL-NOTICES.md) for retained license handling, and
-[`AGENTS.md`](AGENTS.md) for the repository's authoring rules.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for package ownership, focused checks and contribution rules. Extensions use Pi APIs and validated events, never another extension's source or settings.
 
 ## Documentation
 
-- [Package boundaries](docs/package-boundaries.md): runtime ownership, persistence and shared contracts.
-- [Extension portfolio](docs/extension-portfolio.md): each capability's value, alternatives and conditional use.
-- [Retired packages](docs/retired-packages.md): removed packages, their last versions and replacements.
-- [Ecosystem and host review, 2026-11-01](docs/upstream-review-2026-11-01.md): oh-my-pi and ecosystem study, the Pi 1.4.0 baseline move, retirements and ports.
-- [Upstream review, 2026-10-23](docs/upstream-review-2026-10-23.md): pinned sources, selective ports and deferred candidates.
-- [Compatibility and verification](docs/compatibility.md): tested host, dependency ownership and integration limits.
-- [Design decisions](docs/open-decisions.md): isolation, deferred imports, orchestration and resource admission.
-- [Task and status navigation](docs/status-navigation.md): shell-job views, status-owner actions and the UI protocol.
-- [Release guide](docs/releasing.md): independent versioning, publication and recovery.
+- Package READMEs: installation, commands and package-local references.
+- [Compatibility](docs/compatibility.md): host requirements and verification limits.
+- [Releasing](docs/releasing.md): independent Changesets versions and Trusted Publishing.
+- [Retired packages](docs/retired-packages.md): migration paths.
+- [License](LICENSE) and [third-party notices](LEGAL-NOTICES.md).
