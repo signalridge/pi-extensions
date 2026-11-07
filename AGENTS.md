@@ -57,11 +57,14 @@ setup.
   behavior. Give the technical reason instead.
 - READMEs under `packages/` ship inside the npm tarball and render on npmjs.com.
   Hold them to this rule most strictly.
+- Keep tracked documentation about current use and maintenance. Put one-off
+  audits, research notes, acceptance reports and incident timelines in issues
+  or PR discussions instead; retain required license and attribution notices.
 
 ## Quality
 
 - Use Pi's public APIs and `pi.events` for cross-extension communication.
-- Avoid dynamic imports (except to defer loading a TUI-only dependency out of headless paths — see `docs/open-decisions.md`) and `any`; validate event-bus payloads at package boundaries.
+- Avoid dynamic imports (except to defer loading a TUI-only dependency out of headless paths — see `CONTRIBUTING.md#runtime-boundaries`) and `any`; validate event-bus payloads at package boundaries.
 - Guard TUI-only features with `ctx.mode === "tui"` and dialogs with `ctx.hasUI`.
 - Run `bun run check` before committing.
 - Add tests for state transitions, persistence, event ownership, and recovery behavior.
