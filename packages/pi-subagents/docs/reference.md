@@ -1,0 +1,947 @@
+# pi-subagents reference
+
+[Start with the README](../README.md).
+
+- [Custom agents](#custom-agents)
+- [Tools](#tools)
+- [Model tiers](#model-tiers)
+- [Model scope](#model-scope)
+- [Persistent settings](#persistent-settings)
+- [Parent runtime and notifications](#parent-runtime-and-notifications)
+- [Host-routed clarification (background only)](#opt-in-parent-clarification-background-only)
+- [Scheduling](#scheduling)
+- [UI](#ui)
+- [Observer and foreground handoff](#observer-and-foreground-handoff)
+- [Commands](#commands)
+- [Graceful max turns](#graceful-max-turns)
+- [Concurrency](#concurrency)
+- [Join strategies](#join-strategies)
+- [Events](#events)
+- [Cross-Extension RPC](#cross-extension-rpc)
+- [Persistent agent memory](#persistent-agent-memory)
+- [Worktree isolation](#worktree-isolation)
+- [Skill preloading](#skill-preloading)
+- [Tool denylist](#tool-denylist)
+- [Upstream and local divergence](#upstream-and-local-divergence)
+
+## Custom agents
+
+Define custom agent types by creating `.md` files. The filename becomes the agent type name; a default's name overrides it. Dispatch matches case-insensitively (`explore`, `Explore`, `EXPLORE`); unresolved top-level types use the configured fallback with a note, while nested allowlists fail closed.
+
+Agents are discovered from three locations (higher priority wins):
+
+| Priority | Location | Scope |
+|----------|----------|-------|
+| 1 (highest) | `.pi/agents/<name>.md` | Project — pi's config dir; authoritative, and where `/agents` writes |
+| 2 | `.agents/agents/<name>.md` | Project — the shared cross-tool `.agents` workspace (same convention as `.agents/skills/`) |
+| 3 | `$PI_CODING_AGENT_DIR/agents/<name>.md` (default `~/.pi/agent/agents/<name>.md`) | Global — available everywhere |
+
+Project-level agents override global ones with the same name, so you can customize a global agent for a specific project. If both project locations define the same name, **`.pi/agents/` wins** — `.pi` stays the project authority; `.agents/agents/` is an additional read location for projects that keep their agent assets in the `.agents` workspace. The global location follows Pi's `PI_CODING_AGENT_DIR` setting and can relocate all agent state.
+
+Malformed or unreadable files are skipped with a path-qualified warning by default. If a malformed project file shadows a valid lower-priority definition with the same name, the loader warns which definition survived; set `strictAgentFiles: true` in `subagents.json` to fail closed during the first `session_start` instead. Strict validation and discovery use that session's `ctx.cwd`, not the process cwd, and a failed validation registers no root tools, manager, or RPC responder. Reloads after startup remain lenient; an accidental edit cannot terminate an active session. Unchanged warning keys are suppressed while their discovery root remains in the bounded 64-root cache; if that root is evicted, a later unchanged reload may warn again.
+Interactive agent-file edits are compare-and-commit operations: replacements are written to a flushed temporary file, new files honor the process umask, and all mutations use a package-local, non-expiring atomic lock directory with bounded acquisition retries. Orphaned locks are never stolen; the error names the lock path to inspect/remove. Only writers using this protocol coordinate with these operations. Non-cooperating editors are detected when a content comparison observes their change, but portable Node has no universal filesystem CAS, so this is not a claim of an arbitrary-editor lock.
+
+### Example: `.pi/agents/auditor.md`
+
+This example uses the shipped `high` tier; configure that profile in `subagents.json` for your chosen model/thinking pair.
+
+```markdown
+---
+description: Security Code Reviewer
+tools: read, grep, find, bash
+tier: high
+max_turns: 30
+---
+
+You are a security auditor. Review code for vulnerabilities including:
+- Injection flaws (SQL, command, XSS)
+- Authentication and authorization issues
+- Sensitive data exposure
+- Insecure configurations
+
+Report findings with file paths, line numbers, severity, and remediation advice.
+```
+
+Then spawn it like any built-in type:
+
+```
+Agent({ subagent_type: "auditor", prompt: "Review the auth module", description: "Security audit" })
+```
+
+### Frontmatter fields
+
+All fields are optional — sensible defaults for everything.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `description` | filename | Agent description shown in tool listings |
+| `display_name` | — | Display name for UI (e.g. the agent list, the conversation overlay) |
+| `tools` | all 7 | Which tools the agent can call. Built-in names (`read, grep, …`, or Claude Code's `Read, Glob, MultiEdit, …`), `*` / `all` (all built-ins), `none`, and `ext:<extension>` / `ext:<extension>/<tool>` selectors for extension tools. See [Tool & extension scoping](#tool--extension-scoping) below |
+| `extensions` | `true` | Which extensions to load for the agent. `true` (all child-safe defaults), `false` (none), or an explicit list: `[mcp, "/abs/path.ts", "*"]`. `pi-background` is excluded; intentional selection is refused by name. See [Tool & extension scoping](#tool--extension-scoping) below |
+| `exclude_extensions` | — | Extension denylist applied after `extensions:` — exclude wins. Plain names only (case-insensitive), no paths or `*`. Useful with `extensions: true` to drop one extension (e.g. `pi-notify`) |
+| `skills` | `true` | `true` uses Pi's discovered skills, including skills supplied by loaded extensions; `false` exposes none; a comma-separated list preloads only those named skills into the system prompt (see [Skill Preloading](#skill-preloading) for discovery locations) |
+| `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
+| `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them. Claude Code's `disallowedTools` key and tool names (`Write`, `Glob`) work too; each entry denies that exact name and the built-in it maps to |
+| `ask_tools` | — | Comma-separated tools whose first call requires human approval. Approval permits later calls to that tool across resumed turns of the current in-memory child. It is not persisted: reopening an evicted child from disk or restarting Pi asks again. Without an interactive approver, calls are blocked |
+| `isolation` | — | `worktree` runs in an isolated git worktree; explicit `off` locks ordinary invocations to no worktree |
+| `tier` | none | This agent's default model tier, by name, from `agentTiers.profiles`. A tier passed at the call site overrides it. When set, it chooses the configured model/thinking pair — see [Model tiers](#model-tiers) |
+| ~~`model`~~ | — | **Removed.** An agent no longer chooses its own model; use `tier`. A file that still has it loads normally, with a warning naming it — the line simply has no effect |
+| ~~`thinking`~~ | — | **Removed**, same as `model` above |
+| `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
+| `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
+| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
+| `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd |
+| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
+| `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
+| `inherit_context` | `false` | `true` is refused: the host cannot safely transfer post-hook parent context or pin the child's physical provider endpoint |
+| `run_in_background` | `false` | Run in background by default |
+| `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
+| `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
+
+Frontmatter locks `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation`; call parameters fill unspecified strategy fields. A call-site `tier` overrides the file tier. Retired `model` and `thinking` fields are ignored with a warning naming them, never authoritative model pins.
+
+`inherit_context: true` is rejected before child creation, for top-level, nested, mention-started, and managed agents. A parent's session projection is **pre-hook**: Pi does not expose the post-`context` / `context_with_system` result to this extension, and a child cannot atomically pin the same physical endpoint across virtual/provider routes. A `raw_for` confirmation would not fix that request-time auth/routing race. Pass a deliberately sanitized summary in the Agent task prompt instead; if context must be edited in the parent session, persist a `context_edit` first and still pass only the summary you intend to disclose. Normal calls with `inherit_context: false` are unchanged. Older persisted child sessions containing the inherited-history prompt cannot resume or switch models safely; start a new child session with a sanitized task rather than reopening them.
+
+**Programmatic/legacy model resolution.** This applies to direct code/legacy RPC inputs, not ignored frontmatter `model:`/`thinking:` fields. A compatibility model pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which resolves pi's configured `enabledModels` patterns.)
+
+### Nested subagents
+
+Nested delegation is default-off. Set `allowed_subagents` only on a non-isolated custom agent that owns a real fan-out responsibility:
+
+```yaml
+---
+tools: read, grep, find
+extensions: false
+allowed_subagents: support-file-finder, support-callsite-tracer   # or `all`
+---
+```
+
+**The allowlist is a privilege boundary, not just a routing hint.** A child runs with *its own* `tools:`, `extensions:`, and `isolated:` — the parent's restrictions are not inherited — so delegation grants the parent the union of what the listed agents can do. The read-only agent above can write and run commands through any listed agent that can, and `all` reaches every enabled agent including `general-purpose`. Choose the list as carefully as you would choose `tools:` itself; that is the main reason this is default-off.
+
+`allowed_subagents` is runtime-enforced. A comma-separated list restricts nesting to those types; `all` (or `"*"` / `true`, matching how `extensions:` and `skills:` take booleans) allows any enabled agent; omitted, empty, `none`, or `false` means no nested tools are injected at all. Unknown, disabled, and out-of-list types are rejected rather than falling back — regardless of the project's [fallback agent](#persistent-settings) setting, so a configured fallback can never hand a nested caller an agent outside its allowlist — and a programmatic nested model input is validated against [Model Scope](#model-scope) exactly like a top-level spawn. Result, resume, and steering operations are ownership-scoped, so a parent can control only its own children. Nested records remain internal to that parent and do not appear in top-level tools, lifecycle events, or agent UI — so when a parent finishes, is stopped, or ends a resumed turn, its nested children are stopped with it. They do write their own `.output` transcript (subject to the same `output_transcript` gate), filed under the root session's directory alongside their ancestors', so a nested run can still be inspected after the fact. Their token usage is folded into every ancestor's totals up to the top-level agent (lifecycle events, completion notifications, `/agents`), so nested spend stays attributable at any depth even though the children themselves stay hidden. A nested result that ends `stopped`, `aborted`, or `steered` is labelled as partial, the same guarantee top-level results carry.
+
+The hard cap is depth 2 by default: main session (0) → subagent (1) → nested child (2). Change it project-wide with `maxSubagentDepth` in `subagents.json` (or `/agents → Settings → Nested depth`); `0` or `1` turns nesting off everywhere. An agent already at the cap gets no nested tools at all — not even `get_subagent_result`, since it can never own a child. A child must independently set `allowed_subagents` to delegate again; isolated agents never receive nested tools.
+
+Nested children don't occupy `maxConcurrent` slots — their parent already holds one, and queueing them behind it would deadlock a parent waiting on its own child. The depth cap bounds how *deep* nesting goes, not how *wide*: a parent's only limit on concurrent children is that each spawn costs it a turn. Pair `allowed_subagents` with a `max_turns` on that agent if you want a hard ceiling on its fan-out.
+
+Because a subagent session never activates this extension (that is what keeps a child from building a second agent manager, and it is why nested tools are injected directly instead), a subagent also gets none of the extension's other surfaces: no `/agents` command, no cross-extension RPC handlers, no `subagents:ready` event.
+
+### Child project trust
+
+Root startup and reload also gate this package's project `subagents.json`, `.pi/agents`, `.agents/agents`, and custom tool description on the public project-trust decision. Unknown or throwing trust checks skip project configuration before parsing; global definitions/settings and embedded defaults remain available. Global aliases into denied roots are not treated as global authority. The runner rejects a denied project-owned definition (including the actual fallback definition) before package resolution, even when it requests an extension outside the project or in a global package cache.
+
+On Pi 1.4.0, children capture the parent's public `isProjectTrusted()` decision and configuration root before resolving child resources. Missing or failed trust checks mean denial; children never prompt for or grant project trust. The child passes its derived trust explicitly to `SettingsManager`, governing project settings merging, resource/package discovery, and project MCP configuration. Denied project settings and MCP configuration are not merged. Before the SDK reads native global `settings.json` or `mcp.json`, the child checks their lexical and canonical sources against every retained denied root. A global file or agent-directory alias into a denied root fails child admission, even with extensions disabled; genuine global files and aliases into an approved parent remain usable.
+
+Trust belongs to the **configuration root**, not the tool execution directory. Execution in a worktree with `configCwd` pinned to the trusted parent retains that parent's resources (including MCP configuration), also for nested children. A different configuration root, including a newly copied worktree, is not implicitly trusted. Resource checks retain **all denied ancestor roots**, including the captured parent root whose trust was denied and the child's untrusted `configCwd`. Lexical and canonical path checks apply to explicit, configured, and discovered extension paths before their factories execute, and to discovered/preloaded skills before instruction injection. Changing `cwd`/`configCwd`, naming an explicit parent extension, or using a symlink/package alias cannot re-admit the denied source. Named skill preloading also checks global-root ancestor aliases against all retained denied roots.
+
+Genuine user/global resources outside denied roots remain available subject to the child's normal policy. This is a resource-source and instruction-loading boundary, **not an OS sandbox**: arbitrary allowed global extension code can perform its own I/O or register MCP servers; project trust does not contain that code's behavior. `isolated`, `extensions: false`, named extension selection, and skill restrictions still narrow access independently. Project context files and appended prompts remain suppressed in child resource loading; append-mode agents receive only the parent's already-built system prompt.
+
+### Tool & extension scoping
+
+`extensions:` decides **which extensions load**, `tools:` decides **which tools surface to the LLM**. They compose:
+
+```yaml
+# Default (both omitted): child-safe extensions load, all 7 built-ins surface
+
+tools: read, grep, find           # narrow to listed built-ins; extensions still load
+tools: "*"                        # all 7 built-ins (alias: `all`)
+tools: none                       # zero built-ins (alias: `""`)
+tools: "*, ext:mcp/search"        # built-ins plus one extension tool
+
+extensions: false                 # no extensions load
+extensions: [mcp]                 # only mcp loads
+extensions: ["*", "/abs/foo.ts"]  # all defaults plus one path-loaded extension
+
+exclude_extensions: pi-notify     # everything except pi-notify (with extensions: true)
+
+# Specialist: load one extension, expose only one of its tools, keep built-ins
+extensions: [mcp]
+tools: "*, ext:mcp/search"
+
+isolated: true                    # hermetic: built-ins only, no extensions/skills/context
+```
+
+A few rules the examples don't make obvious:
+
+- `extensions:` is the loading authority, subject to child lifecycle safety. `pi-background` is excluded **before its factory loads**, including under default inheritance and `"*"`; an `extension-error:…` warning names it. Its jobs can wake a retained child after `session.prompt()` finishes, when the manager has marked the record terminal, released its concurrency slot, and removed its worktree. Until manager-owned asynchronous continuation exists, explicitly selecting `pi-background` (by name, alias, package path, or entry path) is refused by name rather than silently dropped. `ext:pi-background` cannot override this boundary and warns as an unloaded selector. Ordinary extensions remain available; parent sessions are unaffected. This does not add or change another extension's settings.
+- `ext:foo` in `tools:` narrows what surfaces; it can't load `foo` on its own. Mismatches fire `extension-error:…` warnings.
+- Any `ext:` entry flips extension tools to an explicit allowlist — unnamed extensions still load (handlers fire) but expose no tools. So `tools: "*, ext:mcp/search"` exposes only `search` from `mcp`, nothing from any other extension.
+- Extension names match case-insensitively (`[Mcp]` = `[mcp]`); tool names in `ext:foo/bar` stay case-sensitive.
+- Extensions that register tools **lazily** work too. MCP-backed extensions typically can't enumerate their tools until their servers connect, so they register from `session_start` or `before_agent_start` rather than at load. Subagent scoping is re-derived as tools appear, including under `ext:` selectors. Scoping does not override Pi's own exposure: `deferred`/`codemode` tools and `defaultActive: false` tools are not activated for the model, and tools deliberately deactivated during a session stay inactive on later turns. Pi may still allow nested `ctx.executeTool()` calls to deferred/codemode tools, but the child's selector and `ask_tools:` approval gate both model-issued and nested calls.
+- A configured `defaultToolTimeoutMs` bounds the public `tool_call` policy and each selected extension handler using one deadline per call, including nested calls and handlers registered later with `pi.on`. On expiry the call is blocked; a Promise race returns control but **cannot cancel side effects** of a misbehaving hook that keeps running. Interactive `ask_tools:` confirmation is human decision time, not tool execution time: the deadline starts after approval. The separate execution timeout can still abort a tool whose `execute()` hangs.
+- When the SDK exports public codemode, tool-search, and MCP factories (as on the verified Pi 1.4.0 baseline), they are included as built-in extensions in children. `extensions: false` omits them; `extensions: [mcp]` selects MCP; `exclude_extensions: mcp` removes it; and `tools: ext:codemode`, `ext:tool-search`, or `ext:mcp/<tool>` narrows their tools like any other extension. Capability checks omit factories that the host does not export; this fallback is not an older-host support guarantee. Whenever extensions are enabled, the child uses Pi's public package resolver to select discovered paths **before** loading factories. Thus an excluded extension cannot register a conflicting `/mcp` command and displace a selected replaceable built-in before filtering. Resolution can perform configured package installs, as Pi's normal loader does, and a selected extension that fails to load is reported rather than silently dropped.
+- Explicit sources are validated separately before canonical deduplication, so a real file plus its file alias, or two package-directory aliases, load once without falsely reporting a missing source. Ownership names are unioned for admission/exclusion, but whole-package priority uses each resource's declaring package; direct entries use the canonical declaring owner. A package that aliases another package's entry does not lose its unrelated entries when the target is explicitly selected. Directory-backed modules are matched to Node's supported module entry without evaluating factories; undeclared siblings are not attributed to that package.
+- An installed **package** extension matches by its package short name (`@scope/pi-subagents` → `[pi-subagents]`), in addition to its path-derived name (a package whose entry is `src/index.ts` also answers to `[src]`). Prefer the package name — the path-derived one is incidental.
+- Plain `tools:` typos fail loudly: `tools: reed, grep` fires `tools-error:…` instead of silently producing an under-tooled agent.
+- Claude Code agent files work as written: built-in names match case-insensitively (`Read` = `read`), `Glob` means `find` and `MultiEdit` means `edit`, and Claude Code tools Pi lacks (`WebFetch`, `Task`) fire the same `tools-error:…` warning. Bare `mcp__…` entries are not yet supported.
+- `exclude_extensions:` wins over `extensions:` and over `ext:` selectors — an excluded extension never loads and a `tools: ext:` entry can't pull it back. Plain names only (no paths, no `*`); a name matching nothing fires an `extension-error:…` warning.
+- `exclude_extensions:` is **not a sandbox**: preselection prevents excluded discovered factories from loading into the child, but resolving configured packages can still install code. Allowed extensions run with the Pi process's permissions. Don't rely on extension selection to contain untrusted packages.
+- Array and string forms are equivalent: `[a, b]` == `"a, b"`.
+
+## Tools
+
+### `Agent`
+
+Launch a sub-agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `prompt` | string | yes | The task for the agent |
+| `description` | string | yes | Short 3-5 word summary (shown in UI) |
+| `subagent_type` | string | yes | Agent type (built-in or custom) |
+| `tier` | string | no | Model tier for this spawn, by name. Overrides the agent's own default tier. Unknown tiers are rejected, not substituted — see [Model tiers](#model-tiers) |
+| `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
+| `run_in_background` | boolean | no | Run without blocking |
+| `resume` | string | no | Agent ID to resume a previous session |
+| `isolated` | boolean | no | No extension/MCP tools |
+| `isolation` | `"worktree"` | no | Run in an isolated git worktree |
+| `inherit_context` | boolean | no | Defaults to `false`; `true` is refused before child dispatch. Put a sanitized summary in `prompt` instead |
+
+### Remembered ordinary-agent continuation
+
+With `rememberAgents` enabled, `Agent({ resume: "<agent-id>", ... })` and an existing `@handle` can continue an ordinary child after eviction or reload. The original ID/handle, native child session, exact saved leaf, parent identity and package-written ownership marker must agree on the current branch. Current trusted definitions and tier policy are resolved again; original invocation restrictions cannot be widened. Isolated continuation requires the original existing, registered, clean checkout, never a replacement worktree or a downgrade to the main checkout. Managed/workflow and nested agents remain under their owners' recovery controls. Parent-clarification channels are runtime-owned and do not qualify for cold reopening. Per-call `isolated` and `isolation` parameters are unsupported on cold resume: omit them to retain the original restrictions and current definition's narrowing, or start a fresh Agent for an isolation transition. Explicit values are rejected before allocation rather than ignored.
+
+Cold sessions become live-resumable only after final route/history admission. Rejected setup or handoff is shut down and disposed, never retained as a live-resume fallback. Shutdown journal writes are included in a finalized receipt only after teardown and renewed native identity, original-route and plain-history validation on the owning parent branch; a rejected route or opaque history cannot mint replacement consent. Native leases also cover foreground resumed runs and remain held through actual run/teardown settlement, including after a bounded manager shutdown returns.
+
+New receipts and native identity markers retain a bounded **catalog-route** identity from the public `AgentSession.model`: provider, API, actual model ID and `baseUrl`. **Only an exact provider/API/model ID/endpoint match in Pi AI's public SDK built-in catalog can establish this proof.** This conservatively excludes custom model IDs even on known endpoints. Configured runtime catalogs are not evidence that a URL is public: a custom URL's path may contain credentials even without user information, query parameters or fragments. Unknown/custom endpoints are omitted from both receipts and ownership markers, not stored with a warning or credential fingerprint. Fresh agents on custom providers still run normally; they simply have no qualified cold-continuation proof. Current policy must resolve to the same qualified identity before a lease/record is claimed, again when queued work starts, and before the native prompt. Missing legacy proof, unknown/virtual routes, changed endpoints or a mismatched native marker refuse continuation with sanitized fresh-Agent guidance. No main or child model/thinking selection is restored or switched to make a receipt match. Headers, credentials and token fingerprints are never retained in route proof.
+
+**This is not physical-endpoint pinning or issuer/profile consent.** Pi 1.5 can substitute an authentication-dependent `baseUrl` at request time after catalog resolution, and its public hooks provide no atomic endpoint pin. Custom provider transport can also route independently. This fence detects catalog-route changes; it does not qualify auth-time endpoint stability. Same provider/model—even the same catalog endpoint—is not proof of cross-profile or cross-issuer replay compatibility. Neither is qualified here. Signed thinking/text/tool content, redacted thinking, deferred handles and unknown replay blocks are conservatively refused on cold reopen, including when raw journal entries were hidden by compaction or context edits. Compaction summaries are SDK string entries; their separately replayed `systemMessage` is checked too. Existing raw-parent-context refusal remains in force. Start a fresh Agent with `inherit_context: false` and an explicitly reviewed, sanitized task summary when continuation is refused.
+
+A native session-file lease remains held until provider/session teardown settles. A crashed owner can leave an orphaned `.subagents-lock`; confirm that its process has exited, inspect the lease, then explicitly remove it before retrying. No elapsed deadline steals a lease. Older/no-receipt, missing, stale and foreign sessions fail closed rather than being adopted, and public callers cannot supply session-file or handle-reclaim capabilities. Continued output appends at the native history boundary rather than replaying old transcript lines.
+
+### `get_subagent_result`
+
+Check status and retrieve results from a background agent.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Agent ID to check |
+| `wait` | boolean | no | Wait for completion |
+| `verbose` | boolean | no | Include full conversation log |
+
+Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
+
+A finished agent's result stays retrievable after its in-memory record is cleaned up (about ten minutes after it finishes) or lost to a reload: every top-level settle, including a foreground `resume`, saves a bounded copy of the final record as a `subagents:record` session entry, and `get_subagent_result` answers from the latest one on the current branch, without the stats or the conversation (`verbose`).
+
+### `steer_subagent`
+
+Send a chat message to a running or queued agent. A running agent receives it after the current tool execution; a queued agent receives it when its session starts.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Agent ID to steer |
+| `message` | string | yes | Message to inject into agent conversation |
+
+### `answer_subagent_question` (main only)
+
+Answer an eligible background child's ordinary clarification: `questionId` is the bounded one-use ID in extension context; `answer` is at most 2,000 characters, an offered `option:N` token for choices, or empty to decline. Forged, expired, cancelled, or stale IDs and unoffered choices are rejected. The tool is never inherited or injected into children and cannot grant permission or override a human rejection.
+
+## Model tiers
+
+An **Agent tier** is one name for a (model, thinking) pair. The host agent picks a
+tier by name and nothing else: the `Agent` tool exposes `tier` and does **not**
+expose `model` or `thinking`, so which model runs is decided by the Agent-tier
+catalogue rather than by the orchestrator improvising per call.
+
+Names are yours. The names below are only an example — `research`,
+`cheap`, `nightly` are equally valid keys. Replace the illustrative provider/model
+values with models available in your environment.
+
+```json
+{
+  "agentTiers": {
+    "defaultTier": "medium",
+    "profiles": {
+      "low":      { "description": "Fast, cheap exploration",       "model": "provider/fast-model", "thinking": "max" },
+      "medium":   { "description": "Ordinary planning and review",  "model": "provider/reasoning-model", "thinking": "max" },
+      "high":     { "description": "Architecture and risky review", "model": "provider/architecture-model", "thinking": "xhigh" },
+      "research": { "description": "Long-context research",         "model": "provider/long-context-model", "thinking": "max" }
+    }
+  }
+}
+```
+
+A profile is all-or-nothing: both `model` and `thinking` are required, and either
+may be the literal `"inherit"` to keep the parent's. `description` is optional and
+defaults to the key; it is what the host reads when choosing between Agent tiers.
+
+### One catalogue, including for workflows
+
+Managed protocol-v4 calls use this same catalogue and resolver. Workflow scripts name only `strength: "low"|"medium"|"high"`; pi-workflows' own `strengths` table maps those words to catalogue keys, never model/thinking values. For example, `{ "strengths": { "low": "cheap-search", "high": "deep" } }` redirects workflow fan-outs without changing Explore's tier. By dispatch, only one tier key remains: the normal resolution, thinking clamp, availability checks and immutable snapshot apply. Unknown tiers fail before dispatch and list the available keys.
+
+Fresh installs ship an effort ladder: `low`, `medium`, `high`. Every shipped
+profile inherits its model, so a new machine gets a working vocabulary without
+this package ever choosing a vendor for you. Those names are also what
+pi-workflows' shipped default table maps its strengths onto — identity, and only
+where you define the name — so a stock machine runs workflows at the strengths
+their scripts asked for. Rename or remove them and that default simply yields
+nothing: a managed call that names no tier uses the agent's own tier, then
+`agentTiers.defaultTier`, and finally falls back to `medium`.
+
+`medium` inherits its model, so on an unconfigured machine that fallback runs on
+the parent session's model. What it buys is a call with a *named* policy, a
+durable resolution snapshot and a scope check — not cheaper work. If you want
+managed work to run somewhere cheaper, set a `defaultTier` whose profile pins a
+model.
+
+That last fallback is scoped to managed calls. It is deliberately **not** the
+catalogue's `defaultTier`: a shipped default that applied to every ordinary spawn
+would silence [`defaultModel`](#defaultmodel) and pin a thinking level on machines
+that configured neither.
+
+So `Default tier` has three settings, not two, and the menu offers all three:
+
+| Setting | Ordinary spawn | Managed workflow call |
+| --- | --- | --- |
+| a tier name | that tier | that tier |
+| `unset` | `defaultModel`, then the parent session | the shipped `medium` |
+| `none` | `defaultModel`, then the parent session | rejected |
+
+`none` is a policy statement, recorded as `noDefaultTier`; `unset` is the absence
+of one. Deleting the profiles has the same effect on managed calls as `none`.
+
+### How the host discovers tiers
+
+The catalogue is rendered into the `Agent` tool description at registration, so
+the host knows the vocabulary before its first call — there is no lookup tool to
+remember. It sees:
+
+```
+Available agent tiers:
+
+- low: Fast, cheap exploration
+  model: provider/fast-model
+  thinking: max
+...
+Default tier: medium
+
+The caller may pass only a tier key. Do not pass model or thinking directly.
+```
+
+A [custom tool description](#persistent-settings) can place it with
+`{{tierList}}`, `{{compactTierList}}` or `{{defaultTier}}`. Tier changes apply on
+the next pi session, since the description is built once at registration.
+
+### Precedence
+
+1. `tier` passed to the `Agent` call
+2. `tier:` in the agent's frontmatter
+3. `agentTiers.defaultTier`
+4. `defaultModel` — a model with no tier attached, for workspaces that want one
+   setting rather than a catalogue
+5. the parent session's model and thinking
+
+An agent cannot pin its own model at any step. `model:`/`thinking:` in
+frontmatter are read only to warn that they are stale, and the built-in agents
+pin nothing either. With nothing configured at all, a subagent runs on the
+parent session's model and thinking level. A parent at `off` runs the subagent
+with thinking off rather than at Pi's per-model or default level.
+
+A **managed workflow call** requires a named policy snapshot rather than the unnamed fallback in steps 4–5, so it gets the shipped `medium` tier after step 3. That profile may inherit the parent model; requiring a named tier does not imply a cheaper physical model or displace ordinary `defaultModel`.
+
+### `defaultModel`
+
+Steps 1–3 are a catalogue; step 4 is one line. Set it when the whole point is
+"subagents run on the cheap model" and there is no second policy to name:
+
+```json
+{ "defaultModel": "anthropic/claude-haiku-4-5" }
+```
+
+It only decides the model — thinking still comes from the parent, because a
+level nobody chose for a specific model is exactly what a tier exists to
+express. Any tier that applies overrides it outright.
+
+Set it from `/agents → Settings → Default model` (Enter opens the picker), or by
+hand. It accepts the same references a tier's `model` does, plus the literal
+`"inherit"`, which is how a project cancels a global `defaultModel` — omitting
+the key inherits whatever the global file set.
+
+Unlike a tier, an unresolvable `defaultModel` does **not** fail the spawn: it
+falls back to the parent model, and the Settings row shows
+`(unavailable, fallback: inherit)`. A tier is refused because someone named that
+policy at the call site; `defaultModel` is the value nobody named, so one
+unauthed provider must not take every spawn on the machine down with it.
+
+### Editing tiers
+
+Manual agent creation saves model/thinking choices through this same catalogue: choose an existing tier, reuse an exact matching pair, or explicitly approve adding a new named tier. Existing tiers are never silently changed. All supported tier thinking values (`inherit`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) round-trip through saved definitions. **Fixed manual `off` is unsupported by the current shared tier schema**: selecting it gives an explicit diagnostic and saves neither an ignored pin nor a translated `inherit`. Parent `off` inheritance remains unchanged. This bounded limitation does not expand or negotiate a new tier protocol.
+
+`/agents → Model tiers` manages the catalogue — new tier, change a tier's model,
+thinking or description, delete one. `defaultTier` lives with the other defaults
+in `/agents → Settings → Default tier`. Both write the project file; the global
+file is never written from the menu.
+
+Two things the menu knows that a hand-edited file does not: the thinking picker
+offers only levels the chosen model supports (the rest get clamped at spawn
+anyway), and a tier dropped as malformed still appears in the list, marked
+`blocked`, so redefining it is one selection rather than an archaeology
+expedition through `subagents.json`.
+
+The `Agent` tool description is built once at registration, so a tier edit
+reaches the model on the next pi session. Resolution itself is live — a spawn
+right after the edit already uses the new profile.
+
+One thing the file format cannot express: a project *deleting* a tier that only
+the global file defines. The menu writes the merged catalogue back to the
+project file, so deleting one of several works, but deleting the last one — or
+clearing a `defaultTier` that only global sets — leaves no `agentTiers` key
+behind, and the global value is inherited again on the next start. Remove it
+from `~/.pi/agent/subagents.json` instead.
+
+### Refusals
+
+A `defaultTier`, or an agent's `tier:`, that names no defined profile is
+reported at **startup**, listing the available keys — a typo there would
+otherwise sit quiet until the first spawn that needed it, possibly minutes into
+a session.
+
+These fail **before** the spawn, with the tier key and where it came from named.
+None of them silently substitutes another model:
+
+- a tier key nobody defined (from the call, the agent file, or `defaultTier`)
+- a profile dropped as malformed during settings load
+- a profile whose model is not available on this machine
+- a syntactically invalid key (blank, whitespace, over 64 characters)
+
+### Merging global and project settings
+
+`~/.pi/agent/subagents.json` supplies the catalogue; `<cwd>/.pi/subagents.json`
+edits it. A project profile replaces its global namesake **whole** — never field
+by field, which would let a project change a model while inheriting a thinking
+level nobody chose for that pair. A project profile that fails validation blocks
+its global namesake rather than reviving it, and `defaultTier` is a simple
+project-over-global override.
+
+### Migrating from `model:`/`thinking:`
+
+Define the Agent-tier profiles once, then replace each agent's `model:`/`thinking:`
+with `tier: <name>`. Files that still carry the old fields load and run — the
+fields are ignored, with a warning naming the file — so the migration can be done
+one agent at a time. Until an agent names a tier it uses `agentTiers.defaultTier`,
+then `defaultModel`, or the parent's model when none is set.
+
+Programmatic callers and the legacy RPC may still pass `model`/`thinking`
+directly. That is the escape hatch for code, not a way to configure an agent.
+
+## Model scope
+
+**Opt-in:** off by default. Enable via `/agents → Settings → Scope models`.
+
+When on, each subagent spawn's effective model is validated against pi's own `enabledModels` list (configured via pi's `/scoped-models` UI). pi-subagents reads that list; it doesn't manage it. Both of pi's settings files are honored: global `~/.pi/agent/settings.json` and project-local `<cwd>/.pi/settings.json`. **Project overrides global** — mirrors pi's `SettingsManager` deep-merge, so a tighter per-project scope (hand-edited into the project settings) is respected.
+
+**Out-of-scope handling depends on source:**
+
+| Model source | Out-of-scope behavior |
+|---|---|
+| Caller-supplied programmatic `model` (only when no Agent tier applies) | Hard error returned to the orchestrator, listing allowed models |
+| Pinned in programmatic agent configuration (not retired frontmatter fields) | Warning toast + the pinned model runs |
+| Parent-inherited (neither set) | Warning toast + parent's model runs |
+
+**Design:** `scopeModels` is a guardrail against unexpected runtime model choices, not a hard policy against user-level config. An applicable Agent tier is checked after its single final resolution; compatibility model inputs are checked only on the no-tier path and cannot override a tier.
+
+**Nested spawns** ([nested subagents](#nested-subagents)) apply the same table against the parent's config root. The hard-error case is identical; the warning cases proceed silently, since a subagent session has no UI to toast to.
+
+**Pattern format:** pi's `enabledModels` entries may use exact `provider/modelId` references, bare IDs or partial names, case-insensitive globs such as `anthropic/*` and `*sonnet*`, and optional `:thinking` suffixes. Non-glob partial names match model IDs or display names, not provider-qualified `provider/partial` references; a glob's thinking suffix is removed before matching, so `custom/*:high` also includes colon-suffixed model IDs. This guard checks only model membership, not the configured thinking level. Malformed non-string entries are ignored without erasing valid entries or disabling a configured project scope. If a configured list resolves to no available models, caller-supplied model choices are refused rather than letting the scope check silently pass; pinned and inherited models retain the warning-and-proceed behavior above.
+
+**No-op safety:** if `enabledModels` is missing or empty in pi's settings, scope check skips entirely — no false positives, no spurious errors.
+
+## Persistent settings
+
+Runtime tuning values set via `/agents` → Settings (max concurrency, default max turns, grace turns, nested depth, fallback agent, default model, default tier, default join mode, scheduling on/off, scope models on/off, strict agent files on/off, disable defaults on/off, output transcript on/off, tool description full/compact/custom, fleet view on/off) persist across pi restarts. Two files, merged on load:
+
+- **Global:** `~/.pi/agent/subagents.json` — your machine-wide defaults. Edit by hand; the `/agents` menu never writes here.
+- **Project:** `<cwd>/.pi/subagents.json` — per-project overrides. Written by `/agents` → Settings.
+
+**Precedence:** project overrides global on any field present in both. Missing fields fall back to the hardcoded defaults (max concurrency `4`, default max turns unlimited, grace turns `5`, nested depth `2`, join mode `smart`, defaults enabled).
+
+The `workflow` settings key is **retired**; a file that still has one is ignored with a warning naming the key. This file holds no workflow routing of its own: a managed `pi-workflows` call arrives naming a key from `agentTiers`, and which key that is was decided on the pi-workflows side by its own `strengths` table — a table of keys into this catalogue, never a second catalogue and never its own `model`/`thinking`. `agentTiers.defaultTier` replaces what `workflow.defaultTier` used to do. See [One catalogue, including for workflows](#one-catalogue-including-for-workflows).
+
+**Default model** (`defaultModel`, unset): the model a non-tiered ordinary subagent runs — see [`defaultModel`](#defaultmodel) for where it sits in precedence, why an unresolvable value falls back instead of failing, and how `"inherit"` lets a project cancel a global default. **Default tier** (`agentTiers.defaultTier`, unset) is the tier applied when neither the caller nor the agent names one; the profiles it selects from live under [`agentTiers`](#model-tiers). It has three settings — a tier name, `unset`, and `none` — which the menu offers separately because the last two behave differently for managed workflow calls; see [Model tiers](#model-tiers) for the table.
+
+**Strict agent files** (`strictAgentFiles`, default `false`): normal startup skips unreadable or malformed agent definitions with a warning that includes the file path. Enable it to fail closed during the first `session_start`, using that session's `ctx.cwd`, with the path in the error instead of silently running a surviving lower-priority override. A failed validation leaves no root manager or RPC responder behind. Reloads after startup remain lenient, so an accidental edit cannot terminate an active session; the setting applies on the next pi session.
+
+**Nested depth** (`maxSubagentDepth`, default `2`): the hard ceiling on [nested delegation](#nested-subagents), counted from the main session (main = 0, its subagents = 1). `0` or `1` disables nesting project-wide regardless of any agent's `allowed_subagents`. Read when a subagent session is built, so a change applies to agents started after it.
+
+**Fallback agent** (`fallbackSubagent`, default `general-purpose`): the agent used when a caller-supplied `subagent_type` doesn't resolve to exactly one enabled agent — unknown, disabled, or ambiguous because two agents differ only by case. Name any enabled agent to route those calls there instead, or set `none` for **strict**, fail-closed dispatch: the call is refused with an error listing the available types, and nothing spawns. Strict mode matters most for background and scheduled calls, which would otherwise start executing a substituted agent before the caller learns anything. Also settable from `/agents → Settings → Fallback agent`. The boolean `false` is accepted as a spelling of `none`, because it would otherwise be dropped as the wrong type and silently leave the permissive default in place. Every other value is read as an agent name, so a mistaken `off` fails loudly at dispatch rather than meaning one thing in the settings file and another in the resolver. A fallback agent that is itself unknown or disabled is a misconfiguration and is reported rather than quietly replaced. Note the default is unchanged and stays permissive by design: with `disableDefaultAgents` and no `general-purpose` of your own, an unresolvable type still resolves to a built-in config carrying *all* tools — set `none` (or name one of your own agents) to close that.
+
+**Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only your project/global custom agents are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
+
+**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+
+**Tool description** (`toolDescriptionMode`, default `"full"`): which Agent tool description the LLM sees. `"full"` is the rich Claude Code-style prompt (~1,400 tokens with the default agents); `"compact"` is ~75% smaller — one-line agent type list, terse usage notes — for small/local models where tool-spec tokens are expensive. Per-option details stay in the parameter descriptions in every mode (the parameter schema is never customizable). Applies on the next pi session.
+
+`"custom"` registers your own description from `<cwd>/.pi/agent-tool-description.md` (project) or `<agentDir>/agent-tool-description.md` (global; project wins). The file is read once at tool registration, so edits also apply on the next pi session. Dynamic parts stay live via placeholders — a static agent list would go stale the moment you add a custom agent:
+
+```markdown
+Launch an autonomous agent. Available types:
+{{typeList}}
+
+Custom agents live in .pi/agents/ or {{agentDir}}/agents/.
+```
+
+Placeholders: `{{typeList}}` (full per-agent descriptions), `{{compactTypeList}}` (first sentence each), `{{agentDir}}`, `{{scheduleGuideline}}` (expands with its own leading newline + `- ` bullet when scheduling is on — place it directly after your last rule line; empty when scheduling is off). Unknown placeholders are left verbatim with a stderr warning; a missing or empty file falls back to `"full"` with a warning. Note the usual trust umbrella: a project-level file shapes the orchestrator's prompt, same as project agents and extensions do.
+
+**Starting point:** copy [`examples/agent-tool-description.md`](../examples/agent-tool-description.md) — it reproduces the default full description exactly (a CI test keeps it in sync), so you can trim from a known-good baseline instead of writing from scratch.
+
+**Example — global defaults for a beefy machine:**
+
+```bash
+mkdir -p ~/.pi/agent
+cat > ~/.pi/agent/subagents.json <<'EOF'
+{
+  "maxConcurrent": 16,
+  "graceTurns": 10
+}
+EOF
+```
+
+Every project now starts with concurrency 16 and grace 10, without ever touching the menu. Individual projects can still override via `/agents` → Settings.
+
+**Failure behavior:** missing file is silent; malformed JSON logs a `[pi-subagents] Ignoring malformed settings at …` warning to stderr; invalid/out-of-range field values are dropped per-field; write failures downgrade the `/agents` toast to a warning with `(session only; failed to persist)`.
+
+## Parent runtime and notifications
+
+Completion reminders remain extension-local while the parent is busy, then merge at a tool-turn boundary; an idle parent gets a short 200 ms coalescing hold. Successful terminal `get_subagent_result` reads consume that attempt's pending reminder. Cancelled/running reads do not consume future completion, unread failures remain eligible, and a resumed attempt gets its own reminder. Existing explicit groups and Claude Code-compatible notification XML remain intact. Messages already handed to Pi cannot be retracted; historical transcript entries are not rewritten.
+
+After a context overflow, a turn started for a completion would resend the same over-window context and fail again, and every failure is a billed request. While the parent's latest meaningful response on the branch overflowed the model's context window (`isContextOverflow` with the current model's window) and no compaction followed it, completions are added to the conversation without starting a turn, question wakes wait, and one warning per overflow episode asks to run `/compact` (or `/codex-compact` when installed) or start a new session. A compaction or a later successful response ends the episode; aborted responses and transient errors (including HTTP 503 and rate limits) do not prove context recovery. Held questions then wake once, after the compaction controller releases; recovery checks local idle for at most 30 seconds without polling the model and is cancelled on retirement.
+
+At a TUI prompt, `@explore find it` can start one background Explore agent, depending on `/agents → Settings → Agent mentions`: `model` drafts the task in a hidden mention-only model turn; `direct` dispatches without that hidden draft; `off` leaves the mention as ordinary input. In `model` mode, a hidden, throwaway turn uses **only the current mention text** to draft the task prompt; it does not receive the parent's conversation, system prompt, other tools, compaction summaries, or context hooks. This prevents raw parent history from reaching a separate provider before request-local privacy hooks can redact it. The resulting Agent spawn is still attributed to the parent; raw `inherit_context: true` is refused before the child starts (see below). For a current origin, the caller may attempt direct dispatch when the hidden turn's result reports neither a spawn nor a refusal. A reported refusal suppresses that fallback, and unavailable-runtime preflight stops dispatch. A pending mention is discarded if you switch sessions or branches before it starts; the off-screen provider turn is cancelled if the switch happens during streaming. An already-started agent is not started twice if a later UI or event update fails.
+
+**Pi runtime requirement:** On hosts where child sessions require the parent's `ModelRuntime`, Pi currently exposes it to extensions only through the registry's private `.runtime` property. If that bridge is missing or incompatible, Agent, mentions, and managed spawns refuse before allocating an ID or making a provider request; they do not silently construct a fresh runtime that would lose custom providers, credentials, or virtual routes. Existing managed idempotency keys remain readable. An explicit child model is validated against the parent runtime *after* final model selection, so a stale `ctx.model` alone does not block a valid physical child model. The error advises updating to a host that exposes the parent runtime, or disabling dispatch until one does.
+
+<a id="opt-in-parent-clarification-background-only"></a>
+## Host-routed clarification (background only)
+
+A **fresh, non-isolated, top-level background** child receives `contact_supervisor` automatically when the host channel is available and Supervisor questions is enabled. Questions go only to the main session, never to a human dialog. There is no per-call routing parameter:
+
+```js
+Agent({
+  subagent_type: "Explore",
+  prompt: "Investigate the schema. Ask only ordinary task clarifications, never approval.",
+  description: "Investigate schema",
+  run_in_background: true,
+})
+```
+
+The child awaits an in-process answer promise. Only its explicit bounded question reaches the main model: sanitized request-local context contains a one-use `questionId`, original `agentId`, and numbered choice tokens. The main-only `answer_subagent_question({ questionId, answer })` accepts free text, an offered `option:N` token, or an empty answer to decline. Display labels are separate from the original choice data returned to the child; duplicate identical answers never resume it twice. Question text is untrusted data, not new instructions or authorization.
+
+The main session first resolves missing reports, internal errors and other questions within existing authorization itself. With a reasonable default it proceeds and briefly explains user-relevant assumptions instead of interrupting. Only a genuine user decision goes to the user: the main session uses the user's language, gives brief background, puts its recommendation first with a reason, and explains the options' consequences. It does not relay internal IDs, file paths, raw errors or the child's wording. Human input or new authorization is not supplied through this clarification channel.
+
+The broker coalesces at most 16 pending questions (one per child), issues at most 64 IDs per session/branch generation, and expires unanswered questions after two minutes. Each question is displayed in hidden request-local context at most once. It requests one normal prepared extension turn only when the root is idle, has no queued messages, has no **observed input/preparation** in progress, is not waiting on a dialog, and has not overflowed its context window; otherwise questions join the next ordinary model context or wake after final `agent_settled`, never at retry-prone `agent_end`. No question means no extra model request. It does not edit genuine user text or images, transfer parent history/credentials into the child, poll a model, persist a separate question history, or automatically retry unanswered questions.
+
+Idle wakes are factory-local authenticated control tokens, not a claim on a familiar sentence. Recognition requires `input.source === "extension"` and an exact namespace/nonce/MAC; an interactive/RPC literal, foreign-namespace extension literal, or invalid MAC remains ordinary input. Admission replaces only the extension-owned input with a distinct frame token. While that admission remains unambiguous, preparation adds an authenticated **empty-content** native custom message as prompt-local frame evidence, never persistent model guidance. Native `message_start` identifies the executing frame; the promptless `agent_start` and old branch messages cannot identify it. Superseding idle genuine input invalidates wake authorization without forgetting accepted control identity; busy input cannot start a competing run, so it leaves the wake intact. Request-local context removes only proven control pairs; verbatim user quotations remain unchanged. Historical proof recognition uses a fixed-size secret and constant recognition state, not an accumulating ledger. At most 16 unresolved or ambiguous admissions are retained independently of the flight; an exhausted admission budget refuses further wakes rather than forgetting unresolved frames.
+
+`before_agent_start` exposes no input source or delivery ID: token text alone cannot prove identity. If genuine INPUT copies an admitted token **before** its preparation reaches this package, both matching frames become ambiguous. That admission is retained inert within the same cap, neither frame receives a control proof or question context, neither is aborted or stripped by token text, and the flight's unannounced questions receive structured no-answer. The extension does not alter literal text or images. Native SDK image normalization can append a hint and resize an attachment; question suppression still requires the first text's authenticated token boundary and its retained ambiguous admission, never generic hint prose. This evidence cannot authorize a control proof or abort. The package cannot atomically cancel the unidentifiable control request before native persistence/provider dispatch. Ambiguous preparations cannot release a genuine input's readiness; idle wakes remain conservatively fenced until session retirement, but later ordinary inputs can still receive new questions normally. An already-prepared wake retains its positive native proof and cannot donate it to a later literal quotation.
+
+An owned request-local `context_with_system` delivery is the ACK. That hook leaves Pi's system messages in place: on Pi 1.4 a changed `context` result folds every mid-conversation system message into the leading one, which would move the cached prompt prefix on every request carrying a question or filtering a wake frame (the same fix as nicobailon/pi-subagents [`f45abdb9`](https://github.com/nicobailon/pi-subagents/commit/f45abdb9640e97411a08c6567df49c4fa18bd235)). A request rewriter that also runs in `context_with_system`, such as `@signalridge/pi-secrets`, covers the appended question text only when this package loads before it. Each question has **one wake attempt**: no ACK within 30 seconds clears only that flight and returns structured no-answer for its still-unannounced questions. Async native authentication rejection and earlier input interception cannot occupy the flight indefinitely or retry acknowledged questions. A superseding genuine prompt retains its own preparation readiness; except for the explicit copied-token ambiguity above, its questions join that prompt or expire normally. Executing-frame ownership separately captures the public `ctx.signal` and its matching native `agent_end`. A competing preparation's busy-failure `agent_settled` cannot clear that frame while the core operation still owns a public signal; only a proven ended and released owner permits cleanup. Native preparation can record inert control tokens and empty frame proofs in ordinary session history; question text and answers are not stored as separate broker entries.
+
+**Public-hook limits:** handlers run in registration/load order. Observed genuine INPUT retires idle readiness synchronously, before later awaits. This package's mention interception releases only its own INPUT-scoped preparation on a native `handled` result; a thrown handler is not handled (Pi reports it and continues), and another concurrently preparing input is never released by that mention. Pi exposes neither an earlier handler's in-progress input nor a generic input-handled/auth-rejection completion notification. External handling/rejection after observation can therefore retain preparation readiness until session retirement; no timer guesses that a genuine prompt is inactive. Unresolved accepted wake preparations also retain their bounded admission slots until preparation arrives or the activation is replaced.
+
+Pi has no cancellable post-preparation/pre-persistence boundary. Pi 1.2+ counts a starting run as busy, so a prompt submitted while a wake prepares is either refused (“already processing”) or queued into that run: steering joins the wake's first request and a follow-up runs after it. Neither invalidates the wake, and neither steering nor follow-up input is discarded by aborting a stale frame. Older hosts can prepare competing prompts concurrently, and those cannot be atomically serialized or cancelled before native persistence through public hooks. Cancellation can leave an inert native control record; a proven invalidated control frame is never reclassified as ordinary instructions or given question context. Abort is issued only after an authenticated native message boundary proves the currently executing owned frame, never from a global accepted-token guess or to stop a genuine/other run. SDK 1.4.0 coverage includes steered, follow-up, and refused input during wake preparation and at user/proof message-start and message-end awaits, copied unprepared tokens with and without images, default AUTO resizing of real 4096x4096 PNGs while another child's question stays pending, and guard-disabled controls. The package preserves observed frame identity but does not guarantee native concurrent-prompt acceptance or atomic pre-persistence cancellation. This is not a private SDK/renderer/history patch.
+
+Answers are **not human approval or permission grants**. `ask_tools`, `createAskGate`, project trust, external permission dialogs, and human rejections are unchanged. A decision outside existing user task authorization must be declined and left to the human. Cancellation (including an aborted main turn), child stop/removal, timeout, navigation, or reload returns structured no-answer/assumption guidance, never approval. Pending IDs capture the public root session-manager identity, session ID, and complete native branch-entry prefix (including non-model metadata) at child channel construction **and at every question invocation from the live root context**, plus the current child attempt. A terminal child's background resume keeps its channel guard but cannot reuse that older prefix as the origin of a new question. Admission, context reads, and answer dispatch validate both live ancestries, not only generation events or model-text projections. Ordinary appends retain ownership; metadata-distinct divergent ancestry retires it even if an earlier asynchronous committed-tree handler has delayed this extension's notification. Old IDs cannot answer a replacement run.
+
+Fresh foreground, nested, managed, scheduled, isolated and cold-reopened children receive no clarification tool; blockers belong in their final result to the host. A retained background child's channel can continue on background resume. Foreground resume remains supported, but its clarification calls immediately receive no answer rather than waiting on the main session that is awaiting it. Remembered children remain reopenable; cold reopening never restores a question channel. Do not call `get_subagent_result(wait: true)` while an ordinary clarification is pending: that blocks the answering model. Nested children cannot call the root answering tool. Managed protocol v4 and existing configuration are unchanged. Timeouts, cancellation, refusal or a missing host never fall back to a human dialog.
+
+Install the changed package and reload/restart Pi to use this feature; an already running older installed package does not acquire new tools or parameters from checkout edits.
+
+## Scheduling
+
+Add a `schedule` field to register the agent to fire later instead of running now:
+
+```
+Agent({
+  subagent_type: "Explore",
+  prompt: "Look at recent commits and summarize what changed since last week",
+  description: "Weekly commit review",
+  schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
+})
+```
+
+Schedule formats:
+
+- **Cron** — 6-field (`second minute hour day-of-month month day-of-week`), e.g. `"0 0 9 * * 1"` for 9am every Monday, `"0 */15 * * * *"` for every 15 minutes.
+- **Interval** — `"5m"`, `"1h"`, `"30s"`, `"2d"`. Fires repeatedly at that interval.
+- **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
+- **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
+
+When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way. The fire also draws itself into the FleetView list, so a scheduled run is visible while it works and not only when it reports.
+
+Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
+
+**Disable the feature entirely**: `/agents → Settings → Scheduling → disabled` removes `schedule` from the `Agent` tool spec (no LLM-context cost), hides the menu entry, and stops any active scheduler. The schema-level removal takes effect on the next pi session; the runtime kill is immediate. Re-enable from the same menu.
+
+Restrictions:
+- `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
+- Scheduled agents always run in the background; explicitly setting `run_in_background: false` is rejected rather than silently changed.
+- Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
+- **Headless `pi -p` doesn't wait for scheduled subagents.**
+
+## UI
+
+Independent agents use FleetView below the editor; `pi-workflows` owns the separate workflow overview. The retired `widgetMode` setting no longer configures an upper widget.
+
+Runs that enter through the scheduler or a cross-extension spawn appear in the
+list too, alongside `Agent`-tool runs.
+
+Every string these surfaces take from a child run — its description, activity preview, error, the `Agent` tool's own result and completion notification, and the conversation overlay's messages, tool results and command output — is text the extension did not author, so it is neutralized before rendering. Fleet, conversation labels and scheduled-job selectors/confirmations/notifications use `@signalridge/pi-ui` display encoding (controls shown as `\\uXXXX`). Transcript previews drop terminal escape sequences, name remaining unsafe code points as `[U+XXXX]`, and replace binary content with a placeholder. These are display copies, not changes to stored prompts, paths, or messages. An agent file's `display_name` and `description` get the same treatment as they are loaded, since a cloned repository supplies them. A subagent that reads a poisoned file or fetches a hostile page cannot repaint or reorder the parent's terminal.
+
+The token field is annotated with two optional signals inside parens:
+- **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, >=85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
+- **`compactions N`** — number of times the session has compacted, when greater than 0. Stays dim; the percent's color carries urgency.
+
+### FleetView
+
+While subagents are running, a Claude Code-style navigable list renders **below** the editor:
+
+```
+  Esc interrupt · ← agents · ↓ manage
+
+  ● main · current
+  ● general-purpose · Sleep then report 1 · running            11s · 13.1k tokens
+  ● general-purpose · Sleep then report 2 · completed          11s · 13.1k tokens
+  ✗ general-purpose · Sleep then report 3 · failed              4s · 2.1k tokens
+  3 more below
+```
+
+Each row leads with a single-column status mark colored by outcome — `●` while a
+run is live or finished cleanly, `✗` for a failure, `⊘` for one that was
+stopped or aborted — so the column scans vertically without reading the labels.
+Status marks are single-column geometric glyphs to avoid double-width font fallback.
+
+The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press down or left to move focus from the prompt into the list. Up and down move the selection, Enter opens the selected agent's live conversation overlay (it auto-updates as the agent works), and Esc (or up above `main`) returns to the prompt. Selecting `main` returns to the normal view. Regular-mode observers use a complete `╭─╮` / `│` / `╰─╯` border; public fullscreen hosts use a terminal-sized observer. Press Enter to chat with a running agent — type a message and Enter to send it (Esc or an empty submit returns). For a queued agent that has no session yet, type `@handle message` in the main prompt; the message is delivered when it starts. Press `x` and follow the displayed explicit confirmation to stop a running agent; holding one key must not confirm it. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures navigation keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+
+Workflow containers and workflow-owned agents do **not** appear in Fleet. `pi-workflows` owns the single rich workflow overview below the editor and `/workflows` remains its authoritative navigator, including childless paused/interrupted runs. Fleet alone handles empty-prompt arrows for independent agents; the workflow overview takes none.
+
+The old group Enter delegation remains available through `/agents → Retained workflow children → <run> → Open workflow inspector`. It enters the workflow owner's optional inspector, where pause/resume/stop remain. `Inspect retained children` opens the observation-only fallback directly; a failed or absent workflow peer also falls back to it. Both paths work with Fleet disabled. The group label `Workflow <runId> · N retained children` counts retained manager records, not total workflow calls or authoritative status. The terminal-height-bounded child list keeps stable-ID selection, Up/Down, PageUp/PageDown, Home/End and Enter to view a conversation; Esc returns from the conversation to the child list. Sessionless queued children remain visible with an explicit unavailable-session message. Completed owned children remain inspectable while retained, independent of the ordinary four-second linger. Duplicate descriptions receive an ID discriminator only when needed. Detached records are excluded, and controls opened on an old thread attempt cannot steer/stop a replacement attempt. `/agents → Agent runs` also retains direct individual-session access, steering and stop; eligible independent foreground agents retain handoff.
+
+Update Workflows and Subagents together for this layout: older Subagents can still duplicate the new workflow overview, while older Workflows retains its upper progress panel with newer Subagents. The optional validated UI bridge and exact-owned-conversation endpoint remain usable by external observers, without a new required managed capability, usage query, legacy-peer guess or second execution/model policy.
+
+Steering rejection (including a child finishing while the composer is open) preserves the draft and shows an error; Esc explicitly discards it. Completed conversation headers fall back to the retained lifetime usage and compaction count when live activity has been removed.
+
+Individual agent results use restrained text status labels:
+
+| State | Example |
+|-------|---------|
+| **Running** | `● running · turns 3 of 30 · tools 3 · 12.4k tokens (8%)` / `⠹ searching, reading 3 files...` |
+| **Completed** | `● completed · turns 8 · tools 5 · 33.8k tokens (62%) · 12.3s` / `Done` |
+| **Wrapped up** | `● wrapped up · turn limit · turns 50 of 50 · tools 50 · 89.1k tokens (84% · compactions 2) · 45.2s` / `Wrapped up at the turn limit` |
+| **Stopped** | `⊘ stopped · turns 3 · tools 3 · 12.4k tokens (8%)` / `Stopped before completion` |
+| **Error** | `✗ failed · turns 3 · tools 3 · 12.4k tokens (8%)` / `Error: timeout` |
+| **Aborted** | `aborted · turns 55 of 50 · tools 55 · 102.3k tokens (95% · compactions 3)` / `Aborted at the turn limit` |
+
+Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
+
+By default, foreground and background agents each stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled text:
+
+```
+Find auth files · completed
+  turns 3 · tools 3 · 12.4k tokens · 4.1s
+  Found 5 files related to authentication...
+  transcript: .pi/output/agent-abc123.jsonl
+```
+
+Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+
+## Observer and foreground handoff
+
+Select a retained agent with a session in /agents to observe it. Scroll up pauses following; Home opens first available history and End/Ctrl+End the latest. Bounded windows retain older-message navigation; ] pages message text and [ returns to its first text page. Enter composes steering and native rejection retains the draft. Controls remain bound to the selected session and complete managed attempt, never a replacement reusing its ID.
+
+Ctrl+B at an empty focused main prompt transfers one eligible foreground agent without restarting it. In its observer, b arms handoff, y confirms; x arms stop, y confirms, Esc cancels. ID, session, transcript and worktree remain unchanged. Managed, nested, resumed and internal-generation tasks are excluded; a full background pool refuses transfer, never exceeds capacity.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/agents` | Interactive agent management menu |
+
+The `/agents` command opens an interactive menu:
+
+```
+Agent runs (2) · 1 running · 0 queued · 1 completed · 0 wrapped up · 0 stopped · 0 aborted · 0 failed
+Agent types (6) · unified list of defaults and custom agents
+Model tiers (3) · the (model, thinking) catalogue
+Create new agent
+Settings
+```
+
+- **Agent runs** — select any retained run with a session to open its conversation viewer. Queued runs without a session remain listed but are not openable until they start; selecting one offers a stop confirmation, and `@handle message` queues a chat message. The summary reports running, queued, completed, wrapped up, stopped, aborted, and failed buckets separately. While a run is still active, press Enter to open the chat composer, then Enter again to send a message that redirects the agent (same mechanism as the `steer_subagent` tool; Esc or an empty submit returns), or press `x` and follow the displayed explicit confirmation to stop/abort it — including **background** agents, which a global Esc can't unambiguously target (Esc still stops a blocking foreground `Agent` call). A stopped agent reports its partial output flagged as incomplete, not as a completion.
+- **Agent types** — unified list with textual source labels (`project`, `global`, and `disabled`). Each row shows the agent's model, and the highlighted agent's full description appears below the list. The model column flags `(unavailable, fallback: inherit)` when a configured model can't be resolved (it would silently inherit the parent model), and shows `(resolved: provider/id)` when it resolves to a different provider or version than configured. Select an agent to manage it:
+  - **Default agents** (no override): Eject (export as `.md`), Disable
+  - **Default agents** (ejected/overridden): Edit, Disable, Reset to default, Delete
+  - **Custom agents**: Edit, Disable, Delete
+  - **Disabled agents**: Enable, Edit, Delete
+- **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
+- **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list with a `disabled` label and can be re-enabled
+- **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do; a sub-agent writes a unique same-directory staging file, and the parent parses and compare-commits it to the target). Any name is allowed, including default agent names (overrides them)
+- **Model tiers** — create, edit and delete the [tier](#model-tiers) profiles. Each row shows what the tier resolves to on this machine (`small — claude-haiku-4-5 · thinking max`), and a tier dropped as malformed is listed as `blocked` so it can be fixed rather than staying invisible. The model picker offers this machine's available models (narrowed to your scope when **Scope models** is on) plus `inherit` and a typed escape hatch; the thinking picker offers only the levels the chosen model actually supports, since the rest would be silently clamped at spawn. Deleting the tier that `defaultTier` names clears the default in the same step
+- **Settings** — configure max concurrency, default max turns, grace turns, default model, default tier, and join mode at runtime
+
+## Graceful max turns
+
+Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
+
+1. At `max_turns` — steering message: *"Wrap up immediately — provide your final answer now."*
+2. Up to 5 grace turns to finish cleanly
+3. Hard abort only after the grace period
+
+Each resumed prompt gets its own counters, not an unlimited continuation or a deduction from prior turns. This applies to foreground/background resumes, nested children, mentions, and reused managed threads. Agent frontmatter remains authoritative; without a per-resume override, the original invocation's turn limit is inherited, falling back to configured defaults. Resume overrides use the same non-negative safe-integer validation as spawning; caller zero cannot disable an inherited/configured cap. An authoritative frontmatter zero remains unlimited, even after an earlier finite invocation. Nested resumes reload the same branch-local definitions as nested spawns, never the root registry; an internal resume without scoped policy retains its admitted invocation budget. A retained session's admitted turn policy, including unlimited, survives later project-default changes; the manager supplies that same effective cap to queued and running progress trackers. The existing token/tool-call caps and tool timeout also apply to resumed prompts. Budgets are event-based: an already-running provider/tool can overshoot within one event or ignore abort; these are not process-isolation guarantees.
+
+Confirmed shutdown retires grouped completion, batch-finalization, held-nudge timers, and invocation-owned foreground spinners before awaiting child teardown. Captured delivery callbacks cannot wake the main model or publish foreground progress afterward, even while a provider ignores abort. Refused or failed resume admissions retire their own UI callbacks; an admitted run owns cleanup until settlement. Mention continuations cannot publish notifications after their root/runtime retires. Managed lifecycle/usage receipts remain available during cooperative shutdown; vetoable navigation attempts do not dispose these resources.
+
+| Status | Meaning | UI treatment |
+|--------|---------|-------------|
+| `completed` | Finished naturally | `completed` |
+| `steered` | Wrapped up at the limit; output may be partial | `wrapped up · turn limit` in warning color |
+| `aborted` | Grace period exceeded | `aborted` in warning color |
+| `stopped` | User-initiated abort | `stopped` |
+
+## Concurrency
+
+Background agents are subject to a configurable concurrency limit (default: 4). Excess agents are automatically queued and start as running agents complete. Queued agents appear in the list once they start.
+
+Foreground agents bypass the queue — they block the parent anyway.
+
+## Join strategies
+
+When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
+
+| Mode | Behavior |
+|------|----------|
+| `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
+| `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
+| `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
+
+**Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
+
+**Configuration:**
+- Configure join mode in `/agents` → Settings → Join mode
+
+## Events
+
+Agent lifecycle events are emitted via `pi.events.emit()` so other extensions can react:
+
+| Event | When | Key fields |
+|-------|------|------------|
+| `subagents:created` | Background agent registered | `id`, `type`, `description`, `isBackground`, optional `owner` |
+| `subagents:started` | Agent transitions to running (including queued→running) | `id`, `type`, `description`, optional `owner` |
+| `subagents:completed` | Agent finished successfully (background and foreground) | `id`, `type`, `durationMs`, `tokens` (lifetime `{ input, output, total }`), `toolUses`, `result`, optional `outputFile`/`owner` |
+| `subagents:failed` | Agent errored, stopped, or aborted (background and foreground) | same as completed + `error`, `status`, optional `outputFile`/`owner` |
+| `subagents:steered` | Steering message sent | `id`, `message` |
+| `subagents:compacted` | Agent's session successfully compacted | `id`, `type`, `description`, `reason` (`"manual"` / `"threshold"` / `"overflow"`), `tokensBefore`, `compactionCount`, optional `owner` |
+| `subagents:scheduled` | Schedule lifecycle change | `{ type: "added" \| "removed" \| "updated" \| "fired" \| "error", … }` (job/agentId/error fields per type) |
+| `subagents:scheduler_ready` | Scheduler bound to session, enabled jobs armed | `sessionId`, `jobCount` |
+| `subagents:ready` | RPC handlers registered and armed — fired on session start; not emitted in a session that excludes pi-subagents | `version: 4`, `capabilities` (`managedSpawn`, `lifecycleOwner`, `ownedStop`, `ownedQuiescence`, `childContext`, `agentTiers`, `managedPolicy` — all required), `routingPolicy` (Agent-tier catalogue + fingerprint) |
+| `subagents:settings_loaded` | Persisted settings applied at extension init | `settings` (merged global + project) |
+| `subagents:settings_changed` | `/agents` → Settings mutation was applied | `settings`, `persisted` (`boolean` — `false` on write failure) |
+
+`tokens.total` = `input + output + cacheWrite`. `cacheRead` is excluded — each turn's `cacheRead` is the cumulative cached prefix re-read on that one API call, so summing per-message would over-count it. Use `contextUsage.percent` (surfaced as `(NN%)` in the agent list) for current context size.
+
+## Cross-Extension RPC
+
+Other pi extensions can spawn and stop subagents programmatically via the `pi.events` event bus, without importing this package directly.
+
+All RPC replies use a standardized envelope: `{ success: true, data?: T }` on success, `{ success: false, error: string }` on failure.
+
+### Discovery
+
+Listen for `subagents:ready` to know when RPC handlers are available:
+
+```typescript
+pi.events.on("subagents:ready", () => {
+  // RPC handlers are registered — safe to call ping/spawn/stop
+});
+```
+
+`subagents:ready` fires only when pi-subagents is actually loaded **and bound** in the current session. A session that excludes it (via an agent's `extensions:`) emits no `subagents:ready` and does not answer the RPC channels — exactly as if pi-subagents were not installed. Treat "no `subagents:ready`" as "not available here" and give discovery a timeout rather than waiting indefinitely.
+
+### Ping
+
+Check if the subagents extension is loaded and get the protocol version and current routing-policy fingerprint:
+
+```typescript
+const requestId = crypto.randomUUID();
+const unsub = pi.events.on(`subagents:rpc:ping:reply:${requestId}`, (reply) => {
+  unsub();
+  if (reply.success) console.log("Protocol version:", reply.data.version, "routing policy:", reply.data.routingPolicy.fingerprint);
+});
+pi.events.emit("subagents:rpc:ping", { requestId });
+```
+
+The reply always carries `version`, `capabilities`, and `routingPolicy`. Anything beyond those is **requested by name** through an optional `include` array, and is sent only to a caller that asked:
+
+```typescript
+pi.events.emit("subagents:rpc:ping", { requestId, include: ["maxConcurrent"] });
+```
+
+`include` accepts up to 8 names; unknown ones are ignored. Today the only one is `maxConcurrent`, the live background-agent pool size — the number of background slots a spawn competes for, which `/agents` can change mid-session, so read it per operation rather than caching it at session start.
+
+Opt-in rather than volunteered, because the envelope is validated with `rejectUnknownKeys`: a field added unconditionally would make every already-published caller reject the handshake and lose the peer entirely. Asking keeps both directions working without a version bump — an older peer answers without the field, and a caller that never asks gets the same envelope it has always parsed. Treat an absent field as "this peer does not publish it" and fall back to your own default; it is not an error.
+
+### Managed spawn (protocol v4)
+
+Workflow-owned orchestration uses the `subagents:rpc:spawn-managed` channel. Its request may include the core identity fields plus an optional Agent `tier`, `toolset`, `excludeTools`, `thread`, and `isolation: "worktree"`. There is no per-call `model` or `thinking` — the wire validator rejects them:
+
+```json
+{
+  "requestId": "request-1",
+  "spawnKey": "run-id/node-id/attempt-1",
+  "type": "Explore",
+  "prompt": "Find the relevant files",
+  "description": "Find relevant files",
+  "tier": "low",
+  "excludeTools": ["workflow", "workflow_control"],
+  "isolation": "worktree",
+  "owner": { "extension": "pi-workflows", "runId": "run-id", "nodeId": "node-id", "attemptId": "run-id/node-id/attempt-1" }
+}
+```
+
+The manager validates and resolves the tier, agent configuration, queue, tool, session, and worktree policy against its own Agent-tier catalogue and model scope. The resolved tier and its snapshot are retained on the managed invocation/tombstone. `spawnKey` is idempotent within a root manager; the same normalized request returns the existing agent id and a conflicting request is rejected. **Recovery exception:** persisted managed tombstones from before schema v2 are quarantined, not replayed. Retrying their original normalized `spawnKey` throws “Managed spawn key is quarantined and cannot be reused” rather than returning the old agent ID. Persisted tombstone schema compatibility is separate from the protocol-v4 handshake. A named managed `thread` re-enters one sequential session only while its effective model, thinking, toolset, denylist, isolation, and agent policy fingerprint remain unchanged — including the model and thinking its tier currently resolves to, so switching the session model interrupts a thread whose tier inherits it; a policy change or concurrent call is rejected rather than silently reusing the old session. Managed agents use the normal Agent execution path, queue, retained conversation UI, activity, transcript, compaction, and lifecycle events; their passive overview belongs to Workflows, not FleetView. Only the automatic main-session completion nudge is suppressed for an owner-scoped record. Managed requests must carry an attempt-scoped owner, and `stop-owned`/`quiesce-owned` fail closed when exact node/generation metadata is missing. During branch replacement, timed-out records are detached and late callbacks are suppressed. Pre-tree bus notifications carry the host navigation attempt's signal so workflow consumers can distinguish retries after a veto; the event payload retains a fallback for an absent signal, without establishing support for older hosts. Active or unsettled child work vetoes a tree-navigation attempt rather than being aborted by that attempt. Pi has no post-veto, pre-leaf commit hook, so work started after preflight during asynchronous summarization can be quarantined at commit but cannot be guaranteed to finish.
+
+### Spawn
+
+Spawn a subagent and receive its ID:
+
+```typescript
+const requestId = crypto.randomUUID();
+const unsub = pi.events.on(`subagents:rpc:spawn:reply:${requestId}`, (reply) => {
+  unsub();
+  if (!reply.success) {
+    console.error("Spawn failed:", reply.error);
+  } else {
+    console.log("Agent ID:", reply.data.id);
+  }
+});
+pi.events.emit("subagents:rpc:spawn", {
+  requestId,
+  type: "general-purpose",
+  prompt: "Do something useful",
+  options: { description: "My task", run_in_background: true },
+});
+```
+
+`options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context.
+
+`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, cleanup is attempted in every repo that received a worktree. Failed preservation or removal retains the worktree reference and recovery diagnostics; inspect and save its contents before repairing Git or retrying cleanup. Agents with `memory:` keep reading/writing the parent project's memory.
+
+### Stop
+
+Stop a running agent by ID:
+
+```typescript
+const requestId = crypto.randomUUID();
+const unsub = pi.events.on(`subagents:rpc:stop:reply:${requestId}`, (reply) => {
+  unsub();
+  if (!reply.success) console.error("Stop failed:", reply.error);
+});
+pi.events.emit("subagents:rpc:stop", { requestId, agentId: "agent-id-here" });
+```
+
+### Optional workflow UI bridge
+
+`@signalridge/pi-subagents-protocol` declares a separate version-1 UI contract: `pi-workflows:ui:query`, `pi-workflows:ui:changed`, `pi-workflows:ui:open`, and `subagents:ui:open-owned`. These are not new required managed capabilities and do not grow the strict v4 ping envelope. Query/change payloads are bounded display projections, not DAG or journal storage. An open request is an explicit user UI action, not an agent dispatch or approval grant.
+
+The conversation opener requires the exact `agentId` plus `{ extension, runId, nodeId, attemptId }`, an active root TUI and a retained session. Admission is acknowledged before the dialog closes; unavailable, foreign, sessionless and stale attempts are refused. Reload, tree replacement and shutdown retire pending UI work. Other peers can remain absent without disabling managed execution.
+
+Owned lifecycle events may additionally carry `managedTokens`, the current attempt's usage. Existing `tokens` remains lifetime usage; Fleet never resets cumulative counters on thread reuse. Managed terminal `tokenCount` describes that attempt, including cache writes, so sequential thread calls do not bill earlier turns twice. Older stored terminal facts are not rewritten.
+
+Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
+Workflow callers should pass a foreground signal only to their own wait. Managed child cancellation is explicit through the owner-scoped lifecycle RPC; aborting an RPC wait does not abort the child.
+
+## Persistent agent memory
+
+Agents can have persistent memory across sessions. Set `memory` in frontmatter to enable:
+
+```yaml
+---
+memory: project   # project | local | user
+---
+```
+
+| Scope | Location | Use case |
+|-------|----------|----------|
+| `project` | `.pi/agent-memory/<name>/` | Shared across the team (committed) |
+| `local` | `.pi/agent-memory-local/<name>/` | Machine-specific (gitignored) |
+| `user` | `<agentDir>/agent-memory/<name>/` (default `~/.pi/agent/agent-memory/`, honors `PI_CODING_AGENT_DIR`) | Global personal memory |
+
+The `user` scope previously hardcoded `~/.pi/agent-memory/`. If that legacy directory exists for an agent and the new location doesn't, it keeps being used — existing memories aren't orphaned.
+
+Memory uses a `MEMORY.md` index file and individual memory files with frontmatter. Agents with write tools get full read-write access. **Read-only agents** (no `write`/`edit` tools) automatically get read-only memory — they can consume memories written by other agents but cannot modify them. This prevents unintended tool escalation.
+
+The `disallowed_tools` field is respected when determining write capability — an agent with `tools: write` + `disallowed_tools: write` correctly gets read-only memory.
+
+## Worktree isolation
+
+Set `isolation: worktree` to run an agent in a temporary git worktree:
+
+```
+Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
+```
+
+The agent gets a full, isolated copy of the repository. On completion:
+- **No changes:** worktree is cleaned up automatically
+- **Changes made:** changes are committed to a new branch (`pi-agent-<id>`) and returned in the result
+- **Agent committed its own work:** the branch is created at the agent's HEAD, preserving its commits (uncommitted leftovers are committed on top first)
+
+The automatic preservation commit uses `--no-verify`, so local pre-commit hooks can't block it — the commit is local-only and never pushed, and pre-push/server-side hooks still apply.
+
+If the worktree cannot be created (not a git repo, no commits, or `git worktree add` fails), the `Agent` tool returns a clear error instead of running unisolated — `isolation: "worktree"` is a strict guarantee, not a hint. Initialize git and commit at least once, or omit `isolation`.
+If status, commit, or both preservation-branch attempts fail, cleanup retains the checkout and its Git registration; it does not attempt destructive error cleanup. The result keeps the worktree path, diagnostic, and non-destructive inspection/recovery guidance. Inspect and copy the checkout, including untracked files, before repairing Git or retrying cleanup. After preservation (or confirming no changes), cleanup uses `git worktree remove --force` without overriding Git worktree locks and reports success only after verifying both directory removal and deregistration. A missing checkout with a retained registration reports failure because its detached HEAD, reflog, or index may still be recoverable. A metadata-only helper locks an observed missing registration with a fixed recovery reason so later sessions and Git pruning retain it, even when provider, native-input, child-teardown, or descendant pins prevent checkout cleanup. Existing locks are preserved and never automatically unlocked. Failure to establish a recovery lock is reported explicitly and requires manual recovery. A repeated call after verified directory removal and deregistration is a successful no-op. A removal failure reports the preservation branch when one was created; no direct filesystem-removal fallback runs. At session shutdown, failed removals are retried deepest-first while dependent ancestors remain pinned, and global orphan pruning across all targets is deferred while any worktree reference remains attached; late provider continuations are quarantined, and remaining failures are reported as immutable path- and repository-specific diagnostics via `getWorktreeCleanupFailures()`.
+
+The child prompt also states that the temporary worktree is the only writable checkout and names the original base repository as off-limits. This prevents inherited parent instructions from sending the agent back into the shared tree.
+
+## Skill preloading
+
+Skills can be preloaded by name and injected into the agent's system prompt:
+
+```yaml
+---
+skills: api-conventions, error-handling
+---
+```
+
+**Discovery roots** (checked in this order, first match wins). Both project roots are skipped when the child's configuration project is untrusted or trust is unknown; global named skills still preload unless their lexical or canonical source belongs to either the captured denied parent root or the untrusted child configuration root. Skill names are not explicit paths and cannot bypass that decision:
+
+| Scope | Path | Source |
+|---|---|---|
+| Project | `<cwd>/.pi/skills/` | Pi-standard |
+| Project | `<cwd>/.agents/skills/` | [Agent Skills spec](https://agentskills.io/integrate-skills) |
+| User | `$PI_CODING_AGENT_DIR/skills/` (default `~/.pi/agent/skills/`) | Pi-standard |
+| User | `~/.agents/skills/` | [Agent Skills spec](https://agentskills.io/integrate-skills) |
+| User | `~/.pi/skills/` | Legacy (pre-Pi) |
+
+**Per root, a skill named `foo` resolves to the first of:**
+
+- `<root>/foo.md` — flat file at the top level
+- `<root>/foo/SKILL.md` — directory skill (top-level)
+- `<root>/*/.../foo/SKILL.md` — directory skill, found by recursive descent
+
+Recursion skips dotfile directories and `node_modules`. A directory that itself contains a `SKILL.md` is treated as a single skill — we don't descend into it. Traversal is byte-order sorted for deterministic resolution across filesystems.
+
+**Security:** symlinks are rejected at every layer (root, flat file, skill directory, `SKILL.md` inside a skill directory) — intentional deviation from Pi, which follows symlinks. Skill names with path-traversal characters (`..`, `/`, `\`, spaces, leading dot, >128 chars) are rejected.
+
+## Tool denylist
+
+Block specific tools from an agent even if extensions provide them:
+
+```yaml
+---
+tools: read, bash, grep, write
+disallowed_tools: write, edit
+---
+```
+
+This is useful for creating agents that inherit extension tools but should not have write access.
+
+## Upstream and local divergence
+
+Derived from [tintinweb/pi-subagents](https://github.com/tintinweb/pi-subagents); the upstream MIT license is preserved. The FleetView editor-focus fix from [commit `7da6bef828d7582ee33386ece9379c170e7742c4`](https://github.com/tintinweb/pi-subagents/commit/7da6bef828d7582ee33386ece9379c170e7742c4) (2026-10-09, #374; reported by @BarrMan) is selectively ported: callable `getText`/`setText` identifies non-inheriting custom editors without taking dialog or selector keys. No clone-parent-history behavior is imported; raw `inherit_context: true` remains refused. This fork also excludes `pi-background` from child resource loading until asynchronous child continuation has manager-owned lifecycle accounting.
+
+The container-first FleetView and bounded drill-down patterns are independently adapted from tintinweb/pi-subagents at [`221df02323c6b6350ea8474579e0ee0f6cc84cea`](https://github.com/tintinweb/pi-subagents/tree/221df02323c6b6350ea8474579e0ee0f6cc84cea/src/ui) and [`fd8d81618d80ae83a3faf40cb87dae99cca33264`](https://github.com/tintinweb/pi-subagents/tree/fd8d81618d80ae83a3faf40cb87dae99cca33264/src/ui). Collision-only child-label discriminators are inspired by [nicobailon/pi-subagents `69673c7fbf3351e54a5b0786a7e9d9fff625a749`](https://github.com/nicobailon/pi-subagents/blob/69673c7fbf3351e54a5b0786a7e9d9fff625a749/src/tui/render-helpers.ts). The workflow engine and phase inspector remain owned by `pi-workflows`, not copied into this package. A separate optional, validated UI protocol opens that owner's inspector from explicit retained-child navigation; workflow overview rendering now belongs entirely to `pi-workflows`. Without that peer, retained groups keep the observation-only child list under `/agents`. No workflow source imports, inferred DAG state or second queue/model policy are introduced. The managed protocol remains v4.
+
+Resume-budget and shutdown parity fixes selectively adapt upstream work at [`d7c9ec0`](https://github.com/tintinweb/pi-subagents/commit/d7c9ec0b027b91c7ab9da0fa5f4ae203474a5bdf), [`ca93a52`](https://github.com/tintinweb/pi-subagents/commit/ca93a5247e72e7053fcd10bea7125d6c4205f949) (unreleased after the 0.22 tag), and [`83be963`](https://github.com/tintinweb/pi-subagents/commit/83be963a969eb359af29cbbb4d4af2d01748bfb5) (released in 0.22). They retain this fork's manager-owned sessions, resource budgets, activity accounting, and protocol v4; the integrated upstream engine is not imported.
+
+Three bounded parity fixes selectively adapt upstream [`fc1ddb3`](https://github.com/tintinweb/pi-subagents/commit/fc1ddb3f0bb289232fd531607b7cbe4c7e4c5f6f) / [`bb7d208`](https://github.com/tintinweb/pi-subagents/commit/bb7d2082235a61169c30d6e05de370cba95da62d) (definition isolation on ordinary RPC/registry spawns, including explicit false/off), [`084d177`](https://github.com/tintinweb/pi-subagents/commit/084d177cfa71a9ce75da5dc69c505b4adbef32b4) (final no-tier model scope), and [`2f8dd3a`](https://github.com/tintinweb/pi-subagents/commit/2f8dd3a3a16fcbad7a5105cbfacb1b722fe04c24) (completion-notification snapshots before delayed delivery). Managed requests retain their request-first filesystem-isolation policy; internal zero-tool generation remains authoritative. Tier resolution still owns the winning model policy, and consumed completions cannot suppress a later resumed attempt. Completion delivery also adapts that commit's parent-boundary outbox: pending completions stay cancellable until tool-turn/idle handoff and coalesce into one steering message per boundary. Protocol v4, approvals, ownership, raw-history refusal, explicit groups, and smart grouping remain local contracts.
+
+The host-routed clarification broker is locally implemented. It uses the existing main session, not an upstream LLM arbitrator, cloned parent history, private UI automation, or an additional Agent per question. Permission gates remain human-owned.

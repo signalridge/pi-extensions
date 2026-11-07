@@ -1,15 +1,13 @@
 # pi-tab-status
 
-Manage as many parallel Pis as your mind can handle without forgetting any of them.
-
-Adds a compact status to tab titles:
+Compact status in Pi terminal-tab titles:
 
 - The optional `ridgeline` style uses `pi · project · working|done|review|blocked`.
 - The default `legacy` style keeps the original emoji indicators: ✅ committed, 🚧 review needed, 🛑 blocked/error, and `running...` while active.
 - `blocked` means no messages or tool calls for 180s while running, or an agent error. A tool that is still executing keeps the tab in `running...` even when it emits no intermediate events, so a long command is never reported as blocked.
 - A run you abort, for example with Escape, returns the tab to its bare `pi - project` title instead of showing it as done or review. Pi 1.1 and later report the abort on `agent_settled`; with older hosts it is inferred from the run's last stop reason.
 
-The more tabs you have open, the better it is. **Currently tracks one active session per tab.**
+Tracks one active session per tab.
 
 ![tab-status](assets/tab-status.png)
 
@@ -19,23 +17,6 @@ The more tabs you have open, the better it is. **Currently tracks one active ses
 
 ```bash
 pi install npm:@signalridge/pi-tab-status
-```
-
-```bash
-pi install npm:@signalridge/pi-tab-status
-```
-
-Then filter to just this extension in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "packages": [
-    {
-      "source": "npm:@signalridge/pi-tab-status",
-      "extensions": ["tab-status.ts"]
-    }
-  ]
-}
 ```
 
 ### Local clone
@@ -51,6 +32,8 @@ Or add to `~/.pi/agent/settings.json`:
   "extensions": ["./packages/pi-tab-status/tab-status.ts"]
 }
 ```
+
+## Settings
 
 Set the original Signalridge style with:
 
@@ -96,11 +79,6 @@ To avoid double alerts:
 
 The tab title behaves the same whether or not notifications are enabled.
 
-## Todo
-
-- [x] Status indicators in terminal tabs
-- [ ] Central location to view and navigate to specific tabs across terminal windows
-
 ## Provenance
 
 The desktop notifications adapt two MIT-licensed sources: the per-terminal
@@ -110,13 +88,9 @@ commit `a17c63e`), and settling on `agent_settled` rather than `agent_end` from
 Pi's `packages/coding-agent/examples/extensions/notify.ts` in
 [`earendil-works/pi`](https://github.com/earendil-works/pi) (commit `25426f7`).
 
-The local version diverges: it is off unless `PI_TAB_STATUS_NOTIFY` enables it
-and accepts a forced protocol; it notifies only in TUI sessions, skips aborted
-runs and also notifies once per entry into this package's stalled `blocked`
-state; it strips control characters, bidi overrides and `;` from both fields
-and caps their length; it also recognizes iTerm2 through `LC_TERMINAL`; and it
-drops the Windows PowerShell toast and the shell sound hook, so it never starts
-a process.
+Local divergence is the opt-in, TUI-only notification policy described above, plus control/bidi/`;` stripping and bounded title/body lengths, `LC_TERMINAL` iTerm2 detection, and omission of process-based Windows toast/sound hooks.
+
+<a id="todo"></a>
 
 ## Changelog
 

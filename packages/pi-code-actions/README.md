@@ -13,11 +13,7 @@
 pi install npm:@signalridge/pi-code-actions
 ```
 
-```bash
-pi install npm:@signalridge/pi-code-actions
-```
-
-Then filter to just this extension in `~/.pi/agent/settings.json`:
+Optional resource filtering in `~/.pi/agent/settings.json` (the manifest already loads only this extension):
 
 ```json
 {

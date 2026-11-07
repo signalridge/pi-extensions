@@ -8,22 +8,7 @@ Pi cannot change its parent process working directory with `cd`. This extension 
 
 This package is the full interactive worktree manager. It is publishable and stable, and opt-in: install it only if your project allows git worktrees. Some repositories forbid them outright — a worktree placed inside the source tree can be picked up by tooling that scans the tree, so check your repository's own guidance before enabling it.
 
-## Features
-
-- Shows compact main, linked, current, detached, locked, and prunable state in worktree selectors.
-- Creates a new branch worktree or attaches an existing unoccupied local branch.
-- Rejects occupied targets and unresolvable symbolic-link ancestors before Git can create a branch.
-- Suggests `~/.worktrees/<main-worktree-name>/<branch>` by default and lets the user configure the root interactively.
-- Optionally switches Pi into a newly created worktree while continuing the current conversation.
-- Switches among existing registered worktrees through Pi's public session replacement API.
-- Removes unlocked, non-current linked worktrees and preserves their branches.
-- Refuses removal when tracked, untracked, manually index-flagged, submodule, or current unreachable detached-commit data may be lost.
-- Refuses removal when ignored local data such as `node_modules/` is present; remove it manually before retrying.
-- Names recovery-only administrative commits in the destructive confirmation instead of making ordinary rebase/reset history block cleanup forever.
-- Always previews stale metadata before pruning it and revalidates the preview after confirmation.
-- Runs Git through argv-based subprocess calls, without interpolating user input into shell commands.
-
-Stdin Git cancellation and timeout use bounded TERM/KILL escalation on the captured process handle. If termination remains unconfirmed, equivalent cwd/argv invocations are blocked until every failed live handle exits, including when multiple invocations were already concurrent. A late exit releases only its own handle; no saved PID is adopted or signaled. Captured output and signal failure diagnostics remain available for recovery.
+Git uses argv-based subprocess calls, not shell interpolation. Stdin Git cancellation and timeout use bounded TERM/KILL escalation on the captured process handle. If termination remains unconfirmed, equivalent cwd/argv invocations are blocked until every failed live handle exits, including when multiple invocations were already concurrent. A late exit releases only its own handle; no saved PID is adopted or signaled. Captured output and signal failure diagnostics remain available for recovery.
 
 ## Install
 
@@ -40,9 +25,10 @@ pi -e npm:@signalridge/pi-worktree
 Try this package locally from the repository root:
 
 ```bash
-just try worktree
-# or: pi -e ./packages/pi-worktree
+pi -e ./packages/pi-worktree
 ```
+
+<a id="features"></a>
 
 ## Usage
 
@@ -52,7 +38,7 @@ Run the command without arguments:
 /worktree
 ```
 
-Choose one action:
+Selectors show main, linked, current, detached, locked and prunable state. Choose one action:
 
 - **Add worktree** — enter a branch, optional start point, and optional path; the confirmation names the branch, base ref, full base commit, and target path before creation, then optionally switch.
 - **Switch worktree** — select another existing worktree and continue this Pi conversation there.
@@ -84,7 +70,7 @@ On Windows, the equivalent default is such as `C:\Users\Alice\.worktrees`. Branc
 
 Leave the path input blank to accept the suggestion. A custom absolute path is used directly; a custom relative path is resolved from the current Pi cwd. The target itself must not exist, and its nearest existing ancestor must resolve without a broken or looping symbolic link. Existing registered worktrees are never moved when this default changes.
 
-The MVP does not expose `--force`, `-B`, `--detach`, `--orphan`, or lock options.
+The command does not expose `--force`, `-B`, `--detach`, `--orphan`, or lock options.
 
 ## Worktree root settings
 
@@ -146,33 +132,13 @@ Use Git directly when you intentionally need force removal, branch deletion, cus
 - Project trust and cwd-bound extension/resource loading during a switch remain owned by Pi.
 - The extension registers no LLM tool, background watcher, project settings, or statusline item.
 
-## Package layout
+<a id="package-layout"></a>
 
-```text
-packages/pi-worktree/
-├── src/
-│   ├── index.ts
-│   ├── command.ts
-│   ├── git.ts
-│   ├── session.ts
-│   ├── settings.ts
-│   └── worktree.ts
-├── test/
-│   ├── command.test.ts
-│   ├── git.integration.test.ts
-│   ├── git.test.ts
-│   ├── remove-ignored-command.test.ts
-│   ├── session.test.ts
-│   └── settings.test.ts
-├── package.json
-├── README.md
-├── LICENSE
-└── tsconfig.json
-```
+Source entrypoint: `src/index.ts`.
 
 ## Local divergence
 
-This fork retains the guarded inventory, quarantine, metadata-pruning, and process-ownership safeguards described above. Git capture budgets count combined stdout/stderr bytes per operation: metadata 64 KiB, inventories 8 MiB, and mutations 1 MiB. Incomplete output is rejected before parsing or expected-nonzero fallback, including sparse-checkout rule checks. An incomplete inventory never authorizes deletion. Mutation overflow may occur after Git commits its change: inspect `git worktree list` and affected paths before retrying; the extension does not automatically roll back that uncertain outcome. Stdin capture handles fragmented UTF-8 and uses the same bounded TERM/KILL/drain ownership on overflow as on cancellation and timeout.
+Derived from [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions); the MIT license is retained. This fork retains the guarded inventory, quarantine, metadata-pruning, and process-ownership safeguards described above. Git capture budgets count combined stdout/stderr bytes per operation: metadata 64 KiB, inventories 8 MiB, and mutations 1 MiB. Incomplete output is rejected before parsing or expected-nonzero fallback, including sparse-checkout rule checks. An incomplete inventory never authorizes deletion. Mutation overflow may occur after Git commits its change: inspect `git worktree list` and affected paths before retrying; the extension does not automatically roll back that uncertain outcome. Stdin capture handles fragmented UTF-8 and uses the same bounded TERM/KILL/drain ownership on overflow as on cancellation and timeout.
 
 ## License
 

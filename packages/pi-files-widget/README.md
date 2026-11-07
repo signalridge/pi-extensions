@@ -12,6 +12,8 @@ Directory symlinks are shown with a `↗` marker and can be expanded like normal
 pi install npm:@signalridge/pi-files-widget
 ```
 
+<a id="dependencies-required"></a>
+
 Required deps (needed for /readfiles):
 
 ```bash
@@ -29,11 +31,7 @@ On other systems, install [bat](https://github.com/sharkdp/bat#installation),
 [glow](https://github.com/charmbracelet/glow#installation) with your package
 manager. The `bat`, `delta` and `glow` commands must be on your `PATH`.
 
-```bash
-pi install npm:@signalridge/pi-files-widget
-```
-
-Then add to `~/.pi/agent/settings.json`:
+Optional resource filter in `~/.pi/agent/settings.json` (installation already loads the manifest's extension):
 
 ```json
 {
@@ -46,7 +44,7 @@ Then add to `~/.pi/agent/settings.json`:
 }
 ```
 
-**Local clone:**
+**Local-clone alternative** (use one source, not both):
 
 Add to your Pi extensions list:
 
@@ -74,13 +72,7 @@ Then reference it in your settings:
 }
 ```
 
-## Dependencies (required)
-
-- `bat`: syntax highlighting
-- `delta`: formatted diffs
-- `glow`: markdown rendering
-
-The `/readfiles` browser requires these tools and will refuse to open until they are installed.
+`/readfiles` refuses to open without the dependencies above: bat for highlighting, delta for diffs and glow for Markdown.
 
 The browser is TUI-only. Retained browser callbacks and polling retire their resources when the live context leaves TUI mode or loses UI access, even before this extension's next session handler runs. Retirement does not close a replacement UI or send comments, notifications, or Git requests.
 

@@ -1,6 +1,6 @@
 import { type ExtensionAPI, type ExtensionContext, SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ParentQuestionBroker, registerParentQuestions } from "../src/parent-questions.js";
+import { PARENT_QUESTION_INSTRUCTION, ParentQuestionBroker, registerParentQuestions } from "../src/parent-questions.js";
 import { createSupervisorTool } from "../src/supervisor.js";
 
 afterEach(() => vi.useRealTimers());
@@ -10,6 +10,18 @@ function questionId(broker: ParentQuestionBroker): string {
 }
 
 describe("parent clarification broker", () => {
+  it("asks the host to resolve internal issues and present only real user decisions plainly", () => {
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("UNTRUSTED DATA");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("Resolve each yourself first");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("reasonable default");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("language the user has been using");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("recommended option first");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("brief background");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("concrete consequence");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("never relay internal IDs, file paths, raw errors");
+    expect(PARENT_QUESTION_INSTRUCTION).toContain("never override a human rejection");
+  });
+
   it("keeps raw choices separate from bounded sanitized display and answers only once", async () => {
     const changed = vi.fn();
     const broker = new ParentQuestionBroker(changed);
@@ -71,7 +83,7 @@ describe("parent clarification broker", () => {
 
   it("injects parent contact without a human UI and returns structured decline", async () => {
     const broker = new ParentQuestionBroker(vi.fn());
-    const tool = createSupervisorTool({ agentLabel: "child", parentQuestion: (question, choices, signal) => broker.request(owner(), question, choices, signal) })[0];
+    const tool = createSupervisorTool({ parentQuestion: (question, choices, signal) => broker.request(owner(), question, choices, signal) })[0];
     const reply = tool.execute("contact", { question: "Which?" }, undefined, undefined, {} as ExtensionContext);
     expect(tool.description).toContain("Never use this channel for permission");
     broker.answer(questionId(broker), "");

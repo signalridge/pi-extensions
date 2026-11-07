@@ -134,6 +134,21 @@ function savedRecord(parent: SessionManager, id: string): AgentRecord & { reopen
 }
 
 describe("cold ordinary Agent continuation", () => {
+  it("keeps default background children reopenable without restoring their question channel", async () => {
+    const activation = await activate();
+    const created = await activation.call({ subagent_type: "Explore", prompt: "first", description: "background", run_in_background: true });
+    const id = (created.details as { agentId: string }).agentId;
+    await manager.getRecordMutable(id)!.promise;
+    expect(vi.mocked(runAgent).mock.lastCall?.[3]).toMatchObject({ supervisorQuestions: "parent", parentQuestion: expect.any(Function) });
+    expect(savedResumableAgents(activation.parent.getBranch(), activation.parent.getSessionId()).some(entry => entry.id === id)).toBe(true);
+    await evict();
+    expect(manager.getRecordMutable(id)).toBeUndefined();
+    const result = await activation.call({ resume: id, prompt: "continue" });
+    expect((result.details as { agentId: string }).agentId).toBe(id);
+    expect(vi.mocked(runAgent).mock.lastCall?.[3]).toMatchObject({ supervisorQuestions: false });
+    expect(vi.mocked(runAgent).mock.lastCall?.[3].parentQuestion).toBeUndefined();
+  });
+
   it("reopens after eviction with stable ID/handle and appends the transcript exactly once", async () => {
     const a = await initial();
     const old = manager.getRecordMutable(a.id)!;

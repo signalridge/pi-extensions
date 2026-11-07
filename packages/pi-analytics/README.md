@@ -7,22 +7,13 @@
 
 Healthy startup, reload, and resume do not emit an experimental warning. Storage initialization and write failures still report actionable warnings.
 
-`@signalridge/pi-analytics` is independently publishable and opt-in: it is marked `piExtension.lifecycle: experimental`, so it is released only when a changeset names it and is never enabled for you automatically.
+The package is opt-in and never enabled automatically.
 
 `@signalridge/pi-analytics` is a local-first [Pi coding agent](https://pi.dev) extension that counts model calls, skill activations, tool activity, and observed provider errors without storing conversation or tool content.
 
-## Features
+<a id="features"></a>
 
-- Starts collecting settled Pi response cycles after installation with no configuration or startup I/O.
-- Breaks skill activations down by explicit user invocation, model loading, provider, and model.
-- Counts tool calls, failures, average duration, and model attribution.
-- Reports logical LLM calls per response with average, median, P95, maximum, and distribution buckets.
-- Reviews requested versus explicitly reported model IDs, with a bounded preview and searchable pair details.
-- Separates HTTP 429/5xx responses, conservative connection-error categories, recovered errors, and terminal provider failures.
-- Offers Today, rolling 7-day, rolling 30-day, and all-time views through one `/analytics` TUI/RPC dashboard.
-- Stores only content-free metadata in private, versioned JSON Lines files.
-- Uses one writer file per Pi runtime, so concurrent Pi processes never share a routine writer lock.
-- Never starts a server or sends analytics anywhere.
+Collects settled response cycles without configuration or startup I/O; no server or network analytics. The dashboard offers Today, rolling 7/30-day and all-time views, including tool-call counts/failures/average duration and logical-call averages/median/P95/max/distribution. Each runtime owns its JSONL writer, avoiding a shared routine writer lock.
 
 ## Install
 
@@ -162,31 +153,9 @@ If legacy history matters, stop every old Pi process first and preserve both fil
 - Prometheus, JSON/CSV export, cloud sync, browser dashboards, token/cost reporting, and project attribution are not included.
 - Statistics cover only events visible through Pi's public extension API. Cache-warming usage recorded outside normal assistant turns is not imported into this event-based store.
 
-## Package layout
+<a id="package-layout"></a>
 
-```text
-packages/pi-analytics/
-├── src/
-│   ├── index.ts              # Thin Pi entrypoint
-│   ├── analytics.ts          # Pi lifecycle, command, and session ownership
-│   ├── collector.ts          # Content-free response-cycle state machine
-│   ├── errors.ts             # Conservative error classification
-│   ├── skills.ts             # Explicit and model skill detection
-│   ├── menu.ts               # TUI/RPC analytics dashboard
-│   ├── response-screen.ts    # Bounded model-pair preview and read-only details
-│   ├── reported-model.ts     # Optional reported-model metadata bounds
-│   ├── types.ts              # Observation records
-│   └── storage/
-│       ├── files.ts          # Private generations, writes, reads, and Clear
-│       ├── format.ts         # Versioned JSONL codec and validation
-│       ├── queries.ts        # Incremental aggregate projections
-│       └── store.ts          # Lifecycle-safe storage facade
-├── test/
-├── README.md
-├── LICENSE
-├── package.json
-└── tsconfig.json
-```
+Source entrypoint: `src/index.ts`.
 
 ## Upstream and local divergence
 

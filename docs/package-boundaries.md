@@ -68,31 +68,9 @@ native operations or descendant execution frames are quiescent.
 
 ## Choosing capabilities
 
-Separate responsibilities do not mean every extension should be enabled:
+Use the [portfolio selection rules and capability tables](extension-portfolio.md#selection-rules) to choose extensions and alternatives, rather than enabling everything.
 
-- Use one main-session continuation controller per task. Goal owns objective
-  completion; Ralph owns explicit file-backed iterations. Ralph follow-ups are
-  not Goal-owned automatic responses; budgets and stop/completion states remain
-  independent. Neither controller's budget is a cap on the whole combination.
-  Goal with a finite Workflow preserves a clearer
-  objective/orchestration/execution hierarchy.
-- Todo is a manually maintained checklist, not evidence that Workflow tasks
-  executed. Avoid maintaining the same progress independently in Todo, Ralph
-  task files and Workflow state.
-- Usage aggregates persisted tokens/costs; Analytics derives operational
-  metrics; Stamp annotates transcript records; Worktime measures current active
-  spans. Their values are not additive and they do not require each other.
-- Recall saves curated excerpts; Recap provides temporary model-generated
-  orientation; Sessions navigates history and transfers reviewed summaries.
-  Native `/resume`, `/tree` and `/copy` may suffice without any of them.
-- Statusline is a presentation preference, not a prerequisite for extension
-  statuses: Pi's native footer also renders status keys. Keep one footer owner
-  and one effective owner for each editor shortcut or external state reporter.
-- Prefix and Welcome are optional presentation choices. Provider guidance and
-  priority-tier selection are useful only when their specific behavior is wanted.
-
-Libraries are dependencies, never independently enabled extensions. Experimental
-packages remain deliberate opt-ins, not part of a default catalogue.
+Goal owns objective completion; Ralph owns file-backed iterations. Ralph follow-ups are not Goal-owned automatic responses: budgets and stop/completion states remain independent, and neither budget caps the combination. Prefer one main-session continuation controller per task; Goal with a finite Workflow gives a clearer objective/orchestration/execution hierarchy.
 
 ## Background processes
 

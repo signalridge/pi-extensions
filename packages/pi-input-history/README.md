@@ -6,9 +6,7 @@
 
 ## Why
 
-Pi's built-in ↑/↓ history only covers the current session and is lost on reload. This extension persists your last 100 prompts across sessions and adds an fzf/atuin-style **Ctrl+R** popup — a scrollable, live-filtered list of past prompts — so you can find any of them instantly.
-
-The popup is rendered with Pi's native TUI components and adapts to narrow terminals. It requires at least five terminal rows to keep both the query and a result visible. Opening below that minimum, or shrinking below it while searching, cancels the popup without changing the draft.
+Persist the last 100 prompts across sessions, beyond Pi's native current-session ↑/↓ history, and search them with **Ctrl+R**.
 
 ## Install
 
@@ -24,6 +22,8 @@ From the repository root:
 pi -e ./packages/pi-input-history
 ```
 
+<a id="features"></a>
+
 ## Usage
 
 ### Persistent history
@@ -34,7 +34,7 @@ On session start, your last 100 prompts across all sessions are loaded into the 
 
 1. Press **Ctrl+R** to open the popup — a large centred two-pane dialog, `fzf --preview` style. The left pane lists your recent prompts newest-first, each row carrying its position and age; the right pane shows the **full text** of the highlighted entry, which one-line summaries cannot convey for long prompts.
 2. Type to fuzzy-filter the list live (subsequence matching, space-separated multi-token).
-3. The selected row shows as a full-width highlight bar; matched characters are underlined in your theme's accent color.
+3. The selected row is highlighted full-width; matched characters use grapheme-safe accent underlining. Results deduplicate cached cross-session prompts and merge live branch history.
 4. Navigate and accept:
 
 | Key                         | Action                       |
@@ -49,14 +49,7 @@ Arrow and Emacs bindings follow the list (`Ctrl+P`/`Ctrl+N` = previous/next line
 
 History stores the original leading/trailing whitespace and multiline text. All ordered text parts are concatenated without adding separators; search and previews use separate display copies. Recall is **text-only**: image-bearing messages contribute their text, but images are not restored. The host editor may normalize tabs and line endings when text is inserted.
 
-## Features
-
-- **fzf-style two-pane popup** — a live-filtered list plus a preview pane showing the highlighted prompt in full, instead of a single-line prompt.
-- **Cross-session persistence** — history survives across sessions automatically.
-- **Fuzzy subsequence matching** — type partial characters in order, multi-token support with spaces.
-- **Grapheme-safe highlighting** — matched positions shown with accent color underline on a full-width selection bar.
-- **Deduplication** — no duplicate entries across sessions.
-- **Current session awareness** — merges live branch history with cached cross-session history.
+The native-TUI popup needs at least five terminal rows. Opening or shrinking below that minimum cancels without changing the draft.
 
 ## Selective upstream compatibility
 

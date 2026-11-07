@@ -139,9 +139,7 @@ Subagents, with skills/prompts/context/themes/MCP disabled. Environment variable
 are allowlisted, providers are faux only, startup network checks are disabled,
 and an inherited Node preload rejects network access and writes outside the
 case sandbox. This guard is a test assertion, not an OS security sandbox.
-The notice lane intentionally uses only its own generated local package in a
-disposable package settings list, so the native host can establish package
-provenance; it does not discover installed user resources.
+The separate [native notice lane](compatibility.md#native-15-workflow-and-package-notice-lane) owns package-discovery isolation and notice outcome evidence.
 
 All waits are finite: 30 seconds for cold CLI/Jiti startup, 12 seconds per
 scenario condition, 8 seconds for graceful exit, 2 seconds each for TERM/KILL
@@ -167,5 +165,4 @@ cursor restoration, live resize, real shell logs and confirmed stop. Set
 Widths of one/two cells are component-tested; the complete Pi 1.0.4 editor can
 recurse while wrapping a wide draft at one column, so real CLI resize acceptance
 uses a minimum of 20 columns. Committed CJK/paste checks are not physical-terminal
-IME/preedit qualification. These checks do not establish live-provider/OAuth,
-external-LSP or every-platform compatibility.
+IME/preedit qualification. See [compatibility limits](compatibility.md#integration-limits) for the remaining provider, external-LSP and platform exclusions.

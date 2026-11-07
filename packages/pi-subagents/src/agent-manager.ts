@@ -1167,7 +1167,17 @@ export class AgentManager {
   /** Whether spawned agents get `contact_supervisor` (settings). */
   private supervisorQuestions = true;
   private parentQuestionFactory?: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler;
-  private parentQuestionAgents = new WeakSet<AgentRecord>();
+  /**
+   * Parent-channel children resumed in the foreground: the main agent is
+   * blocked awaiting them, so their questions resolve as unanswered at once.
+   */
+  private foregroundResumed = new WeakSet<AgentRecord>();
+
+  private guardParentQuestion(record: AgentRecord, handler: ParentQuestionHandler): ParentQuestionHandler {
+    return (question, choices, signal) => this.foregroundResumed.has(record)
+      ? Promise.resolve({ status: "unanswered", reason: "the main agent is waiting on this foreground run" })
+      : handler(question, choices, signal);
+  }
 
   /** Package-local root capability; no managed RPC schema or global settings change. */
   setParentQuestionFactory(factory: (record: AgentRecord, ctx: ExtensionContext) => ParentQuestionHandler): void {
@@ -1864,7 +1874,8 @@ export class AgentManager {
         ...options, description: entry.description, rootSessionId: ctx.sessionManager.getSessionId(),
         cwd: entry.reopen!.cwd, isolation: entry.reopen!.isolation,
         isolated: entry.reopen!.isolated || policy.isolated, inheritContext: policy.inheritContext,
-        supervisorQuestions: entry.reopen!.supervisorQuestions && this.supervisorQuestions && options.supervisorQuestions !== false,
+        // A reopened conversation never has a parent question channel.
+        supervisorQuestions: false,
         excludeTools: [...new Set([...(entry.reopen!.excludeTools ?? []), ...(options.excludeTools ?? [])])],
       }, undefined, entry.id, undefined, entry);
     } catch (error) {
@@ -1967,11 +1978,14 @@ export class AgentManager {
       });
       options = { ...options, isolated: coldResume?.reopen?.isolated || policy.isolated, isolation: policy.isolation };
     }
-    if (options.supervisorQuestions === "parent" &&
-        (options.isBackground !== true || options.parentAgentId !== undefined || coldResume ||
-          options.isolated || !this.supervisorQuestions || !this.parentQuestionFactory)) {
-      throw new Error('Parent clarification requires a fresh, non-isolated top-level background Agent with supervisor questions enabled. Set run_in_background: true; foreground calls cannot answer while blocked.');
+    const canAskParent = options.isBackground === true && options.parentAgentId === undefined &&
+      !owner && !coldResume && !options.isolated && this.supervisorQuestions &&
+      this.parentQuestionFactory !== undefined;
+    if (options.supervisorQuestions === "parent" && !canAskParent) {
+      throw new Error("Parent clarification requires a fresh, non-isolated top-level background agent with an available main-agent channel.");
     }
+    // Routing is a host decision, never a model-selected or human-UI fallback.
+    options = { ...options, supervisorQuestions: canAskParent && options.supervisorQuestions !== false ? "parent" : false };
     // Admission must be synchronous and shape-only: a child can select another
     // model after this point, but no unsupported host may receive an ID, branch
     // budget, queue slot, lifecycle event, or transcript before the guard fails.
@@ -2092,9 +2106,8 @@ export class AgentManager {
       options,
       internalOverride,
       coldResume,
-      ...(options.supervisorQuestions === "parent" ? { parentQuestion: this.parentQuestionFactory!(record, ctx) } : {}),
+      ...(options.supervisorQuestions === "parent" ? { parentQuestion: this.guardParentQuestion(record, this.parentQuestionFactory!(record, ctx)) } : {}),
     };
-    if (options.supervisorQuestions === "parent") this.parentQuestionAgents.add(record);
     // Lifecycle observers may synchronously stop or dispose a freshly allocated
     // record. Do not let the normal queue/start path resurrect that decision.
     if (
@@ -2550,7 +2563,8 @@ export class AgentManager {
       assertNoRawInheritance(policy.inheritContext);
       if (!coldResume.reopen?.worktree && policy.isolation === "worktree") throw new Error("The current definition requires a new isolated checkout. Start a new Agent; continuation never creates one.");
       options = { ...options, isolated: coldResume.reopen!.isolated || policy.isolated, inheritContext: policy.inheritContext,
-        supervisorQuestions: coldResume.reopen!.supervisorQuestions && this.supervisorQuestions && options.supervisorQuestions !== false,
+        // Cold resume never has a parent question channel.
+        supervisorQuestions: false,
         maxTurns: resolveMaxTurns(definition, options.maxTurns) };
       assertReopenRoute(coldResume.reopen?.route, resolveAgentRunModel(ctx, definition, options));
       validateAgentReopen(coldResume, ctx);
@@ -2728,7 +2742,7 @@ export class AgentManager {
           record.sessionFile =
             session.sessionManager?.getSessionFile?.() ??
             (session as { sessionFile?: string })?.sessionFile;
-          if (!coldResume && !record.owner && !record.parentAgentId && !this.parentQuestionAgents.has(record) && record.handle && record.sessionFile) {
+          if (!coldResume && !record.owner && !record.parentAgentId && record.handle && record.sessionFile) {
             const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
             const header = session.sessionManager?.getHeader?.();
             if (parentSessionFile && header?.parentSession === parentSessionFile) {
@@ -3364,9 +3378,6 @@ export class AgentManager {
       if (!isWorktreeIsolationEnabled()) throw new Error("Worktree isolation is disabled; continuation cannot downgrade the original isolated checkout.");
       assertReusableWorktree(record.reopen.worktree);
     }
-    if (this.parentQuestionAgents.has(record) && options?.isBackground !== true) {
-      throw new Error('This child uses parent clarification; resume it with run_in_background: true to avoid blocking the answering model.');
-    }
     assertSafeChildSession(
       record.session,
       record.invocation?.inheritContext === true,
@@ -3443,6 +3454,7 @@ export class AgentManager {
     // must not await the already-completed spawn while this native run is live.
     let settleForeground!: () => void;
     record.promise = new Promise<string>(resolve => { settleForeground = () => resolve(record.result ?? ""); });
+    this.foregroundResumed.add(record);
     try {
     this.settlingRecords.add(id);
     const control = this.beginResumeControl(id, record, signal, snapshot);
@@ -3518,6 +3530,7 @@ export class AgentManager {
     this.retryDeferredRecordRemovals();
     return record;
     } finally {
+      this.foregroundResumed.delete(record);
       settleForeground();
     }
   }
@@ -4144,7 +4157,7 @@ export class AgentManager {
    */
   private indexResumable(record: AgentRecord): void {
     if (!this.rememberAgents) return;
-    if (record.parentAgentId !== undefined || record.owner || this.parentQuestionAgents.has(record)) return;
+    if (record.parentAgentId !== undefined || record.owner) return;
     const reopen = captureAgentReopenMetadata(record);
     if (!record.sessionFile || (!record.session && !reopen)) return;
     const entry: ResumableAgentEntry = {
