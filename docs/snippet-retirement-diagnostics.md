@@ -23,15 +23,14 @@ Both original immediate assertions, their messages, and candidate assertions are
 preserved. #85's independent owned-promise gate is exercised by normal Code
 Actions tests, not substituted for historical OS-process evidence.
 
-The candidate checkout is the immutable PR **head SHA** (`github.event.pull_request.head.sha`),
-not GitHub's synthetic PR merge preview. Manual runs use `github.sha`, the immutable
-commit selected for that dispatch. `candidate-source.json` records the actual
+The candidate checkout for a manual run is `github.sha`, the immutable commit selected
+for that dispatch. `candidate-source.json` records the actual
 checked-out revision and content hashes; the workflow expression uses only trusted
 GitHub context, never an interpolated user ref.
 
 ## Primary run
 
-Use **Snippet retirement diagnostics**, manually or on a same-repository PR. One
+Run **Snippet retirement diagnostics** manually with workflow dispatch. One
 native x64 `ubuntu-24.04` job installs Node **24.21.0** and Bun **1.3.14** once,
 then installs each source's own frozen lockfile separately with scripts disabled.
 It runs 200 **pairs** by default (bounded configurable 1–1000), alternating
