@@ -1,6 +1,6 @@
 {
   "name": "@signalridge/pi-stamp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Pi extension for transcript timestamps, assistant metadata, and tool timing.",
   "type": "module",
   "license": "MIT",
