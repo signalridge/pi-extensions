@@ -94,7 +94,7 @@ describe("parent questions on the real offline Pi SDK", () => {
   it("starts queued children without polling, wakes the idle main, resumes the asking child, and keeps permission denial human", async () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    const rawChoice = "sqlite\u001b[31m";
+    const rawChoice = "sqlite\u001b]0;HIDDEN_CHILD_INSTRUCTION\u0007";
     child.setResponses([
       async () => { await gate; return fauxAssistantMessage(fauxText("blocker done")); },
       context => {
@@ -103,8 +103,11 @@ describe("parent questions on the real offline Pi SDK", () => {
         return fauxAssistantMessage(fauxToolCall("contact_supervisor", { question: "Which database?", options: [rawChoice, "postgres"] }), { stopReason: "toolUse" });
       },
       context => {
-        expect(JSON.stringify(context)).toContain("Main agent clarification");
-        expect(JSON.stringify(context)).toContain(JSON.stringify(rawChoice).slice(1, -1));
+        const contact = context.messages.find(message => message.role === "toolResult" && message.toolName === "contact_supervisor");
+        expect(contact).toMatchObject({ details: { status: "answered", answer: "sqlite" } });
+        expect(JSON.stringify(contact)).toContain("Main agent selected child-authored option");
+        expect(JSON.stringify(contact)).not.toContain("HIDDEN_CHILD_INSTRUCTION");
+        expect(JSON.stringify(contact)).not.toContain("\\u001b");
         return fauxAssistantMessage(fauxToolCall("read", { path: join(root, "sensitive") }), { stopReason: "toolUse" });
       },
       context => {

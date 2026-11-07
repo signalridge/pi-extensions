@@ -141,15 +141,17 @@ export class ParentQuestionBroker {
     }
     const item = this.pending.get(id);
     if (!item) throw new Error("Unknown, expired, cancelled, or stale questionId.");
-    let rawAnswer = answer;
+    let returnedAnswer = answer;
     if (answer.trim() && item.options.length > 0) {
       const index = item.options.findIndex((_option, i) => answer === `option:${i + 1}`);
       if (index < 0) throw new Error("Choose an offered option:N token or use an empty answer to decline.");
-      rawAnswer = item.options[index];
+      // A token selects only the label actually shown to the main agent, not
+      // terminal-control payloads hidden in the child's original choice.
+      returnedAnswer = display(item.options[index], 200);
     }
     this.answered.set(id, { owner: item.owner, answer });
     const declined = !answer.trim();
-    this.finish(id, declined ? { status: "unanswered", reason: "parent declined; human authorization may be required" } : { status: "answered", answer: rawAnswer });
+    this.finish(id, declined ? { status: "unanswered", reason: "parent declined; human authorization may be required" } : { status: "answered", answer: returnedAnswer });
     return { status: declined ? "declined" : "answered" };
   }
 

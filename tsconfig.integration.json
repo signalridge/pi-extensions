@@ -9,6 +9,7 @@
   "include": [
     "scripts/pi-schema-inference.fixture.ts",
     "scripts/subagent-input-compat.fixture.ts",
+    "scripts/subagent-supervisor-compat.fixture.ts",
     "scripts/editor-composition.test.ts",
     "scripts/status-navigation.test.ts",
     "scripts/fixtures/workflow-cli.ts",

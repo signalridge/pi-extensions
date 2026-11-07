@@ -21,6 +21,25 @@ describe("host-only supervisor questions", () => {
     expect(ask.select).not.toHaveBeenCalled();
   });
 
+  it("ignores legacy UI fields without reading getters or emitting notices", async () => {
+    const parentQuestion = vi.fn<ParentQuestionHandler>().mockResolvedValue({ status: "answered", answer: "Use existing." });
+    const readLegacy = vi.fn((): never => { throw new Error("Legacy UI must not be read"); });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const legacyContext = { get ask() { return readLegacy(); }, get agentLabel() { return readLegacy(); } };
+      expect(createSupervisorTool(legacyContext)).toEqual([]);
+      // Preserve descriptors: object spread would invoke the getters itself.
+      const tools = createSupervisorTool(Object.defineProperties({ parentQuestion }, Object.getOwnPropertyDescriptors(legacyContext)));
+      expect(tools).toHaveLength(1);
+      const result = await tools[0].execute("question", { question: "Which?" }, undefined, undefined, context);
+      expect(result.details).toEqual({ status: "answered", answer: "Use existing." });
+      expect(readLegacy).not.toHaveBeenCalled();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("sends the original bounded question and choices to the host, never the human UI", async () => {
     const parentQuestion = vi.fn<ParentQuestionHandler>().mockResolvedValue({ status: "answered", answer: "Use the existing report." });
     const ask = { input: vi.fn(), select: vi.fn() };

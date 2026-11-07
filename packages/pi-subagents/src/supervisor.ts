@@ -25,7 +25,17 @@ const MAX_OPTION = 200;
 /** Most options a child may offer. */
 const MAX_OPTIONS = 8;
 
+/** @deprecated Compatibility type only; child-to-human clarification is disabled. */
+export interface SupervisorAsk {
+  input(title: string, placeholder?: string): Promise<string | undefined>;
+  select(title: string, options: string[]): Promise<string | undefined>;
+}
+
 export interface SupervisorToolContext {
+  /** @deprecated Ignored; never called or used as a human fallback. */
+  ask?: SupervisorAsk;
+  /** @deprecated Ignored; retained for source-level callers. */
+  agentLabel?: string;
   /** Manager-issued background-only clarification channel, not approval. */
   parentQuestion?: ParentQuestionHandler;
 }
@@ -62,7 +72,7 @@ export function createSupervisorTool(context: SupervisorToolContext) {
         const reply = await parentQuestion(params.question, params.options, signal);
         return {
           content: [{ type: "text" as const, text: reply.status === "answered"
-            ? `Main agent clarification (NOT human approval or a permission grant): ${reply.answer}`
+            ? `${params.options?.length ? "Main agent selected child-authored option" : "Main agent clarification"} (NOT human approval or a permission grant): ${reply.answer}`
             : `No answer (${reply.reason}). Proceed only within existing authorization, state any safe assumption, or stop and report the blocker in your final result if human authorization is required.` }],
           details: reply,
         };
