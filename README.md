@@ -1,5 +1,8 @@
 # signalridge Pi extensions
 
+> [!WARNING]
+> **This repository is retired and no longer maintained.** Every `@signalridge/pi-*` package is deprecated on npm and will receive no further releases, fixes or security updates. The repository is archived read-only; existing published versions remain installable but are unsupported. Uninstall them with `pi remove npm:@signalridge/<package>`.
+
 Independent extensions for [Pi](https://pi.dev): subagents, workflows, developer tools and session UI. Each package has its own configuration, README and npm release; the private repository root is development tooling only.
 
 The development host is **Pi 1.5.0**. See [compatibility](docs/compatibility.md) for platform and integration limits.
