@@ -4,27 +4,6 @@ Loads provider-specific context files (CLAUDE.md, CODEX.md, GEMINI.md) based on 
 
 ## How it works
 
-```mermaid
-flowchart LR
-    S1["~/.pi/agent/"] --> B
-    S2["project/"] --> B
-    
-    subgraph Core ["Pi Core"]
-        B["Select first readable context file<br/><sub>per directory</sub>"]
-    end
-    
-    subgraph Ext ["agent-guidance extension"]
-        B --> C{Which provider?}
-        C -->|Anthropic| D[+ CLAUDE.md]
-        C -->|OpenAI/Codex| E[+ CODEX.md]
-        C -->|Google| F[+ GEMINI.md]
-    end
-    
-    D --> G[System Prompt]
-    E --> G
-    F --> G
-```
-
 | Provider | File |
 |----------|------|
 | Anthropic | CLAUDE.md |
@@ -87,13 +66,7 @@ after `/tree` moves to a branch that never saw it, or after a context edit
 replaces that result, the file is delivered again. Resuming a session does not
 repeat a delivery. A file whose content changed is delivered again.
 
-The text is appended to the tool result rather than sent as a hidden steering
-message. It is then part of the result the model reads when it first touches
-that directory, before it acts on the file; it appears in the transcript under
-the tool call that caused it; and compaction summarizes it together with that
-call. A steering message would arrive only after the whole tool batch, as a
-separate user-role message the user does not see, and would queue alongside
-other steering and follow-up messages.
+Guidance is delivered in the triggering tool result, not a hidden steering message: it is available when that directory is first touched, visible under that call and compacted with it, rather than arriving after the tool batch.
 
 ## Install
 
@@ -104,7 +77,7 @@ pi install npm:@signalridge/pi-agent-guidance
 ```
 
 
-Then filter to just this extension in `~/.pi/agent/settings.json`:
+Optional resource filter (the manifest already selects only `agent-guidance.ts`) in `~/.pi/agent/settings.json`:
 
 ```json
 {
@@ -117,10 +90,14 @@ Then filter to just this extension in `~/.pi/agent/settings.json`:
 }
 ```
 
-### Local clone (setup script)
+<a id="local-clone-setup-script"></a>
+
+### Local clone (checkout-only setup script)
+
+From the repository root:
 
 ```bash
-./setup.sh
+./packages/pi-agent-guidance/setup.sh
 ```
 
 Links the extension to `<agent-dir>/extensions/` and helps you set up
@@ -141,7 +118,7 @@ Starter templates in `templates/`:
 
 Install with:
 ```bash
-ln -s "$(pwd)/agent-guidance/templates/CLAUDE.md" ~/.pi/agent/
+ln -s "$(pwd)/packages/pi-agent-guidance/templates/CLAUDE.md" ~/.pi/agent/
 ```
 
 ## Configuration (optional)

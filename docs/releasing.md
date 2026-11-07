@@ -11,14 +11,7 @@ Every package versions independently (`fixed: []` and `linked: []` in
 `.changeset/config.json`). One package can ship a fix without changing unrelated
 packages' versions.
 
-Choose the bump from what the change does to someone who already installed the
-package:
-
-The test is: **does another package's code stop working?** An import, an
-exported type, an event or RPC payload shape, a protocol version — those are
-compiled against, and breaking one breaks a build. User-facing configuration is
-not: a settings key or a frontmatter field that stops being read degrades with a
-warning, and the session keeps running.
+Choose the bump by asking **does another package's code stop working?** Compiled exports, event/RPC shapes and protocols qualify; retiring user settings/frontmatter instead degrades with a named warning while the session keeps running.
 
 | Bump | When |
 | --- | --- |
@@ -39,11 +32,7 @@ Three rules keep this honest:
 - **`bun run check:changesets` fails when a package's published files changed
   without a changeset naming it.** "Published files" is the manifest's own
   `files` array, so a test, a `tsconfig.json`, or a CI edit is not a reason to
-  demand a version, and a `src/` or `README.md` edit always is. Without it, a
-  package whose source changed but that no changeset names is simply never
-  released: the repository looks current while npm keeps serving the old code,
-  and nothing surfaces the gap until someone installs it. CI runs this with
-  `fetch-depth: 0` so the merge base resolves.
+  demand a version, and a `src/` or `README.md` edit always is. CI uses `fetch-depth: 0` so the merge base resolves.
 - **`bun run check:versions` fails when a package's local version is *behind*
   the npm `latest` tag.** The publisher refuses to move a dist-tag backward, so
   that state blocks the release outright. Equal is the normal resting state
@@ -75,8 +64,8 @@ pinned, and re-check this option when upgrading.
 2. After the change reaches `main`, `.github/workflows/publish-packages.yml` creates or updates the
    **Version Packages** PR. Review its independent version bumps, changelogs, and lockfile, then
    merge that PR.
-3. Every push and manual dispatch enters the workflow-level `queue: max` concurrency group, so release transitions are retained and processed one at a time. The job checks out the event SHA with full history, classifies whether it is current `origin/main` or an authenticated release transition, and runs `bun run check` against that exact revision before any Changesets write. It then fetches `origin/main` and revalidates at the last workflow boundary before the action, so a revision that became stale during validation cannot update the Version Packages PR while an authenticated release transition still drains. A release-shaped commit is authorized only when GitHub reports a merged same-repository PR from `changeset-release/main` to `main`, and the fetched PR head exactly matches the API `head.sha`; a manually named **Version Packages** commit is insufficient.
-4. The Changesets action updates the **Version Packages** PR only when its checkout still equals current `origin/main`; stale ordinary revisions are a no-op. An authenticated stale release transition is still drained through the action's publish command, so a newer `main` push cannot permanently skip it. Only package manifests changed by that release commit are loaded from the authenticated PR-head snapshot. Those exact directories are packed, so later `main` changes cannot enter an older release. Existing versions are integrity-checked and release/tag-reconciled, missing versions are published one at a time in dependency order, and package names absent from npm fail as unbootstrapped. Before a write, the publisher also refuses to move the selected npm dist-tag backward to an older SemVer. Each successful package is immediately reported or given its direct GitHub release against the merged event SHA, so a later package failure does not erase earlier success.
+3. Push/manual runs enter workflow-level `queue: max`, retaining transitions serially. The event SHA is checked out with full history and passes `bun run check` before any Changesets write. A final fetch/revalidation permits Version Packages PR updates only from current `origin/main`; stale ordinary revisions do nothing.
+4. Authenticated stale release transitions still drain. Authentication requires GitHub's merged same-repository `changeset-release/main` → `main` PR and a fetched head exactly matching API `head.sha`, not merely a **Version Packages** commit title. Only manifests changed by that release commit and exact directories from its immutable authenticated PR-head snapshot are packed. Existing versions require matching integrity and release/tag reconciliation; missing versions publish serially in dependency order. Missing npm names fail as unbootstrapped, and dist-tags never move backward. Each success is immediately reported or given a direct GitHub release against the merged event SHA, surviving later failures.
 
 The workflow uses Bun for the workspace and Node/npm for Changesets publication. It supplies npm
 provenance through OIDC (`NPM_CONFIG_PROVENANCE=true`) and deliberately does not use `NPM_TOKEN`.
@@ -120,9 +109,7 @@ printf '%s' "$NPM_TOKEN" \
 ```
 
 After either bootstrap, configure that package's npm Trusted Publisher binding immediately. Do not use
-the token wrapper for normal Changesets releases. The normal OIDC Changesets path is the GitHub Actions
-workflow: it uses `PAT_TOKEN` for the Version Packages PR and npm Trusted Publishing with the workflow's
-OIDC `id-token`; it does not use `NPM_TOKEN`.
+the token wrapper for normal Changesets releases; [one-time configuration](#required-one-time-configuration) separates PAT and OIDC responsibilities.
 
 Recheck npm before each bootstrap instead of relying on a stale package list. If the exact scope/package
 lookup returns 404, bootstrap that one package; if it exists, use normal Changesets publication.
@@ -130,18 +117,7 @@ lookup returns 404, bootstrap that one package; if it exists, use normal Changes
 ## Rate limits and recovery
 
 HTTP 429 responses are registry/account-side throttling. Switching npm to pnpm, changing the
-package manager, or parallelizing publishes does not bypass the limit. After the authenticated
-release-transition gate passes, the publisher queries only the package manifests changed by that
-transition, from the immutable PR-head snapshot. It publishes missing versions serially; versions
-already present are integrity-checked and their GitHub releases/tags reconciled; existing npm
-dist-tags are not rewritten by this path and must be verified after recovery. Packages outside the
-current transition are not inspected. A package name absent from npm still fails as unbootstrapped. The
-publisher retries transient 429 responses with exponential backoff and `Retry-After` when available,
-and checks `dist.integrity` before resuming a matching version. Every successful package (including
-an integrity-confirmed recovery) is reported immediately before the next package is attempted; a
-later failure does not roll back an earlier tag/release report. The selected npm dist-tag is monotonic: if the registry already points it at a newer SemVer, the
-older publish fails closed instead of moving the tag backward. The default cooldown between package
-writes is 10 seconds; set `PUBLISH_COOLDOWN_MS` only when a deliberate override is needed.
+package manager, or parallelizing publishes does not bypass the limit. Recovery retains [normal-flow selection, immutable-snapshot, serial-write, integrity and tag-safety rules](#normal-flow); packages outside the transition are not inspected. Existing npm dist-tags are not rewritten by workflow recovery and must be verified afterward. Transient 429s retry with exponential backoff and `Retry-After`; matching versions require `dist.integrity`, and each success is reported before the next package. The default between-write cooldown is 10 seconds; `PUBLISH_COOLDOWN_MS` is a deliberate override.
 
 For a partial custom release, rerun a dry preflight for the affected package and then rerun the same
 selection; already matching versions are skipped and mismatched integrity is rejected:
@@ -155,9 +131,7 @@ For a partial Changesets workflow release, rerun the **same workflow SHA** after
 Packages PR was merged and that npm shows the expected versions. The rerun authenticates the same PR
 head snapshot, skips matching versions only after integrity verification, and recovers missing tags or
 GitHub releases. The direct-release target remains the merged `GITHUB_SHA`; its artifact and changelog
-body still come from the PR-head snapshot. The retained workflow queue serializes release writes, and only the checkout that still matches the current `origin/main` may update the Version Packages PR. Do not create a
-new version or force a tag to compensate for a transient failure. If a package name has never existed
-on npm, bootstrap that single package first, then configure OIDC and resume the release.
+body still come from the PR-head snapshot. Do not create a new version or force a tag to compensate for a transient failure. Never-published names need [single-package bootstrap](#new-package-bootstrap) and OIDC configuration before resuming.
 
 A rerun always executes the publisher from that original SHA, so a publisher fix merged later cannot
 reach it. Rerun only while `main` still points at the release commit: the Changesets action creates

@@ -8,7 +8,7 @@ A Pi extension that displays aggregated usage statistics across all sessions.
 
 - **Tested Pi host:** `1.4.0` — see the `peerDependencies` range for installation compatibility.
 
-Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usage` includes that auxiliary usage in totals under `Tools / summaries`. Nested-agent reports are reconciled against recursively scanned child sessions, so a child call is counted once: when every child session file behind a report is part of the scan, the children are the record and the parent's aggregate is skipped. For partial scans, only missing contributions are counted when all six child cost/token fields exactly sum to the report and each scanned contribution has an exact persisted vector. Inconsistent partial reports remain counted in full and a period-scoped unresolved-overlap insight warns that totals may double-count them, even with zero or unknown recorded cost; no exact residual is invented. This accounting-integrity warning also appears in zero-cost Insights and exports; ordinary spend insights still require recorded cost. Pi 0.87+ also records standalone model-attributed usage (such as cache warming); `/usage` counts it under its actual provider and model without adding a fictitious assistant message. A context edit explains the first request on its own branch only when its target was already in the previous assistant's model-visible context and remains in context after compaction; editing a newly appended user message does not mask a genuine cache-prefix miss. A `cache_warm` call refreshes the cache TTL only for its provider/model on that branch. Parent-linked journal entries also keep sibling compactions and assistant history separate. Sessions recorded by older Pi versions still parse; they simply carry no newer entry types.
+Older sessions still parse without newer entry types. Pi 0.81+ auxiliary tool/summary usage and 0.87+ standalone model usage are included without inventing assistant messages. See [Data source](#data-source) for reconciliation and branch-aware accounting; wildcard host peers do not establish universal compatibility.
 
 ## Install
 
@@ -18,11 +18,7 @@ Pi 0.81.0+ can persist tool-result, compaction, and branch-summary usage. `/usag
 pi install npm:@signalridge/pi-usage-extension
 ```
 
-```bash
-pi install npm:@signalridge/pi-usage-extension
-```
-
-Then filter to just this extension in `~/.pi/agent/settings.json`:
+Optional resource filter in `~/.pi/agent/settings.json` (the manifest already loads only index.ts):
 
 ```json
 {
@@ -171,7 +167,7 @@ Time periods and collection hour buckets are calculated in the local timezone wh
 | **↓Out** | Output tokens *(dimmed)* |
 | **Cache** | Cache read + write tokens *(dimmed; informational)* |
 
-> **As of 0.2.0:** `Tokens = Input + Output + CacheWrite` and `↑In = Input + CacheWrite`. `CacheRead` stays out of `Tokens` so repeated cache hits don't swamp the dashboard. The dashboard itself shows a one-line footer reminder.
+Cache reads are excluded from fresh-token totals so repeated hits do not swamp them; the dashboard includes a footer reminder.
 
 On narrow terminals, `/usage` automatically switches to a compact table instead of overflowing the terminal. Hidden columns reappear as soon as you widen the terminal.
 
@@ -199,7 +195,7 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 - **On-disk cache.** Per-file extraction results are cached in `<agentDir>/usage-extension-cache.json` (respects `PI_CODING_AGENT_DIR`), keyed by file size + mtime. Warm opens only re-parse session files that changed since the last run — on a 5.2 GB / 3,310-file corpus that takes the open from ~17 s to ~0.3 s.
 - **First open** after install (or after deleting the cache) does a one-off full build, showing the usual cancellable loader. Cancelling skips unfinished cache writes; the next open reparses any files not already in a previous completed cache. Cache reads and tuple decoding check for cancellation, but an already-running synchronous `JSON.parse` cannot be interrupted until it completes.
 - Cache writes use an exclusive lock; a long-running writer's lock is never stolen based on file age. If an orphaned `<agentDir>/usage-extension-cache.json.lock` blocks cache updates, first confirm no `/usage` writer is active, then remove **only the `.lock` file** manually and retry. The dashboard can still calculate usage without a cache update. The cache itself is safe to delete at any time; it is rebuilt automatically. Corrupt or version-mismatched caches are ignored and rebuilt rather than trusted. v12 entries require finite, nonnegative numeric accounting/timestamp slots without string or object coercion; invalid entries are reparsed from unchanged source journals even when their file stats match.
-- **The cache format is v12.** v12 reparses dispatched response thinking levels and direct tool usage preceding nested-call metadata; v11 retains concrete response-model metadata and successful zero-usage cache-warm timestamps; v10 retained assistant ancestry and branch-specific cache-warm timestamps, v9 retained cache-warming kinds and branch-aware context-edit boundaries, v8 added standalone usage and context edits, v7 retained `parentSession` lineage, v6 added stable entry IDs, and v5 retained child-session linkage. The first open after upgrading does a one-off full rebuild (with a progress message and live file counter), then warm opens are fast again.
+- **Cache format v12** retains dispatched response thinking, direct tool usage before nested-call metadata, concrete response-model metadata, successful zero-usage cache-warm timestamps/kinds, assistant ancestry, branch-specific context edits, standalone usage, parentSession lineage, stable entry IDs and child-session linkage. Older formats rebuild once after upgrade, with a progress message/live file counter; subsequent opens use the warm cache.
 - Large nested-agent tool results use an allocation-safe metadata parser: multi-megabyte output bodies are scanned as bytes rather than decoded and JSON-parsed in full.
 
 ## Provider notes
@@ -220,15 +216,17 @@ Cache token support varies by provider:
 | Google | ✓ | ✗ |
 | OpenAI Codex | ✓ | ✗ |
 
-The "Cache" column combines both read and write tokens.
-
-`Tokens` and `↑In` include cache writes but intentionally exclude cache reads. That keeps totals aligned with fresh/billed prompt work without letting repeated cache hits swamp the dashboard.
+See [Columns](#columns) for fresh-token and cache formulas.
 
 ## Data source
 
 Statistics are parsed recursively from session files in `~/.pi/agent/sessions/`, including nested subagent runs such as `run-0/` directories. Each session is a JSONL file containing assistant messages and, on Pi 0.81.0+, optional usage on tool-result, compaction, and branch-summary entries.
 
-Copied usage is deduplicated by stable entry ID and its complete accounting fingerprint only when scanned session-file lineage proves the observations belong together. Sibling copies require a matching observation in a scanned common ancestor; proof is resolved before aggregation, independent of filename order. Independent reused IDs, conflicting vectors, and distinct parallel entry IDs remain separate. Nested-agent reports are suppressed when all child session files are scanned (resolved across copies of the parent entry, since branch copies change runId-derived paths). Exact partial reports contribute only missing child vectors; inconsistent partial reports retain their aggregate with an unresolved-overlap warning. Missing usage stays under `Tools / summaries`. Tool and summary usage contributes cost and tokens to totals, graphs, project/session mix, and burn trend, but does not count as an assistant message or distort conversation context/cache insights.
+Copied usage deduplicates only with stable entry ID, complete accounting fingerprint and proven scanned session-file lineage. Sibling copies require a matching scanned common ancestor before aggregation, independent of filename order. Independent reused IDs, conflicting vectors and distinct parallel IDs remain separate.
+
+Nested reports are suppressed when every child file is scanned, resolving paths across parent-entry copies whose runId paths differ. Partial reports contribute only missing vectors when all six child cost/token fields exactly sum to the report and every scanned contribution has an exact persisted vector. Otherwise the whole report remains with a period-scoped unresolved-overlap warning, even at zero/unknown cost; no residual is invented. The warning also appears in zero-cost Insights/exports, while spend insights still require recorded cost.
+
+Unattributed tool/summary usage stays under `Tools / summaries`, contributing cost/tokens to totals, graphs, project/session mix and burn trend without inflating assistant counts or context/cache insights. Standalone usage (including cache warming) uses its actual provider/model without a fictitious message. A `cache_warm` call refreshes TTL only for that provider/model on that branch. Context edits explain a first request only when the target was in the previous assistant's model-visible context and remains after compaction; editing a new user message does not conceal a genuine prefix miss. Parent-linked history keeps sibling compactions/assistants separate.
 
 Respects the `PI_CODING_AGENT_DIR` environment variable if set.
 

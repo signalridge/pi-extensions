@@ -154,17 +154,9 @@ lists them.
 
 ### Native 1.5 workflow and package-notice lane
 
-`python3 scripts/workflow-cli.py` uses the repository-pinned 1.5.0 CLI in fresh
-PTYs with disposable HOME/agent/cwd paths established before SDK load, a faux-only
-provider and an inherited network/write guard. It runs eight workflow overview
-cases (both renderers, both Workflows/Subagents orders, Fleet on/off) plus twelve
-native package-notice starts. It checks actual rendering/lifecycle, not just SDK
-widget registration. [Status navigation](status-navigation.md#native-pi-15-workflow-overview-acceptance)
-lists exact commands, artifacts, cleanup ownership, finite deadlines and detailed
-coverage. `--lane workflows` and `--lane notices` run independently.
+`python3 scripts/workflow-cli.py` has separately runnable `--lane workflows` and `--lane notices` cases on the pinned 1.5.0 CLI. [Status navigation](status-navigation.md#native-pi-15-workflow-overview-acceptance) owns the workflow matrix/result, real-rendering evidence, isolated faux-only PTY setup, artifacts, finite deadlines and cleanup contract.
 
-The notice lane generates a local fixture package with `pi.changelogPath`, then
-lets native Pi package loading and its own settings manager handle notices:
+The notice lane loads only its generated local fixture package with `pi.changelogPath` in a disposable package settings list; it does not discover installed user resources. Native Pi package loading establishes provenance and its own settings manager handles notices:
 
 - First-seen 1.0.0 records the package version without displaying its changelog.
 - Upgrading to 1.1.0 displays only the new entry and persists acknowledgement;
@@ -179,9 +171,7 @@ Both regular and fullscreen execute all six notice starts. These are local
 package discovery/settings/PTY checks, not npm update/download, every package
 source identity or tarball installation acceptance. Existing package changelog
 manifests remain authoritative; no extension-owned notice controller, duplicate
-notice setting or root Pi manifest is introduced. The full lane currently passes
-376 assertions. It qualifies this bounded offline CLI scenario, **not** the whole
-repository, live managed-agent usage or every Pi 1.5 feature.
+notice setting or root Pi manifest is introduced. This qualifies only the bounded offline CLI scenario, **not** the whole repository, live managed-agent usage or every Pi 1.5 feature.
 
 Offline SDK/faux-provider, process-fixture and rendered-component tests do not
 establish live OAuth/provider, browser, external LSP, remote host, physical

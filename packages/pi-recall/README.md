@@ -9,18 +9,6 @@ Healthy startup, reload, and resume do not emit an experimental warning. Command
 
 `@signalridge/pi-recall` saves selected text messages from the active Pi session branch and lets you preview or quote them in another session. Saved content remains local until you explicitly insert a quote into a draft and submit it.
 
-## Features
-
-- Saves any eligible user or assistant text message from the current active session branch—not only the latest message.
-- Recalls saved messages across sessions using **Current cwd**, **All**, or **Current session** scope.
-- Cycles TUI scope with `Tab` and `Shift+Tab`, with the active scope and result count always visible.
-- Fuzzy-searches saved message text, role, and session name inside the active TUI scope.
-- Deletes the selected TUI result with `Ctrl+D` after confirmation, then restores the same scope and query.
-- Previews the complete saved text before use.
-- Inserts an XML-marked quote at the TUI editor cursor without submitting it automatically.
-- Stores versioned JSONL locally with cross-process locking, private permissions, and atomic replacement.
-- Fails closed when storage is malformed, unsupported, oversized, symlinked, or not a regular file.
-
 ## Install
 
 Install persistently from npm:
@@ -40,6 +28,8 @@ Try this package from a local checkout:
 ```bash
 pi -e ./packages/pi-recall
 ```
+
+<a id="features"></a>
 
 ## Quick start
 
@@ -127,33 +117,12 @@ Terminal controls are removed from labels, previews, metadata, and errors before
 
 - No tags, saved-query persistence, message editing, reordering, batch deletion, import/export, automatic expiry, or automatic context injection.
 - No cross-session transcript browser: only previously saved records can be recalled across sessions.
-- Text only; images and tool payloads are deliberately omitted.
 - The custom TUI picker is keyboard-operated. RPC uses sequential dialogs.
 - Custom UI completion uses the shared public-API editor-preservation adapter: observable writes before completion survive the host's saved-draft restoration, and later destination writes remain authoritative. This is not a universal ownership guarantee; invalid contexts and indistinguishable writes of the opening draft cannot be recovered.
-- Scope and search preferences are not persisted; every new `/recall` interaction starts at **Current cwd** with an empty query.
 
-## Package layout
+<a id="package-layout"></a>
 
-```text
-packages/pi-recall/
-├── src/
-│   ├── index.ts       # Thin Pi package entrypoint
-│   ├── menu.ts        # Standard manager screens and TUI/RPC flow
-│   ├── messages.ts    # Text extraction, scope filtering, previews, and quote format
-│   ├── picker.ts      # Scoped TUI saved-message picker
-│   ├── recall.ts      # Command registration and session lifecycle ownership
-│   └── store.ts       # Locked, validated, atomic JSONL storage
-├── test/
-│   ├── menu.test.ts
-│   ├── messages.test.ts
-│   ├── picker.test.ts
-│   ├── recall.test.ts
-│   └── store.test.ts
-├── README.md
-├── LICENSE
-├── package.json
-└── tsconfig.json
-```
+Source entrypoint: `src/index.ts`.
 
 ## License
 

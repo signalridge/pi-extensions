@@ -82,7 +82,7 @@ immediately and notify on completion by default: do independent work rather than
 polling or sleeping. Inspect deliberately with `background_list` or
 `background_logs`. Ordinary `bash` is never auto-detached or overridden.
 
-### Finite work
+## Finite work
 
 ```js
 bash_background({
@@ -103,7 +103,7 @@ A successful start reports a spawned process, not command success. Command
 failures appear as a completed job with its exit code/error, and an exit event
 unless disabled. Launch validation failures throw a tool error.
 
-### Event-driven monitoring
+## Event-driven monitoring
 
 ```js
 monitor({
@@ -117,205 +117,20 @@ monitor({
 monitor({ id: "<job-id>", patterns: ["FAIL", "Tests passed"] })
 ```
 
-Supply **exactly one** of `command` or `id`. Patterns are case-sensitive literal
-substrings of future output lines, not regular expressions. Whitespace is
-preserved exactly: `" ERROR "` and `"ERROR"` are different patterns. Only exact
-duplicates are removed; bounds apply to the original pattern. Matching happens
-incrementally, without requiring a newline. Replacing rules
-resets their matching state; previous output is not replayed. Each distinct
-pattern fires once by default. Limits are eight patterns, 256 characters per
-pattern and 8 KiB per matching line. Oversized lines are truncated for matching;
-use logs for their retained content. Stdout and stderr are decoded independently
-so fragmented UTF-8 or interleaved streams do not create artificial matches.
 
-Set `repeat: true` for new repeated occurrences and `cooldown_ms` to control their
-rate (default 10 seconds, minimum one second, maximum one hour). An old occurrence
-is not replayed when unrelated text is appended; matches suppressed during the
-cooldown are consumed, not delayed. The extension also
-limits automatic wake batches to at most one every ten seconds. Patterns that
-never occur remain silent: inspect the actual output to choose accurate markers.
-
-A wake never starts a turn while the session's latest meaningful response overflowed the
-model's context window and no compaction followed it: that turn would resend the
-same over-window context and fail again. Events are still added to the
-conversation as context, and one warning per overflow episode asks to run
-`/compact` (or `/codex-compact` when installed) or start a new session. A
-compaction or a later successful response restores normal wakes. Aborted responses and
-transient errors (including HTTP 503 and rate limits) do not prove context recovery.
-
-New monitor commands have **no timeout by default**. An optional `timeout_ms`
-bounds their lifetime. When attaching to an existing job, its original timeout
-and exit-notification policy remain unchanged. `notify` on the watch controls
-match notifications (`turn` or `context`); a newly started monitor uses it for
-exits too. Attaching cannot change launch cwd/description/timeout.
-
-```js
-background_logs({ id: "<job-id>", tail: 200, stream: "stderr" })
-background_stop({ id: "<job-id>" })
-background_clear({ id: "<completed-job-id>" })
-```
+Supply exactly one of command or id. Patterns are case-sensitive future-output literal substrings, not regexes; no newline is required and prior output is not replayed. Each pattern fires once by default; repeat: true opts into repeated occurrences with cooldown_ms (default 10s, range 1s–1h). Limits: eight patterns, 256 characters each, 8 KiB matching lines. New monitor commands have no timeout unless timeout_ms is set; attaching preserves original launch/exit policy. [Matching and delivery reference](docs/reference.md#event-driven-monitoring).
 
 ## Interactive task UI
 
-Only explicit human commands or **Ctrl+Alt+B** open a screen; job output and model
-tool calls never steal focus. Press **Ctrl+Alt+B** from Pi's native prompt editor
-to choose a task (including an empty list when no jobs exist). While jobs or
-notifications are retained, the owned status line shows `Ctrl+Alt+B tasks` beside
-compact counts: `R` running, `F` finished, `P` pending notifications, and
-`PAUSED` when notification delivery needs attention. The pending/paused markers
-remain readable in a 40-column status allocation. This is a keyboard entry hint,
-not a clickable status-bar button: Pi's `setStatus` API accepts text only. The shortcut uses Pi's
-editor shortcut route, not a raw terminal listener; focused dialogs and viewers
-retain their input and a repeated shortcut does not reset selection. Custom
-editors must forward Pi's extension shortcuts to support it. **Ctrl+B** is unchanged.
-Escape returns to the original editor draft and cursor.
-
-Commands remain available:
-
-```text
-/background                 # live task list
-/background view <job-id>   # live stdout/stderr log viewer
-/background status         # notification/status snapshot, no custom screen
-/background retry          # existing explicit notification recovery
-```
-
-The compact task roster puts status, elapsed time, and description before a short
-ID, with running/completed counts and visible/selected positions. It stays a plain
-list, without a dashboard or empty full-terminal padding. Selection and the first
-visible row follow opaque IDs as jobs change. If the selected job disappears,
-selection clears: Enter/stop/clear cannot silently target a neighbor. Navigate
-again to choose another job.
-
-**Enter** opens a scrollable overview with wrapped description, full ID, command,
-cwd, status, exit code/signal, error, and dropped log bytes. Enter again or **l**
-opens logs. `/background view <job-id>` still opens logs directly. The log viewer
-has scrolling, follow-tail, and both/stdout/stderr filters. Keyboard controls
-(defaults below; Pi's configured selection up/down, page, confirm, and cancel keys
-are honored and shown in the screen's help):
-
-- **↑/↓**, **Home/End**, **PgUp/PgDn**: select tasks or scroll details/logs; End follows the log tail.
-- **Enter**: tasks → overview → logs; **l**: overview → logs.
-- **Esc**: logs → overview → tasks → close, preserving parent selection and viewport.
-  Escape remains available even in a tiny terminal.
-- **f**: toggle tail following; **s**: cycle both/stdout/stderr.
-  Pausing keeps one bounded, sanitized snapshot stable while output continues;
-  End or resuming follow refreshes the current retained tail. Resize preserves
-  the snapshot's source position. A one-column terminal marks oversized
-  graphemes as `?`; widening restores their original text.
-- **x**, then **y**: stop exactly the captured owned job and wait for confirmed exit.
-- **d**, then **y**: clear exactly one confirmed terminal job, never a running job.
-  Any other key cancels confirmation; repeated keys and Enter do not confirm.
-
-Stop/clear use the same manager and cancellation ownership as tools, including
-cancelling only undelivered notices. Stop failures remain visible and recoverable
-without changing selection. Session retirement closes the old screen and releases
-its subscriptions before late output or async results can draw or control jobs.
-Cancelled navigation preflight does not retire jobs.
-
-Layout fits the current terminal height in regular and fullscreen modes, including
-narrow/CJK terminals. Untrusted logs are byte-bounded **before** sanitization and
-wrapping, without Markdown interpretation or terminal control sequences. The
-viewer shows at most the latest 1,000 retained lines and 64 KiB before wrapping;
-manager retention stays at 256 KiB per job. Closing a view releases its local
-subscriptions and its elapsed-time refresh timer; the timer runs only while a
-mounted roster/overview has running jobs. Output changes request coalesced TUI
-renders, not model turns or automatic navigation.
-
-Custom screens require both `ctx.mode === "tui"` and `ctx.hasUI`. RPC/JSON/print
-keep all tools and command snapshots/hints, but never call custom UI. The TUI
-module is host-provided and deferred until an explicit TUI command or shortcut. There is no
-PTY attachment, raw-PID control, SSH support, or durable job scope.
+Only human `/background` or Ctrl+Alt+B opens the task roster; Enter → overview → logs (or l), Esc backs out preserving draft/cursor. `/background view <id>` opens logs; `status` reports delivery state and `retry` explicitly recovers paused notices. Stop x then y and clear d then y require distinct confirmation. Ctrl+B is unchanged. Ctrl+Alt+S → Background tasks also opens the owner view when supported. Tools/output never steal focus. RPC/JSON/print keep tools/snapshots, not custom UI; short-lived hosts may kill unfinished jobs. [Complete controls, viewport and ownership](docs/reference.md#interactive-task-ui).
 
 ## Lifecycle and limits
 
-- At most eight running jobs and 32 retained jobs. Admission evicts the oldest
-  completed job when necessary, never a running process.
-- Combined stdout/stderr retention is 256 KiB **per job**, in memory. Oldest bytes
-  are discarded; `droppedBytes` exposes this loss. Logs default to 200 lines and
-  accept at most 1,000; model-facing log text is additionally capped at 24 KiB.
-- Pending notifications are bounded and coalesced per job. Event messages are
-  capped at 8 KiB; whole job summaries that do not fit remain queued for a later
-  batch. Individual excerpts are truncated. Capacity overflow warns and is counted
-  in the next accepted event message. Output is explicitly marked untrusted data.
-  Terminal control sequences are removed from model-facing output.
-- Jobs survive ordinary agent turns. Reload, successful session replacement,
-  session-tree navigation, and shutdown terminate jobs and discard their logs
-  and undelivered notifications. **No jobs or logs are restored from a session
-  file**, and no temporary log files are written.
-- Stop and shutdown send TERM, then escalate to KILL while the original owned
-  process-group leader is still live. Stop waits for confirmed exit. Normal shell
-  completion reports its result on shell exit, not pipe closure, and cleans
-  same-group descendants with inherited or redirected output. Pipes keep draining
-  through cleanup, preserving the shell's exit result and termination logs.
-  Cleanup grace is not charged to the command deadline. Intentional-stop output remains
-  in logs but cannot create new watch notifications. Commands must not daemonize
-  or escape their process group; this is not a service manager.
-- The supervisor's startup handshake is bounded to five seconds independently
-  of the command timeout, including inherited Node debugger flags.
-- Cancelling the launch before successful startup cleans up the process. Once
-  the tool returns, the job belongs to the session, not to that tool's abort
-  signal. Use `background_stop` to cancel later.
-- No polling model turns, sleep loops, or background agents. Small timers only
-  implement timeout, termination grace, batching and notification cooldown.
+At most eight running/32 retained jobs, with 256 KiB combined logs per job; oldest completed jobs/bytes may be evicted. Logs default to 200 lines (max 1,000), model text 24 KiB. IDs are session-owned, never arbitrary PIDs. Jobs survive ordinary turns, not reload/session/tree replacement/shutdown: no durable jobs/log restoration or temporary log files.
 
-### Notification safety and recovery
+Exit notifications default to turn and can cost provider tokens; context records without a turn, off is silent. Reading a terminal job with logs or an explicit-ID list consumes its exit reminder, not unread monitor matches; all-jobs/running/cancelled reads do not. Already accepted messages cannot be retracted. Delivery pauses on missing/ambiguous ACK or after three bounded retries; explicit retry can duplicate an ambiguously acknowledged message. Overflow records context without waking: compact or start a new session. [ACK, retries and recovery](docs/reference.md#notification-safety-and-recovery).
 
-A successful `background_logs` read of a terminal job, or `background_list`
-with that terminal job's explicit ID, consumes its pending exit reminder. An
-all-jobs overview does not consume reminders; running reads do not consume a
-future exit. Unread monitor matches remain pending even when the exit is read.
-Cancelled/failed reads do not acknowledge the exit. Already accepted transcript
-messages cannot be erased by reading their result.
-
-Events remain extension-local while Pi is busy, compacting, navigating sessions,
-or has queued work. Delivery is guarded by the fully settled boundary rather than
-`agent_end`. No background message is inserted between a tool call and its result.
-Events are persisted as context-only custom messages; a separate short user-message
-wake runs the normal `input`/`before_agent_start` prompt pipeline. This preserves
-other extensions' guidance, routing and continuation hooks. An exact wake ID
-acknowledges the resulting user message before provider execution. The input hook
-also consumes a known extension-sourced wake whose job owner has retired,
-including a wake suspended in an earlier input handler when the host commits a
-new leaf before this package's tree callback runs. Ownership captures the session
-manager, session ID, and observed branch entry-ID prefix. Ordinary appends remain
-owned; divergence retires the owner permanently at tool, delivery, consumption,
-ACK, and asynchronous UI/update boundaries. Unrecognized lookalike inputs are
-left unchanged. Context-only acceptance is
-confirmed directly in the public transcript without a model call.
-Terminal events are not duplicated by multiple child-process callbacks.
-
-Synchronous delivery errors or an unaccepted wake observed at a settled boundary
-are retried at most three times with backoff, then delivery pauses. A missing
-acknowledgment after a run starts, or after a 30-second acknowledgment deadline
-without a settled event, is ambiguous: delivery pauses instead of blindly
-resending. This also exposes consumed input and asynchronous host rejection;
-a late exact acknowledgment clears the pause.
-`background_list` reports pending/paused delivery and the TUI shows a compact
-owned status line. Use:
-
-```text
-/background status
-/background retry
-```
-
-Retry is an explicit recovery action and can redeliver an ambiguously acknowledged
-message. An input consumed by another extension, cancelled navigation, or manual
-compaction without a subsequent agent run can defer notices; use retry after Pi
-is idle. Switch, tree, and fork preflight gate delivery without destroying jobs or
-the outbox on cancellation. Retry rechecks its captured live owner after waiting
-for idle; it cannot recover an owner retired by committed navigation. Already handed-off transcript messages cannot be retracted by stopping a
-job. Public hooks cannot fence an arbitrary later extension handler that suspends
-after this package's input guard. Intentional stops/clears cancel only undelivered
-notices.
-
-`context` notifications do not start a model turn but become part of later model
-context. `turn` notifications can consume provider tokens. Repeated monitoring is
-an explicit opt-in, not a guarantee of zero cost.
-
-TUI status is guarded by `ctx.mode === "tui"`; supported notifications use
-`ctx.hasUI`. Tools work independently of UI in RPC/JSON/print modes, but a
-short-lived host may shut down before a background job finishes and then kills
-it. Use an interactive or long-lived RPC session for asynchronous work.
+Stop waits for confirmed owned group exit. TERM/KILL cleanup is not a service manager: commands must not daemonize or escape their group. Node supervisor readiness is bounded to five seconds, independently of job timeout.
 
 ## Security and integration
 
@@ -358,40 +173,18 @@ and process supervision uses Node builtins.
 
 ```bash
 bun run --cwd packages/pi-background check
-# Actual CLI shortcut/focus acceptance (macOS/Linux, Python 3 standard library):
 python3 packages/pi-background/test/shortcut-cli.py
 ```
 
-Historical task-viewer acceptance reported 108 passing package tests and the
-complete repository gate. Historical Pi 1.0.4 CLI runs through isolated
-fullscreen/regular PTYs reported 161 checks, covering model tool exposure, asynchronous real shell
-execution alongside independent work, live logs, paging, CJK resize, distinct-key
-stop/clear, editor draft restoration and process-group cleanup. Fixtures use an
-offline faux provider and harmless local processes, not live provider credentials
-or physical-terminal qualification. The committed `test/shortcut-cli.py` harness separately recorded 72 shortcut checks
-across 100×30 and 40×12 fullscreen/regular CLI PTYs: empty entry, repeated keys,
-CJK draft/cursor restoration, native dialog/foreign overlay focus, stable task
-selection, log/stop navigation without model turns, and committed session
-retirement. Its instrumentation observes public component renders and editor text;
-Pi still owns actual terminal input, global shortcut routing, focus, and rendering.
-Historical counts are reports from those runs, not evidence that uncommitted
-CLI instrumentation can be rerun from this package. Use committed tests and the
-explicitly named shortcut harness for reproducible checks.
+[Bounded historical acceptance](docs/reference.md#development) distinguishes offline macOS/PTY evidence from Linux, live-provider and physical-terminal qualification.
 
 ## License
 
 MIT
 
-## Status navigation
+## Reference
 
-With a compatible status selector, **Ctrl+Alt+S**, choose **Background tasks**,
-then **Enter** opens this package's existing task UI. Ctrl+Alt+B and `/background`
-remain available. This optional integration is TUI-only and presentation-only:
-querying status never opens a screen, starts a job, or sends a model message.
-Selections are bound to one live session/branch surface; stale selections are
-not redirected after navigation or reload. The wire carries bounded action
-identifiers and labels, never commands, logs, execution controls, or callbacks.
+Detailed contracts and legacy section links:
 
-Passive task counts also refresh after silent (`notify: "off"`) completion,
-retention changes, and clears, without another tool/model turn. Output bursts
-coalesce into a short refresh rather than opening UI or producing notifications.
+- <a id="notification-safety-and-recovery"></a>[Notification safety and recovery](docs/reference.md#notification-safety-and-recovery)
+- <a id="status-navigation"></a>[Status navigation](docs/reference.md#status-navigation)

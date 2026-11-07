@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall, validateToolArguments } from "@earendil-works/pi-ai";
 import { type AgentSession, createAgentSession, DefaultResourceLoader, type ExtensionContext, ModelRegistry, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runAgent } from "../src/agent-runner.js";
@@ -75,13 +75,18 @@ describe("parent questions on the real offline Pi SDK", () => {
     return session.getToolDefinition("Agent")!.execute("spawn", { ...args, ...options }, undefined, undefined, ctx);
   }
 
-  it("refuses foreground, isolated, scheduled, and mode-changing resume requests before child/model allocation", async () => {
+  it("omits routing from the tool schema and silently ignores an old argument", async () => {
+    const tool = session.getToolDefinition("Agent")!;
+    expect(tool.parameters.properties).not.toHaveProperty("supervisor_questions");
+    child.setResponses([() => fauxAssistantMessage(fauxText("finished normally"))]);
+    const validated = validateToolArguments(tool, { type: "toolCall", id: "old-client", name: "Agent", arguments: { ...args, supervisor_questions: "human" } });
+    const result = await tool.execute("old-client", validated, undefined, undefined, ctx);
+    expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("finished normally") });
+    expect(JSON.stringify(result)).not.toContain("retired");
+    expect(JSON.stringify(result)).not.toContain("supervisor_questions");
     expect(main.state.callCount).toBe(0);
-    for (const extra of [{}, { run_in_background: false }, { run_in_background: true, isolated: true }, { run_in_background: true, schedule: "+10m" }, { run_in_background: true, resume: "forged" }]) {
-      await expect(spawn({ supervisor_questions: "parent", ...extra })).rejects.toThrow(/fresh non-isolated background/);
-    }
-    expect(child.state.callCount).toBe(0);
-    expect(main.state.callCount).toBe(0);
+    expect(input).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
     const answer = session.getToolDefinition("answer_subagent_question")!;
     await expect(answer.execute("forged", { questionId: "forged", answer: "approved" }, undefined, undefined, ctx)).rejects.toThrow("Unknown");
   });
@@ -89,7 +94,7 @@ describe("parent questions on the real offline Pi SDK", () => {
   it("starts queued children without polling, wakes the idle main, resumes the asking child, and keeps permission denial human", async () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
-    const rawChoice = "sqlite\u001b[31m";
+    const rawChoice = "sqlite\u001b]0;HIDDEN_CHILD_INSTRUCTION\u0007";
     child.setResponses([
       async () => { await gate; return fauxAssistantMessage(fauxText("blocker done")); },
       context => {
@@ -98,8 +103,11 @@ describe("parent questions on the real offline Pi SDK", () => {
         return fauxAssistantMessage(fauxToolCall("contact_supervisor", { question: "Which database?", options: [rawChoice, "postgres"] }), { stopReason: "toolUse" });
       },
       context => {
-        expect(JSON.stringify(context)).toContain("Main agent clarification");
-        expect(JSON.stringify(context)).toContain(JSON.stringify(rawChoice).slice(1, -1));
+        const contact = context.messages.find(message => message.role === "toolResult" && message.toolName === "contact_supervisor");
+        expect(contact).toMatchObject({ details: { status: "answered", answer: "sqlite" } });
+        expect(JSON.stringify(contact)).toContain("Main agent selected child-authored option");
+        expect(JSON.stringify(contact)).not.toContain("HIDDEN_CHILD_INSTRUCTION");
+        expect(JSON.stringify(contact)).not.toContain("\\u001b");
         return fauxAssistantMessage(fauxToolCall("read", { path: join(root, "sensitive") }), { stopReason: "toolUse" });
       },
       context => {
@@ -132,7 +140,7 @@ describe("parent questions on the real offline Pi SDK", () => {
     const first = await spawn({ run_in_background: true });
     expect(first).toBeDefined();
     await vi.waitFor(() => expect(child.state.callCount).toBe(1));
-    const second = await spawn({ run_in_background: true, supervisor_questions: "parent" });
+    const second = await spawn({ run_in_background: true, supervisor_questions: "off" });
     expect(second.content[0]).toMatchObject({ text: expect.stringContaining("queued") });
     expect(child.state.callCount).toBe(1);
     expect(main.state.callCount).toBe(1);
@@ -149,7 +157,17 @@ describe("parent questions on the real offline Pi SDK", () => {
     const id = /Agent ID: ([^\n]+)/.exec(second.content[0]?.type === "text" ? second.content[0].text : "")?.[1];
     expect(id).toBeDefined();
     await vi.waitFor(() => expect(session.isIdle).toBe(true));
-    await expect(spawn({ resume: id, run_in_background: false })).rejects.toThrow("run_in_background: true");
+    child.setResponses([
+      () => fauxAssistantMessage(fauxToolCall("contact_supervisor", { question: "Foreground cannot wait on its parent" }), { stopReason: "toolUse" }),
+      context => {
+        expect(JSON.stringify(context)).toContain("No answer");
+        return fauxAssistantMessage(fauxText("foreground resumed without blocking"));
+      },
+    ]);
+    const resumed = await spawn({ resume: id, run_in_background: false });
+    expect(resumed.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("foreground resumed without blocking") });
+    expect(input).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
   });
 
   it.each(["admission", "context", "answer"])("fences %s against a real native summary commit before this extension's TREE handler runs", async boundary => {
@@ -371,13 +389,17 @@ describe("parent questions on the real offline Pi SDK", () => {
     }
   });
 
-  it("leaves omitted mode human and never invokes a supervising clone", async () => {
+  it("withholds contact_supervisor in a foreground child even when the human UI exists", async () => {
     child.setResponses([
       () => fauxAssistantMessage(fauxToolCall("contact_supervisor", { question: "Ordinary clarification?" }), { stopReason: "toolUse" }),
-      context => { expect(JSON.stringify(context)).toContain("human answer"); return fauxAssistantMessage(fauxText("done")); },
+      context => {
+        expect(JSON.stringify(context)).toMatch(/not found|not available/i);
+        return fauxAssistantMessage(fauxText("reporting the blocker in the final result"));
+      },
     ]);
     await spawn();
-    expect(input).toHaveBeenCalledOnce();
+    expect(input).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
     expect(confirm).not.toHaveBeenCalled();
     expect(main.state.callCount).toBe(0);
   });

@@ -4,11 +4,39 @@
 
 ![session-recap widget in a live Pi session](./assets/recap.png)
 
-Built for multi-clauding / multi-pi workflows where several agent sessions run in parallel tabs.
-
-The recap orients rather than reports: it states the high-level task first (what you're building or debugging), then the concrete next step — the last assistant message is already on screen; what you've lost after a context switch is the task thread.
+For parallel Pi tabs: the recap states the high-level task and concrete next step rather than repeating the last assistant message.
 
 **Privacy default: no recap provider requests.** Recaps use an independent provider request built from session history *before* Pi's request-local `context` hooks run. A hook that redacts secrets from the parent provider request does **not** redact this history. To deliberately send raw history to a specific physical model, start Pi with both `--recap-allow-raw-history` and `--recap-model "provider/model-id"` (for example, `--recap-model "anthropic/claude-haiku-4-5"`). Review that destination's data policy before opting in. Without both flags, `/recap` explains how to enable it; automatic triggers remain silent and make no provider request.
+
+## Install
+
+<a id="pi-package-manager"></a>
+
+```bash
+pi install npm:@signalridge/pi-session-recap
+```
+
+Optional resource filter in `~/.pi/agent/settings.json` (the manifest already loads only this extension):
+
+```json
+{ "packages": [{ "source": "npm:@signalridge/pi-session-recap", "extensions": ["index.ts"] }] }
+```
+
+<a id="local-clone"></a>
+
+Local-clone alternative:
+
+```json
+{ "extensions": ["./packages/pi-session-recap/index.ts"] }
+```
+
+## Quick start
+
+```bash
+pi --recap-allow-raw-history --recap-model "anthropic/claude-haiku-4-5"
+```
+
+Then use `/recap` for an immediate recap, or let the activity triggers below run.
 
 ## How it triggers
 
@@ -50,37 +78,6 @@ Custom providers work when they use a built-in pi-ai API type. Pi-only custom ha
 ### Upstream attribution
 
 The fullscreen transcript placement and explicit Codex reasoning-off behavior are derived from [tmustier/pi-extensions `session-recap` v0.5.0](https://github.com/tmustier/pi-extensions/tree/09706a7/session-recap). Projected-context recaps and settlement handling follow [upstream v0.5.1](https://github.com/tmustier/pi-extensions/tree/4a63a2e/session-recap), adapted here for older Pi hosts, branch ownership, model selection, authentication checks, and bounded native-message context. Session attribution follows [pinned upstream v0.6.1](https://github.com/tmustier/pi-extensions/tree/f2632e7da3cadc4f22fb8367e7c4454779ec1a05/session-recap), preserving these local privacy and cancellation boundaries. The upstream MIT notice is retained alongside the local notice in `LICENSE`.
-
-## Install
-
-### Pi package manager
-
-```bash
-pi install npm:@signalridge/pi-session-recap
-```
-
-Filter to just this extension in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "packages": [
-    {
-      "source": "npm:@signalridge/pi-session-recap",
-      "extensions": ["index.ts"]
-    }
-  ]
-}
-```
-
-### Local clone
-
-```json
-{
-  "extensions": [
-    "./packages/pi-session-recap/index.ts"
-  ]
-}
-```
 
 ## Flags
 

@@ -714,9 +714,9 @@ export interface RunOptions {
    */
   rememberAgents?: boolean;
   /**
-   * Whether this agent may ask its human a question with `contact_supervisor`.
-   * Defaults to on wherever there is a UI to ask through; `false` withholds the
-   * tool entirely rather than injecting one that always refuses.
+   * Internal routing for `contact_supervisor`. Only `"parent"` (with a
+   * manager-issued `parentQuestion`) injects the tool, routed to the main
+   * agent; anything else withholds it. There is no human dialog path.
    */
   supervisorQuestions?: boolean | "parent";
   /** Manager-issued root clarification channel; never supplied by child tool args. */
@@ -939,7 +939,7 @@ export async function runAgent(
   // caller may be cancelled before this async function gets its first turn.
   throwIfAborted(options.signal);
   if (options.supervisorQuestions === "parent" && !options.parentQuestion) {
-    throw new Error('Parent clarification requires a manager-issued background channel. Use Agent with run_in_background: true and supervisor_questions: "parent".');
+    throw new Error("Parent clarification requires a manager-issued background channel.");
   }
   const parentProjectTrust = captureProjectTrust(ctx);
   // Configuration provenance is established synchronously, before definition
@@ -1545,22 +1545,13 @@ export async function runAgent(
     : [];
   // `contact_supervisor` is injected separately from the nested tools and under
   // a different condition. Nesting is gated on `allowedSubagents`, but the agent
-  // that most needs to ask a question is a LEAF one that cannot delegate — so
-  // gating them together would withhold it from exactly those agents. It needs
-  // only a human to answer, which `hasUI` decides. Isolation still suppresses
-  // it: an `isolated: true` agent is defined as built-in tools only.
+  // that most needs to ask a question is a LEAF one that cannot delegate. It
+  // exists only with a manager-issued main-agent channel (fresh top-level
+  // background spawns); there is no human dialog path. Isolation still
+  // suppresses it: an `isolated: true` agent is defined as built-in tools only.
   const supervisorTools =
-    (ctx.hasUI || options.supervisorQuestions === "parent") && !isolated && options.supervisorQuestions !== false
-      ? createSupervisorTool({
-          ...(options.supervisorQuestions === "parent" ? { parentQuestion: options.parentQuestion } : {}),
-          // Use the canonical agent type, not display_name: the question must
-          // identify the actual subagent that requested the decision.
-          agentLabel: agentConfig?.name ?? type,
-          ask: {
-            input: (title, placeholder) => ctx.ui.input(title, placeholder),
-            select: (title, choices) => ctx.ui.select(title, choices),
-          },
-        })
+    options.supervisorQuestions === "parent" && !isolated
+      ? createSupervisorTool({ parentQuestion: options.parentQuestion })
       : [];
   const injectedTools = [...nestedTools, ...supervisorTools];
   const nestedToolNames = new Set(injectedTools.map(tool => tool.name));

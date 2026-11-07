@@ -8,16 +8,7 @@ It only reads PR metadata for the current branch. It counts comments and reviews
 
 It is intentionally ambient: no slash command, no custom tool, no widget, and no comment injection.
 
-Hyperlink capability handling is selectively ported from [narumiruna/pi-extensions](https://github.com/narumiruna/pi-extensions/commit/36a5ad5149d890b03803c9fa971b875656dcf4e4): PR numbers use OSC 8 links only when Pi reports hyperlink support and the URL passes validation; otherwise they remain plain text. Local monitoring, cancellation and expiry safeguards are retained.
-
-## Features
-
-- Automatically shows compact PR status in Pi's statusline.
-- Refreshes the current branch PR every minute and after agent turns.
-- Shows PR number, GitHub checks state, review state, and comment/review count.
-- Does not read or expose PR discussion text; use `gh pr view --comments` or GitHub directly when you need the conversation.
-- Uses GitHub CLI auth and repository resolution; the extension stores no GitHub token.
-- No slash commands, LLM tools, widgets, webhook server, or separate runtime service.
+<a id="features"></a>
 
 Example statusline text:
 
@@ -63,7 +54,12 @@ gh auth login --hostname github.example.com:8443
 
 The extension shells out to `gh`; GitHub Enterprise hosts and credential storage are delegated to `gh`. It uses the PR URL host (including any port) for follow-up API calls, so no manual `GH_HOST` is required.
 
-## Behavior
+<a id="behavior"></a>
+<a id="known-limits"></a>
+
+## Behavior and limits
+
+Uses `gh` authentication without storing tokens; no direct API, GITHUB_TOKEN fallback, webhook or separate service. Only the current branch is queried, via `gh pr view` plus one GraphQL count query per refresh. Counts combine comments and reviews, not unresolved review-thread counts; use GitHub or `gh pr view --comments` for discussion text.
 
 The extension runs passively:
 
@@ -77,26 +73,13 @@ The extension runs passively:
 
 Each subprocess has an independent combined stdout/stderr capture budget: PR metadata 1 MiB, GraphQL counts 64 KiB, and Git HEAD-path discovery 16 KiB. Incomplete output is rejected before parsing or CLI failure classification; overflow is not reported as a timeout. These operation budgets are not settings.
 
-## Known limits
+<a id="package-layout"></a>
 
-- Requires `gh`; there is no direct GitHub API, `GITHUB_TOKEN` fallback, or manual `GH_HOST` requirement.
-- Only the current branch PR is shown; there is no command or tool for arbitrary PR lookup.
-- Comment count uses `gh pr view` comments and reviews, not precise unresolved review-thread counts.
-- It does not read PR comment bodies, review bodies, inline diff comments, or unresolved review-thread text.
-- While a session is open, refresh runs every 60 seconds in addition to session start, branch changes, and agent turns; each refresh invokes `gh pr view` and one GraphQL count query.
+Source entrypoint: `src/index.ts`.
 
-## Package layout
+## Provenance
 
-```text
-packages/pi-github-pr/
-├── src/index.ts
-├── src/github-pr.ts
-├── test/github-pr.test.ts
-├── package.json
-├── README.md
-├── LICENSE
-└── tsconfig.json
-```
+Hyperlink handling selectively adapts [narumiruna/pi-extensions 36a5ad5](https://github.com/narumiruna/pi-extensions/commit/36a5ad5149d890b03803c9fa971b875656dcf4e4): OSC 8 links require Pi-reported support and a validated URL, otherwise plain text. Local monitoring, cancellation and expiry safeguards remain.
 
 ## License
 

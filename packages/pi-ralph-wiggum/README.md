@@ -1,10 +1,6 @@
 # Ralph Wiggum Extension
 
-Long-running agent loops for iterative development. Best for long-running-tasks that are verifiable. Builds on Geoffrey Huntley's ralph-loop for Claude Code and adapts it for Pi.
-This one is cool because:
-- You can ask Pi and it will set up and run the loop all by itself in-session. If you prefer, it can also invoke another Pi via tmux
-- You can have multiple parallel loops at once in the same repo (unlike OG ralph-wiggum)
-- You can ask Pi to self-reflect at regular intervals so it doesn't mindlessly grind through wrong instructions (optional)
+Flat, in-session agent loops for verifiable iterative development, adapted from Geoffrey Huntley's Ralph loop. Ask Pi to create and run a task checklist, optionally with periodic reflection. Multiple loops can coexist in one repository; a separate Pi via tmux remains an alternative.
 
 <img width="432" height="357" alt="Screenshot 2026-01-07 at 17 16 24" src="https://github.com/user-attachments/assets/68cdab11-76c6-4aed-9ea1-558cbb267ea6" />
 
@@ -16,23 +12,7 @@ This one is cool because:
 pi install npm:@signalridge/pi-ralph-wiggum
 ```
 
-```bash
-pi install npm:@signalridge/pi-ralph-wiggum
-```
-
-Then filter to just this extension in `~/.pi/agent/settings.json`:
-
-```json
-{
-  "packages": [
-    {
-      "source": "npm:@signalridge/pi-ralph-wiggum",
-      "extensions": ["./index.ts"],
-      "skills": ["./SKILL.md"]
-    }
-  ]
-}
-```
+The package manifest already selects its extension and `SKILL.md`; no additional resource filter is required.
 
 ## Recommended usage: just ask Pi
 You ask Pi to set up a ralph-wiggum loop.
@@ -98,8 +78,8 @@ Known paused, completed, replayed, or retired iteration deliveries are rejected 
 | Option | Description |
 |--------|-------------|
 | `--max-iterations N` | Stop after N iterations (default 50) |
-| `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
-| `--reflect-every N` | Reflect every N iterations |
+| `--items-per-iteration N` | Suggest N items per turn (prompt hint; default 0, no limit) |
+| `--reflect-every N` | Reflect every N iterations (default 0, disabled) |
 
 Counts must be nonnegative safe integers, validated before task files or ownership change.
 CLI values use decimal integer digits (optionally quoted), not fractions or exponent notation.

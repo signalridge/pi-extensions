@@ -57,6 +57,20 @@ describe("managed spawn protocol", () => {
     setAgentTiersSettings({});
   });
 
+  it("does not issue the ordinary host-question channel to managed workflow children", async () => {
+    setAgentTiersSettings({ profiles: { low: { model: "inherit", thinking: "inherit" } } });
+    vi.mocked(runAgent).mockResolvedValue({ responseText: "done", session: { dispose: vi.fn() } as never, aborted: false, steered: false });
+    manager = new AgentManager(undefined, 1, undefined, undefined, undefined, { append: () => {} });
+    const factory = vi.fn(() => async () => ({ status: "answered" as const, answer: "not for managed work" }));
+    manager.setParentQuestionFactory(factory);
+    const spawned = manager.spawnManaged(pi, ctx, request, managedPolicy);
+    await manager.getRecordMutable(spawned.id)!.promise;
+    const options = vi.mocked(runAgent).mock.lastCall?.[3];
+    expect(options?.supervisorQuestions).toBe(false);
+    expect(options?.parentQuestion).toBeUndefined();
+    expect(factory).not.toHaveBeenCalled();
+  });
+
   it("accepts managed policy hints and rejects invalid owners", () => {
     expect(
       validateManagedSpawnRequest({

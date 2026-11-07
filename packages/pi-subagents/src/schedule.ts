@@ -254,6 +254,7 @@ export class SubagentScheduler {
       agentId = manager.spawn(pi, ctx, dispatch.type, job.prompt, {
         description: job.description,
         isBackground: true,
+        supervisorQuestions: false,
         bypassQueue: true,
         model: resolvedModel,
         maxTurns: job.max_turns,

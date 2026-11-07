@@ -366,6 +366,7 @@ describe("SubagentScheduler — fire path", () => {
     const optsArg = manager.spawn.mock.calls[0][4];
     expect(optsArg.bypassQueue).toBe(true);
     expect(optsArg.isBackground).toBe(true);
+    expect(optsArg.supervisorQuestions).toBe(false);
   });
 
   it("disabled jobs do not fire", () => {

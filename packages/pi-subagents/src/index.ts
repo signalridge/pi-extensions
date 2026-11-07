@@ -2761,9 +2761,6 @@ Terse command-style prompts produce shallow, generic work.
             "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
         }),
       ),
-      supervisor_questions: Type.Optional(Type.Union([Type.Literal("human"), Type.Literal("parent"), Type.Literal("off")], {
-        description: 'Explicit question routing, default human. "parent" is ordinary clarification only (never permission/approval), supported only for fresh non-isolated top-level background calls. No schedules or mode-changing resumes.',
-      })),
       resume: Type.Optional(
         Type.String({
           description:
@@ -2966,10 +2963,6 @@ Terse command-style prompts produce shallow, generic work.
         for (const key of ["isolated", "isolation"] as const) {
           if (params[key] !== undefined) throw new Error(`Cold resume does not support per-call ${key}; omit ${key} to preserve the original restrictions, or start a fresh Agent.`);
         }
-        if (params.supervisor_questions === "parent") {
-          throw new Error('supervisor_questions: "parent" requires a fresh non-isolated background Agent. Set run_in_background: true, omit schedule/resume, and enable Supervisor questions. Foreground calls cannot answer while blocked.');
-        }
-        if (params.supervisor_questions !== undefined) throw new Error('Resume preserves the child question mode; omit supervisor_questions and use run_in_background: true for a parent-mode child.');
         if (params.schedule) return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
         if (params.inherit_context === true) throw new Error(INHERIT_CONTEXT_UNAVAILABLE);
         signal?.throwIfAborted();
@@ -3025,16 +3018,6 @@ Terse command-style prompts produce shallow, generic work.
         ...params,
         agentTiers: getAgentTiersSettings(),
       });
-      if (params.supervisor_questions === "parent" &&
-          (!resolvedConfig.runInBackground || resolvedConfig.isolated || params.schedule || params.resume || !isSupervisorQuestionsEnabled())) {
-        throw new Error('supervisor_questions: "parent" requires a fresh non-isolated background Agent. Set run_in_background: true, omit schedule/resume, and enable Supervisor questions. Foreground calls cannot answer while blocked.');
-      }
-      if (params.schedule && params.supervisor_questions !== undefined) {
-        throw new Error('Scheduled calls do not support per-call question routing; omit supervisor_questions.');
-      }
-      if (params.resume && params.supervisor_questions !== undefined) {
-        throw new Error('Resume preserves the child question mode; omit supervisor_questions and use run_in_background: true for a parent-mode child.');
-      }
       if (!params.resume && !params.schedule && resolvedConfig.inheritContext) {
         return textResult(INHERIT_CONTEXT_UNAVAILABLE);
       }
@@ -3402,7 +3385,8 @@ Terse command-style prompts produce shallow, generic work.
             : thinking,
           agentTier: resolvedConfig.requestedAgentTier,
           isBackground: true,
-          supervisorQuestions: params.supervisor_questions === "parent" ? "parent" : params.supervisor_questions === "off" ? false : undefined,
+          // Questions go only to the main agent; ineligible spawns get no channel.
+          supervisorQuestions: isSupervisorQuestionsEnabled() && !isolated && !params.schedule && !params.resume,
           isolation,
           invocation: agentInvocation,
           rootSessionId: ctx.sessionManager.getSessionId(),
@@ -3572,7 +3556,7 @@ Terse command-style prompts produce shallow, generic work.
               : thinking,
             agentTier: resolvedConfig.requestedAgentTier,
             isolation,
-            supervisorQuestions: params.supervisor_questions === "off" ? false : undefined,
+            supervisorQuestions: false,
             invocation: agentInvocation,
             signal,
             rootSessionId: ctx.sessionManager.getSessionId(),

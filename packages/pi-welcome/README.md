@@ -51,38 +51,19 @@ pi -e ./packages/pi-welcome
 
 ## Turn on `quietStartup`
 
-The card is designed to be the whole opening screen. Pi's own startup is a
-separate header, key-hint block, and one `[Section]` per resource kind with a
-blank line between each; leaving both on shows two unrelated designs and about
-forty-five lines of them. Set:
+To show the card without Pi's separate startup listing, set:
 
 ```json
 { "quietStartup": true }
 ```
 
-in `~/.pi/agent/settings.json` (or `/settings` → Quiet startup). Pi then prints
-nothing at startup and this card stands alone. Diagnostics — resource
-collisions, extension load errors — are still shown when quiet, so nothing
-actionable is hidden.
-
-Leaving `quietStartup: false` is supported and changes nothing about the card;
-Pi simply prints its own block above it again.
+in `~/.pi/agent/settings.json` (or `/settings` → Quiet startup). Resource collisions and extension-load diagnostics still appear. `false` is supported: Pi's own startup block appears above the unchanged card.
 
 ## Where the inventory comes from
 
-With `quietStartup` on, Pi's `[Context]`/`[Skills]`/`[Prompts]`/`[Themes]`/
-`[Extensions]` sections are gone and nothing brings them back — `/reload` re-runs
-the same suppressed listing — so this card is the only place they appear. It
-names them rather than counting them, capped at eight per row with a `+N` tail.
+Inventory is **live at render**, collected when the renderer is created after resource discovery, not persisted with startup facts. Rows show at most eight names plus a `+N` tail; quiet startup and `/reload` leave native resource listings suppressed.
 
-Skills and prompts come from `getCommands()`, **not** from `loadSkills()`. An
-extension may contribute skill paths through `resources_discover`, which is
-where most of them come from in practice, and the standalone loader cannot see
-those: on a session showing dozens of skills it returns zero. `getCommands()`
-reports what Pi actually registered. Collection happens at renderer component
-creation, after `bindExtensions()` finishes `resources_discover`, not during
-`session_start` before discovery. The inventory is labeled **live at render**;
-it is not a persisted startup snapshot.
+- Skills/prompts: `getCommands()` reports actual registrations, including extension-provided `resources_discover` skills that standalone `loadSkills()` cannot see.
 
 **Configured packages** comes from `pi.getSettings()`, which already resolves
 project trust and merges configuration. Packages filtered to no resources are

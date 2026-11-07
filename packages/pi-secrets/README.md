@@ -9,6 +9,20 @@ runs, so a command that needs the token still works.
 
 The package is **experimental** and opt-in.
 
+## Install
+
+```bash
+pi install npm:@signalridge/pi-secrets
+```
+
+<a id="use-from-this-checkout"></a>
+
+Alternative, from this repository's root:
+
+```bash
+pi -e ./packages/pi-secrets
+```
+
 ## What it protects, and what it does not
 
 It protects the provider-bound conversation: user, assistant and tool-result
@@ -96,7 +110,7 @@ this hook, so the stored assistant message keeps the placeholders the model
 wrote. Restoration is textual: the model quoted a placeholder, not the value, so
 a value containing quote characters can change how a shell command parses.
 
-## What you see
+<a id="what-you-see"></a>
 
 Tool-call rows show the arguments as the model wrote them, so they display
 placeholders, not values. Tool results, your own messages and the session file
@@ -151,10 +165,7 @@ All batch strings are discovered before any are projected. Cooperating callers
 project full eligible history before truncation/budget slicing, then project the
 assembled side request. Neither stored history nor side-thread messages change;
 side replies are not blanket-restored. Only the existing native `tool_call`
-boundary restores issued tokens. The coverage is limited to native conversation
-requests and cooperating pi-btw `/btw`/`advisor` requests. System prompts, images,
-opaque signatures, compaction generation and export remain outside this service.
-Rewritten signed reasoning is not a claim of acceptance by signed providers.
+boundary restores issued tokens. Coverage follows [the exclusions above](#what-it-protects-and-what-it-does-not); rewritten signed reasoning does not establish signed-provider acceptance.
 
 ## Configuration
 
@@ -194,20 +205,6 @@ scope and entry index, never a value. Files are read once per session start.
 tracked per source, which configuration files loaded, how many replacements the
 last request needed, how many tool calls and placeholders were restored, and the
 key status. It never shows values, placeholders or labels.
-
-## Install
-
-```bash
-pi install npm:@signalridge/pi-secrets
-```
-
-## Use from this checkout
-
-From the repository root:
-
-```bash
-pi -e ./packages/pi-secrets
-```
 
 ## Provenance
 

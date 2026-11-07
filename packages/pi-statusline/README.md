@@ -10,7 +10,7 @@ Typical output is similar to:
 gpt-5.6-sol · think max · main                         ctx 42%
 ```
 
-There are no persistent branch icons, emoji, powerline blocks, hard-coded backgrounds, or ornamental per-segment symbols in the default profile. A single dim `·` separator is used between text fields. Normal metadata is muted; accent and warning/error colors are reserved for current or abnormal state.
+The default uses one dim `·` separator and muted metadata, reserving accent/warning/error colors for current or abnormal state. No persistent icons, emoji, powerline blocks or hard-coded backgrounds.
 
 ## Selective upstream compatibility
 
@@ -124,27 +124,9 @@ Retained footer callbacks also check the live mode and UI eligibility before wor
 
 The JSON editor honors Pi's configured external editor. Session replacement or reload retires the dialog without killing that program or restoring its obsolete draft; when the program exits, the surviving terminal may resume. Quit suppression requires statusline to remain loaded in the replacement session. If a reload removes the extension, no replacement instance can observe later quit, so the pending editor retains the host's native restart behavior.
 
-## Package layout
+<a id="package-layout"></a>
 
-```text
-packages/pi-statusline/
-├── src/
-│   ├── statusline.ts          # thin Pi lifecycle entrypoint
-│   ├── commands.ts            # settings and menu workflows
-│   ├── status-inspector.ts    # owned, read-only status navigation
-│   ├── status-actions.ts      # bounded owner-detail protocol consumer
-│   ├── render.ts              # data-to-segment projection
-│   ├── context-confidence.ts  # branch/model-owned context display confidence
-│   ├── powerline.ts           # restrained text and optional powerline renderers
-│   ├── settings.ts            # canonical/legacy loading and atomic saves
-│   ├── git-status.ts          # argv-based asynchronous Git status
-│   ├── extension-status.ts    # text-only extension status projection
-│   └── presets/               # optional palette ramps
-├── test/
-├── README.md
-├── LICENSE
-└── package.json
-```
+Source entrypoint: `src/index.ts`.
 
 ## Local divergence
 
