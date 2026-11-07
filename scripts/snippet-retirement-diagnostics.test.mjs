@@ -148,13 +148,16 @@ for (const prefix of ["rescue", "emergency-rescue"]) {
 test("workflow is same-VM, read-only, pinned, bounded and uploads evidence after failure", () => {
   const workflow = readFileSync(path.join(root, ".github/workflows/snippet-retirement-diagnostics.yml"), "utf8");
   assert.match(workflow, /contents: read/);
-  assert.match(workflow, /head\.repo\.full_name == github\.repository/);
+  assert.match(workflow, /^on:\n {2}workflow_dispatch:\n/m);
+  assert.doesNotMatch(workflow, /pull_request|workflow_run|^ {2}push:/m);
   assert.match(workflow, /runs-on: ubuntu-24\.04/);
+  assert.match(workflow, /ref: \$\{\{ github\.sha \}\}\n {10}path: candidate/);
+  assert.match(workflow, /ref: c00f9f990f201340b27658dcb525ddcdb14c08ec\n {10}path: baseline/);
+  assert.match(workflow, /python3 scripts\/fixtures\/snippet-retirement-pidfd\.py --probe/);
   assert.match(
     workflow,
-    /ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}\n {10}path: candidate/,
+    /node candidate\/scripts\/snippet-retirement-diagnostics\.mjs baseline candidate diagnostic-evidence "\$PAIRS" primary/,
   );
-  assert.match(workflow, /python3 scripts\/fixtures\/snippet-retirement-pidfd\.py --probe/);
   assert.match(workflow, /timeout-minutes: 30/);
   assert.match(workflow, /default: "200"/);
   assert.match(workflow, /node-version: 24\.21\.0/);

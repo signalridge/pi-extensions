@@ -7,27 +7,18 @@ on:
         default: "200"
         required: true
         type: string
-  pull_request:
-    paths:
-      - packages/pi-code-actions/**
-      - scripts/snippet-retirement-diagnostics*
-      - scripts/fixtures/snippet-retirement-observer.mjs
-      - scripts/fixtures/snippet-retirement-pidfd*.py
-      - .github/workflows/snippet-retirement-diagnostics.yml
 permissions:
   contents: read
 jobs:
   native-paired-observation:
-    # Never run privileged PR-target code or use secrets. Forks can run manually
-    # after review; no write permission, OIDC, or persisted checkout credentials.
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    # No write permission, OIDC, or persisted checkout credentials.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Candidate source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           path: candidate
           fetch-depth: 0
           persist-credentials: false
